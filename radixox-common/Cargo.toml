@@ -1,0 +1,16 @@
+[package]
+name = "radixox-common"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Common library for RadixOx - Redis-like data store"
+
+[dependencies]
+serde.workspace = true
+monoio.workspace = true
+prost.workspace = true
+bytes.workspace = true
+
+[build-dependencies]
+prost-build = "0.14.3" # Pour transformer le .proto en code Rust

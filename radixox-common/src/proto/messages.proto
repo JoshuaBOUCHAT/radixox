@@ -1,0 +1,41 @@
+syntax = "proto3";
+package radixox;
+
+// L'enveloppe principale pour toutes les requêtes client
+message NetCommand {
+  oneof net_action {
+    NetSetRequest set = 1;
+    NetGetRequest get = 2;
+    NetGetNRequest getn = 3;
+  }
+}
+
+message NetSetRequest {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message NetGetRequest { bytes key = 1; }
+
+message NetGetNRequest {
+  bytes pattern = 1; // Le pattern avec '*'
+}
+
+message NetResponse {
+  oneof result {
+    NetErrorResponse error = 1;
+    NetSuccessResponse success = 2;
+  }
+}
+
+message NetErrorResponse { string message = 2; }
+
+message NetSuccessResponse {
+  oneof body {
+    bytes get_val = 1;
+    NetGetNval keys_val = 2;
+    // Si c'est un SET, le body peut être vide ou un simple bool
+  }
+}
+
+message NetGetNval { repeated bytes keys = 1; }

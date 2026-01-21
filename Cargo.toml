@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["radixox-common", "radixox-client", "radixox-server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Joshua"]
+license = "MIT"
+
+[workspace.dependencies]
+radixox-common = { path = "radixox-common" }
+monoio = "0.2.4"
+prost = "0.14.3"
+serde = { version = "1.0.228", features = ["derive"] }
+bytes = { version = "1", features = ["serde"] }

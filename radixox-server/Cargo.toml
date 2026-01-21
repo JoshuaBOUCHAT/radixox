@@ -1,0 +1,15 @@
+[package]
+name = "radixox-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "RadixOx server - Redis-like data store"
+
+[dependencies]
+serde.workspace = true
+monoio.workspace = true
+prost.workspace = true
+serde_json = "1.0.149"
+slotmap = "1.1.1"
+arrayvec = "0.7.6"
