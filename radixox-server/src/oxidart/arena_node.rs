@@ -37,20 +37,25 @@ pub trait Inode {
     fn get_val(&self) -> Option<Bytes>;
 }
 
-pub struct SmallNode {
+pub struct SmallChilds {
     val: Option<Bytes>,
     nodes: ArrayVec<NodeChild, { NodeType::Small.size() }>,
 }
+impl SmallChilds {
+    fn insert_new_child(&mut self, radix: u8) -> Result<(), MediumChilds> {
+        if self.nodes.is_full() {}
+    }
+}
 
-pub struct MediumNode {
+pub struct MediumChilds {
     val: Option<Bytes>,
     nodes: ArrayVec<NodeChild, { NodeType::Medium.size() }>,
 }
-pub struct LargeNode {
+pub struct LargeChilds {
     val: Option<Bytes>,
     nodes: ArrayVec<NodeChild, { NodeType::Large.size() }>,
 }
-pub struct HugeNode {
+pub struct HugeChilds {
     val: Option<Bytes>,
     nodes: [Option<NodeChild>; 128],
 }
@@ -72,11 +77,11 @@ macro_rules! impl_node_array {
     };
 }
 
-impl_node_array!(SmallNode);
-impl_node_array!(MediumNode);
-impl_node_array!(LargeNode);
+impl_node_array!(SmallChilds);
+impl_node_array!(MediumChilds);
+impl_node_array!(LargeChilds);
 
-impl Inode for HugeNode {
+impl Inode for HugeChilds {
     fn get_child(&self, radix: u8) -> Option<NodeChild> {
         assert!(radix.is_ascii());
         self.nodes[radix as usize].clone()
