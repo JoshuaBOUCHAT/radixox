@@ -424,8 +424,10 @@ name = "radixox-server"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
+ "bytes",
  "monoio",
  "prost",
+ "radixox-common",
  "serde",
  "serde_json",
  "slotmap",

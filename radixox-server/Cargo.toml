@@ -10,6 +10,8 @@ description = "RadixOx server - Redis-like data store"
 serde.workspace = true
 monoio.workspace = true
 prost.workspace = true
+bytes.workspace = true
+radixox-common = { path = "../radixox-common" }
 serde_json = "1.0.149"
 slotmap = "1.1.1"
 arrayvec = "0.7.6"

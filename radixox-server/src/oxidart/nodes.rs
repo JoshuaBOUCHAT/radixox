@@ -1,87 +1,54 @@
-use arrayvec::ArrayVec;
-use prost::bytes::Bytes;
-use slotmap::DefaultKey;
+use std::{
+    collections::binary_heap::PeekMut,
+    ops::{Index, IndexMut},
+};
 
-#[derive(Clone, Copy)]
-pub enum NodeType {
-    Small,
-    Medium,
-    Large,
-    Huge,
-}
-impl NodeType {
-    const fn size(&self) -> usize {
-        match self {
-            Self::Small => 4,
-            Self::Medium => 8,
-            Self::Large => 32,
-            Self::Huge => 128,
-        }
-    }
-}
+use bytes::Bytes;
 
+#[derive(Clone, Default)]
 pub struct Node {
-    is_word: bool,
-    children: NodeChild,
-}
-
-#[derive(Clone)]
-pub struct NodeChild {
-    node_type: NodeType,
-    idx: DefaultKey,
+    val: Option<Bytes>,
+    childs: Vec<Node>,
     radix: u8,
 }
-
-pub trait Inode {
-    fn get_child(&self, radix: u8) -> Option<NodeChild>;
-    fn get_val(&self) -> Option<Bytes>;
-}
-
-pub struct SmallNode {
-    val: Option<Bytes>,
-    nodes: ArrayVec<NodeChild, { NodeType::Small.size() }>,
-}
-
-pub struct MediumNode {
-    val: Option<Bytes>,
-    nodes: ArrayVec<NodeChild, { NodeType::Medium.size() }>,
-}
-pub struct LargeNode {
-    val: Option<Bytes>,
-    nodes: ArrayVec<NodeChild, { NodeType::Large.size() }>,
-}
-pub struct HugeNode {
-    val: Option<Bytes>,
-    nodes: [Option<NodeChild>; 128],
-}
-
-macro_rules! impl_node_array {
-    ($name:ident) => {
-        impl Inode for $name {
-            fn get_child(&self, radix: u8) -> Option<NodeChild> {
-                self.nodes
-                    .iter()
-                    .find(|&child| child.radix == radix)
-                    .cloned()
-            }
-
-            fn get_val(&self) -> Option<Bytes> {
-                self.val.clone()
-            }
-        }
-    };
-}
-
-impl_node_array!(SmallNode);
-impl_node_array!(MediumNode);
-impl_node_array!(LargeNode);
-
-impl Inode for HugeNode {
-    fn get_child(&self, radix: u8) -> Option<NodeChild> {
+impl Node {
+    pub(crate) fn new(radix: u8) -> Self {
         assert!(radix.is_ascii());
-        self.nodes[radix as usize].clone()
+        Self {
+            val: None,
+            childs: vec![],
+            radix,
+        }
     }
-    fn get_val(&self) -> Option<Bytes> {
+    pub(crate) fn add_child_mut(&mut self, radix: u8) -> &mut Self {
+        self.childs.push(Node::new(radix));
+        unsafe { self.childs.last_mut().unwrap_unchecked() }
+    }
+    pub(crate) fn last_mut(&mut self) -> Option<&mut Self> {
+        self.childs.last_mut()
+    }
+    pub(crate) fn set_val(&mut self, val: Bytes) {
+        self.val = Some(val)
+    }
+}
+
+impl Node {
+    pub fn get_child(&self, radix: u8) -> Option<usize> {
+        self.childs.iter().position(|child| child.radix == radix)
+    }
+
+    pub fn get_val(&self) -> Option<Bytes> {
         self.val.clone()
+    }
+}
+impl Index<usize> for Node {
+    type Output = Node;
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.childs[index]
+    }
+}
+impl IndexMut<usize> for Node {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.childs[index]
     }
 }

@@ -9,6 +9,7 @@ pub mod network {
         CommandEmpty,
         GetEmpty,
         SetEmpty,
+        KeyNotAscii,
     }
     impl NetValidate<Command> for NetCommand {
         fn validate(self) -> Result<Command, NetError> {
@@ -25,7 +26,8 @@ pub mod network {
                     if get.key.len() == 0 {
                         return Err(NetError::GetEmpty);
                     }
-                    Ok(Command::get(get.key))
+
+                    Command::get(get.key).map_err(|_| NetError::KeyNotAscii)
                 }
                 NetAction::Getn(_getn) => {
                     todo!()
@@ -34,7 +36,8 @@ pub mod network {
                     if set.key.len() == 0 {
                         return Err(NetError::SetEmpty);
                     }
-                    Ok(Command::set(set.key, set.value))
+
+                    Command::set(set.key, set.value).map_err(|_| NetError::KeyNotAscii)
                 }
             }
         }
