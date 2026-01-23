@@ -1,175 +1,255 @@
-use std::ops::Index;
-
 use bytes::Bytes;
 use radixox_common::protocol::{GetAction, SetAction};
 
 use slotmap::{DefaultKey, SlotMap};
 
 use crate::oxidart::arena_node::{
-    HugeChilds, Inode, LargeChilds, MediumChilds, Node, NodeChildIdx, NodeType, SmallChilds,
+    ChildIdx, HugeChilds, Inode, LargeChilds, MediumChilds, Node, NodeType, SmallChilds,
 };
-
-pub(crate) struct OxidArtArena {
-    small_map: SlotMap<DefaultKey, SmallChilds>,
+#[derive(Debug)]
+pub struct OxidArtArena {
+    pub small_map: SlotMap<DefaultKey, SmallChilds>,
     medium_map: SlotMap<DefaultKey, MediumChilds>,
     large_map: SlotMap<DefaultKey, LargeChilds>,
     huge_map: SlotMap<DefaultKey, HugeChilds>,
-    root: [NodeChildIdx; 128],
-    root_data: Option<Bytes>,
+    ///Dummy radix for root
+    root: Node,
 }
 impl OxidArtArena {
-    fn new() -> Self {
-        let mut small_map: SlotMap<DefaultKey, SmallChilds> = SlotMap::new();
-        let root = core::array::from_fn(|_| {
-            let idx = small_map.insert(SmallChilds::default());
-            NodeChildIdx::new(idx, super::arena_node::NodeType::Small)
-        });
+    pub fn new() -> Self {
+        let mut huge_map: SlotMap<DefaultKey, HugeChilds> = SlotMap::new();
+
+        let root_key = huge_map.insert(HugeChilds::default());
+        let root_idx = ChildIdx {
+            idx: root_key,
+            node_type: NodeType::Huge,
+        };
+        //Dummy radix for root
+        let root = Node {
+            idx: root_idx,
+            radix: 0,
+            val: None,
+        };
         Self {
-            small_map,
+            small_map: SlotMap::new(),
             root,
             medium_map: SlotMap::new(),
             large_map: SlotMap::new(),
-            huge_map: SlotMap::new(),
-            root_data: None,
+            huge_map,
         }
     }
-    pub fn insert_new_node(&mut self, val: Option<Bytes>) -> NodeChildIdx {
-        let idx = self.small_map.insert(SmallChilds::new_node(val));
-        NodeChildIdx {
-            idx,
-            node_type: super::arena_node::NodeType::Small,
-        }
+    fn insert_new_node(&mut self, val: Option<Bytes>, radix: u8) -> Node {
+        let key = self.small_map.insert(SmallChilds::new_node(None));
+        let idx = ChildIdx::new_small(key);
+        Node { idx, val, radix }
     }
 
     pub fn get(&self, get_action: GetAction) -> Option<Bytes> {
         let key = get_action.into_byte();
         if key.is_empty() {
-            return self.root_data.clone();
+            return self.root.val.clone();
         }
-        let mut actual_child_view = self.get_node_childs_view(&self.root[key[0] as usize]);
-        //This code iter to key.len -1 as we need the the child view that point to the desired node
-        for i in 1..(key.len() - 1) {
-            actual_child_view =
-                self.get_node_childs_view(&actual_child_view.get_child(key[i])?.idx);
+        let mut actual_child_view = self.get_node_childs_view(&self.root.idx);
+        // Traverse all characters except the last one
+        for i in 0..(key.len() - 1) {
+            let node = actual_child_view.get_child(key[i])?;
+            actual_child_view = self.get_node_childs_view(&node.idx);
         }
+        // Get the final node's value
         let node_child = actual_child_view.get_child(*key.last().unwrap())?;
         node_child.val
     }
+    //fn get_child_val(&self, idx: &ChildIdx) -> Option<Bytes> {}
     pub fn set(&mut self, set_action: SetAction) {
         let (key, val) = set_action.into_parts();
-        if key.is_empty() {
-            self.root_data = Some(val);
+        let key_len = key.len();
+        if key_len == 0 {
+            self.root.val = Some(val);
             return;
         }
-        let mut actual_child_idx = self.root[key[0] as usize].clone();
-        if self.get_node_childs_view(&actual_child_idx).is_full() {
-            if let Some(node) = self
-                .get_node_childs_view(&actual_child_idx)
-                .get_child(key[1])
-            {
-                actual_child_idx = node.idx;
-            }
+        if key_len == 1 {
+            self.handle_first_node_set(key[0], Some(val));
+            return;
         }
-
+        let mut fathers_childs_idx = self.root.idx.clone();
+        //Ici on passe None comme val car on ne souhaite pas  definir la val du node de lvl1
+        let mut actual_idx = self.handle_first_node_set(key[0], None);
         for i in 1..(key.len() - 1) {
-            if let Some(node) = self
-                .get_node_childs_view(&actual_child_idx)
-                .get_child(key[i])
-            {
-                actual_child_idx = node.idx;
+            let radix = key[i];
+            if let Some(node) = self.get_node_childs_view(&actual_idx).get_child(radix) {
+                (fathers_childs_idx, actual_idx) = (actual_idx, node.idx);
                 continue;
             }
-            let new_node_idx = self.insert_new_node(None);
-            let view_mut = self.get_node_childs_view_mut(&actual_child_idx);
-            view_mut.is_full();
-        }
-    }
+            let new_node = self.insert_new_node(None, radix);
+            let new_idx = new_node.idx.clone();
 
-    fn get_node_childs_view(&self, index: &NodeChildIdx) -> NodeChildsView<'_> {
-        use super::arena_node::NodeType::*;
-        match index.node_type {
-            Huge => NodeChildsView::Huge(&self.huge_map[index.idx]),
-            Large => NodeChildsView::Large(&self.large_map[index.idx]),
-            Medium => NodeChildsView::Medium(&self.medium_map[index.idx]),
-            Small => NodeChildsView::Small(&self.small_map[index.idx]),
-        }
-    }
+            if self.get_node_childs_view(&actual_idx).is_full() {
+                //STEP-2v1 set the childs_idx to the new one as the upgrade change the index
 
-    fn get_node_childs_view_mut(&mut self, index: &NodeChildIdx) -> NodeChildsViewMut<'_> {
-        use super::arena_node::NodeType::*;
-        match index.node_type {
-            Huge => NodeChildsViewMut::Huge(&mut self.huge_map[index.idx]),
-            Large => NodeChildsViewMut::Large(&mut self.large_map[index.idx]),
-            Medium => NodeChildsViewMut::Medium(&mut self.medium_map[index.idx]),
-            Small => NodeChildsViewMut::Small(&mut self.small_map[index.idx]),
+                self.upgrade(&fathers_childs_idx, key[i - 1], &actual_idx, new_node);
+            } else {
+                //STEP-2v2 Simply add the new child in the root list as it is not full yet
+                self.insert(&actual_idx, new_node);
+            }
+            (fathers_childs_idx, actual_idx) = (actual_idx, new_idx)
         }
+        let view_mut = self.get_node_childs_view_mut(&actual_idx);
+        let last_radix = *key.last().unwrap();
+        if let Some(node) = view_mut.get_child_mut(last_radix) {
+            node.val = Some(val);
+            return;
+        }
+        let new_node = self.insert_new_node(Some(val), last_radix);
+        self.get_node_childs_view_mut(&actual_idx)
+            .add_node(new_node);
     }
-    pub fn upgrade(&mut self, idx: NodeChildIdx, node: Node) -> NodeChildIdx {
-        match self.get_node_childs_view(&idx) {
-            NodeChildsView::Huge(_) => panic!("Huge should no be upgrade"),
-            NodeChildsView::Large(v) => NodeChildIdx {
+    fn handle_first_node_set(&mut self, radix: u8, maybe_val: Option<Bytes>) -> ChildIdx {
+        let root_child_index = self.root.idx.clone();
+
+        //STEP-1 if the wanted child exist then just return the index
+        let view_mut = self.get_node_childs_view_mut(&root_child_index);
+        if let Some(node) = view_mut.get_child_mut(radix) {
+            if let Some(val) = maybe_val {
+                node.val = Some(val);
+            }
+            return node.idx.clone();
+        }
+        //STEP-2 Create the needed child
+
+        let new_node = self.insert_new_node(maybe_val, radix);
+        let new_idx = new_node.idx.clone();
+
+        //STEP-3 Inserting here we don't need to check if it full because root node is by initialisation HUGE and HUGE can't be full
+        self.insert(&root_child_index, new_node);
+
+        new_idx
+    }
+    pub fn upgrade(
+        &mut self,
+        fathers_childs_idx: &ChildIdx,
+        actual_radix: u8,
+        idx: &ChildIdx,
+        node: Node,
+    ) -> ChildIdx {
+        use crate::oxidart::arena_node::NodeType;
+        //STEP-1 Retrieve Childs container and upgrade it
+        let new_idx = match self.get_node_childs_view(&idx) {
+            ChildsView::Huge(_) => panic!("Huge should no be upgrade"),
+            ChildsView::Large(v) => ChildIdx {
                 idx: self.huge_map.insert(v.upgrade(node)),
                 node_type: NodeType::Huge,
             },
-            NodeChildsView::Medium(v) => NodeChildIdx {
+            ChildsView::Medium(v) => ChildIdx {
                 idx: self.large_map.insert(v.upgrade(node)),
                 node_type: NodeType::Large,
             },
-            NodeChildsView::Small(v) => NodeChildIdx {
+            ChildsView::Small(v) => ChildIdx {
                 idx: self.medium_map.insert(v.upgrade(node)),
                 node_type: NodeType::Medium,
             },
+        };
+        //STEP-2 Remove the old child container
+        self.delete(&idx);
+        //STEP-3 Make the Node parent point to the new child
+        self.get_node_childs_view_mut(fathers_childs_idx)
+            .update_child_idx(actual_radix, new_idx.clone());
+
+        new_idx
+    }
+
+    fn get_node_childs_view(&self, index: &ChildIdx) -> ChildsView<'_> {
+        use super::arena_node::NodeType::*;
+        match index.node_type {
+            Huge => ChildsView::Huge(&self.huge_map[index.idx]),
+            Large => ChildsView::Large(&self.large_map[index.idx]),
+            Medium => ChildsView::Medium(&self.medium_map[index.idx]),
+            Small => ChildsView::Small(&self.small_map[index.idx]),
         }
+    }
+
+    fn get_node_childs_view_mut(&mut self, index: &ChildIdx) -> ChildsViewMut<'_> {
+        use super::arena_node::NodeType::*;
+        match index.node_type {
+            Huge => ChildsViewMut::Huge(&mut self.huge_map[index.idx]),
+            Large => ChildsViewMut::Large(&mut self.large_map[index.idx]),
+            Medium => ChildsViewMut::Medium(&mut self.medium_map[index.idx]),
+            Small => ChildsViewMut::Small(&mut self.small_map[index.idx]),
+        }
+    }
+
+    fn delete(&mut self, index: &ChildIdx) {
+        use super::arena_node::NodeType::*;
+        match index.node_type {
+            Huge => {
+                self.huge_map.remove(index.idx);
+            }
+            Large => {
+                self.large_map.remove(index.idx);
+            }
+            Medium => {
+                self.medium_map.remove(index.idx);
+            }
+            Small => {
+                self.small_map.remove(index.idx);
+            }
+        };
+    }
+    fn insert(&mut self, node_child_idx: &ChildIdx, node: Node) {
+        self.get_node_childs_view_mut(node_child_idx).add_node(node);
     }
 }
 
-enum NodeChildsView<'a> {
+enum ChildsView<'a> {
     Small(&'a SmallChilds),
     Medium(&'a MediumChilds),
     Large(&'a LargeChilds),
     Huge(&'a HugeChilds),
 }
-enum NodeChildsViewMut<'a> {
+enum ChildsViewMut<'a> {
     Small(&'a mut SmallChilds),
     Medium(&'a mut MediumChilds),
     Large(&'a mut LargeChilds),
     Huge(&'a mut HugeChilds),
 }
-impl NodeChildsView<'_> {
+macro_rules! impl_view {
+    ($self:ident, $fn:ident) => {
+        match $self {
+            Self::Small(c) => c.$fn(),
+            Self::Medium(c) => c.$fn(),
+            Self::Large(c) => c.$fn(),
+            Self::Huge(c) => c.$fn(),
+        }
+    };
+    ($self:ident, $fn:ident, $($arg:expr),+) => {
+        match $self {
+            Self::Small(c) => c.$fn($($arg),+),
+            Self::Medium(c) => c.$fn($($arg),+),
+            Self::Large(c) => c.$fn($($arg),+),
+            Self::Huge(c) => c.$fn($($arg),+),
+        }
+    };
+}
+
+impl ChildsView<'_> {
     #[inline]
     fn get_child(&self, radix: u8) -> Option<Node> {
-        match self {
-            Self::Medium(a) => a.get_child(radix),
-            Self::Huge(a) => a.get_child(radix),
-            Self::Small(a) => a.get_child(radix),
-            Self::Large(a) => a.get_child(radix),
-        }
+        impl_view!(self, get_child, radix)
     }
     fn is_full(&self) -> bool {
-        match self {
-            Self::Medium(a) => a.is_full(),
-            Self::Huge(a) => a.is_full(),
-            Self::Small(a) => a.is_full(),
-            Self::Large(a) => a.is_full(),
-        }
+        impl_view!(self, is_full)
     }
 }
-impl NodeChildsViewMut<'_> {
+
+impl<'a> ChildsViewMut<'a> {
     #[inline]
-    fn get_child(&mut self, radix: u8) -> Option<Node> {
-        match self {
-            Self::Medium(a) => a.get_child(radix),
-            Self::Huge(a) => a.get_child(radix),
-            Self::Small(a) => a.get_child(radix),
-            Self::Large(a) => a.get_child(radix),
-        }
+    fn get_child_mut(self, radix: u8) -> Option<&'a mut Node> {
+        impl_view!(self, get_child_mut, radix)
     }
-    fn is_full(&self) -> bool {
-        match self {
-            Self::Medium(a) => a.is_full(),
-            Self::Huge(a) => a.is_full(),
-            Self::Small(a) => a.is_full(),
-            Self::Large(a) => a.is_full(),
-        }
+
+    fn add_node(&mut self, node: Node) {
+        impl_view!(self, insert_node, node)
+    }
+    fn update_child_idx(&mut self, radix: u8, new_idx: ChildIdx) {
+        impl_view!(self, update_child_idx, radix, new_idx);
     }
 }

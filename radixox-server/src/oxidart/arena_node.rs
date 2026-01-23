@@ -2,7 +2,7 @@ use arrayvec::ArrayVec;
 use prost::bytes::Bytes;
 use slotmap::DefaultKey;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum NodeType {
     Small,
     Medium,
@@ -20,22 +20,42 @@ impl NodeType {
     }
 }
 
-#[derive(Clone)]
-pub struct NodeChildIdx {
+#[derive(Clone, Debug)]
+pub struct ChildIdx {
     pub idx: DefaultKey,
     pub node_type: NodeType,
 }
-impl NodeChildIdx {
-    pub(crate) fn new(idx: DefaultKey, node_type: NodeType) -> Self {
-        Self { idx, node_type }
+impl ChildIdx {
+    #[allow(unused)]
+    pub(crate) fn new(key: DefaultKey, node_type: NodeType) -> Self {
+        Self {
+            idx: key,
+            node_type,
+        }
+    }
+    pub(crate) fn new_small(idx: DefaultKey) -> Self {
+        Self {
+            idx,
+            node_type: NodeType::Small,
+        }
     }
 }
 
 #[derive(Clone)]
 pub struct Node {
     pub radix: u8,
-    pub idx: NodeChildIdx,
+    pub idx: ChildIdx,
     pub val: Option<Bytes>,
+}
+
+impl std::fmt::Debug for Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Node")
+            .field("radix", &(self.radix as char))
+            .field("idx", &self.idx)
+            .field("val", &self.val)
+            .finish()
+    }
 }
 
 pub trait Inode {
@@ -45,8 +65,11 @@ pub trait Inode {
     fn is_full(&self) -> bool {
         false
     }
+    fn insert_node(&mut self, node: Node);
+    fn update_child_idx(&mut self, radix: u8, new_idx: ChildIdx);
+    fn get_child_mut(&mut self, radix: u8) -> Option<&mut Node>;
 }
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct SmallChilds {
     val: Option<Bytes>,
     nodes: ArrayVec<Node, { NodeType::Small.size() }>,
@@ -74,6 +97,7 @@ impl SmallChilds {
     }
 }
 
+#[derive(Debug)]
 pub struct MediumChilds {
     val: Option<Bytes>,
     nodes: ArrayVec<Node, { NodeType::Medium.size() }>,
@@ -89,7 +113,7 @@ impl MediumChilds {
         }
     }
 }
-
+#[derive(Debug)]
 pub struct LargeChilds {
     val: Option<Bytes>,
     nodes: ArrayVec<Node, { NodeType::Large.size() }>,
@@ -109,7 +133,7 @@ impl LargeChilds {
         }
     }
 }
-
+#[derive(Debug)]
 pub struct HugeChilds {
     val: Option<Bytes>,
     nodes: [Option<Node>; 128],
@@ -131,6 +155,19 @@ macro_rules! impl_node_array {
             fn is_full(&self) -> bool {
                 self.nodes.is_full()
             }
+            fn insert_node(&mut self, node: Node) {
+                self.nodes.push(node);
+            }
+            fn update_child_idx(&mut self, radix: u8, new_idx: ChildIdx) {
+                self.nodes
+                    .iter_mut()
+                    .find(|node| node.radix == radix)
+                    .expect("Ask to update a child idx for a child that do not exist")
+                    .idx = new_idx;
+            }
+            fn get_child_mut(&mut self, radix: u8) -> Option<&mut Node> {
+                self.nodes.iter_mut().find(|child| child.radix == radix)
+            }
         }
     };
 }
@@ -146,5 +183,26 @@ impl Inode for HugeChilds {
     }
     fn get_val(&self) -> Option<Bytes> {
         self.val.clone()
+    }
+    fn insert_node(&mut self, node: Node) {
+        let index = node.radix as usize;
+        self.nodes[index] = Some(node);
+    }
+    fn update_child_idx(&mut self, radix: u8, new_idx: ChildIdx) {
+        self.nodes[radix as usize]
+            .as_mut()
+            .expect("Ask to update a child idx for a child that do not exist")
+            .idx = new_idx
+    }
+    fn get_child_mut(&mut self, radix: u8) -> Option<&mut Node> {
+        self.nodes[radix as usize].as_mut()
+    }
+}
+impl Default for HugeChilds {
+    fn default() -> Self {
+        HugeChilds {
+            val: None,
+            nodes: [const { None }; 128],
+        }
     }
 }
