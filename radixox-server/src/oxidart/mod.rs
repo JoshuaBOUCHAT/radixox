@@ -1,3 +1,2 @@
 mod arena_node;
-mod nodes;
-mod oxid_art;
+mod arena_oxid_art;
