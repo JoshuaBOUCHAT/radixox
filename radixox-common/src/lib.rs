@@ -1,7 +1,11 @@
 use crate::network::NetError;
 
 pub mod network {
-    use crate::{NetValidate, network::net_command::NetAction, protocol::Command};
+    use crate::{
+        NetValidate,
+        network::net_command::NetAction,
+        protocol::{Command, CommandAction},
+    };
 
     include!(concat!(env!("OUT_DIR"), "/radixox.rs"));
 
@@ -16,20 +20,24 @@ pub mod network {
             let Some(command_action) = self.net_action else {
                 return Err(NetError::CommandEmpty);
             };
-            command_action.validate()
+            Ok(Command::new(command_action.validate()?, self.request_id))
         }
     }
-    impl NetValidate<Command> for NetAction {
-        fn validate(self) -> Result<Command, NetError> {
+    impl NetValidate<CommandAction> for NetAction {
+        fn validate(self) -> Result<CommandAction, NetError> {
             match self {
-                NetAction::Get(get) => Command::get(get.key).map_err(|_| NetError::KeyNotAscii),
+                NetAction::Get(get) => {
+                    CommandAction::get(get.key).map_err(|_| NetError::KeyNotAscii)
+                }
                 NetAction::Getn(_getn) => {
                     todo!()
                 }
                 NetAction::Set(set) => {
-                    Command::set(set.key, set.value).map_err(|_| NetError::KeyNotAscii)
+                    CommandAction::set(set.key, set.value).map_err(|_| NetError::KeyNotAscii)
                 }
-                NetAction::Del(del) => Command::del(del.key).map_err(|_| NetError::KeyNotAscii),
+                NetAction::Del(del) => {
+                    CommandAction::del(del.key).map_err(|_| NetError::KeyNotAscii)
+                }
             }
         }
     }

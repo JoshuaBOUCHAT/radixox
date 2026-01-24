@@ -62,6 +62,7 @@ impl OxidArtArena {
     //fn get_child_val(&self, idx: &ChildIdx) -> Option<Bytes> {}
     pub fn set(&mut self, set_action: SetAction) {
         let (key, val) = set_action.into_parts();
+        //STEP-1.1 Handle special case len 1 and 0
         let key_len = key.len();
         if key_len == 0 {
             self.root.val = Some(val);
@@ -71,11 +72,15 @@ impl OxidArtArena {
             self.handle_first_node_set(key[0], Some(val));
             return;
         }
+        //STEP-1.2 Handle normal case
         let mut fathers_childs_idx = self.root.idx.clone();
         //Ici on passe None comme val car on ne souhaite pas  definir la val du node de lvl1
         let mut actual_idx = self.handle_first_node_set(key[0], None);
+        //STEP-2 Cross the tree nodes for each radix if the coresponding node do not existe create it and go forward
+        //Only go to key.len() -1 because the last radix is the special case where we insert data
         for i in 1..(key.len() - 1) {
             let radix = key[i];
+            //STEP-2.1 If the node allready existe simply go forward
             if let Some(node) = self.get_node_childs_view(&actual_idx).get_child(radix) {
                 (fathers_childs_idx, actual_idx) = (actual_idx, node.idx);
                 continue;
@@ -84,11 +89,11 @@ impl OxidArtArena {
             let new_idx = new_node.idx.clone();
 
             if self.get_node_childs_view(&actual_idx).is_full() {
-                //STEP-2v1 set the childs_idx to the new one as the upgrade change the index
+                //STEP-2v2 set the childs_idx to the new one as the upgrade change the index
 
                 self.upgrade(&fathers_childs_idx, key[i - 1], &actual_idx, new_node);
             } else {
-                //STEP-2v2 Simply add the new child in the root list as it is not full yet
+                //STEP-2v3 Simply add the new child in the root list as it is not full yet
                 self.insert(&actual_idx, new_node);
             }
             (fathers_childs_idx, actual_idx) = (actual_idx, new_idx)
@@ -106,6 +111,7 @@ impl OxidArtArena {
             self.insert(&actual_idx, new_node);
         }
     }
+
     fn handle_first_node_set(&mut self, radix: u8, maybe_val: Option<Bytes>) -> ChildIdx {
         let root_child_index = self.root.idx.clone();
 

@@ -1,12 +1,15 @@
 [package]
-name = "radixox-client"
+name = "radixox"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Test client for RadixOx server"
+description = "RadixOx client library"
 
 [dependencies]
+slotmap.workspace = true
+radixox-common.workspace = true
 serde.workspace = true
 monoio.workspace = true
 prost.workspace = true
+bytes.workspace = true
