@@ -15,3 +15,4 @@ radixox-common = { path = "../radixox-common" }
 serde_json = "1.0.149"
 slotmap = "1.1.1"
 arrayvec = "0.7.6"
+rand = "0.9.2"

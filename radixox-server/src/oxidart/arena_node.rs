@@ -61,13 +61,14 @@ impl std::fmt::Debug for Node {
 pub trait Inode {
     fn get_child(&self, radix: u8) -> Option<Node>;
     fn get_val(&self) -> Option<Bytes>;
-    ///
     fn is_full(&self) -> bool {
         false
     }
     fn insert_node(&mut self, node: Node);
     fn update_child_idx(&mut self, radix: u8, new_idx: ChildIdx);
     fn get_child_mut(&mut self, radix: u8) -> Option<&mut Node>;
+    fn remove_child(&mut self, radix: u8);
+    fn count(&self) -> usize;
 }
 #[derive(Default, Debug)]
 pub struct SmallChilds {
@@ -168,6 +169,14 @@ macro_rules! impl_node_array {
             fn get_child_mut(&mut self, radix: u8) -> Option<&mut Node> {
                 self.nodes.iter_mut().find(|child| child.radix == radix)
             }
+            fn remove_child(&mut self, radix: u8) {
+                if let Some(pos) = self.nodes.iter().position(|n| n.radix == radix) {
+                    self.nodes.swap_remove(pos);
+                }
+            }
+            fn count(&self) -> usize {
+                self.nodes.len()
+            }
         }
     };
 }
@@ -196,6 +205,12 @@ impl Inode for HugeChilds {
     }
     fn get_child_mut(&mut self, radix: u8) -> Option<&mut Node> {
         self.nodes[radix as usize].as_mut()
+    }
+    fn remove_child(&mut self, radix: u8) {
+        self.nodes[radix as usize] = None;
+    }
+    fn count(&self) -> usize {
+        self.nodes.iter().filter(|n| n.is_some()).count()
     }
 }
 impl Default for HugeChilds {

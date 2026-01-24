@@ -7,6 +7,7 @@ message NetCommand {
     NetSetRequest set = 1;
     NetGetRequest get = 2;
     NetGetNRequest getn = 3;
+    NetDelRequest del = 4;
   }
 }
 
@@ -16,6 +17,7 @@ message NetSetRequest {
 }
 
 message NetGetRequest { bytes key = 1; }
+message NetDelRequest { bytes key = 1; }
 
 message NetGetNRequest {
   bytes pattern = 1; // Le pattern avec '*'
@@ -34,7 +36,6 @@ message NetSuccessResponse {
   oneof body {
     bytes get_val = 1;
     NetGetNval keys_val = 2;
-    // Si c'est un SET, le body peut être vide ou un simple bool
   }
 }
 

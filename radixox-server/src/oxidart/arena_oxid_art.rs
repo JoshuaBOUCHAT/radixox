@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use radixox_common::protocol::{GetAction, SetAction};
+use radixox_common::protocol::{DelAction, GetAction, SetAction};
 
 use slotmap::{DefaultKey, SlotMap};
 
@@ -45,7 +45,7 @@ impl OxidArtArena {
     }
 
     pub fn get(&self, get_action: GetAction) -> Option<Bytes> {
-        let key = get_action.into_byte();
+        let key = get_action.into_parts();
         if key.is_empty() {
             return self.root.val.clone();
         }
@@ -100,8 +100,11 @@ impl OxidArtArena {
             return;
         }
         let new_node = self.insert_new_node(Some(val), last_radix);
-        self.get_node_childs_view_mut(&actual_idx)
-            .add_node(new_node);
+        if self.get_node_childs_view(&actual_idx).is_full() {
+            self.upgrade(&fathers_childs_idx, key[key_len - 2], &actual_idx, new_node);
+        } else {
+            self.insert(&actual_idx, new_node);
+        }
     }
     fn handle_first_node_set(&mut self, radix: u8, maybe_val: Option<Bytes>) -> ChildIdx {
         let root_child_index = self.root.idx.clone();
@@ -149,7 +152,7 @@ impl OxidArtArena {
             },
         };
         //STEP-2 Remove the old child container
-        self.delete(&idx);
+        self.delete_childs(&idx);
         //STEP-3 Make the Node parent point to the new child
         self.get_node_childs_view_mut(fathers_childs_idx)
             .update_child_idx(actual_radix, new_idx.clone());
@@ -177,7 +180,7 @@ impl OxidArtArena {
         }
     }
 
-    fn delete(&mut self, index: &ChildIdx) {
+    fn delete_childs(&mut self, index: &ChildIdx) {
         use super::arena_node::NodeType::*;
         match index.node_type {
             Huge => {
@@ -196,6 +199,67 @@ impl OxidArtArena {
     }
     fn insert(&mut self, node_child_idx: &ChildIdx, node: Node) {
         self.get_node_childs_view_mut(node_child_idx).add_node(node);
+    }
+    pub fn delete(&mut self, del_action: DelAction) -> Option<Bytes> {
+        let key = del_action.into_parts();
+        if key.is_empty() {
+            return self.root.val.take();
+        }
+
+        // Track branch point: (parent_childs_idx, radix_to_remove)
+        let mut branch_point: (ChildIdx, u8) = (self.root.idx.clone(), key[0]);
+        let mut childs_to_delete: Vec<ChildIdx> = Vec::new();
+
+        let mut parent_idx = self.root.idx.clone();
+        let mut actual_child_view = self.get_node_childs_view(&self.root.idx);
+
+        for i in 0..(key.len() - 1) {
+            let node = actual_child_view.get_child(key[i])?;
+
+            let next_view = self.get_node_childs_view(&node.idx);
+
+            // Is this a branch point? (has value OR multiple children)
+            if node.val.is_some() || next_view.get_child_count() > 1 {
+                // New branch point - reset
+                branch_point = (node.idx.clone(), key[i + 1]);
+                childs_to_delete.clear();
+            } else {
+                childs_to_delete.push(node.idx.clone());
+            }
+
+            parent_idx = node.idx.clone();
+            actual_child_view = next_view;
+        }
+
+        let last_radix = *key.last().expect("key should have last delete");
+        // Last node
+        let node = actual_child_view.get_child(last_radix)?;
+        let final_view = self.get_node_childs_view(&node.idx);
+        let has_children = final_view.get_child_count() > 0;
+
+        // Take the value from the node
+        let val = self
+            .get_node_childs_view_mut(&parent_idx)
+            .get_child_mut(last_radix)?
+            .val
+            .take();
+
+        if !has_children {
+            // No children - delete the whole branch from branch point
+            childs_to_delete.push(node.idx.clone());
+
+            // Remove child from branch parent
+            let (bp_idx, bp_radix) = branch_point;
+            self.get_node_childs_view_mut(&bp_idx)
+                .remove_child(bp_radix);
+
+            // Delete all child containers (just pop, no search needed!)
+            for idx in childs_to_delete {
+                self.delete_childs(&idx);
+            }
+        }
+
+        return val;
     }
 }
 
@@ -238,6 +302,9 @@ impl ChildsView<'_> {
     fn is_full(&self) -> bool {
         impl_view!(self, is_full)
     }
+    fn get_child_count(&self) -> usize {
+        impl_view!(self, count)
+    }
 }
 
 impl<'a> ChildsViewMut<'a> {
@@ -251,5 +318,8 @@ impl<'a> ChildsViewMut<'a> {
     }
     fn update_child_idx(&mut self, radix: u8, new_idx: ChildIdx) {
         impl_view!(self, update_child_idx, radix, new_idx);
+    }
+    fn remove_child(&mut self, radix: u8) {
+        impl_view!(self, remove_child, radix);
     }
 }

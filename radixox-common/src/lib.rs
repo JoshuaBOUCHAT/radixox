@@ -22,23 +22,14 @@ pub mod network {
     impl NetValidate<Command> for NetAction {
         fn validate(self) -> Result<Command, NetError> {
             match self {
-                NetAction::Get(get) => {
-                    if get.key.len() == 0 {
-                        return Err(NetError::GetEmpty);
-                    }
-
-                    Command::get(get.key).map_err(|_| NetError::KeyNotAscii)
-                }
+                NetAction::Get(get) => Command::get(get.key).map_err(|_| NetError::KeyNotAscii),
                 NetAction::Getn(_getn) => {
                     todo!()
                 }
                 NetAction::Set(set) => {
-                    if set.key.len() == 0 {
-                        return Err(NetError::SetEmpty);
-                    }
-
                     Command::set(set.key, set.value).map_err(|_| NetError::KeyNotAscii)
                 }
+                NetAction::Del(del) => Command::del(del.key).map_err(|_| NetError::KeyNotAscii),
             }
         }
     }
