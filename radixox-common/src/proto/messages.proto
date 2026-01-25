@@ -26,7 +26,7 @@ message NetGetNRequest {
 
 message NetResponse {
   uint32 request_id = 1;
-  oneof result {
+  oneof net_response_result {
     NetErrorResponse error = 2;
     NetSuccessResponse success = 3;
   }

@@ -7,12 +7,14 @@ use monoio::io::{OwnedReadHalf, Splitable};
 use monoio::net::TcpStream;
 
 use prost::Message;
-use radixox_common::network::Response;
 use radixox_common::network::net_command::NetAction;
+use radixox_common::network::{NetResponse, Response};
+use radixox_common::protocol::read_message;
 use slotmap::{DefaultKey, SlotMap};
 
 use std::cell::RefCell;
 use std::net::SocketAddr;
+use std::rc::Rc;
 // La commande que tes tâches envoient à la boucle IO
 pub struct Command {
     pub key: Bytes,
@@ -22,16 +24,23 @@ pub struct Command {
 
 type IOResult<T> = std::io::Result<T>;
 
-struct RadixClient {
+struct MonoIOClient {
     write: OwnedWriteHalf<TcpStream>,
     map: SlotMap<DefaultKey, Sender<Response>>,
 }
 
-pub struct RadixClientCell {
-    client: RefCell<RadixClient>,
+pub struct SharedMonoIOClient {
+    client: Rc<RefCell<MonoIOClient>>,
+}
+impl Clone for SharedMonoIOClient {
+    fn clone(&self) -> Self {
+        Self {
+            client: Rc::clone(&self.client),
+        }
+    }
 }
 
-impl RadixClientCell {
+impl SharedMonoIOClient {
     pub async fn send(&self, command: NetAction) -> Response {
         let (tx, rx) = local_sync::oneshot::channel::<Response>();
         let mut buffer = BytesMut::new();
@@ -42,9 +51,39 @@ impl RadixClientCell {
     }
     pub async fn new(addr: SocketAddr) -> IOResult<Self> {
         let stream = TcpStream::connect(addr).await.expect("Failed to connect");
-        let (mut read_stream, mut write_stream) = stream.into_split();
+        let (read_stream, mut write_stream) = stream.into_split();
+        let client = MonoIOClient {
+            map: SlotMap::new(),
+            write: write_stream,
+        };
+        let ret = Self {
+            client: Rc::new(RefCell::new(client)),
+        };
 
-        monoio::spawn(async move { loop {} });
+        monoio::spawn(async move {
+            let mut read_stream = read_stream;
+            let mut buffer = Vec::with_capacity(1 << 16);
+            let shared_client = ret.clone();
+            loop {
+                let response = match read_message::<NetResponse, Response>(
+                    &mut read_stream,
+                    &mut buffer,
+                )
+                .await
+                {
+                    Err(err) => {
+                        eprintln!("Error: {}", err);
+                        continue;
+                    }
+                    Ok(response) => response,
+                };
+                shared_client
+                    .client
+                    .borrow_mut()
+                    .map
+                    .remove(response.command_id);
+            }
+        });
 
         todo!()
     }

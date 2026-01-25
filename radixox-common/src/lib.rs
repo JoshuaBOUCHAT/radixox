@@ -3,13 +3,15 @@ use monoio::{
     net::TcpStream,
 };
 
-use crate::network::NetError;
+use crate::network::{
+    NetError, Response, ResponseResult, net_response::NetResponseResult, net_success_response::Body,
+};
 
 pub mod network {
     use bytes::Bytes;
 
     use crate::{
-        NetValidate,
+        NetValidate, get_response_result,
         network::net_command::NetAction,
         protocol::{Command, CommandAction},
     };
@@ -24,7 +26,11 @@ pub mod network {
         KeyNotAscii,
         ResponseBodyEmpty,
     }
-    pub enum Response {
+    pub struct Response {
+        pub command_id: u32,
+        pub result: ResponseResult,
+    }
+    pub enum ResponseResult {
         Empty,
         Err(),
         Data(Bytes),
@@ -58,21 +64,27 @@ pub mod network {
     }
     impl NetValidate<Response> for NetResponse {
         fn validate(self) -> Result<Response, NetError> {
-            let Some(result) = self.result else {
-                return Ok(Response::Empty);
-            };
-
-            let success_val = match result {
-                net_response::Result::Error(err) => return Err(NetError::NetError(err.message)),
-                net_response::Result::Success(success_val) => success_val,
-            };
-
-            let body = success_val.body.ok_or(NetError::ResponseBodyEmpty)?;
-            match body {
-                net_success_response::Body::GetVal(val) => Ok(Response::Data(val)),
-                net_success_response::Body::KeysVal(vals) => Ok(Response::Datas(vals.keys)),
-            }
+            Ok(Response {
+                result: get_response_result(self.net_response_result)?,
+                command_id: self.request_id,
+            })
         }
+    }
+}
+fn get_response_result(net_res: Option<NetResponseResult>) -> Result<ResponseResult, NetError> {
+    let Some(result) = net_res else {
+        return Ok(ResponseResult::Empty);
+    };
+
+    let success_val = match result {
+        crate::NetResponseResult::Error(err) => return Err(NetError::NetError(err.message)),
+        crate::NetResponseResult::Success(success_val) => success_val,
+    };
+
+    let body = success_val.body.ok_or(NetError::ResponseBodyEmpty)?;
+    match body {
+        Body::GetVal(val) => Ok(ResponseResult::Data(val)),
+        Body::KeysVal(vals) => Ok(ResponseResult::Datas(vals.keys)),
     }
 }
 
