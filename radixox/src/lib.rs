@@ -1,29 +1,12 @@
-use std::sync::Mutex;
-
-use bytes::Bytes;
-use bytes::BytesMut;
-use monoio::io::AsyncWriteRentExt;
-use monoio::net::TcpStream;
-use monoio::spawn;
-use prost::Message;
-pub use radixox_common::network;
-use radixox_common::network::NetCommand;
-use radixox_common::network::NetGetRequest;
-use radixox_common::network::net_command::NetAction;
-pub use radixox_common::protocol;
-use radixox_common::protocol::Command;
-use radixox_common::protocol::CommandAction;
-use radixox_common::protocol::GetAction;
-use slotmap::SlotMap;
-
-pub struct OxidART {
-    stream: TcpStream,
-    mpsc:
-}
+pub mod monoio_client;
+pub mod tokio_client;
+pub struct OxidART {}
 impl OxidART {
     pub async fn new(addr: core::net::SocketAddr) -> std::io::Result<Self> {
         let stream = TcpStream::connect_addr(addr).await?;
-        Ok(Self { stream })
+        let (read, write) = stream.into_split();
+
+        Ok(Self {})
     }
     pub async fn get(
         &mut self,

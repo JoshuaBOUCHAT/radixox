@@ -13,3 +13,13 @@ serde.workspace = true
 monoio.workspace = true
 prost.workspace = true
 bytes.workspace = true
+
+# Feature spécifique
+tokio = { version = "1.49.0", features = ["full"], optional = true }
+async-trait = { version = "0.1.89", optional = true }
+local-sync = "0.1.1"
+
+[features]
+default = ["tokio"]
+# Cette feature activera les dépendances nécessaires pour le bridge
+tokio = ["dep:tokio", "dep:async-trait"]
