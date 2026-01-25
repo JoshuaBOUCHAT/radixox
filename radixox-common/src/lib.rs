@@ -1,6 +1,13 @@
+use monoio::{
+    io::{OwnedReadHalf, stream::Stream},
+    net::TcpStream,
+};
+
 use crate::network::NetError;
 
 pub mod network {
+    use bytes::Bytes;
+
     use crate::{
         NetValidate,
         network::net_command::NetAction,
@@ -10,10 +17,18 @@ pub mod network {
     include!(concat!(env!("OUT_DIR"), "/radixox.rs"));
 
     pub enum NetError {
+        NetError(String),
         CommandEmpty,
         GetEmpty,
         SetEmpty,
         KeyNotAscii,
+        ResponseBodyEmpty,
+    }
+    pub enum Response {
+        Empty,
+        Err(),
+        Data(Bytes),
+        Datas(Vec<Bytes>),
     }
     impl NetValidate<Command> for NetCommand {
         fn validate(self) -> Result<Command, NetError> {
@@ -41,11 +56,39 @@ pub mod network {
             }
         }
     }
+    impl NetValidate<Response> for NetResponse {
+        fn validate(self) -> Result<Response, NetError> {
+            let Some(result) = self.result else {
+                return Ok(Response::Empty);
+            };
+
+            let success_val = match result {
+                net_response::Result::Error(err) => return Err(NetError::NetError(err.message)),
+                net_response::Result::Success(success_val) => success_val,
+            };
+
+            let body = success_val.body.ok_or(NetError::ResponseBodyEmpty)?;
+            match body {
+                net_success_response::Body::GetVal(val) => Ok(Response::Data(val)),
+                net_success_response::Body::KeysVal(vals) => Ok(Response::Datas(vals.keys)),
+            }
+        }
+    }
 }
+
 pub mod protocol;
 pub trait NetValidate<T>
 where
     Self: Sized,
 {
     fn validate(self) -> Result<T, NetError>;
+}
+pub trait FromStream
+where
+    Self: Sized,
+{
+    fn from_stream(
+        stream: &mut OwnedReadHalf<TcpStream>,
+        buffer: &mut Vec<u8>,
+    ) -> std::io::Result<Self>;
 }
