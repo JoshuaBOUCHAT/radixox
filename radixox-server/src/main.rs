@@ -35,9 +35,7 @@ async fn main() -> IOResult<()> {
     loop {
         let (stream, addr) = listener.accept().await?;
         println!("Connection from {addr}");
-        if let Err(e) = handle_connection(stream, shared_art.clone()).await {
-            eprintln!("Error: {e}");
-        }
+        monoio::spawn(handle_connection(stream, shared_art.clone()));
     }
 }
 
@@ -48,23 +46,23 @@ async fn handle_connection(mut stream: TcpStream, arena: SharedART) -> IOResult<
         let cmd = read_command(&mut stream, &mut buf).await?;
         println!("Received: {cmd}");
 
-        let response = execute_command(cmd, arena);
+        let response = execute_command(cmd, arena.clone());
         write_response(&mut stream, &response).await?;
     }
 }
 
-fn execute_command(cmd: Command, arena: &mut OxidArtArena) -> NetResponse {
+fn execute_command(cmd: Command, arena: SharedART) -> NetResponse {
     match cmd.action {
         CommandAction::Set(action) => {
-            arena.set(action);
+            arena.borrow_mut().set(action);
             success_response(None, cmd.command_id)
         }
         CommandAction::Get(action) => {
-            let val = arena.get(action);
+            let val = arena.borrow_mut().get(action);
             success_response(val, cmd.command_id)
         }
         CommandAction::Del(action) => {
-            let val = arena.delete(action);
+            let val = arena.borrow_mut().delete(action);
             success_response(val, cmd.command_id)
         }
     }

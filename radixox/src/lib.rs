@@ -18,13 +18,18 @@ use slotmap::SlotMap;
 
 pub struct OxidART {
     stream: TcpStream,
+    mpsc:
 }
 impl OxidART {
     pub async fn new(addr: core::net::SocketAddr) -> std::io::Result<Self> {
         let stream = TcpStream::connect_addr(addr).await?;
         Ok(Self { stream })
     }
-    pub async fn get(&mut self, get_action: GetAction) -> Option<Bytes> {
+    pub async fn get(
+        &mut self,
+        get_action: GetAction,
+        chanels: monoio::io::stream,
+    ) -> Option<Bytes> {
         let request_id = None;
 
         let net_command = NetCommand {
