@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use monoio::{
     buf::IoBufMut,
     io::{AsyncReadRent, AsyncReadRentExt, OwnedReadHalf},
@@ -14,10 +14,10 @@ type IOResult<T> = std::io::Result<T>;
 
 pub struct Command {
     pub action: CommandAction,
-    pub command_id: u32,
+    pub command_id: u64,
 }
 impl Command {
-    pub fn new(action: CommandAction, command_id: u32) -> Self {
+    pub fn new(action: CommandAction, command_id: u64) -> Self {
         Command { action, command_id }
     }
 }
@@ -43,6 +43,9 @@ pub struct GetAction {
     key: Bytes,
 }
 pub struct DelAction {
+    key: Bytes,
+}
+pub struct GetN {
     key: Bytes,
 }
 
@@ -143,14 +146,6 @@ mod tests {
     fn it_works() {}
 }
 
-fn parse_varint_header(buf: &[u8], n: usize) -> IOResult<(usize, usize)> {
-    let mut cursor = std::io::Cursor::new(&buf[..n]);
-    let msg_len = prost::encoding::decode_varint(&mut cursor)
-        .map_err(|e| std::io::Error::other(format!("Varint: {e}")))? as usize;
-
-    Ok((msg_len, cursor.position() as usize))
-}
-
 /// Decode le buffer en Command
 fn decode_message<T, V>(buf: &[u8]) -> IOResult<V>
 where
@@ -170,12 +165,18 @@ pub async fn read_message<T, V>(
 where
     T: Message + NetValidate<V> + Default,
 {
+    //println!("  Message recieve");
     // 1. On récupère le buffer (ownership)
-    let tmp = std::mem::take(buf);
+    let mut tmp = std::mem::take(buf);
 
+    if tmp.capacity() < 4 {
+        tmp.reserve(4);
+    }
+
+    //println!("  Reading message len");
     // 2. Première lecture (on peut lire le header + une partie du payload)
-    let (res, tmp_slice) = stream.read_exact(tmp.slice_mut(0..4)).await;
-    let tmp = tmp_slice.into_inner();
+    let header_buf = vec![0u8; 4];
+    let (res, header_buf) = stream.read_exact(header_buf).await;
     let n = res?;
 
     if n == 0 {
@@ -183,23 +184,24 @@ where
         return Err(std::io::ErrorKind::ConnectionReset.into());
     }
 
-    // 3. Analyse du header
-    let (msg_len, varint_len) = parse_varint_header(&tmp, n)?;
-    let total_expected = varint_len + msg_len;
+    let msg_len = u32::from_be_bytes(core::array::from_fn(|i| header_buf[i])) as usize;
+    //println!("  Message len:{}", msg_len);
 
     // 4. On vérifie s'il nous en manque
-    let mut tmp = tmp;
-    if n < total_expected {
-        let slice = tmp.slice_mut(n..total_expected);
 
-        let (res, slice) = stream.read_exact(slice).await;
-        res?;
+    tmp.reserve(msg_len);
 
-        tmp = slice.into_inner();
-    }
+    //println!("  Reading the message");
+    let (res, slice_mut) = stream.read_exact(tmp.slice_mut(0..msg_len)).await;
+    tmp = slice_mut.into_inner();
+    res.expect("faut check");
 
+    //println!("  Message read");
+
+    //println!("  Decoding message");
     // 5. Décodage (Zero-copy via slice)
-    let cmd = decode_message::<T, V>(&tmp[varint_len..total_expected])?;
+    let cmd = decode_message::<T, V>(tmp.as_slice())?;
+    //println!("  Message decoded");
 
     // 6. On rend le buffer pour la prochaine itération
     // Optionnel : on pourrait vider le buffer ici ou gérer le "surplus" lu
@@ -207,4 +209,70 @@ where
     buf.clear();
 
     Ok(cmd)
+}
+pub async fn read_message_batch<T, V>(
+    stream: &mut OwnedReadHalf<TcpStream>,
+    datas: &mut BytesMut,
+) -> IOResult<Vec<V>>
+where
+    T: Message + NetValidate<V> + Default,
+{
+    // 1. Monoio prend le buffer (Transfert d'ownership pour io_uring)
+    let buffer = std::mem::take(datas);
+    let len = buffer.len();
+    let (n, buf) = stream.read(buffer.slice_mut(len..)).await;
+    let mut buf = buf.into_inner();
+
+    if !n.as_ref().is_ok_and(|nb| *nb != 0) {
+        println!("{}", std::io::Error::last_os_error());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("{:?}", n),
+        ));
+    }
+
+    let mut res = Vec::new();
+    let mut cursor = 0;
+
+    // 2. Boucle de parsing sur le buffer actuel
+    // On utilise un curseur pour ne pas modifier le buffer pendant qu'on lit
+    while buf.len() - cursor >= 4 {
+        let start = cursor;
+        let msg_len =
+            u32::from_be_bytes([buf[start], buf[start + 1], buf[start + 2], buf[start + 3]])
+                as usize;
+
+        let total_len = 4 + msg_len;
+
+        // Si le message est incomplet dans le buffer actuel
+        if buf.len() - cursor < total_len {
+            break;
+        }
+
+        // Extraction et décodage (Zero-copy via slicing)
+        let data = &buf[start + 4..start + total_len];
+        if let Ok(net_message) = T::decode(data) {
+            if let Ok(validated) = net_message.validate() {
+                res.push(validated);
+            }
+        }
+
+        cursor += total_len;
+    }
+
+    // 3. LE SHIFT : Maximiser l'espace pour le prochain syscall
+    if cursor > 0 {
+        if cursor < buf.len() {
+            // On déplace le "reste" du message au tout début du buffer
+            buf.copy_within(cursor.., 0);
+            buf.truncate(buf.len() - cursor);
+        } else {
+            // Tout a été lu, on reset simplement le buffer à zéro (O(1))
+            buf.clear();
+        }
+    }
+
+    // On rend le buffer propre à la boucle infinie
+    *datas = buf;
+    Ok(res)
 }

@@ -206,7 +206,7 @@ impl OxidArtArena {
     fn insert(&mut self, node_child_idx: &ChildIdx, node: Node) {
         self.get_node_childs_view_mut(node_child_idx).add_node(node);
     }
-    pub fn delete(&mut self, del_action: DelAction) -> Option<Bytes> {
+    pub fn del(&mut self, del_action: DelAction) -> Option<Bytes> {
         let key = del_action.into_parts();
         if key.is_empty() {
             return self.root.val.take();

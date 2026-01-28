@@ -3,7 +3,7 @@ package radixox;
 
 // L'enveloppe principale pour toutes les requêtes client
 message NetCommand {
-  uint32 request_id = 1;
+  uint64 request_id = 1;
   oneof net_action {
     NetSetRequest set = 2;
     NetGetRequest get = 3;
@@ -25,7 +25,7 @@ message NetGetNRequest {
 }
 
 message NetResponse {
-  uint32 request_id = 1;
+  uint64 request_id = 1;
   oneof net_response_result {
     NetErrorResponse error = 2;
     NetSuccessResponse success = 3;
