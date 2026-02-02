@@ -1,90 +1,105 @@
+use bytes::Bytes;
+
 pub mod monoio_client;
 pub mod tokio_client;
-pub struct OxidART {}
 
 #[cfg(test)]
-mod tests {
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+mod tests;
 
-    use monoio::{net::TcpStream, time::Instant};
-    use radixox_common::network::{NetGetRequest, NetSetRequest, net_command::NetAction};
+// ============================================================================
+// CLIENT TRAIT - Ergonomic API for key-value operations
+// ============================================================================
 
-    use crate::monoio_client::monoio_art::SharedMonoIOClient;
+/// Error type for ART client operations
+#[derive(Debug)]
+pub enum ArtError {
+    /// Network/IO error
+    Io(std::io::Error),
+    /// Encoding error (protobuf)
+    Encode(prost::EncodeError),
+    /// Serialization error (JSON)
+    Serialize(String),
+    /// Deserialization error (JSON)
+    Deserialize(String),
+    /// Channel receive error
+    ChannelClosed,
+}
 
-    #[monoio::test]
-    async fn it_works() {
-        let addr_v4 = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8379);
-    }
-
-    #[monoio::test(enable_timer = true)]
-    async fn test_alphabet_hardcore() {
-        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 24), 8379));
-
-        let client = SharedMonoIOClient::new(addr)
-            .await
-            .expect("client init error");
-
-        let words: Vec<String> = include_str!("../../list.txt")
-            .lines()
-            .map(|s| s.to_string())
-            .collect();
-
-        let total_words = words.len();
-        let now = Instant::now();
-
-        // --- PHASE 1 : SET ---
-        let mut handles = Vec::new();
-        for chunk in words.chunks(50) {
-            let chunk_data = chunk.to_vec();
-            let c = client.clone();
-
-            // monoio::spawn renvoie un JoinHandle
-            let handle = monoio::spawn(async move {
-                for word in chunk_data {
-                    let action = NetAction::Set(NetSetRequest {
-                        key: word.clone().into(),
-                        value: word.into(),
-                    });
-
-                    c.send(action).expect("enc").await.expect("resp");
-                }
-            });
-            handles.push(handle);
-        }
-
-        // On attend toutes les tâches de SET
-        for h in handles {
-            h.await;
-        }
-        println!("Time for SET: {}s", now.elapsed().as_secs_f32());
-
-        // --- PHASE 2 : GET ---
-        let mut handles = Vec::new();
-        let get_start = Instant::now();
-        for chunk in words.chunks(50) {
-            let chunk_data = chunk.to_vec();
-            let c = client.clone();
-
-            let handle = monoio::spawn(async move {
-                for word in chunk_data {
-                    let action = NetAction::Get(NetGetRequest { key: word.into() });
-                    c.send(action).expect("enc").await.expect("resp");
-                }
-            });
-            handles.push(handle);
-        }
-
-        for h in handles {
-            h.await;
-        }
-
-        let elapsed = now.elapsed();
-        println!("---------------------------------------");
-        println!("Total Time: {}s", elapsed.as_secs_f32());
-        println!(
-            "Throughput: {} req/s",
-            (total_words * 2) as f32 / elapsed.as_secs_f32()
-        );
-        println!("---------------------------------------");
+impl From<std::io::Error> for ArtError {
+    fn from(e: std::io::Error) -> Self {
+        ArtError::Io(e)
     }
 }
+
+impl From<prost::EncodeError> for ArtError {
+    fn from(e: prost::EncodeError) -> Self {
+        ArtError::Encode(e)
+    }
+}
+
+/// Trait for key-value store clients
+///
+/// Provides ergonomic methods accepting flexible input types:
+/// - Keys: `&[u8]`, `&str`, `String`, `Bytes`
+/// - Values: `&[u8]`, `&str`, `String`, `Bytes`, or any `Serialize` type via `_json` methods
+pub trait ArtClient {
+    // ========================================================================
+    // Single key operations
+    // ========================================================================
+
+    /// Get a value by key
+    fn get(&self, key: impl AsRef<[u8]>) -> impl Future<Output = Result<Option<Bytes>, ArtError>>;
+
+    /// Set a key-value pair
+    fn set(
+        &self,
+        key: impl AsRef<[u8]>,
+        value: impl Into<Bytes>,
+    ) -> impl Future<Output = Result<(), ArtError>>;
+
+    /// Delete a key and return its value
+    fn del(&self, key: impl AsRef<[u8]>) -> impl Future<Output = Result<Option<Bytes>, ArtError>>;
+
+    // ========================================================================
+    // Prefix operations (implicit wildcard suffix)
+    // ========================================================================
+
+    /// Get all values with keys starting with the given prefix
+    fn getn(&self, prefix: impl AsRef<[u8]>) -> impl Future<Output = Result<Vec<Bytes>, ArtError>>;
+
+    /// Delete all keys starting with the given prefix
+    fn deln(&self, prefix: impl AsRef<[u8]>) -> impl Future<Output = Result<(), ArtError>>;
+
+    // ========================================================================
+    // JSON convenience methods
+    // ========================================================================
+
+    /// Get and deserialize a JSON value
+    fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        key: impl AsRef<[u8]>,
+    ) -> impl Future<Output = Result<Option<T>, ArtError>> {
+        async {
+            let Some(data) = self.get(key).await? else {
+                return Ok(None);
+            };
+            serde_json::from_slice(&data)
+                .map(Some)
+                .map_err(|e| ArtError::Deserialize(e.to_string()))
+        }
+    }
+
+    /// Serialize and set a JSON value
+    fn set_json<T: serde::Serialize>(
+        &self,
+        key: impl AsRef<[u8]>,
+        value: &T,
+    ) -> impl Future<Output = Result<(), ArtError>> {
+        async {
+            let json = serde_json::to_vec(value).map_err(|e| ArtError::Serialize(e.to_string()))?;
+            self.set(key, json).await
+        }
+    }
+}
+
+use std::future::Future;

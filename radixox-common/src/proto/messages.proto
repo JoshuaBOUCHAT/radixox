@@ -1,7 +1,11 @@
 syntax = "proto3";
 package radixox;
 
-// L'enveloppe principale pour toutes les requêtes client
+// ============================================================================
+// REQUEST MESSAGES
+// ============================================================================
+
+// Main request envelope
 message NetCommand {
   uint64 request_id = 1;
   oneof net_action {
@@ -9,9 +13,11 @@ message NetCommand {
     NetGetRequest get = 3;
     NetGetNRequest getn = 4;
     NetDelRequest del = 5;
+    NetDelNRequest deln = 6;
   }
 }
 
+// Single key operations
 message NetSetRequest {
   bytes key = 1;
   bytes value = 2;
@@ -20,10 +26,15 @@ message NetSetRequest {
 message NetGetRequest { bytes key = 1; }
 message NetDelRequest { bytes key = 1; }
 
-message NetGetNRequest {
-  bytes pattern = 1; // Le pattern avec '*'
-}
+// Prefix-based operations (implicit wildcard suffix: "user" matches "user:*")
+message NetGetNRequest { bytes prefix = 1; }
+message NetDelNRequest { bytes prefix = 1; }
 
+// ============================================================================
+// RESPONSE MESSAGES
+// ============================================================================
+
+// Main response envelope
 message NetResponse {
   uint64 request_id = 1;
   oneof net_response_result {
@@ -36,9 +47,10 @@ message NetErrorResponse { string message = 2; }
 
 message NetSuccessResponse {
   oneof body {
-    bytes get_val = 1;
-    NetGetNval keys_val = 2;
+    bytes single_value = 1;           // Response for GET
+    NetMultiValueResponse multi_value = 2;  // Response for GETN
   }
 }
 
-message NetGetNval { repeated bytes keys = 1; }
+// Multi-value response for pattern operations
+message NetMultiValueResponse { repeated bytes values = 1; }

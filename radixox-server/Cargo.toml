@@ -7,13 +7,8 @@ license.workspace = true
 description = "RadixOx server - Redis-like data store"
 
 [dependencies]
-serde.workspace = true
 monoio.workspace = true
 prost.workspace = true
 bytes.workspace = true
+oxidart.workspace = true
 radixox-common = { path = "../radixox-common" }
-serde_json = "1.0.149"
-slotmap.workspace = true
-
-arrayvec = "0.7.6"
-rand = "0.9.2"

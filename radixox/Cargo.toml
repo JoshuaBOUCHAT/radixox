@@ -10,16 +10,16 @@ description = "RadixOx client library"
 slotmap.workspace = true
 radixox-common.workspace = true
 serde.workspace = true
+serde_json = "1.0"
 monoio.workspace = true
 prost.workspace = true
 bytes.workspace = true
-
-# Feature spécifique
-tokio = { version = "1.49.0", features = ["full"], optional = true }
-async-trait = { version = "0.1.89", optional = true }
 local-sync = "0.1.1"
 
+# Optional tokio support (for future bridge)
+tokio = { version = "1.49.0", features = ["full"], optional = true }
+async-trait = { version = "0.1.89", optional = true }
+
 [features]
-default = ["tokio"]
-# Cette feature activera les dépendances nécessaires pour le bridge
+default = []
 tokio = ["dep:tokio", "dep:async-trait"]

@@ -8,57 +8,65 @@ use monoio::{
 };
 use prost::Message;
 
-use crate::{FromStream, NetValidate};
+use crate::NetValidate;
 
 type IOResult<T> = std::io::Result<T>;
 
+// ============================================================================
+// COMMAND STRUCTURES
+// ============================================================================
+
+/// A validated command with its action and unique identifier
 pub struct Command {
     pub action: CommandAction,
     pub command_id: u64,
 }
+
 impl Command {
     pub fn new(action: CommandAction, command_id: u64) -> Self {
         Command { action, command_id }
     }
 }
-/*impl FromStream for Command {
-    async fn from_stream(
-        stream: &mut monoio::io::OwnedReadHalf<TcpStream>,
-        buffer: &mut Vec<u8>,
-    ) -> std::io::Result<Self> {
-        read_message(stream, buffer).await
-    }
-}*/
 
+/// All possible command actions
 pub enum CommandAction {
     Set(SetAction),
     Get(GetAction),
+    GetN(GetNAction),
     Del(DelAction),
-}
-pub struct SetAction {
-    key: Bytes,
-    val: Bytes,
-}
-pub struct GetAction {
-    key: Bytes,
-}
-pub struct DelAction {
-    key: Bytes,
-}
-pub struct GetN {
-    key: Bytes,
+    DelN(DelNAction),
 }
 
 impl CommandAction {
     pub fn get(key: Bytes) -> Result<Self, &'static str> {
         Ok(Self::Get(GetAction::new(key)?))
     }
+
     pub fn set(key: Bytes, val: Bytes) -> Result<Self, &'static str> {
         Ok(Self::Set(SetAction::new(key, val)?))
     }
+
     pub fn del(key: Bytes) -> Result<Self, &'static str> {
         Ok(Self::Del(DelAction::new(key)?))
     }
+
+    pub fn getn(prefix: Bytes) -> Result<Self, &'static str> {
+        Ok(Self::GetN(GetNAction::new(prefix)?))
+    }
+
+    pub fn deln(prefix: Bytes) -> Result<Self, &'static str> {
+        Ok(Self::DelN(DelNAction::new(prefix)?))
+    }
+}
+
+// ============================================================================
+// SINGLE KEY ACTIONS
+// ============================================================================
+
+/// SET action: store a value at a key
+pub struct SetAction {
+    key: Bytes,
+    val: Bytes,
 }
 
 impl SetAction {
@@ -69,41 +77,109 @@ impl SetAction {
             Err("Key contain non ASCII characters")
         }
     }
-    ///return (key,val)
+
+    /// Returns (key, value)
     pub fn into_parts(self) -> (Bytes, Bytes) {
         (self.key, self.val)
     }
 }
 
+/// GET action: retrieve a value by key
+pub struct GetAction {
+    key: Bytes,
+}
+
 impl GetAction {
-    pub fn into_parts(self) -> Bytes {
-        self.key
-    }
     pub fn new(key: Bytes) -> Result<Self, &'static str> {
         if key.is_ascii() {
             Ok(Self { key })
         } else {
             Err("Key contain non ASCII characters")
         }
+    }
+
+    pub fn into_parts(self) -> Bytes {
+        self.key
     }
 }
 
+/// DEL action: delete a value by key
+pub struct DelAction {
+    key: Bytes,
+}
+
 impl DelAction {
-    pub fn into_parts(self) -> Bytes {
-        self.key
-    }
     pub fn new(key: Bytes) -> Result<Self, &'static str> {
         if key.is_ascii() {
             Ok(Self { key })
         } else {
             Err("Key contain non ASCII characters")
         }
+    }
+
+    pub fn into_parts(self) -> Bytes {
+        self.key
+    }
+}
+
+// ============================================================================
+// PREFIX-BASED ACTIONS (implicit wildcard suffix)
+// ============================================================================
+
+/// GETN action: retrieve all values with keys starting with the given prefix
+/// Example: prefix "user" matches "user:1", "user:2", "user:admin", etc.
+pub struct GetNAction {
+    prefix: Bytes,
+}
+
+impl GetNAction {
+    pub fn new(prefix: Bytes) -> Result<Self, &'static str> {
+        if prefix.is_ascii() {
+            Ok(Self { prefix })
+        } else {
+            Err("Prefix contain non ASCII characters")
+        }
+    }
+
+    pub fn into_parts(self) -> Bytes {
+        self.prefix
+    }
+}
+
+/// DELN action: delete all keys starting with the given prefix
+/// Example: prefix "session" deletes "session:1", "session:abc", etc.
+pub struct DelNAction {
+    prefix: Bytes,
+}
+
+impl DelNAction {
+    pub fn new(prefix: Bytes) -> Result<Self, &'static str> {
+        if prefix.is_ascii() {
+            Ok(Self { prefix })
+        } else {
+            Err("Prefix contain non ASCII characters")
+        }
+    }
+
+    pub fn into_parts(self) -> Bytes {
+        self.prefix
+    }
+}
+
+// ============================================================================
+// DISPLAY IMPLEMENTATIONS
+// ============================================================================
+
+impl Display for SetAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let key = std::str::from_utf8(&self.key).unwrap();
+        let val = String::from_utf8_lossy(&self.val);
+        write!(f, "key: {key}\n    value: {val}")
     }
 }
 
 impl Display for GetAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Key is ASCII so from_utf8 is safe
         let key = std::str::from_utf8(&self.key).unwrap();
         write!(f, "key: {key}")
     }
@@ -116,37 +192,43 @@ impl Display for DelAction {
     }
 }
 
-impl Display for SetAction {
+impl Display for GetNAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let key = std::str::from_utf8(&self.key).unwrap();
-        let val = String::from_utf8_lossy(&self.val);
-        write!(f, "key: {key}\n    value: {val}")
+        let prefix = std::str::from_utf8(&self.prefix).unwrap();
+        write!(f, "prefix: {prefix}")
+    }
+}
+
+impl Display for DelNAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let prefix = std::str::from_utf8(&self.prefix).unwrap();
+        write!(f, "prefix: {prefix}")
     }
 }
 
 impl Display for CommandAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CommandAction::Get(action) => write!(f, "GET:\n    {action}"),
-            CommandAction::Del(action) => write!(f, "DEL:\n    {action}"),
             CommandAction::Set(action) => write!(f, "SET:\n    {action}"),
+            CommandAction::Get(action) => write!(f, "GET:\n    {action}"),
+            CommandAction::GetN(action) => write!(f, "GETN:\n    {action}"),
+            CommandAction::Del(action) => write!(f, "DEL:\n    {action}"),
+            CommandAction::DelN(action) => write!(f, "DELN:\n    {action}"),
         }
     }
 }
+
 impl Display for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: ID: {}", self.action, self.command_id)
     }
 }
 
-#[cfg(test)]
-mod tests {
+// ============================================================================
+// NETWORK I/O
+// ============================================================================
 
-    #[test]
-    fn it_works() {}
-}
-
-/// Decode le buffer en Command
+/// Decode buffer into a validated message
 fn decode_message<T, V>(buf: &[u8]) -> IOResult<V>
 where
     T: Message + NetValidate<V> + Default,
@@ -158,6 +240,7 @@ where
         .map_err(|_| std::io::Error::other("Invalid command"))
 }
 
+/// Read a single message from the stream
 pub async fn read_message<T, V>(
     stream: &mut OwnedReadHalf<TcpStream>,
     buf: &mut Vec<u8>,
@@ -165,16 +248,13 @@ pub async fn read_message<T, V>(
 where
     T: Message + NetValidate<V> + Default,
 {
-    //println!("  Message recieve");
-    // 1. On récupère le buffer (ownership)
     let mut tmp = std::mem::take(buf);
 
     if tmp.capacity() < 4 {
         tmp.reserve(4);
     }
 
-    //println!("  Reading message len");
-    // 2. Première lecture (on peut lire le header + une partie du payload)
+    // Read 4-byte header (message length)
     let header_buf = vec![0u8; 4];
     let (res, header_buf) = stream.read_exact(header_buf).await;
     let n = res?;
@@ -185,31 +265,25 @@ where
     }
 
     let msg_len = u32::from_be_bytes(core::array::from_fn(|i| header_buf[i])) as usize;
-    //println!("  Message len:{}", msg_len);
 
-    // 4. On vérifie s'il nous en manque
-
+    // Read message payload
     tmp.reserve(msg_len);
 
-    //println!("  Reading the message");
     let (res, slice_mut) = stream.read_exact(tmp.slice_mut(0..msg_len)).await;
     tmp = slice_mut.into_inner();
     res.expect("faut check");
 
-    //println!("  Message read");
-
-    //println!("  Decoding message");
-    // 5. Décodage (Zero-copy via slice)
+    // Decode and validate
     let cmd = decode_message::<T, V>(tmp.as_slice())?;
-    //println!("  Message decoded");
 
-    // 6. On rend le buffer pour la prochaine itération
-    // Optionnel : on pourrait vider le buffer ici ou gérer le "surplus" lu
+    // Return buffer for reuse
     *buf = tmp;
     buf.clear();
 
     Ok(cmd)
 }
+
+/// Read a batch of messages from the stream (for high throughput)
 pub async fn read_message_batch<T, V>(
     stream: &mut OwnedReadHalf<TcpStream>,
     datas: &mut BytesMut,
@@ -217,7 +291,7 @@ pub async fn read_message_batch<T, V>(
 where
     T: Message + NetValidate<V> + Default,
 {
-    // 1. Monoio prend le buffer (Transfert d'ownership pour io_uring)
+    // Monoio takes buffer ownership for io_uring
     let buffer = std::mem::take(datas);
     let len = buffer.len();
     let (n, buf) = stream.read(buffer.slice_mut(len..)).await;
@@ -234,8 +308,7 @@ where
     let mut res = Vec::new();
     let mut cursor = 0;
 
-    // 2. Boucle de parsing sur le buffer actuel
-    // On utilise un curseur pour ne pas modifier le buffer pendant qu'on lit
+    // Parse messages from buffer using cursor
     while buf.len() - cursor >= 4 {
         let start = cursor;
         let msg_len =
@@ -244,12 +317,12 @@ where
 
         let total_len = 4 + msg_len;
 
-        // Si le message est incomplet dans le buffer actuel
+        // Incomplete message, wait for more data
         if buf.len() - cursor < total_len {
             break;
         }
 
-        // Extraction et décodage (Zero-copy via slicing)
+        // Zero-copy decode via slicing
         let data = &buf[start + 4..start + total_len];
         if let Ok(net_message) = T::decode(data) {
             if let Ok(validated) = net_message.validate() {
@@ -260,19 +333,22 @@ where
         cursor += total_len;
     }
 
-    // 3. LE SHIFT : Maximiser l'espace pour le prochain syscall
+    // Shift remaining bytes to start of buffer
     if cursor > 0 {
         if cursor < buf.len() {
-            // On déplace le "reste" du message au tout début du buffer
             buf.copy_within(cursor.., 0);
             buf.truncate(buf.len() - cursor);
         } else {
-            // Tout a été lu, on reset simplement le buffer à zéro (O(1))
             buf.clear();
         }
     }
 
-    // On rend le buffer propre à la boucle infinie
     *datas = buf;
     Ok(res)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn it_works() {}
 }
