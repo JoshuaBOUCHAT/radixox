@@ -1,3 +1,30 @@
+//! Monoio-based client implementation.
+//!
+//! This module provides a high-performance async client using the monoio runtime
+//! with io_uring support on Linux.
+//!
+//! # Architecture
+//!
+//! The client uses a split architecture:
+//! - **Write loop**: Batches outgoing requests on a 1ms timer for throughput
+//! - **Read loop**: Processes incoming responses and dispatches to waiters
+//!
+//! # Example
+//!
+//! ```no_run
+//! use std::net::{SocketAddr, SocketAddrV4, Ipv4Addr};
+//! use radixox::{ArtClient, monoio_client::monoio_art::SharedMonoIOClient};
+//!
+//! #[monoio::main]
+//! async fn main() {
+//!     let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8379));
+//!     let client = SharedMonoIOClient::new(addr).await.unwrap();
+//!
+//!     client.set("hello", "world").await.unwrap();
+//!     println!("{:?}", client.get("hello").await);
+//! }
+//! ```
+
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
