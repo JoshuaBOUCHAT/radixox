@@ -1,162 +1,177 @@
 # RadixOx
 
-**High-performance in-memory key-value store built with Rust and io_uring.**
+**2x faster than Redis. Built with Rust, io_uring, and Adaptive Radix Trees.**
 
-RadixOx is a Redis-like data store optimized for modern Linux systems, leveraging io_uring for minimal syscall overhead and maximum throughput.
+RadixOx is a high-performance in-memory key-value store that speaks the Redis protocol. Drop-in replacement for Redis with twice the throughput and half the latency.
 
-## Features
+## Benchmarks
 
-- **Blazing fast** - io_uring based networking with monoio runtime
-- **Adaptive Radix Tree** - Memory-efficient storage via [OxidART](https://github.com/your-repo/oxidart)
-- **Prefix operations** - Native support for `getn`/`deln` pattern queries
-- **Simple protocol** - Protobuf-based wire format
-- **Ergonomic client** - Flexible API accepting `&str`, `String`, `Bytes`, etc.
+Tested with [memtier_benchmark](https://github.com/RedisLabs/memtier_benchmark) on the same hardware:
+
+| Metric | Redis | RadixOx | Improvement |
+|--------|-------|---------|-------------|
+| **Throughput** | 74,023 ops/s | 143,926 ops/s | **1.94x** |
+| **Avg Latency** | 6.75 ms | 3.47 ms | **1.95x lower** |
+| **p99 Latency** | 16.51 ms | 6.56 ms | **2.52x lower** |
+| **p99.9 Latency** | 40.70 ms | 23.17 ms | **1.76x lower** |
+
+```
+# RadixOx results
+Sets        28,785 ops/s    3.47ms avg    6.59ms p99
+Gets       115,140 ops/s    3.47ms avg    6.56ms p99
+Total      143,926 ops/s    3.47ms avg    6.56ms p99
+```
+
+## Why RadixOx?
+
+- **io_uring** - Zero-copy async I/O via [monoio](https://github.com/bytedance/monoio), not epoll
+- **Adaptive Radix Tree** - Cache-friendly O(k) lookups with [OxidArt](https://github.com/your-repo/oxidart)
+- **Single-threaded** - No locks, no contention, predictable latency
+- **Zero-copy parsing** - Direct `Bytes` slices, minimal allocations
+- **Redis compatible** - Works with `redis-cli`, any Redis client library
+
+## Quick Start
+
+```bash
+# Build and run
+cargo run --bin radixox-resp --features resp --release
+
+# Test with redis-cli
+redis-cli -p 6379 PING        # PONG
+redis-cli -p 6379 SET foo bar # OK
+redis-cli -p 6379 GET foo     # "bar"
+
+# Benchmark
+redis-benchmark -p 6379 -t SET,GET -n 100000 -q
+memtier_benchmark -p 6379 --protocol=redis -t 4 -c 50
+```
+
+## Supported Commands
+
+Full Redis RESP2 protocol support:
+
+| Category | Commands |
+|----------|----------|
+| **Connection** | `PING` `QUIT` `ECHO` `SELECT` |
+| **Strings** | `GET` `SET` `SETNX` `SETEX` `MGET` `MSET` |
+| **Keys** | `DEL` `EXISTS` `TYPE` `KEYS` `DBSIZE` `FLUSHDB` |
+| **Expiration** | `TTL` `PTTL` `EXPIRE` `PEXPIRE` `PERSIST` |
+
+### SET Options
+
+```bash
+SET key value EX 60      # Expire in 60 seconds
+SET key value PX 5000    # Expire in 5000 milliseconds
+SET key value NX         # Only set if not exists
+SET key value XX         # Only set if exists
+```
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      radixox (client)                       │
-│  ┌─────────────────┐  ┌─────────────────┐                   │
-│  │  monoio_client  │  │  tokio_client   │  (future)         │
-│  │  (io_uring)     │  │  (epoll bridge) │                   │
-│  └────────┬────────┘  └─────────────────┘                   │
-└───────────┼─────────────────────────────────────────────────┘
-            │ TCP + Protobuf
-            ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   radixox-server                            │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │                    OxidART                          │    │
-│  │              (Adaptive Radix Tree)                  │    │
-│  └─────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────┘
-            │
-            ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   radixox-common                            │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │
-│  │   Protocol   │  │   Network    │  │   Protobuf   │       │
-│  │  (Commands)  │  │  (Encoding)  │  │  (Messages)  │       │
-│  └──────────────┘  └──────────────┘  └──────────────┘       │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                         radixox-resp                                │
+│                                                                     │
+│   ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐ │
+│   │   monoio     │    │    RESP2     │    │      OxidArt         │ │
+│   │  (io_uring)  │───▶│   Parser     │───▶│  (Adaptive Radix     │ │
+│   │              │    │  zero-copy   │    │   Tree + TTL)        │ │
+│   └──────────────┘    └──────────────┘    └──────────────────────┘ │
+│                                                                     │
+│   io_buf ──▶ read_buf ──▶ Frame ──▶ OxidArt ──▶ write_buf ──▶ TCP │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-## Quick Start
+**Data Flow:**
+1. `io_buf` - Kernel I/O buffer (io_uring ownership transfer)
+2. `read_buf` - Accumulates data for parsing
+3. `decode_bytes_mut()` - Zero-copy RESP parsing into `Frame`
+4. `OxidArt` - Execute command on Adaptive Radix Tree
+5. `write_buf` - Encode response, reused per connection
 
-### Server
+## Native Rust Client
 
-```bash
-cargo run -p radixox-server --release
-# Listening on 0.0.0.0:8379
-```
-
-### Client
+For maximum performance, use the native monoio client (protobuf protocol on port 8379):
 
 ```rust
-use std::net::{SocketAddr, SocketAddrV4, Ipv4Addr};
 use radixox::{ArtClient, monoio_client::monoio_art::SharedMonoIOClient};
+use std::net::{SocketAddr, SocketAddrV4, Ipv4Addr};
 
 #[monoio::main]
 async fn main() {
     let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8379));
     let client = SharedMonoIOClient::new(addr).await.unwrap();
 
-    // SET / GET / DEL
+    // Basic operations
     client.set("user:1", "Alice").await.unwrap();
     let val = client.get("user:1").await.unwrap();
-    println!("Got: {:?}", val); // Some(b"Alice")
 
-    // Prefix operations
+    // Prefix operations (native, not available in Redis)
     client.set("session:abc", "data1").await.unwrap();
     client.set("session:xyz", "data2").await.unwrap();
 
-    let sessions = client.getn("session").await.unwrap();
-    println!("Found {} sessions", sessions.len()); // 2
+    let sessions = client.getn("session").await.unwrap(); // Get all session:*
+    client.deln("session").await.unwrap();                // Delete all session:*
 
-    client.deln("session").await.unwrap(); // Delete all sessions
+    // JSON serialization
+    client.set_json("config", &my_struct).await.unwrap();
+    let config: MyStruct = client.get_json("config").await.unwrap().unwrap();
 }
 ```
 
-### JSON Serialization
+## Server Binaries
 
-```rust
-use serde::{Serialize, Deserialize};
+| Binary | Port | Protocol | Use Case |
+|--------|------|----------|----------|
+| `radixox-resp` | 6379 | Redis RESP2 | Drop-in Redis replacement |
+| `radixox-legacy` | 8379 | Protobuf | Native Rust client, prefix ops |
 
-#[derive(Serialize, Deserialize)]
-struct User {
-    id: u64,
-    name: String,
-}
+```bash
+# Redis-compatible server
+cargo run --bin radixox-resp --features resp --release
 
-let user = User { id: 1, name: "Alice".into() };
-client.set_json("user:1", &user).await?;
-
-let retrieved: User = client.get_json("user:1").await?.unwrap();
+# Native protobuf server
+cargo run --bin radixox-legacy --features legacy --release
 ```
 
-## Commands
+## Building
 
-| Command | Description | Example |
-|---------|-------------|---------|
-| `SET` | Store a value | `set("key", "value")` |
-| `GET` | Retrieve a value | `get("key")` |
-| `DEL` | Delete a key | `del("key")` |
-| `GETN` | Get all values with prefix | `getn("user")` → matches `user:*` |
-| `DELN` | Delete all keys with prefix | `deln("session")` → deletes `session:*` |
+```bash
+# Build everything
+cargo build --workspace --release
+
+# Build specific server
+cargo build -p radixox-server --features resp --release
+
+# Run tests
+./radixox-server/test_resp.sh
+
+# Generate docs
+cargo doc --workspace --no-deps --open
+```
+
+## Requirements
+
+- **Linux 5.1+** (io_uring support)
+- **Rust 2024 edition**
 
 ## Workspace Structure
 
 ```
 radixox/
-├── radixox/           # Client library
-│   └── src/
-│       ├── lib.rs           # ArtClient trait
-│       ├── monoio_client/   # io_uring implementation
-│       └── tokio_client/    # Tokio bridge (planned)
-│
-├── radixox-server/    # Server binary
-│   └── src/
-│       └── main.rs          # TCP server with OxidART backend
-│
-├── radixox-common/    # Shared protocol
-│   └── src/
-│       ├── lib.rs           # Network encoding/validation
-│       ├── protocol.rs      # Command types
-│       └── proto/
-│           └── messages.proto
-│
-└── Cargo.toml         # Workspace manifest
+├── radixox-server/     # Server binaries (RESP + legacy)
+├── radixox-common/     # Shared types, protobuf definitions
+├── radixox/            # Native Rust client libraries
+└── Cargo.toml          # Workspace manifest
 ```
 
-## Performance
+## Roadmap
 
-RadixOx is designed for high throughput:
-
-- **Request batching** - Client buffers requests and flushes every 1ms
-- **Response batching** - Server processes multiple commands per read
-- **Zero-copy parsing** - Protobuf with `Bytes` for minimal allocations
-- **io_uring** - Kernel-level async I/O on Linux 5.1+
-
-## Requirements
-
-- **Rust** 2024 edition (nightly)
-- **Linux** 5.1+ (for io_uring)
-- **Dependencies**: monoio, prost, bytes, serde
-
-## Building
-
-```bash
-# Build all
-cargo build --workspace --release
-
-# Run tests (requires server running)
-cargo run -p radixox-server --release &
-cargo test -p radixox --release
-
-# Generate docs
-cargo doc --workspace --no-deps --open
-```
+- [ ] `SCAN` - Cursor-based iteration
+- [ ] `INCR/DECR` - Atomic counters
+- [ ] Pub/Sub
+- [ ] Persistence (RDB/AOF)
+- [ ] Cluster mode
 
 ## License
 

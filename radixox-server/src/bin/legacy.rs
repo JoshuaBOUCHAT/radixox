@@ -1,33 +1,34 @@
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use monoio::io::{AsyncWriteRentExt, Splitable};
 use monoio::net::{TcpListener, TcpStream};
 
 use oxidart::OxidArt;
+use oxidart::monoio::{spawn_evictor, spawn_ticker};
 use radixox_common::NetEncode;
 use radixox_common::network::net_response::NetResponseResult;
-use radixox_common::network::{
-    NetCommand, NetMultiValueResponse, NetResponse, NetSuccessResponse,
-};
+use radixox_common::network::{NetCommand, NetMultiValueResponse, NetResponse, NetSuccessResponse};
 use radixox_common::protocol::{Command, CommandAction, read_message_batch};
 
 type IOResult<T> = std::io::Result<T>;
 
-/// 32 KiB max message size
-const MAX_MSG_SIZE: usize = 32 * 1024;
-/// Varint header max (10 bytes for u64, but 3 bytes enough for 32KB)
+const MAX_MSG_SIZE: usize = 1024 * 1024 * 100;
 const HEADER_SIZE: usize = 10;
 
 type SharedART = Rc<RefCell<OxidArt>>;
 
-#[monoio::main]
+#[monoio::main(enable_timer = true)]
 async fn main() -> IOResult<()> {
     let listener = TcpListener::bind("0.0.0.0:8379")?;
-    println!("Listening on 0.0.0.0:8379");
+    println!("RadixOx Legacy Server listening on 0.0.0.0:8379");
 
     let shared_art = SharedART::new(RefCell::new(OxidArt::new()));
+    spawn_ticker(shared_art.clone(), Duration::from_millis(100));
+    spawn_evictor(shared_art.clone(), Duration::from_secs(1));
+    shared_art.borrow_mut().tick();
 
     loop {
         let (stream, _addr) = listener.accept().await?;
@@ -89,13 +90,11 @@ fn execute_command(cmd: Command, arena: &mut OxidArt) -> NetResponse {
         }
         CommandAction::GetN(action) => {
             let pairs = arena.getn(action.into_parts());
-            // Extract values from (key, value) pairs
             let values: Vec<Bytes> = pairs.into_iter().map(|(_, v)| v).collect();
             multi_response(values, cmd.command_id)
         }
         CommandAction::DelN(action) => {
             let _count = arena.deln(action.into_parts());
-            // DelN returns no data, just confirmation
             success_response(None, cmd.command_id)
         }
     }

@@ -22,14 +22,14 @@
 //!     let client = SharedMonoIOClient::new(addr).await.unwrap();
 //!
 //!     // Basic operations
-//!     client.set("user:1", "Alice").await.unwrap();
+//!     client.set("user:1", "Alice").await;
 //!     let val = client.get("user:1").await.unwrap();
 //!     assert_eq!(val, Some("Alice".into()));
 //!
 //!     // Prefix operations
-//!     client.set("session:a", "data_a").await.unwrap();
-//!     client.set("session:b", "data_b").await.unwrap();
-//!     let sessions = client.getn("session").await.unwrap();
+//!     client.set("session:a", "data_a").await;
+//!     client.set("session:b", "data_b").await;
+//!     let sessions = client.getn("session").await;
 //!     assert_eq!(sessions.len(), 2);
 //!
 //!     // Cleanup with prefix delete
@@ -146,9 +146,9 @@ impl From<prost::EncodeError> for ArtError {
 ///
 /// async fn example(client: impl ArtClient) {
 ///     // All of these work for keys:
-///     client.set("key", "value").await.unwrap();
-///     client.set(String::from("key"), "value").await.unwrap();
-///     client.set(b"key".as_slice(), "value").await.unwrap();
+///     client.set("key", "value").await;
+///     client.set(String::from("key"), "value").await;
+///     client.set(b"key".as_slice(), "value").await;
 /// }
 /// ```
 pub trait ArtClient {
@@ -184,8 +184,8 @@ pub trait ArtClient {
     /// ```no_run
     /// # use radixox::ArtClient;
     /// # async fn example(client: impl ArtClient) {
-    /// client.set("user:1", "Alice").await?;
-    /// client.set("user:2", b"Bob".to_vec()).await?;
+    /// client.set("user:1", "Alice").await;
+    /// client.set("user:2", b"Bob".to_vec()).await;
     /// # Ok::<(), radixox::ArtError>(())
     /// # }
     /// ```
@@ -224,9 +224,9 @@ pub trait ArtClient {
     /// ```no_run
     /// # use radixox::ArtClient;
     /// # async fn example(client: impl ArtClient) {
-    /// client.set("item:a", "1").await?;
-    /// client.set("item:b", "2").await?;
-    /// client.set("other:x", "3").await?;
+    /// client.set("item:a", "1").await;
+    /// client.set("item:b", "2").await;
+    /// client.set("other:x", "3").await;
     ///
     /// let items = client.getn("item").await?;
     /// assert_eq!(items.len(), 2); // Only "item:a" and "item:b"

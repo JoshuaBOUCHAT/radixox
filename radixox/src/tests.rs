@@ -1,4 +1,5 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::str::from_utf8;
 
 use monoio::time::Instant;
 
@@ -77,6 +78,10 @@ async fn test_getn() {
 
     // Get all with prefix
     let values = client.getn("prefix").await.unwrap();
+    for word in values.iter().filter_map(|i| from_utf8(i).ok()) {
+        println!("Words: {}", word);
+    }
+
     assert_eq!(values.len(), 3);
 
     // Cleanup
@@ -84,7 +89,7 @@ async fn test_getn() {
     client.del("other:x").await.unwrap();
 }
 
-#[monoio::test]
+#[monoio::test(enable_timer = true)]
 async fn test_deln() {
     let client = SharedMonoIOClient::new(SERVER_ADDR)
         .await
@@ -139,6 +144,8 @@ async fn test_json_serde() {
 // PERFORMANCE / STRESS TESTS
 // ============================================================================
 
+const CHUNCK_SIZE: usize = 50;
+
 #[monoio::test(enable_timer = true)]
 async fn test_throughput() {
     let client = SharedMonoIOClient::new(SERVER_ADDR)
@@ -155,7 +162,7 @@ async fn test_throughput() {
 
     // --- PHASE 1: SET ---
     let mut handles = Vec::new();
-    for chunk in words.chunks(50) {
+    for chunk in words.chunks(CHUNCK_SIZE) {
         let chunk_data = chunk.to_vec();
         let c = client.clone();
 
@@ -175,13 +182,16 @@ async fn test_throughput() {
 
     // --- PHASE 2: GET ---
     let mut handles = Vec::new();
-    for chunk in words.chunks(50) {
+    for chunk in words.chunks(CHUNCK_SIZE) {
         let chunk_data = chunk.to_vec();
         let c = client.clone();
 
         let handle = monoio::spawn(async move {
             for word in chunk_data {
-                c.get(&word).await.unwrap();
+                let r_word = c.get(&word).await.unwrap().unwrap();
+                if word.as_bytes() != r_word {
+                    assert!(false, "invalide response");
+                }
             }
         });
         handles.push(handle);
@@ -199,8 +209,21 @@ async fn test_throughput() {
     println!("Throughput: {:.0} req/s", throughput);
     println!("---------------------------------------");
 
-    // Cleanup
-    for word in &words {
-        client.del(word).await.ok();
+    let mut del_handles = Vec::new();
+    for chunk in words.chunks(CHUNCK_SIZE) {
+        // On peut prendre des chunks plus gros pour le cleanup
+        let chunk_data = chunk.to_vec();
+        let c = client.clone();
+
+        let handle = monoio::spawn(async move {
+            for word in chunk_data {
+                let _ = c.del(&word).await;
+            }
+        });
+        del_handles.push(handle);
+    }
+
+    for h in del_handles {
+        h.await;
     }
 }

@@ -15,4 +15,4 @@ prost = "0.14.3"
 serde = { version = "1.0.228", features = ["derive"] }
 bytes = { version = "1", features = ["serde"] }
 slotmap = "1.1.1"
-oxidart = { path = "../oxidart" }
+oxidart = { path = "../oxidart", features = ["monoio"] }

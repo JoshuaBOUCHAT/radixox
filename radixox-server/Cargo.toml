@@ -6,9 +6,29 @@ authors.workspace = true
 license.workspace = true
 description = "RadixOx server - Redis-like data store"
 
+[[bin]]
+name = "radixox-legacy"
+path = "src/bin/legacy.rs"
+required-features = ["legacy"]
+
+[[bin]]
+name = "radixox-resp"
+path = "src/bin/resp.rs"
+required-features = ["resp"]
+
+[features]
+default = ["legacy", "resp"]
+legacy = ["dep:prost", "dep:radixox-common"]
+resp = ["dep:redis-protocol"]
+
 [dependencies]
 monoio.workspace = true
-prost.workspace = true
 bytes.workspace = true
 oxidart.workspace = true
-radixox-common = { path = "../radixox-common" }
+
+# Legacy protocol (protobuf)
+prost = { workspace = true, optional = true }
+radixox-common = { path = "../radixox-common", optional = true }
+
+# Redis protocol (RESP)
+redis-protocol = { version = "5", default-features = false, features = ["std", "resp2", "resp3", "bytes"], optional = true }
