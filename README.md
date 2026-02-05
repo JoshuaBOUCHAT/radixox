@@ -72,13 +72,13 @@ SET key value XX         # Only set if exists
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         radixox-resp                                │
 │                                                                     │
-│   ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐ │
-│   │   monoio     │    │    RESP2     │    │      OxidArt         │ │
-│   │  (io_uring)  │───▶│   Parser     │───▶│  (Adaptive Radix     │ │
-│   │              │    │  zero-copy   │    │   Tree + TTL)        │ │
-│   └──────────────┘    └──────────────┘    └──────────────────────┘ │
+│   ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐  │
+│   │   monoio     │    │    RESP2     │    │      OxidArt         │  │
+│   │  (io_uring)  │───▶│   Parser     │───▶│  (Adaptive Radix     │  │
+│   │              │    │  zero-copy   │    │   Tree + TTL)        │  │
+│   └──────────────┘    └──────────────┘    └──────────────────────┘  │
 │                                                                     │
-│   io_buf ──▶ read_buf ──▶ Frame ──▶ OxidArt ──▶ write_buf ──▶ TCP │
+│   io_buf ──▶ read_buf ──▶ Frame ──▶ OxidArt ──▶ write_buf ──▶ TCP   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -121,10 +121,10 @@ async fn main() {
 
 ## Server Binaries
 
-| Binary | Port | Protocol | Use Case |
-|--------|------|----------|----------|
-| `radixox-resp` | 6379 | Redis RESP2 | Drop-in Redis replacement |
-| `radixox-legacy` | 8379 | Protobuf | Native Rust client, prefix ops |
+| Binary           | Port | Protocol    | Use Case                       |
+|------------------|------|-------------|--------------------------------|
+| `radixox-resp`   | 6379 | Redis RESP2 | Drop-in Redis replacement      |
+| `radixox-legacy` | 8379 | Protobuf    | Native Rust client, prefix ops |
 
 ```bash
 # Redis-compatible server
