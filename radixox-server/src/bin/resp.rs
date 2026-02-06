@@ -5,6 +5,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt, Splitable};
 use monoio::net::{TcpListener, TcpStream};
+use smallvec::SmallVec;
 
 use oxidart::monoio::{spawn_evictor, spawn_ticker};
 use oxidart::{OxidArt, TtlResult};
@@ -40,6 +41,7 @@ async fn main() -> IOResult<()> {
 }
 
 async fn handle_connection(stream: TcpStream, art: SharedART) -> IOResult<()> {
+    //stream.set_nodelay(true)?;
     let (mut read, mut write) = stream.into_split();
     let mut read_buf = BytesMut::with_capacity(BUFFER_SIZE);
     let mut write_buf = BytesMut::with_capacity(BUFFER_SIZE);
@@ -95,18 +97,22 @@ enum Handler {
     DataOnly(fn(&mut OxidArt) -> Frame),
 }
 
-fn resp_pong() -> Frame { Frame::SimpleString(PONG.clone()) }
-fn resp_ok() -> Frame { Frame::SimpleString(OK.clone()) }
+fn resp_pong() -> Frame {
+    Frame::SimpleString(PONG.clone())
+}
+fn resp_ok() -> Frame {
+    Frame::SimpleString(OK.clone())
+}
 
 static COMMANDS: &[(&[u8], Handler)] = &[
     // Meta commands - no data access
+    (b"GET", Handler::Data(cmd_get)),
+    (b"SET", Handler::Data(cmd_set)),
     (b"PING", Handler::Static(resp_pong)),
     (b"QUIT", Handler::Static(resp_ok)),
     (b"SELECT", Handler::Static(resp_ok)),
     (b"ECHO", Handler::Args(cmd_echo)),
     // Data commands - need OxidArt
-    (b"GET", Handler::Data(cmd_get)),
-    (b"SET", Handler::Data(cmd_set)),
     (b"DEL", Handler::Data(cmd_del)),
     (b"KEYS", Handler::Data(cmd_keys)),
     (b"TTL", Handler::Data(cmd_ttl)),
@@ -145,10 +151,10 @@ fn execute_command(frame: Frame, art: &mut OxidArt) -> Frame {
     Frame::Error(format!("ERR unknown command '{}'", String::from_utf8_lossy(cmd)).into())
 }
 
-fn frame_to_args(frame: Frame) -> Option<Vec<Bytes>> {
+fn frame_to_args(frame: Frame) -> Option<SmallVec<[Bytes; 3]>> {
     match frame {
         Frame::Array(arr) => {
-            let mut args = Vec::with_capacity(arr.len());
+            let mut args = SmallVec::with_capacity(arr.len());
             for f in arr {
                 match f {
                     Frame::BulkString(b) => args.push(b),
@@ -158,8 +164,8 @@ fn frame_to_args(frame: Frame) -> Option<Vec<Bytes>> {
             }
             Some(args)
         }
-        Frame::BulkString(b) => Some(vec![b]),
-        Frame::SimpleString(s) => Some(vec![s]),
+        Frame::BulkString(b) => Some(smallvec::smallvec![b]),
+        Frame::SimpleString(s) => Some(smallvec::smallvec![s]),
         _ => None,
     }
 }
@@ -203,16 +209,18 @@ fn parse_set_options(args: &[Bytes]) -> Result<SetOptions, Frame> {
             if i >= args.len() {
                 return Err(Frame::Error("ERR syntax error".into()));
             }
-            let secs: u64 = parse_int(&args[i])
-                .ok_or_else(|| Frame::Error("ERR value is not an integer or out of range".into()))?;
+            let secs: u64 = parse_int(&args[i]).ok_or_else(|| {
+                Frame::Error("ERR value is not an integer or out of range".into())
+            })?;
             opts.ttl = Some(Duration::from_secs(secs));
         } else if args[i].eq_ignore_ascii_case(b"PX") {
             i += 1;
             if i >= args.len() {
                 return Err(Frame::Error("ERR syntax error".into()));
             }
-            let ms: u64 = parse_int(&args[i])
-                .ok_or_else(|| Frame::Error("ERR value is not an integer or out of range".into()))?;
+            let ms: u64 = parse_int(&args[i]).ok_or_else(|| {
+                Frame::Error("ERR value is not an integer or out of range".into())
+            })?;
             opts.ttl = Some(Duration::from_millis(ms));
         } else if args[i].eq_ignore_ascii_case(b"NX") {
             opts.condition = SetCondition::IfNotExists;
@@ -257,12 +265,14 @@ fn cmd_set(args: &[Bytes], art: &mut OxidArt) -> Frame {
         Err(e) => return e,
     };
 
-    // Check condition before setting
-    let key_exists = art.get(key.clone()).is_some();
-    match opts.condition {
-        SetCondition::IfNotExists if key_exists => return Frame::Null,
-        SetCondition::IfExists if !key_exists => return Frame::Null,
-        _ => {}
+    // Check condition before setting (skip lookup when Always)
+    if !matches!(opts.condition, SetCondition::Always) {
+        let key_exists = art.get(key.clone()).is_some();
+        match opts.condition {
+            SetCondition::IfNotExists if key_exists => return Frame::Null,
+            SetCondition::IfExists if !key_exists => return Frame::Null,
+            _ => {}
+        }
     }
 
     match opts.ttl {

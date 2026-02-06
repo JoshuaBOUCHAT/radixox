@@ -32,3 +32,4 @@ radixox-common = { path = "../radixox-common", optional = true }
 
 # Redis protocol (RESP)
 redis-protocol = { version = "5", default-features = false, features = ["std", "resp2", "resp3", "bytes"], optional = true }
+smallvec = "1.15.1"

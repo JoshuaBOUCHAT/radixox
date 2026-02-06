@@ -612,6 +612,7 @@ dependencies = [
  "prost",
  "radixox-common",
  "redis-protocol",
+ "smallvec",
 ]
 
 [[package]]
