@@ -16,10 +16,17 @@ name = "radixox-resp"
 path = "src/bin/resp.rs"
 required-features = ["resp"]
 
+
+[[bin]]
+name = "radixox-resp-multithread"
+path = "src/bin/multithread.rs"
+required-features = ["resp", "multithread"]
+
 [features]
-default = ["legacy", "resp"]
+default = ["legacy", "resp", "multithread"]
 legacy = ["dep:prost", "dep:radixox-common"]
 resp = ["dep:redis-protocol"]
+multithread = ["dep:tokio", "dep:crossbeam", "dep:boxcar"]
 
 [dependencies]
 monoio.workspace = true
@@ -31,4 +38,14 @@ prost = { workspace = true, optional = true }
 radixox-common = { path = "../radixox-common", optional = true }
 
 # Redis protocol (RESP)
-redis-protocol = { version = "5", default-features = false, features = ["std", "resp2", "resp3", "bytes"], optional = true }
+redis-protocol = { version = "5", default-features = false, features = [
+    "std",
+    "resp2",
+    "resp3",
+    "bytes",
+], optional = true }
+tokio = { version = "1.49.0", features = ["full"], optional = true }
+crossbeam = { version = "0.8.4", features = [
+    "crossbeam-channel",
+], optional = true }
+boxcar = { version = "0.2", optional = true }

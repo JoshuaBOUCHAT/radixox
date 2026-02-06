@@ -16,3 +16,9 @@ serde = { version = "1.0.228", features = ["derive"] }
 bytes = { version = "1", features = ["serde"] }
 slotmap = "1.1.1"
 oxidart = { version = "0.3.0", features = ["monoio"] }
+
+[profile.release]
+debug = true
+split-debuginfo = "packed" # Optionnel, aide parfois sur certaines distribs
+strip = false              # On s'assure que rien n'est retiré
+incremental = false

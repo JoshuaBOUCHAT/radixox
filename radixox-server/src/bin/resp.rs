@@ -39,7 +39,7 @@ async fn main() -> IOResult<()> {
     }
 }
 
-async fn handle_connection(stream: TcpStream, art: SharedART) -> IOResult<()> {
+pub(crate) async fn handle_connection(stream: TcpStream, art: SharedART) -> IOResult<()> {
     let (mut read, mut write) = stream.into_split();
     let mut read_buf = BytesMut::with_capacity(BUFFER_SIZE);
     let mut write_buf = BytesMut::with_capacity(BUFFER_SIZE);
@@ -95,8 +95,12 @@ enum Handler {
     DataOnly(fn(&mut OxidArt) -> Frame),
 }
 
-fn resp_pong() -> Frame { Frame::SimpleString(PONG.clone()) }
-fn resp_ok() -> Frame { Frame::SimpleString(OK.clone()) }
+fn resp_pong() -> Frame {
+    Frame::SimpleString(PONG.clone())
+}
+fn resp_ok() -> Frame {
+    Frame::SimpleString(OK.clone())
+}
 
 static COMMANDS: &[(&[u8], Handler)] = &[
     // Meta commands - no data access
@@ -203,16 +207,18 @@ fn parse_set_options(args: &[Bytes]) -> Result<SetOptions, Frame> {
             if i >= args.len() {
                 return Err(Frame::Error("ERR syntax error".into()));
             }
-            let secs: u64 = parse_int(&args[i])
-                .ok_or_else(|| Frame::Error("ERR value is not an integer or out of range".into()))?;
+            let secs: u64 = parse_int(&args[i]).ok_or_else(|| {
+                Frame::Error("ERR value is not an integer or out of range".into())
+            })?;
             opts.ttl = Some(Duration::from_secs(secs));
         } else if args[i].eq_ignore_ascii_case(b"PX") {
             i += 1;
             if i >= args.len() {
                 return Err(Frame::Error("ERR syntax error".into()));
             }
-            let ms: u64 = parse_int(&args[i])
-                .ok_or_else(|| Frame::Error("ERR value is not an integer or out of range".into()))?;
+            let ms: u64 = parse_int(&args[i]).ok_or_else(|| {
+                Frame::Error("ERR value is not an integer or out of range".into())
+            })?;
             opts.ttl = Some(Duration::from_millis(ms));
         } else if args[i].eq_ignore_ascii_case(b"NX") {
             opts.condition = SetCondition::IfNotExists;
