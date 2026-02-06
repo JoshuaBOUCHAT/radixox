@@ -1,34 +1,52 @@
 # RadixOx
 
-**2x faster than Redis. Built with Rust, io_uring, and Adaptive Radix Trees.**
+**A fast Redis-compatible key-value store. Built with Rust, io_uring, and Adaptive Radix Trees.**
 
-RadixOx is a high-performance in-memory key-value store that speaks the Redis protocol. Drop-in replacement for Redis with twice the throughput and half the latency.
+RadixOx is a high-performance in-memory key-value store that speaks the Redis protocol. Drop-in replacement for Redis with lower tail latency, built on a single-threaded io_uring architecture.
 
 ## Benchmarks
 
-Tested with [memtier_benchmark](https://github.com/RedisLabs/memtier_benchmark) on the same hardware:
+Tested with [memtier_benchmark](https://github.com/RedisLabs/memtier_benchmark) on the same machine, both servers tuned (`1 thread, 500 clients, 50/50 GET/SET, 32B values, 100K key space`):
 
-| Metric | Redis | RadixOx | Improvement |
-|--------|-------|---------|-------------|
-| **Throughput** | 74,023 ops/s | 143,926 ops/s | **1.94x** |
-| **Avg Latency** | 6.75 ms | 3.47 ms | **1.95x lower** |
-| **p99 Latency** | 16.51 ms | 6.56 ms | **2.52x lower** |
-| **p99.9 Latency** | 40.70 ms | 23.17 ms | **1.76x lower** |
+| Metric | Redis (optimized) | RadixOx | Delta |
+|--------|-------------------|---------|-------|
+| **Throughput** | 128,534 ops/s | 132,454 ops/s | **+3%** |
+| **Avg Latency** | 3.89 ms | 3.80 ms | **-2%** |
+| **p99 Latency** | 10.30 ms | 8.03 ms | **-22%** |
 
 ```
-# RadixOx results
-Sets        28,785 ops/s    3.47ms avg    6.59ms p99
-Gets       115,140 ops/s    3.47ms avg    6.56ms p99
-Total      143,926 ops/s    3.47ms avg    6.56ms p99
+# RadixOx
+Sets        66,227 ops/s    3.80ms avg    8.03ms p99
+Gets        66,227 ops/s    3.80ms avg    8.06ms p99
+Total      132,454 ops/s    3.80ms avg    8.03ms p99
+
+# Redis (optimized config)
+Sets        64,267 ops/s    3.89ms avg   10.24ms p99
+Gets        64,267 ops/s    3.89ms avg   10.30ms p99
+Total      128,534 ops/s    3.89ms avg   10.30ms p99
 ```
 
 ## Why RadixOx?
 
 - **io_uring** - Zero-copy async I/O via [monoio](https://github.com/bytedance/monoio), not epoll
-- **Adaptive Radix Tree** - Cache-friendly O(k) lookups with [OxidArt](https://github.com/your-repo/oxidart)
+- **Adaptive Radix Tree** - Cache-friendly O(k) lookups with [OxidArt](https://crates.io/crates/oxidart)
 - **Single-threaded** - No locks, no contention, predictable latency
 - **Zero-copy parsing** - Direct `Bytes` slices, minimal allocations
 - **Redis compatible** - Works with `redis-cli`, any Redis client library
+
+### Prefix queries: where RadixOx really shines
+
+Redis stores keys in a flat hash table. `KEYS user:*` must scan **every key in the database** — O(N) where N is the total number of keys, regardless of how many match.
+
+RadixOx stores keys in an Adaptive Radix Tree, a trie-like structure where keys sharing a common prefix share the same path in the tree. `KEYS user:*` traverses directly to the `user:` subtree and only visits matching keys — **O(k)** where k is the number of results, not the total database size.
+
+```
+# 1M keys total, 1000 start with "user:"
+# Redis:    KEYS user:*  →  scans 1,000,000 keys   O(N)
+# RadixOx:  KEYS user:*  →  visits 1,000 keys       O(k)
+```
+
+This makes RadixOx a natural fit for workloads with hierarchical keys (`user:123:session`, `config:app:feature`, `cache:region:item`) where prefix operations are frequent.
 
 ## Quick Start
 

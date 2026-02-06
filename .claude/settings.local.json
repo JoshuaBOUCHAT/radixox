@@ -2,7 +2,15 @@
   "permissions": {
     "allow": [
       "Bash(cargo init:*)",
-      "Bash(cargo build:*)"
+      "Bash(cargo build:*)",
+      "Bash(git ls-tree:*)",
+      "Bash(git checkout:*)",
+      "Bash(git commit:*)",
+      "WebSearch",
+      "Bash(grep:*)",
+      "Bash(cargo metadata:*)",
+      "Bash(python3:*)",
+      "Bash(git -C /home/joshua/rust/radixox log --oneline -15)"
     ]
   }
 }
