@@ -1,13 +1,17 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use local_sync::mpsc::unbounded;
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt, Splitable};
 use monoio::net::{TcpListener, TcpStream};
 use smallvec::SmallVec;
 
+use oxidart::counter::CounterError;
 use oxidart::monoio::{spawn_evictor, spawn_ticker};
+use oxidart::value::Value;
 use oxidart::{OxidArt, TtlResult};
 use redis_protocol::resp2::decode::decode_bytes_mut;
 use redis_protocol::resp2::encode::extend_encode;
@@ -15,6 +19,8 @@ use redis_protocol::resp2::types::BytesFrame as Frame;
 
 type IOResult<T> = std::io::Result<T>;
 type SharedART = Rc<RefCell<OxidArt>>;
+type ConnId = u64;
+type SharedRegistry = Rc<RefCell<HashMap<Bytes, HashMap<ConnId, unbounded::Tx<Bytes>>>>>;
 
 const BUFFER_SIZE: usize = 64 * 1024;
 
@@ -28,65 +34,191 @@ async fn main() -> IOResult<()> {
     let listener = TcpListener::bind("0.0.0.0:6379")?;
     println!("RadixOx RESP Server listening on 0.0.0.0:6379");
 
-    let shared_art = SharedART::new(RefCell::new(OxidArt::new()));
-    spawn_ticker(shared_art.clone(), Duration::from_millis(100));
-    spawn_evictor(shared_art.clone(), Duration::from_secs(1));
-    shared_art.borrow_mut().tick();
+    let shared_art =
+        OxidArt::shared_with_evictor(Duration::from_millis(100), Duration::from_secs(1));
+
+    let registry: SharedRegistry = Rc::new(RefCell::new(HashMap::new()));
+    let conn_counter: Rc<Cell<ConnId>> = Rc::new(Cell::new(0));
 
     loop {
         let (stream, addr) = listener.accept().await?;
         println!("New connection from {}", addr);
-        monoio::spawn(handle_connection(stream, shared_art.clone()));
+        let conn_id = conn_counter.get();
+        conn_counter.set(conn_id.wrapping_add(1));
+        monoio::spawn(handle_connection(
+            stream,
+            shared_art.clone(),
+            registry.clone(),
+            conn_id,
+        ));
     }
 }
 
-async fn handle_connection(stream: TcpStream, art: SharedART) -> IOResult<()> {
-    //stream.set_nodelay(true)?;
-    let (mut read, mut write) = stream.into_split();
+struct Conn {
+    write_buf: BytesMut,
+    sub_tx: Option<unbounded::Tx<Bytes>>,
+    sub_channels: HashSet<Bytes>,
+    conn_id: ConnId,
+}
+
+impl Conn {
+    fn new(conn_id: ConnId) -> Self {
+        Self {
+            write_buf: BytesMut::with_capacity(BUFFER_SIZE),
+            sub_tx: None,
+            sub_channels: HashSet::new(),
+            conn_id,
+        }
+    }
+
+    /// Route a frame to the client — direct write (normal) or channel (subscriber).
+    #[inline]
+    fn send(&mut self, frame: Frame) {
+        if let Some(tx) = &self.sub_tx {
+            send_via_tx(tx, frame);
+        } else {
+            extend_encode(&mut self.write_buf, &frame).expect("encode should not fail");
+        }
+    }
+
+    /// Dispatch a non-SUBSCRIBE command.
+    fn handle_cmd(
+        &mut self,
+        cmd: &[u8],
+        args: &[Bytes],
+        art: &SharedART,
+        registry: &SharedRegistry,
+    ) {
+        if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") {
+            if let Some(tx) = &self.sub_tx {
+                handle_unsubscribe(args, registry, self.conn_id, &mut self.sub_channels, tx);
+            }
+        } else if cmd.eq_ignore_ascii_case(b"PUBLISH") {
+            self.send(cmd_publish(args, registry));
+        } else if !self.sub_channels.is_empty() {
+            // Subscriber mode: only PING/QUIT allowed
+            if cmd.eq_ignore_ascii_case(b"PING") {
+                self.send(resp_pong());
+            } else if cmd.eq_ignore_ascii_case(b"QUIT") {
+                self.send(resp_ok());
+            } else {
+                self.send(Frame::Error(
+                    "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / PUBLISH are allowed in this context".into(),
+                ));
+            }
+        } else {
+            // Normal mode (or unsubscribed back to normal)
+            self.send(dispatch_command(cmd, args, &mut art.borrow_mut()));
+        }
+    }
+}
+
+async fn handle_connection(
+    stream: TcpStream,
+    art: SharedART,
+    registry: SharedRegistry,
+    conn_id: ConnId,
+) -> IOResult<()> {
+    let (mut read, write) = stream.into_split();
     let mut read_buf = BytesMut::with_capacity(BUFFER_SIZE);
-    let mut write_buf = BytesMut::with_capacity(BUFFER_SIZE);
-    // Separate buffer for io_uring reads - gets ownership transferred to kernel
     let mut io_buf = BytesMut::with_capacity(BUFFER_SIZE);
+    let mut write_half = Some(write);
+    let mut conn = Conn::new(conn_id);
 
     loop {
-        // Read data from socket (monoio takes ownership, returns it back)
         let (res, returned_buf) = read.read(io_buf).await;
         io_buf = returned_buf;
 
         let n = match res {
-            Ok(0) => return Ok(()), // Connection closed
+            Ok(0) => break,
             Ok(n) => n,
-            Err(e) => return Err(e),
+            Err(e) => {
+                cleanup_subscriptions(&registry, conn_id, &conn.sub_channels);
+                return Err(e);
+            }
         };
 
-        // Append read data to parse buffer
         read_buf.extend_from_slice(&io_buf[..n]);
         io_buf.clear();
 
-        // Parse and execute commands (can be multiple in pipeline)
         loop {
-            match decode_bytes_mut(&mut read_buf) {
-                Ok(Some((frame, _consumed, _buf))) => {
-                    let response = execute_command(frame, &mut art.borrow_mut());
-                    extend_encode(&mut write_buf, &response).expect("encode should not fail");
-                }
-                Ok(None) => break, // Need more data
+            let frame = match decode_bytes_mut(&mut read_buf) {
+                Ok(Some((frame, _, _))) => frame,
+                Ok(None) => break,
                 Err(e) => {
                     eprintln!("Parse error: {:?}", e);
-                    let err_response = Frame::Error(format!("ERR parse error: {:?}", e).into());
-                    extend_encode(&mut write_buf, &err_response).expect("encode should not fail");
+                    conn.send(Frame::Error(format!("ERR parse error: {:?}", e).into()));
                     break;
                 }
+            };
+
+            let args = match frame_to_args(frame) {
+                Some(args) if !args.is_empty() => args,
+                _ => {
+                    conn.send(Frame::Error(ERR_EMPTY_CMD.into()));
+                    continue;
+                }
+            };
+
+            let cmd = &args[0];
+
+            if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") {
+                if conn.sub_tx.is_none() {
+                    let (tx, rx) = unbounded::channel::<Bytes>();
+                    let mut w = write_half.take().unwrap();
+                    if !conn.write_buf.is_empty() {
+                        let buf = std::mem::replace(&mut conn.write_buf, BytesMut::new());
+                        let (res, ret) = w.write_all(buf).await;
+                        conn.write_buf = ret;
+                        res?;
+                        conn.write_buf.clear();
+                    }
+                    monoio::spawn(pubsub_writer(rx, w));
+                    conn.sub_tx = Some(tx);
+                }
+                handle_subscribe(
+                    &args[1..],
+                    &registry,
+                    conn_id,
+                    &mut conn.sub_channels,
+                    conn.sub_tx.as_ref().unwrap(),
+                );
+            } else {
+                conn.handle_cmd(cmd, &args[1..], &art, &registry);
             }
         }
 
-        // Write all responses at once
-        if !write_buf.is_empty() {
-            let (res, buf) = write.write_all(write_buf).await;
-            write_buf = buf;
-            res?;
-            write_buf.clear();
+        // Flush (normal mode only — subscriber mode writes go through channel)
+        if let Some(w) = &mut write_half {
+            if !conn.write_buf.is_empty() {
+                let buf = std::mem::replace(&mut conn.write_buf, BytesMut::new());
+                let (res, ret) = w.write_all(buf).await;
+                conn.write_buf = ret;
+                res?;
+                conn.write_buf.clear();
+            }
         }
+    }
+
+    cleanup_subscriptions(&registry, conn_id, &conn.sub_channels);
+    Ok(())
+}
+
+/// Writer task spawned per subscriber. Owns the write half exclusively.
+/// Batch-drains the channel to minimize syscalls. Dies on write error.
+async fn pubsub_writer(mut rx: unbounded::Rx<Bytes>, mut write: impl AsyncWriteRentExt) {
+    let mut buf = BytesMut::with_capacity(BUFFER_SIZE);
+    while let Some(msg) = rx.recv().await {
+        buf.extend_from_slice(&msg);
+        while let Ok(m) = rx.try_recv() {
+            buf.extend_from_slice(&m);
+        }
+        let (res, returned) = write.write_all(buf).await;
+        buf = returned;
+        if res.is_err() {
+            return;
+        }
+        buf.clear();
     }
 }
 
@@ -108,6 +240,10 @@ static COMMANDS: &[(&[u8], Handler)] = &[
     // Meta commands - no data access
     (b"GET", Handler::Data(cmd_get)),
     (b"SET", Handler::Data(cmd_set)),
+    (b"INCR", Handler::Data(cmd_incr)),
+    (b"DECR", Handler::Data(cmd_decr)),
+    (b"INCRBY", Handler::Data(cmd_incrby)),
+    (b"DECRBY", Handler::Data(cmd_decrby)),
     (b"PING", Handler::Static(resp_pong)),
     (b"QUIT", Handler::Static(resp_ok)),
     (b"SELECT", Handler::Static(resp_ok)),
@@ -130,19 +266,13 @@ static COMMANDS: &[(&[u8], Handler)] = &[
     (b"FLUSHDB", Handler::DataOnly(cmd_flushdb)),
 ];
 
-fn execute_command(frame: Frame, art: &mut OxidArt) -> Frame {
-    let args = match frame_to_args(frame) {
-        Some(args) if !args.is_empty() => args,
-        _ => return Frame::Error(ERR_EMPTY_CMD.into()),
-    };
-
-    let cmd = &args[0];
+fn dispatch_command(cmd: &[u8], args: &[Bytes], art: &mut OxidArt) -> Frame {
     for (name, handler) in COMMANDS {
         if cmd.eq_ignore_ascii_case(name) {
             return match handler {
                 Handler::Static(f) => f(),
-                Handler::Args(f) => f(&args[1..]),
-                Handler::Data(f) => f(&args[1..], art),
+                Handler::Args(f) => f(args),
+                Handler::Data(f) => f(args, art),
                 Handler::DataOnly(f) => f(art),
             };
         }
@@ -248,7 +378,12 @@ fn cmd_get(args: &[Bytes], art: &mut OxidArt) -> Frame {
         return Frame::Error("ERR wrong number of arguments for 'GET' command".into());
     }
     match art.get(args[0].clone()) {
-        Some(val) => Frame::BulkString(val),
+        Some(val) => match val.as_bytes() {
+            Some(b) => Frame::BulkString(b),
+            None => Frame::Error(
+                "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+            ),
+        },
         None => Frame::Null,
     }
 }
@@ -259,7 +394,7 @@ fn cmd_set(args: &[Bytes], art: &mut OxidArt) -> Frame {
     }
 
     let key = args[0].clone();
-    let val = args[1].clone();
+    let val = Value::String(args[1].clone());
     let opts = match parse_set_options(&args[2..]) {
         Ok(o) => o,
         Err(e) => return e,
@@ -283,6 +418,63 @@ fn cmd_set(args: &[Bytes], art: &mut OxidArt) -> Frame {
     Frame::SimpleString(OK.clone())
 }
 
+fn counter_err(e: CounterError) -> Frame {
+    match e {
+        CounterError::NotAnInteger => {
+            Frame::Error("ERR value is not an integer or out of range".into())
+        }
+        CounterError::Overflow => Frame::Error("ERR increment or decrement would overflow".into()),
+    }
+}
+
+fn cmd_incr(args: &[Bytes], art: &mut OxidArt) -> Frame {
+    if args.is_empty() {
+        return Frame::Error("ERR wrong number of arguments for 'INCR' command".into());
+    }
+    match art.incr(args[0].clone()) {
+        Ok(val) => Frame::Integer(val),
+        Err(e) => counter_err(e),
+    }
+}
+
+fn cmd_decr(args: &[Bytes], art: &mut OxidArt) -> Frame {
+    if args.is_empty() {
+        return Frame::Error("ERR wrong number of arguments for 'DECR' command".into());
+    }
+    match art.decr(args[0].clone()) {
+        Ok(val) => Frame::Integer(val),
+        Err(e) => counter_err(e),
+    }
+}
+
+fn cmd_incrby(args: &[Bytes], art: &mut OxidArt) -> Frame {
+    if args.len() < 2 {
+        return Frame::Error("ERR wrong number of arguments for 'INCRBY' command".into());
+    }
+    let delta: i64 = match parse_int(&args[1]) {
+        Some(d) => d,
+        None => return Frame::Error("ERR value is not an integer or out of range".into()),
+    };
+    match art.incrby(args[0].clone(), delta) {
+        Ok(val) => Frame::Integer(val),
+        Err(e) => counter_err(e),
+    }
+}
+
+fn cmd_decrby(args: &[Bytes], art: &mut OxidArt) -> Frame {
+    if args.len() < 2 {
+        return Frame::Error("ERR wrong number of arguments for 'DECRBY' command".into());
+    }
+    let delta: i64 = match parse_int(&args[1]) {
+        Some(d) => d,
+        None => return Frame::Error("ERR value is not an integer or out of range".into()),
+    };
+    match art.decrby(args[0].clone(), delta) {
+        Ok(val) => Frame::Integer(val),
+        Err(e) => counter_err(e),
+    }
+}
+
 fn cmd_del(args: &[Bytes], art: &mut OxidArt) -> Frame {
     if args.is_empty() {
         return Frame::Error("ERR wrong number of arguments for 'DEL' command".into());
@@ -298,24 +490,104 @@ fn cmd_del(args: &[Bytes], art: &mut OxidArt) -> Frame {
 }
 
 fn cmd_keys(args: &[Bytes], art: &mut OxidArt) -> Frame {
-    let pattern = if args.is_empty() {
-        Bytes::new()
-    } else {
-        // Simple prefix matching: "user:*" -> prefix "user:"
-        let mut p = args[0].clone();
-        if p.ends_with(b"*") {
-            p = p.slice(..p.len() - 1);
+    if args.is_empty() {
+        // No pattern = all keys
+        let keys: Vec<Frame> = art
+            .getn(Bytes::new())
+            .into_iter()
+            .map(|(k, _)| Frame::BulkString(k))
+            .collect();
+        return Frame::Array(keys);
+    }
+
+    let pattern = &args[0];
+
+    // Fast path: simple "prefix*" or bare prefix with no glob chars → getn
+    if is_simple_prefix(pattern) {
+        let prefix = if pattern.ends_with(b"*") {
+            pattern.slice(..pattern.len() - 1)
+        } else {
+            pattern.clone()
+        };
+        let keys: Vec<Frame> = art
+            .getn(prefix)
+            .into_iter()
+            .map(|(k, _)| Frame::BulkString(k))
+            .collect();
+        return Frame::Array(keys);
+    }
+
+    // Slow path: complex glob → convert to regex → DFA traversal
+    let regex = glob_to_regex(pattern);
+    match art.getn_regex(&regex) {
+        Ok(pairs) => {
+            let keys: Vec<Frame> = pairs
+                .into_iter()
+                .map(|(k, _)| Frame::BulkString(k))
+                .collect();
+            Frame::Array(keys)
         }
-        p
+        Err(_) => Frame::Error("ERR invalid pattern".into()),
+    }
+}
+
+/// Returns true if the pattern is a simple prefix (no glob chars except a trailing *)
+fn is_simple_prefix(pattern: &[u8]) -> bool {
+    let end = if pattern.ends_with(b"*") {
+        pattern.len() - 1
+    } else {
+        pattern.len()
     };
+    !pattern[..end]
+        .iter()
+        .any(|&b| b == b'*' || b == b'?' || b == b'[' || b == b']')
+}
 
-    let pairs = art.getn(pattern);
-    let keys: Vec<Frame> = pairs
-        .into_iter()
-        .map(|(k, _)| Frame::BulkString(k))
-        .collect();
+/// Converts a Redis glob pattern to an anchored regex.
+///
+/// Redis glob rules:
+///   *      → .*       (match any sequence)
+///   ?      → .        (match one char)
+///   [abc]  → [abc]    (character class, passed through)
+///   \x     → \x       (escape, passed through)
+///   other  → escaped literal
+fn glob_to_regex(pattern: &[u8]) -> String {
+    let mut regex = String::with_capacity(pattern.len() * 2);
+    regex.push('^');
 
-    Frame::Array(keys)
+    let mut i = 0;
+    while i < pattern.len() {
+        match pattern[i] {
+            b'*' => regex.push_str(".*"),
+            b'?' => regex.push('.'),
+            b'[' => {
+                regex.push('[');
+                i += 1;
+                while i < pattern.len() && pattern[i] != b']' {
+                    regex.push(pattern[i] as char);
+                    i += 1;
+                }
+                if i < pattern.len() {
+                    regex.push(']');
+                }
+            }
+            b'\\' if i + 1 < pattern.len() => {
+                regex.push('\\');
+                i += 1;
+                regex.push(pattern[i] as char);
+            }
+            // Escape regex metacharacters
+            b'.' | b'+' | b'^' | b'$' | b'{' | b'}' | b'(' | b')' | b'|' | b'#' | b'&' | b'~' => {
+                regex.push('\\');
+                regex.push(pattern[i] as char);
+            }
+            b => regex.push(b as char),
+        }
+        i += 1;
+    }
+
+    regex.push('$');
+    regex
 }
 
 fn cmd_ttl(args: &[Bytes], art: &mut OxidArt) -> Frame {
@@ -384,7 +656,10 @@ fn cmd_mget(args: &[Bytes], art: &mut OxidArt) -> Frame {
     let results: Vec<Frame> = args
         .iter()
         .map(|key| match art.get(key.clone()) {
-            Some(val) => Frame::BulkString(val),
+            Some(val) => match val.as_bytes() {
+                Some(b) => Frame::BulkString(b),
+                None => Frame::Null,
+            },
             None => Frame::Null,
         })
         .collect();
@@ -398,7 +673,7 @@ fn cmd_mset(args: &[Bytes], art: &mut OxidArt) -> Frame {
     }
 
     for pair in args.chunks_exact(2) {
-        art.set(pair[0].clone(), pair[1].clone());
+        art.set(pair[0].clone(), Value::String(pair[1].clone()));
     }
 
     Frame::SimpleString(OK.clone())
@@ -414,7 +689,7 @@ fn cmd_setnx(args: &[Bytes], art: &mut OxidArt) -> Frame {
         return Frame::Integer(0);
     }
 
-    art.set(key, args[1].clone());
+    art.set(key, Value::String(args[1].clone()));
     Frame::Integer(1)
 }
 
@@ -428,7 +703,7 @@ fn cmd_setex(args: &[Bytes], art: &mut OxidArt) -> Frame {
         Some(s) => s,
         None => return Frame::Error("ERR value is not an integer or out of range".into()),
     };
-    let val = args[2].clone();
+    let val = Value::String(args[2].clone());
 
     art.set_ttl(key, Duration::from_secs(secs), val);
     Frame::SimpleString(OK.clone())
@@ -486,7 +761,137 @@ fn cmd_type(args: &[Bytes], art: &mut OxidArt) -> Frame {
     }
 
     match art.get(args[0].clone()) {
-        Some(_) => Frame::SimpleString(Bytes::from_static(b"string")),
+        Some(val) => Frame::SimpleString(Bytes::from_static(val.redis_type().as_str().as_bytes())),
         None => Frame::SimpleString(Bytes::from_static(b"none")),
+    }
+}
+
+// =============================================================================
+// Pub/Sub
+// =============================================================================
+
+fn encode_pubsub_push(channel: &Bytes, message: &Bytes) -> Bytes {
+    let frame = Frame::Array(vec![
+        Frame::BulkString(Bytes::from_static(b"message")),
+        Frame::BulkString(channel.clone()),
+        Frame::BulkString(message.clone()),
+    ]);
+    let mut buf = BytesMut::new();
+    extend_encode(&mut buf, &frame).expect("encode should not fail");
+    buf.freeze()
+}
+
+fn handle_subscribe(
+    args: &[Bytes],
+    registry: &SharedRegistry,
+    conn_id: ConnId,
+    sub_channels: &mut HashSet<Bytes>,
+    tx: &unbounded::Tx<Bytes>,
+) {
+    if args.is_empty() {
+        send_via_tx(
+            tx,
+            Frame::Error("ERR wrong number of arguments for 'SUBSCRIBE' command".into()),
+        );
+        return;
+    }
+
+    let mut reg = registry.borrow_mut();
+    for ch in args {
+        sub_channels.insert(ch.clone());
+        reg.entry(ch.clone())
+            .or_default()
+            .insert(conn_id, tx.clone());
+
+        send_via_tx(
+            tx,
+            Frame::Array(vec![
+                Frame::BulkString(Bytes::from_static(b"subscribe")),
+                Frame::BulkString(ch.clone()),
+                Frame::Integer(sub_channels.len() as i64),
+            ]),
+        );
+    }
+}
+
+fn handle_unsubscribe(
+    args: &[Bytes],
+    registry: &SharedRegistry,
+    conn_id: ConnId,
+    sub_channels: &mut HashSet<Bytes>,
+    tx: &unbounded::Tx<Bytes>,
+) {
+    let channels_to_remove: Vec<Bytes> = if args.is_empty() {
+        sub_channels.iter().cloned().collect()
+    } else {
+        args.to_vec()
+    };
+
+    let mut reg = registry.borrow_mut();
+    for ch in &channels_to_remove {
+        sub_channels.remove(ch);
+        if let Some(subs) = reg.get_mut(ch) {
+            subs.remove(&conn_id);
+            if subs.is_empty() {
+                reg.remove(ch);
+            }
+        }
+
+        send_via_tx(
+            tx,
+            Frame::Array(vec![
+                Frame::BulkString(Bytes::from_static(b"unsubscribe")),
+                Frame::BulkString(ch.clone()),
+                Frame::Integer(sub_channels.len() as i64),
+            ]),
+        );
+    }
+}
+
+/// Encode a frame and send it through the pub/sub writer channel.
+#[inline]
+fn send_via_tx(tx: &unbounded::Tx<Bytes>, frame: Frame) {
+    let mut buf = BytesMut::new();
+    extend_encode(&mut buf, &frame).expect("encode should not fail");
+    let _ = tx.send(buf.freeze());
+}
+
+fn cmd_publish(args: &[Bytes], registry: &SharedRegistry) -> Frame {
+    if args.len() < 2 {
+        return Frame::Error("ERR wrong number of arguments for 'PUBLISH' command".into());
+    }
+
+    let channel = &args[0];
+    let message = &args[1];
+    let encoded = encode_pubsub_push(channel, message);
+
+    let mut reg = registry.borrow_mut();
+    let Some(subs) = reg.get_mut(channel) else {
+        return Frame::Integer(0);
+    };
+
+    // Send to all subscribers, remove dead ones
+    subs.retain(|_, tx| tx.send(encoded.clone()).is_ok());
+    let count = subs.len() as i64;
+
+    if subs.is_empty() {
+        reg.remove(channel);
+    }
+
+    Frame::Integer(count)
+}
+
+fn cleanup_subscriptions(registry: &SharedRegistry, conn_id: ConnId, channels: &HashSet<Bytes>) {
+    if channels.is_empty() {
+        return;
+    }
+    let mut reg = registry.borrow_mut();
+    for ch in channels {
+        if let Some(subs) = reg.get_mut(ch) {
+            subs.remove(&conn_id);
+            if subs.is_empty() {
+                reg.remove(ch);
+            }
+        }
     }
 }

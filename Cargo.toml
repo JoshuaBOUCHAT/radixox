@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["radixox-common", "radixox", "radixox-server"]
+members = ["radixox-common", "radixox", "radixox-server", "oxidart"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,4 +15,5 @@ prost = "0.14.3"
 serde = { version = "1.0.228", features = ["derive"] }
 bytes = { version = "1", features = ["serde"] }
 slotmap = "1.1.1"
-oxidart = { version = "0.3.0", features = ["monoio"] }
+oxidart = { path = "oxidart", features = ["monoio", "regex"] }
+smallvec = "1.15.1"

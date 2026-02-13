@@ -8,6 +8,7 @@ use monoio::net::{TcpListener, TcpStream};
 
 use oxidart::OxidArt;
 use oxidart::monoio::{spawn_evictor, spawn_ticker};
+use oxidart::value::Value;
 use radixox_common::NetEncode;
 use radixox_common::network::net_response::NetResponseResult;
 use radixox_common::network::{NetCommand, NetMultiValueResponse, NetResponse, NetSuccessResponse};
@@ -77,20 +78,20 @@ fn execute_command(cmd: Command, arena: &mut OxidArt) -> NetResponse {
     match cmd.action {
         CommandAction::Set(action) => {
             let (key, val) = action.into_parts();
-            arena.set(key, val);
+            arena.set(key, Value::String(val));
             success_response(None, cmd.command_id)
         }
         CommandAction::Get(action) => {
-            let val = arena.get(action.into_parts());
+            let val = arena.get(action.into_parts()).and_then(|v| v.as_bytes());
             success_response(val, cmd.command_id)
         }
         CommandAction::Del(action) => {
-            let val = arena.del(action.into_parts());
+            let val = arena.del(action.into_parts()).and_then(|v| v.as_bytes());
             success_response(val, cmd.command_id)
         }
         CommandAction::GetN(action) => {
             let pairs = arena.getn(action.into_parts());
-            let values: Vec<Bytes> = pairs.into_iter().map(|(_, v)| v).collect();
+            let values: Vec<Bytes> = pairs.into_iter().filter_map(|(_, v)| v.as_bytes()).collect();
             multi_response(values, cmd.command_id)
         }
         CommandAction::DelN(action) => {

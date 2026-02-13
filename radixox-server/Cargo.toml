@@ -25,11 +25,17 @@ resp = ["dep:redis-protocol"]
 monoio.workspace = true
 bytes.workspace = true
 oxidart.workspace = true
+smallvec.workspace = true
 
 # Legacy protocol (protobuf)
 prost = { workspace = true, optional = true }
 radixox-common = { path = "../radixox-common", optional = true }
 
 # Redis protocol (RESP)
-redis-protocol = { version = "5", default-features = false, features = ["std", "resp2", "resp3", "bytes"], optional = true }
-smallvec = "1.15.1"
+redis-protocol = { version = "5", default-features = false, features = [
+    "std",
+    "resp2",
+    "resp3",
+    "bytes",
+], optional = true }
+local-sync = "0.1.1"

@@ -10,7 +10,13 @@
       "Bash(grep:*)",
       "Bash(cargo metadata:*)",
       "Bash(python3:*)",
-      "Bash(git -C /home/joshua/rust/radixox log --oneline -15)"
+      "Bash(git -C /home/joshua/rust/radixox log --oneline -15)",
+      "WebFetch(domain:github.com)",
+      "Bash(redis-cli:*)",
+      "Bash(git log:*)",
+      "Bash(ls:*)",
+      "WebFetch(domain:docs.rs)",
+      "Bash(cargo test:*)"
     ]
   }
 }
