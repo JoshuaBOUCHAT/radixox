@@ -70,13 +70,13 @@ O(k) key-value operations where k is key length.
 - Separate `HiSlab<HugeChilds>` for overflow child pointers
 - With TTL: `now: u64` timestamp for expiration checks
 
-**Node structure** (changes with TTL feature):
-- With TTL: `compression: SmallVec<[u8; 8]>`, `val: Option<(Bytes, u64)>`, `parent_idx: u32`, `parent_radix: u8`
-- Without TTL: `compression: SmallVec<[u8; 23]>`, `val: Option<Bytes>`
+**Node structure** (`repr(C)`, **128 bytes** with TTL — fits allocator bucket exactly):
+- With TTL: `childs: Childs`, `compression: CompactStr` (16 bytes, inline ≤14), `val: Option<(Value, u64)>`, `huge_childs_idx: u32`, `parent_idx: u32`, `parent_radix: u8`
+- Without TTL: `compression: CompactStr`, `val: Option<Value>`, `childs: Childs`
 
 **Two-tier child storage (`node_childs.rs`)**:
-- `Childs`: Inline, up to 10 children (64-byte aligned)
-- `HugeChilds`: Overflow for remaining 117 radix values
+- `Childs`: Inline, up to 9 children (64-byte aligned)
+- `HugeChilds`: Overflow for remaining 118 radix values
 
 **Key algorithms**:
 - **Path compression**: Single-child paths collapse into compression vector
