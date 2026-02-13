@@ -1,0 +1,38 @@
+[package]
+name = "oxidart"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+arrayvec = "0.7.6"
+smallvec.workspace = true
+
+monoio = { optional = true, workspace = true }
+tinypointers = { version = "0.2.2", features = [
+    "1byteid",
+], default-features = false }
+
+
+tokio = { version = "1", features = [
+    "time",
+    "sync",
+    "rt",
+    "macros",
+], optional = true }
+hislab = "0.1.3"
+rand = { version = "0.8", optional = true }
+regex-automata = { version = "0.4", optional = true, default-features = false, features = [
+    "dfa-build",
+    "dfa-search",
+    "syntax",
+] }
+
+[features]
+default = ["ttl"]
+ttl = ["hislab/tagged", "hislab/rand", "dep:rand"]
+monoio = ["dep:monoio", "ttl"]
+tokio = ["dep:tokio", "ttl"]
+regex = ["dep:regex-automata", "ttl"]
