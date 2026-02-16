@@ -9,11 +9,9 @@ license.workspace = true
 bytes.workspace = true
 arrayvec = "0.7.6"
 smallvec.workspace = true
+ordered-float = "4.2"
 
 monoio = { optional = true, workspace = true }
-tinypointers = { version = "0.2.2", features = [
-    "1byteid",
-], default-features = false }
 
 
 tokio = { version = "1", features = [
@@ -29,6 +27,7 @@ regex-automata = { version = "0.4", optional = true, default-features = false, f
     "dfa-search",
     "syntax",
 ] }
+thin-vec = "0.2.14"
 
 [features]
 default = ["ttl"]

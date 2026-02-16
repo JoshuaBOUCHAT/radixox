@@ -44,8 +44,13 @@
 //! Keys must be valid ASCII bytes. Non-ASCII keys will trigger a debug assertion.
 
 mod compact_str;
+pub mod error;
+pub mod hcommand;
 mod node_childs;
+pub mod scommand;
 pub mod value;
+pub mod zcommand;
+pub mod zset_inner;
 
 // Prevent enabling both async runtimes at once
 #[cfg(all(feature = "monoio", feature = "tokio"))]
@@ -64,6 +69,9 @@ pub mod regex;
 
 #[cfg(test)]
 mod test;
+
+use std::str::from_utf8;
+use std::u32;
 
 use bytes::Bytes;
 use hislab::HiSlab;
@@ -285,7 +293,21 @@ impl OxidArt {
     /// # Arguments
     ///
     /// * `key` - The key to look up. Must be valid ASCII.
-    pub fn get(&mut self, key: Bytes) -> Option<&Value> {
+    pub fn get(&mut self, key: &[u8]) -> Option<&Value> {
+        let idx = self.get_idx(key)?;
+        debug_assert!(key.is_ascii(), "key must be ASCII");
+        #[cfg(feature = "ttl")]
+        return self.get_node(idx).get_value(self.now);
+        #[cfg(not(feature = "ttl"))]
+        return self.get_node(idx).get_value();
+    }
+    pub(crate) fn get_mut(&mut self, key: &[u8]) -> Option<&mut Value> {
+        let idx = self.get_idx(key)?;
+        debug_assert!(key.is_ascii(), "key must be ASCII");
+        let now = self.now;
+        return self.get_node_mut(idx).get_value_mut(now);
+    }
+    fn get_idx(&mut self, key: &[u8]) -> Option<u32> {
         debug_assert!(key.is_ascii(), "key must be ASCII");
         let key_len = key.len();
         if key_len == 0 {
@@ -296,7 +318,7 @@ impl OxidArt {
                 return None;
             }
             #[cfg(feature = "ttl")]
-            return self.get_node(self.root_idx).get_value(self.now);
+            return Some(self.root_idx);
             #[cfg(not(feature = "ttl"))]
             return self.get_node(self.root_idx).get_value();
         }
@@ -318,7 +340,7 @@ impl OxidArt {
                         return None;
                     }
                     #[cfg(feature = "ttl")]
-                    return self.get_node(idx).get_value(self.now);
+                    return Some(idx);
                     #[cfg(not(feature = "ttl"))]
                     return self.get_node(idx).get_value();
                 }
@@ -442,6 +464,46 @@ impl OxidArt {
             idx = self.find(idx, key[cursor])?;
             cursor += 1;
         }
+    }
+
+    pub(crate) fn ensure_key(&mut self, key: &[u8]) -> u32 {
+        let key_len = key.len();
+        if key_len == 0 {
+            return self.root_idx;
+        }
+
+        let Some(mut idx) = self.find(self.root_idx, key[0]) else {
+            return self.ensure(key, self.root_idx);
+        };
+        let mut cursor = 1;
+
+        loop {
+            let node = self
+                .try_get_node_mut(idx)
+                .expect("idx exist so node should exist");
+            match node.compare_compression_key(&key[cursor..]) {
+                CompResult::Final => return idx,
+                CompResult::Partial(common_len) => {
+                    let key_rest = &key[cursor..];
+                    return self.split_node(common_len, key_rest, idx, None, None);
+                }
+                CompResult::Path => {
+                    cursor += node.compression.len();
+                }
+            }
+            if let Some(new_idx) = self.find(idx, key[cursor]) {
+                idx = new_idx;
+                cursor += 1;
+            } else {
+                return self.ensure(&key[cursor..], idx);
+            }
+        }
+    }
+    fn ensure(&mut self, key_rest: &[u8], parent_idx: u32) -> u32 {
+        let new_node = Node::new_empty_leaf(&key_rest[1..], parent_idx, key_rest[0]);
+        let idx = self.insert(new_node);
+        self.push_child_idx(parent_idx, idx, key_rest[0]);
+        idx
     }
 
     /// Returns a mutable reference to the value at a node index.
@@ -730,55 +792,77 @@ impl OxidArt {
 
             // Split: node compression only partially matches the key
             let key_rest = &key[cursor..];
-            let val_on_intermediate = common_len == key_rest.len();
-
-            // Extract old state and configure intermediate in one pass
-            let (old_compression, old_val, old_childs, old_huge_idx) = {
-                let node = self.get_node_mut(idx);
-                let old_compression = std::mem::take(&mut node.compression);
-                let old_val = node.val.take();
-                let old_childs = std::mem::take(&mut node.childs);
-                let old_huge_idx = std::mem::replace(&mut node.huge_childs_idx, u32::MAX);
-
-                node.compression = CompactStr::from_slice(&old_compression[..common_len]);
-                if val_on_intermediate {
-                    node.val = Some((val.clone(), ttl));
-                }
-
-                (old_compression, old_val, old_childs, old_huge_idx)
-            };
-
-            // Create a node for the old content
-            let old_radix = old_compression[common_len];
-            // Check if old value had a TTL (needs to stay tagged)
-            let old_had_ttl = old_val
-                .as_ref()
-                .map(|(_, old_ttl)| *old_ttl != NO_EXPIRY)
-                .unwrap_or(false);
-            let old_child = Node {
-                huge_childs_idx: old_huge_idx,
-                compression: CompactStr::from_slice(&old_compression[common_len + 1..]),
-                val: old_val,
-                childs: old_childs,
-                parent_idx: idx,
-                parent_radix: old_radix,
-            };
-            let old_child_idx = if old_had_ttl {
-                self.insert_tagged(old_child)
-            } else {
-                self.insert(old_child)
-            };
-            self.get_node_mut(idx).childs.push(old_radix, old_child_idx);
-
-            // If the value doesn't go on the intermediate node, create a new leaf
-            if !val_on_intermediate {
-                let new_radix = key_rest[common_len];
-                let new_compression = &key_rest[common_len + 1..];
-                self.create_node_with_val(idx, new_radix, val, new_compression, ttl);
-            }
+            self.split_node(common_len, key_rest, idx, Some(ttl), Some(val));
 
             return;
         }
+    }
+    fn split_node(
+        &mut self,
+        common_len: usize,
+        key_rest: &[u8],
+        idx: u32,
+        ttl: Option<u64>,
+        mut val: Option<Value>,
+    ) -> u32 {
+        let val_on_intermediate = common_len == key_rest.len();
+        let (old_compression, old_val, old_childs, old_huge_idx) = {
+            let node = self.get_node_mut(idx);
+            let old_compression = std::mem::take(&mut node.compression);
+            let old_val = node.val.take();
+            let old_childs = std::mem::take(&mut node.childs);
+            let old_huge_idx = std::mem::replace(&mut node.huge_childs_idx, u32::MAX);
+
+            node.compression = CompactStr::from_slice(&old_compression[..common_len]);
+            if val_on_intermediate && let Some(val) = val.take() {
+                node.val = Some((val, ttl.unwrap_or(NO_EXPIRY)));
+            }
+
+            (old_compression, old_val, old_childs, old_huge_idx)
+        };
+
+        // Create a node for the old content
+        let old_radix = old_compression[common_len];
+        // Check if old value had a TTL (needs to stay tagged)
+        let old_had_ttl = old_val
+            .as_ref()
+            .map(|(_, old_ttl)| *old_ttl != NO_EXPIRY)
+            .unwrap_or(false);
+        let old_child = Node {
+            huge_childs_idx: old_huge_idx,
+            compression: CompactStr::from_slice(&old_compression[common_len + 1..]),
+            val: old_val,
+            childs: old_childs,
+            parent_idx: idx,
+            parent_radix: old_radix,
+        };
+        let old_child_idx = if old_had_ttl {
+            self.insert_tagged(old_child)
+        } else {
+            self.insert(old_child)
+        };
+
+        self.push_child_idx(idx, old_child_idx, old_radix);
+
+        // If the value doesn't go on the intermediate node, create a new leaf
+        if !val_on_intermediate {
+            let new_radix = key_rest[common_len];
+            let new_compression = &key_rest[common_len + 1..];
+            return if let Some(val) = val {
+                self.create_node_with_val(
+                    idx,
+                    new_radix,
+                    val,
+                    new_compression,
+                    ttl.unwrap_or(NO_EXPIRY),
+                )
+            } else {
+                let new_node = Node::new_empty_leaf(new_compression, idx, new_radix);
+                self.insert(new_node)
+            };
+        }
+
+        idx
     }
 
     #[cfg(not(feature = "ttl"))]
@@ -839,7 +923,7 @@ impl OxidArt {
                 childs: old_childs,
             };
             let old_child_idx = self.insert(old_child);
-            self.get_node_mut(idx).childs.push(old_radix, old_child_idx);
+            self.push_child_idx(idx, old_child_idx, old_radix);
 
             // If the value doesn't go on the intermediate node, create a new leaf
             if !val_on_intermediate {
@@ -860,7 +944,7 @@ impl OxidArt {
         val: Value,
         compression: &[u8],
         ttl: u64,
-    ) {
+    ) -> u32 {
         let (is_full, huge_child_idx) = {
             let father_node = self.get_node(parent_idx);
             (
@@ -891,6 +975,7 @@ impl OxidArt {
                     .push(radix, inserted_idx);
             }
         }
+        inserted_idx
     }
 
     #[cfg(not(feature = "ttl"))]
@@ -905,7 +990,7 @@ impl OxidArt {
         let new_leaf = Node::new_leaf(compression, val);
         let inserted_idx = self.insert(new_leaf);
         match (is_full, huge_child_idx) {
-            (false, _) => self.get_node_mut(idx).childs.push(radix, inserted_idx),
+            (false, _) => self.push_child_idx(idx, inserted_idx, radix),
             (true, None) => {
                 let new_child_idx = self.intiate_new_huge_child(radix, inserted_idx);
                 self.get_node_mut(idx).childs.set_new_childs(new_child_idx);
@@ -943,7 +1028,7 @@ impl OxidArt {
     /// // Key no longer exists
     /// assert_eq!(tree.get(Bytes::from_static(b"key")), None);
     /// ```
-    pub fn del(&mut self, key: Bytes) -> Option<Value> {
+    pub fn del(&mut self, key: &[u8]) -> Option<Value> {
         debug_assert!(key.is_ascii(), "key must be ASCII");
         let key_len = key.len();
         if key_len == 0 {
@@ -1254,6 +1339,28 @@ impl OxidArt {
                 .remove(radix);
         }
     }
+    fn push_child_idx(&mut self, parent_idx: u32, idx: u32, radix: u8) {
+        let huge_idx = {
+            let node = self.get_node_mut(parent_idx);
+            if !node.childs.is_full() {
+                node.childs.push(radix, idx);
+                return;
+            }
+            node.get_huge_childs_idx()
+        };
+
+        let Some(huge_idx) = huge_idx else {
+            let new_huge_idx = self.intiate_new_huge_child(radix, idx);
+            self.get_node_mut(parent_idx).huge_childs_idx = new_huge_idx;
+            return;
+        };
+
+        let huge = self
+            .child_list
+            .get_mut(huge_idx)
+            .expect("expect id exist so huge childs should");
+        huge.push(radix, idx);
+    }
 }
 
 #[repr(C, align(128))]
@@ -1352,6 +1459,13 @@ impl Node {
         }
         Some(val)
     }
+    fn get_value_mut(&mut self, now: u64) -> Option<&mut Value> {
+        let (val, ttl) = self.val.as_mut()?;
+        if *ttl != NO_EXPIRY && *ttl < now {
+            return None;
+        }
+        Some(val)
+    }
 
     #[cfg(not(feature = "ttl"))]
     fn get_value(&self) -> Option<&Value> {
@@ -1391,6 +1505,16 @@ impl Node {
             compression: CompactStr::from_slice(compression),
             val: Some((val, ttl)),
             childs: Childs::default(),
+            parent_idx,
+            parent_radix,
+        }
+    }
+    fn new_empty_leaf(compression: &[u8], parent_idx: u32, parent_radix: u8) -> Self {
+        Self {
+            childs: Childs::default(),
+            compression: CompactStr::from_slice(compression),
+            val: None,
+            huge_childs_idx: u32::MAX,
             parent_idx,
             parent_radix,
         }

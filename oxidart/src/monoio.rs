@@ -196,8 +196,8 @@ pub fn spawn_evictor(art: Rc<RefCell<OxidArt>>, interval: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::value::Value;
+    use bytes::Bytes;
 
     #[monoio::test(enable_timer = true)]
     async fn test_ttl_expiration_with_ticker() {
@@ -261,14 +261,14 @@ mod tests {
         );
 
         // Should exist initially
-        assert!(art.borrow_mut().get(Bytes::from_static(b"test")).is_some());
+        assert!(art.borrow_mut().get(b"test").is_some());
 
         // Wait for expiration
         monoio::time::sleep(Duration::from_secs(2)).await;
         monoio::time::sleep(Duration::from_millis(150)).await;
 
         // Should be expired
-        assert!(art.borrow_mut().get(Bytes::from_static(b"test")).is_none());
+        assert!(art.borrow_mut().get(b"test").is_none());
     }
 
     #[monoio::test(enable_timer = true)]
@@ -328,14 +328,14 @@ mod tests {
         art.borrow_mut().set_now(1000);
 
         // 50 entries expire at t=1010
-        for i in 0..50 {
+        for i in 1..=50 {
             let key = Bytes::from(format!("short:{:03}", i));
             let val = Value::String(Bytes::from(format!("value:{:03}", i)));
             art.borrow_mut().set_ttl(key, Duration::from_secs(10), val);
         }
 
         // 50 entries expire at t=1100
-        for i in 0..50 {
+        for i in 1..=50 {
             let key = Bytes::from(format!("long:{:03}", i));
             let val = Value::String(Bytes::from(format!("value:{:03}", i)));
             art.borrow_mut().set_ttl(key, Duration::from_secs(100), val);
@@ -351,6 +351,7 @@ mod tests {
         art.borrow_mut().set_now(1011);
 
         // Let evictor clean up
+        monoio::time::sleep(Duration::from_millis(100)).await;
         monoio::time::sleep(Duration::from_millis(100)).await;
 
         // Should have evicted the 50 short ones

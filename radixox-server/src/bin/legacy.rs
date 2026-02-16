@@ -82,16 +82,22 @@ fn execute_command(cmd: Command, arena: &mut OxidArt) -> NetResponse {
             success_response(None, cmd.command_id)
         }
         CommandAction::Get(action) => {
-            let val = arena.get(action.into_parts()).and_then(|v| v.as_bytes());
+            let key: &[u8] = &(action.into_parts());
+            let val = arena.get(key).and_then(|v| v.as_bytes());
             success_response(val, cmd.command_id)
         }
         CommandAction::Del(action) => {
-            let val = arena.del(action.into_parts()).and_then(|v| v.as_bytes());
+            let val = arena
+                .del(action.into_parts().as_ref())
+                .and_then(|v| v.as_bytes());
             success_response(val, cmd.command_id)
         }
         CommandAction::GetN(action) => {
             let pairs = arena.getn(action.into_parts());
-            let values: Vec<Bytes> = pairs.into_iter().filter_map(|(_, v)| v.as_bytes()).collect();
+            let values: Vec<Bytes> = pairs
+                .into_iter()
+                .filter_map(|(_, v)| v.as_bytes())
+                .collect();
             multi_response(values, cmd.command_id)
         }
         CommandAction::DelN(action) => {

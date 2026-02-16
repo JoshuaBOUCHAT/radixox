@@ -1,3 +1,5 @@
+mod resp_cmd;
+
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -10,12 +12,16 @@ use monoio::net::{TcpListener, TcpStream};
 use smallvec::SmallVec;
 
 use oxidart::counter::CounterError;
-use oxidart::monoio::{spawn_evictor, spawn_ticker};
 use oxidart::value::Value;
 use oxidart::{OxidArt, TtlResult};
 use redis_protocol::resp2::decode::decode_bytes_mut;
 use redis_protocol::resp2::encode::extend_encode;
 use redis_protocol::resp2::types::BytesFrame as Frame;
+use resp_cmd::{
+    cmd_hdel, cmd_hexists, cmd_hget, cmd_hgetall, cmd_hincrby, cmd_hkeys, cmd_hlen, cmd_hmget,
+    cmd_hmset, cmd_hset, cmd_hvals, cmd_sadd, cmd_scard, cmd_sismember, cmd_smembers, cmd_spop,
+    cmd_srem, cmd_zadd, cmd_zcard, cmd_zincrby, cmd_zrange, cmd_zrem, cmd_zscore,
+};
 
 type IOResult<T> = std::io::Result<T>;
 type SharedART = Rc<RefCell<OxidArt>>;
@@ -264,6 +270,32 @@ static COMMANDS: &[(&[u8], Handler)] = &[
     (b"TYPE", Handler::Data(cmd_type)),
     (b"DBSIZE", Handler::DataOnly(cmd_dbsize)),
     (b"FLUSHDB", Handler::DataOnly(cmd_flushdb)),
+    // Set commands
+    (b"SADD", Handler::Data(cmd_sadd)),
+    (b"SREM", Handler::Data(cmd_srem)),
+    (b"SISMEMBER", Handler::Data(cmd_sismember)),
+    (b"SCARD", Handler::Data(cmd_scard)),
+    (b"SMEMBERS", Handler::Data(cmd_smembers)),
+    (b"SPOP", Handler::Data(cmd_spop)),
+    // Hash commands
+    (b"HSET", Handler::Data(cmd_hset)),
+    (b"HMSET", Handler::Data(cmd_hmset)),  // Legacy compatibility (YCSB)
+    (b"HGET", Handler::Data(cmd_hget)),
+    (b"HGETALL", Handler::Data(cmd_hgetall)),
+    (b"HDEL", Handler::Data(cmd_hdel)),
+    (b"HEXISTS", Handler::Data(cmd_hexists)),
+    (b"HLEN", Handler::Data(cmd_hlen)),
+    (b"HKEYS", Handler::Data(cmd_hkeys)),
+    (b"HVALS", Handler::Data(cmd_hvals)),
+    (b"HMGET", Handler::Data(cmd_hmget)),
+    (b"HINCRBY", Handler::Data(cmd_hincrby)),
+    // ZSet commands
+    (b"ZADD", Handler::Data(cmd_zadd)),
+    (b"ZCARD", Handler::Data(cmd_zcard)),
+    (b"ZRANGE", Handler::Data(cmd_zrange)),
+    (b"ZSCORE", Handler::Data(cmd_zscore)),
+    (b"ZREM", Handler::Data(cmd_zrem)),
+    (b"ZINCRBY", Handler::Data(cmd_zincrby)),
 ];
 
 fn dispatch_command(cmd: &[u8], args: &[Bytes], art: &mut OxidArt) -> Frame {
@@ -377,7 +409,7 @@ fn cmd_get(args: &[Bytes], art: &mut OxidArt) -> Frame {
     if args.is_empty() {
         return Frame::Error("ERR wrong number of arguments for 'GET' command".into());
     }
-    match art.get(args[0].clone()) {
+    match art.get(&args[0]) {
         Some(val) => match val.as_bytes() {
             Some(b) => Frame::BulkString(b),
             None => Frame::Error(
@@ -402,7 +434,7 @@ fn cmd_set(args: &[Bytes], art: &mut OxidArt) -> Frame {
 
     // Check condition before setting (skip lookup when Always)
     if !matches!(opts.condition, SetCondition::Always) {
-        let key_exists = art.get(key.clone()).is_some();
+        let key_exists = art.get(&key).is_some();
         match opts.condition {
             SetCondition::IfNotExists if key_exists => return Frame::Null,
             SetCondition::IfExists if !key_exists => return Frame::Null,
@@ -482,7 +514,7 @@ fn cmd_del(args: &[Bytes], art: &mut OxidArt) -> Frame {
 
     let mut count = 0i64;
     for key in args {
-        if art.del(key.clone()).is_some() {
+        if art.del(&key).is_some() {
             count += 1;
         }
     }
@@ -641,7 +673,7 @@ fn cmd_exists(args: &[Bytes], art: &mut OxidArt) -> Frame {
 
     let mut count = 0i64;
     for key in args {
-        if art.get(key.clone()).is_some() {
+        if art.get(&key).is_some() {
             count += 1;
         }
     }
@@ -655,7 +687,7 @@ fn cmd_mget(args: &[Bytes], art: &mut OxidArt) -> Frame {
 
     let results: Vec<Frame> = args
         .iter()
-        .map(|key| match art.get(key.clone()) {
+        .map(|key| match art.get(&key) {
             Some(val) => match val.as_bytes() {
                 Some(b) => Frame::BulkString(b),
                 None => Frame::Null,
@@ -685,7 +717,7 @@ fn cmd_setnx(args: &[Bytes], art: &mut OxidArt) -> Frame {
     }
 
     let key = args[0].clone();
-    if art.get(key.clone()).is_some() {
+    if art.get(&key).is_some() {
         return Frame::Integer(0);
     }
 
@@ -760,7 +792,7 @@ fn cmd_type(args: &[Bytes], art: &mut OxidArt) -> Frame {
         return Frame::Error("ERR wrong number of arguments for 'TYPE' command".into());
     }
 
-    match art.get(args[0].clone()) {
+    match art.get(&args[0]) {
         Some(val) => Frame::SimpleString(Bytes::from_static(val.redis_type().as_str().as_bytes())),
         None => Frame::SimpleString(Bytes::from_static(b"none")),
     }

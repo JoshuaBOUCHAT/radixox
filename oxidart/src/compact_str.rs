@@ -1,7 +1,6 @@
 use std::ops::Deref;
 
-use bytes::Bytes;
-use tinypointers::TinyBox;
+use thin_vec::ThinVec;
 
 const INLINE_LEN: usize = 14;
 
@@ -13,7 +12,7 @@ pub struct TinyString {
 
 pub enum CompactStr {
     Inline(TinyString),
-    Heap(TinyBox<Bytes>),
+    Heap(ThinVec<u8>),
 }
 
 impl Deref for TinyString {
@@ -52,16 +51,9 @@ impl CompactStr {
 
     pub fn from_slice(data: &[u8]) -> Self {
         if data.len() > INLINE_LEN {
-            return Self::Heap(TinyBox::new(Bytes::copy_from_slice(data)));
+            return Self::Heap(ThinVec::from(data));
         }
         Self::Inline(TinyString::from_slice(data))
-    }
-
-    pub fn from_bytes(bytes: Bytes) -> Self {
-        if bytes.len() > INLINE_LEN {
-            return Self::Heap(TinyBox::new(bytes));
-        }
-        Self::Inline(TinyString::from_slice(&bytes))
     }
 
     pub fn push(&mut self, byte: u8) {
@@ -73,10 +65,10 @@ impl CompactStr {
             }
         }
         // Spill to heap or grow heap
-        let mut new_data = Vec::with_capacity(self.len() + 1);
+        let mut new_data = ThinVec::with_capacity(self.len() + 1);
         new_data.extend_from_slice(self);
         new_data.push(byte);
-        *self = CompactStr::Heap(TinyBox::new(Bytes::from(new_data)));
+        *self = CompactStr::Heap(new_data);
     }
 
     pub fn extend_from_slice(&mut self, data: &[u8]) {
@@ -91,10 +83,10 @@ impl CompactStr {
                 return;
             }
         }
-        let mut new_data = Vec::with_capacity(self.len() + data.len());
+        let mut new_data = ThinVec::with_capacity(self.len() + data.len());
         new_data.extend_from_slice(self);
         new_data.extend_from_slice(data);
-        *self = CompactStr::Heap(TinyBox::new(Bytes::from(new_data)));
+        *self = CompactStr::Heap(new_data);
     }
 }
 

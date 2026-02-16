@@ -130,7 +130,13 @@ Client ──TCP──> io_buf ──extend──> read_buf ──decode_bytes_m
 
 **Shared state**: OxidArt tree is wrapped in `Rc<RefCell<>>` (single-threaded, no locks needed).
 
-**Supported RESP commands**: PING, QUIT, ECHO, SELECT, GET, SET (with EX/PX/NX/XX), SETNX, SETEX, MGET, MSET, DEL, EXISTS, TYPE, KEYS, TTL, PTTL, EXPIRE, PEXPIRE, PERSIST, DBSIZE, FLUSHDB, INCR, DECR, INCRBY, DECRBY, SUBSCRIBE, UNSUBSCRIBE, PUBLISH.
+**Supported RESP commands**:
+- **String/Keys**: PING, QUIT, ECHO, SELECT, GET, SET (with EX/PX/NX/XX), SETNX, SETEX, MGET, MSET, DEL, EXISTS, TYPE, KEYS, TTL, PTTL, EXPIRE, PEXPIRE, PERSIST, DBSIZE, FLUSHDB
+- **Counters**: INCR, DECR, INCRBY, DECRBY
+- **Hash**: HSET, HMSET, HGET, HGETALL, HDEL, HEXISTS, HLEN, HKEYS, HVALS, HMGET, HINCRBY
+- **Set**: SADD, SREM, SISMEMBER, SCARD, SMEMBERS, SPOP
+- **ZSet**: ZADD, ZCARD, ZRANGE, ZSCORE, ZREM, ZINCRBY
+- **Pub/Sub**: SUBSCRIBE, UNSUBSCRIBE, PUBLISH
 
 **KEYS glob pattern matching**: Two code paths:
 - **Fast path**: Simple `prefix*` patterns → `art.getn(prefix)` (pure tree traversal, no DFA)
@@ -174,18 +180,28 @@ Port 8379. Length-prefixed protobuf messages (4-byte big-endian size + payload).
 - **local-sync**: Thread-local channels for Pub/Sub and client request/response
 - **hislab**: Hierarchical bitmap slab allocator with tagged random sampling
 
+## ✅ Implemented Features
+
+### Data Structures
+- [x] ✅ `Value` enum with all Redis types (String, Int, Hash, List, Set, ZSet)
+- [x] ✅ String ↔ Int transparent (INCR zero-parse, GET formats on-fly, TYPE returns "string")
+- [x] ✅ WRONGTYPE errors between families
+- [x] ✅ Hash commands: HSET, HMSET, HGET, HGETALL, HDEL, HEXISTS, HLEN, HKEYS, HVALS, HMGET, HINCRBY
+- [x] ✅ Set commands: SADD, SREM, SMEMBERS, SISMEMBER, SCARD, SPOP
+- [x] ✅ ZSet commands: ZADD, ZRANGE, ZSCORE, ZREM, ZCARD, ZINCRBY (double-indexed: BTreeSet + HashMap)
+
+### Performance Optimizations
+- [x] ✅ BTreeMap for Hash (O(log n) predictable, excellent p99.9)
+- [x] ✅ BTreeSet for Set (ordered iteration, deterministic)
+- [x] ✅ ZSetInner double-index (BTreeSet for range + HashMap for O(1) score lookup)
+- [x] ✅ Node size = 128 bytes (cache-line optimized)
+- [x] ✅ CompactStr with tinypointers (2byteid → 65k slots)
+
 ## TODO / Future Work
 
-### Data Structures (next milestone)
-- [ ] Replace `Bytes` with `Value` enum in oxidart (not generic — specific to radixox)
-- [ ] `Value::None` / `String(Bytes)` / `Int(i64)` / `Hash(Box<Vec<(Bytes, Bytes)>>)` / `List(Box<VecDeque<Bytes>>)` / `Set(Box<HashSet<Bytes>>)` / `ZSet(Box<ZSetInner>)`
-- [ ] String ↔ Int transparent conversion (INCR parses once → Int, GET formats on the fly)
-- [ ] Box all variants except String/Int/None to keep enum at 32 bytes
-- [ ] WRONGTYPE error on type mismatch (except String/Int same family)
-- [ ] Hash commands: HSET, HGET, HGETALL, HDEL, HEXISTS, HLEN, HKEYS, HVALS, HMGET, HINCRBY
 - [ ] List commands: LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN
-- [ ] Set commands: SADD, SREM, SMEMBERS, SISMEMBER, SINTER, SUNION, SDIFF, SCARD
-- [ ] ZSet commands: ZADD, ZRANGE, ZRANGEBYSCORE, ZRANK, ZSCORE, ZREM, ZCARD, ZINCRBY
+- [ ] Set ops: SINTER, SUNION, SDIFF
+- [ ] ZSet: ZRANK, ZRANGEBYSCORE
 
 ### RESP Commands (not yet implemented)
 - [ ] `SCAN cursor [MATCH pattern] [COUNT count]` - Cursor-based iteration

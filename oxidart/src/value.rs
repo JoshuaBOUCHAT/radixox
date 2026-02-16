@@ -1,5 +1,8 @@
 use bytes::Bytes;
-use std::collections::VecDeque;
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use crate::zset_inner::ZSetInner;
 
 // ---------------------------------------------------------------------------
 // Value enum — replaces Bytes as the stored type in OxidArt
@@ -17,14 +20,16 @@ pub enum Value {
     /// Integer — INCR/DECR operate directly, zero parsing.
     /// Transparent: TYPE returns "string", GET formats on the fly.
     Int(i64),
-    /// Hash: field → value pairs. Linear scan, cache-friendly.
-    Hash(Vec<(Bytes, Bytes)>),
+    /// Hash: field → value pairs. BTreeMap for predictable O(log n) and ordered iteration.
+    Hash(BTreeMap<Bytes, Bytes>),
     /// List: ordered collection, push/pop both ends.
     List(VecDeque<Bytes>),
-    /// Set: unique members. Linear scan for small sets.
-    Set(Vec<Bytes>),
+    /// Set: unique members. BTreeSet for ordered iteration.
+    Set(BTreeSet<Bytes>),
     /// Sorted set: members with f64 scores, sorted by (score, member).
-    ZSet(Vec<(Bytes, f64)>),
+    /// Uses ZSetInner with double indexing (BTreeSet + HashMap) for optimal performance.
+    /// Boxed because ZSetInner is much larger than 32 bytes.
+    ZSet(Box<ZSetInner>),
 }
 
 // ---------------------------------------------------------------------------
@@ -129,14 +134,14 @@ impl Value {
 // ---------------------------------------------------------------------------
 
 impl Value {
-    pub fn as_hash_mut(&mut self) -> Result<&mut Vec<(Bytes, Bytes)>, RedisType> {
+    pub fn as_hash_mut(&mut self) -> Result<&mut BTreeMap<Bytes, Bytes>, RedisType> {
         match self {
             Value::Hash(h) => Ok(h),
             other => Err(other.redis_type()),
         }
     }
 
-    pub fn as_hash(&self) -> Result<&Vec<(Bytes, Bytes)>, RedisType> {
+    pub fn as_hash(&self) -> Result<&BTreeMap<Bytes, Bytes>, RedisType> {
         match self {
             Value::Hash(h) => Ok(h),
             other => Err(other.redis_type()),
@@ -169,14 +174,14 @@ impl Value {
 // ---------------------------------------------------------------------------
 
 impl Value {
-    pub fn as_set_mut(&mut self) -> Result<&mut Vec<Bytes>, RedisType> {
+    pub fn as_set_mut(&mut self) -> Result<&mut BTreeSet<Bytes>, RedisType> {
         match self {
             Value::Set(s) => Ok(s),
             other => Err(other.redis_type()),
         }
     }
 
-    pub fn as_set(&self) -> Result<&Vec<Bytes>, RedisType> {
+    pub fn as_set(&self) -> Result<&BTreeSet<Bytes>, RedisType> {
         match self {
             Value::Set(s) => Ok(s),
             other => Err(other.redis_type()),
@@ -189,14 +194,14 @@ impl Value {
 // ---------------------------------------------------------------------------
 
 impl Value {
-    pub fn as_zset_mut(&mut self) -> Result<&mut Vec<(Bytes, f64)>, RedisType> {
+    pub fn as_zset_mut(&mut self) -> Result<&mut ZSetInner, RedisType> {
         match self {
             Value::ZSet(z) => Ok(z),
             other => Err(other.redis_type()),
         }
     }
 
-    pub fn as_zset(&self) -> Result<&Vec<(Bytes, f64)>, RedisType> {
+    pub fn as_zset(&self) -> Result<&ZSetInner, RedisType> {
         match self {
             Value::ZSet(z) => Ok(z),
             other => Err(other.redis_type()),
@@ -205,15 +210,7 @@ impl Value {
 }
 
 // ---------------------------------------------------------------------------
-// ZSet helpers (on the Vec directly)
+// ZSet helpers
 // ---------------------------------------------------------------------------
-
-/// Find insertion position to maintain (score, member) ordering.
-pub fn zset_insert_pos(entries: &[(Bytes, f64)], score: f64, member: &[u8]) -> usize {
-    entries.partition_point(|(m, s)| *s < score || (*s == score && m.as_ref() < member))
-}
-
-/// Find member index by name (linear scan).
-pub fn zset_find(entries: &[(Bytes, f64)], member: &[u8]) -> Option<usize> {
-    entries.iter().position(|(m, _)| m.as_ref() == member)
-}
+// With BTreeSet, insert/remove/find are all O(log n) via the set itself.
+// No manual helpers needed - BTreeSet handles ordering automatically.

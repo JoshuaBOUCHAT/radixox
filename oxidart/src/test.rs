@@ -16,7 +16,7 @@ fn test_get_set_basic() {
     let key = Bytes::from_static(b"Joshua");
     let val = Value::from_str("BOUCHAT");
     art.set(key.clone(), val.clone());
-    assert_eq!(art.get(key), Some(&val));
+    assert_eq!(art.get(&key), Some(&val));
 }
 
 #[test]
@@ -25,13 +25,13 @@ fn test_empty_key() {
     let key = Bytes::from_static(b"");
     let val = Value::from_str("root_value");
     art.set(key.clone(), val.clone());
-    assert_eq!(art.get(key), Some(&val));
+    assert_eq!(art.get(&key), Some(&val));
 }
 
 #[test]
 fn test_get_nonexistent() {
     let mut art = OxidArt::new();
-    assert_eq!(art.get(Bytes::from_static(b"missing")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"missing")), None);
 }
 
 #[test]
@@ -42,10 +42,10 @@ fn test_overwrite_value() {
     let val2 = Value::from_str("value2");
 
     art.set(key.clone(), val1.clone());
-    assert_eq!(art.get(key.clone()), Some(&val1));
+    assert_eq!(art.get(&key), Some(&val1));
 
     art.set(key.clone(), val2.clone());
-    assert_eq!(art.get(key), Some(&val2));
+    assert_eq!(art.get(&key), Some(&val2));
 }
 
 #[test]
@@ -57,15 +57,15 @@ fn test_common_prefix_split() {
     art.set(Bytes::from_static(b"uso"), Value::from_str("val_uso"));
 
     assert_eq!(
-        art.get(Bytes::from_static(b"user")),
+        art.get(&Bytes::from_static(b"user")),
         Some(&Value::from_str("val_user"))
     );
     assert_eq!(
-        art.get(Bytes::from_static(b"uso")),
+        art.get(&Bytes::from_static(b"uso")),
         Some(&Value::from_str("val_uso"))
     );
     // "us" n'a pas de valeur
-    assert_eq!(art.get(Bytes::from_static(b"us")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"us")), None);
 }
 
 #[test]
@@ -77,11 +77,11 @@ fn test_prefix_is_also_key() {
     art.set(Bytes::from_static(b"us"), Value::from_str("val_us"));
 
     assert_eq!(
-        art.get(Bytes::from_static(b"user")),
+        art.get(&Bytes::from_static(b"user")),
         Some(&Value::from_str("val_user"))
     );
     assert_eq!(
-        art.get(Bytes::from_static(b"us")),
+        art.get(&Bytes::from_static(b"us")),
         Some(&Value::from_str("val_us"))
     );
 }
@@ -96,25 +96,25 @@ fn test_multiple_branches() {
     art.set(Bytes::from_static(b"band"), Value::from_str("4"));
 
     assert_eq!(
-        art.get(Bytes::from_static(b"apple")),
+        art.get(&Bytes::from_static(b"apple")),
         Some(&Value::from_str("1"))
     );
     assert_eq!(
-        art.get(Bytes::from_static(b"application")),
+        art.get(&Bytes::from_static(b"application")),
         Some(&Value::from_str("2"))
     );
     assert_eq!(
-        art.get(Bytes::from_static(b"banana")),
+        art.get(&Bytes::from_static(b"banana")),
         Some(&Value::from_str("3"))
     );
     assert_eq!(
-        art.get(Bytes::from_static(b"band")),
+        art.get(&Bytes::from_static(b"band")),
         Some(&Value::from_str("4"))
     );
 
     // Clés partielles qui n'existent pas
-    assert_eq!(art.get(Bytes::from_static(b"app")), None);
-    assert_eq!(art.get(Bytes::from_static(b"ban")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"app")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"ban")), None);
 }
 
 #[test]
@@ -124,17 +124,17 @@ fn test_del_basic() {
     let val = Value::from_str("world");
 
     art.set(key.clone(), val.clone());
-    assert_eq!(art.get(key.clone()), Some(&val));
+    assert_eq!(art.get(&key), Some(&val));
 
-    let deleted = art.del(key.clone());
+    let deleted = art.del(&key);
     assert_eq!(deleted, Some(val));
-    assert_eq!(art.get(key), None);
+    assert_eq!(art.get(&key), None);
 }
 
 #[test]
 fn test_del_nonexistent() {
     let mut art = OxidArt::new();
-    assert_eq!(art.del(Bytes::from_static(b"missing")), None);
+    assert_eq!(art.del(b"missing"), None);
 }
 
 #[test]
@@ -143,8 +143,8 @@ fn test_del_empty_key() {
     let val = Value::from_str("root");
 
     art.set(Bytes::from_static(b""), val.clone());
-    assert_eq!(art.del(Bytes::from_static(b"")), Some(val));
-    assert_eq!(art.get(Bytes::from_static(b"")), None);
+    assert_eq!(art.del(b""), Some(val));
+    assert_eq!(art.get(&Bytes::from_static(b"")), None);
 }
 
 #[test]
@@ -156,16 +156,16 @@ fn test_del_with_recompression() {
     art.set(Bytes::from_static(b"uso"), Value::from_str("val_uso"));
 
     // Supprimer "uso"
-    let deleted = art.del(Bytes::from_static(b"uso"));
+    let deleted = art.del(b"uso");
     assert_eq!(deleted, Some(Value::from_str("val_uso")));
 
     // "user" doit toujours exister
     assert_eq!(
-        art.get(Bytes::from_static(b"user")),
+        art.get(&Bytes::from_static(b"user")),
         Some(&Value::from_str("val_user"))
     );
     // "uso" n'existe plus
-    assert_eq!(art.get(Bytes::from_static(b"uso")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"uso")), None);
 }
 
 #[test]
@@ -178,19 +178,19 @@ fn test_del_intermediate_node_with_children() {
     art.set(Bytes::from_static(b"abc"), Value::from_str("val_abc"));
 
     // Supprimer "ab" qui est intermédiaire
-    let deleted = art.del(Bytes::from_static(b"ab"));
+    let deleted = art.del(b"ab");
     assert_eq!(deleted, Some(Value::from_str("val_ab")));
 
     // "a" et "abc" doivent toujours exister
     assert_eq!(
-        art.get(Bytes::from_static(b"a")),
+        art.get(&Bytes::from_static(b"a")),
         Some(&Value::from_str("val_a"))
     );
     assert_eq!(
-        art.get(Bytes::from_static(b"abc")),
+        art.get(&Bytes::from_static(b"abc")),
         Some(&Value::from_str("val_abc"))
     );
-    assert_eq!(art.get(Bytes::from_static(b"ab")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"ab")), None);
 }
 
 #[test]
@@ -207,7 +207,7 @@ fn test_many_keys_same_prefix() {
     for i in 1..=20u8 {
         let key = Bytes::from(vec![b'x', i]);
         let expected = Value::String(Bytes::from(vec![i]));
-        assert_eq!(art.get(key), Some(&expected));
+        assert_eq!(art.get(&key), Some(&expected));
     }
 }
 
@@ -223,8 +223,8 @@ fn test_long_keys() {
     art.set(key1.clone(), val1.clone());
     art.set(key2.clone(), val2.clone());
 
-    assert_eq!(art.get(key1), Some(&val1));
-    assert_eq!(art.get(key2), Some(&val2));
+    assert_eq!(art.get(&key1), Some(&val1));
+    assert_eq!(art.get(&key2), Some(&val2));
 }
 
 #[test]
@@ -235,10 +235,10 @@ fn test_del_then_reinsert() {
     let val2 = Value::from_str("val2");
 
     art.set(key.clone(), val1.clone());
-    art.del(key.clone());
+    art.del(&key);
     art.set(key.clone(), val2.clone());
 
-    assert_eq!(art.get(key), Some(&val2));
+    assert_eq!(art.get(&key), Some(&val2));
 }
 
 #[test]
@@ -249,13 +249,13 @@ fn test_del_all_keys() {
     art.set(Bytes::from_static(b"b"), Value::from_str("2"));
     art.set(Bytes::from_static(b"c"), Value::from_str("3"));
 
-    art.del(Bytes::from_static(b"a"));
-    art.del(Bytes::from_static(b"b"));
-    art.del(Bytes::from_static(b"c"));
+    art.del(b"a");
+    art.del(b"b");
+    art.del(b"c");
 
-    assert_eq!(art.get(Bytes::from_static(b"a")), None);
-    assert_eq!(art.get(Bytes::from_static(b"b")), None);
-    assert_eq!(art.get(Bytes::from_static(b"c")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"a")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"b")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"c")), None);
 }
 
 #[test]
@@ -265,11 +265,11 @@ fn test_partial_key_not_found() {
     art.set(Bytes::from_static(b"hello_world"), Value::from_str("val"));
 
     // Clés partielles ne doivent pas matcher
-    assert_eq!(art.get(Bytes::from_static(b"hello")), None);
-    assert_eq!(art.get(Bytes::from_static(b"hello_")), None);
-    assert_eq!(art.get(Bytes::from_static(b"hello_worl")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"hello")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"hello_")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"hello_worl")), None);
     // Clé trop longue non plus
-    assert_eq!(art.get(Bytes::from_static(b"hello_world!")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"hello_world!")), None);
 }
 
 // ============ Tests pour getn ============
@@ -441,12 +441,12 @@ fn test_deln_basic() {
     let deleted = art.deln(Bytes::from_static(b"user:"));
 
     assert_eq!(deleted, 3);
-    assert_eq!(art.get(Bytes::from_static(b"user:alice")), None);
-    assert_eq!(art.get(Bytes::from_static(b"user:bob")), None);
-    assert_eq!(art.get(Bytes::from_static(b"user:charlie")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"user:alice")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"user:bob")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"user:charlie")), None);
     // post:1 doit toujours exister
     assert_eq!(
-        art.get(Bytes::from_static(b"post:1")),
+        art.get(&Bytes::from_static(b"post:1")),
         Some(&Value::from_str("post_1"))
     );
 }
@@ -462,9 +462,9 @@ fn test_deln_empty_prefix() {
     let deleted = art.deln(Bytes::from_static(b""));
 
     assert_eq!(deleted, 3);
-    assert_eq!(art.get(Bytes::from_static(b"a")), None);
-    assert_eq!(art.get(Bytes::from_static(b"b")), None);
-    assert_eq!(art.get(Bytes::from_static(b"c")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"a")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"b")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"c")), None);
 }
 
 #[test]
@@ -478,7 +478,7 @@ fn test_deln_no_match() {
     assert_eq!(deleted, 0);
     // user:alice doit toujours exister
     assert_eq!(
-        art.get(Bytes::from_static(b"user:alice")),
+        art.get(&Bytes::from_static(b"user:alice")),
         Some(&Value::from_str("data"))
     );
 }
@@ -498,9 +498,9 @@ fn test_deln_exact_key_with_children() {
     let deleted = art.deln(Bytes::from_static(b"user"));
 
     assert_eq!(deleted, 3);
-    assert_eq!(art.get(Bytes::from_static(b"user")), None);
-    assert_eq!(art.get(Bytes::from_static(b"user:alice")), None);
-    assert_eq!(art.get(Bytes::from_static(b"user:bob")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"user")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"user:alice")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"user:bob")), None);
 }
 
 #[test]
@@ -517,8 +517,8 @@ fn test_deln_prefix_in_compression() {
     let deleted = art.deln(Bytes::from_static(b"app"));
 
     assert_eq!(deleted, 2);
-    assert_eq!(art.get(Bytes::from_static(b"application")), None);
-    assert_eq!(art.get(Bytes::from_static(b"apple")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"application")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"apple")), None);
 }
 
 #[test]
@@ -536,13 +536,13 @@ fn test_deln_with_nested_keys() {
 
     assert_eq!(deleted, 4); // ab, abc, abcd, abd
     assert_eq!(
-        art.get(Bytes::from_static(b"a")),
+        art.get(&Bytes::from_static(b"a")),
         Some(&Value::from_str("1"))
     );
-    assert_eq!(art.get(Bytes::from_static(b"ab")), None);
-    assert_eq!(art.get(Bytes::from_static(b"abc")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"ab")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"abc")), None);
     assert_eq!(
-        art.get(Bytes::from_static(b"b")),
+        art.get(&Bytes::from_static(b"b")),
         Some(&Value::from_str("6"))
     );
 }
@@ -565,7 +565,7 @@ fn test_deln_many_children() {
     // Vérifier qu'ils sont tous supprimés
     for i in 1..=20u8 {
         let key = Bytes::from(vec![b'x', b':', i]);
-        assert_eq!(art.get(key), None);
+        assert_eq!(art.get(&key), None);
     }
 }
 
@@ -579,9 +579,9 @@ fn test_deln_then_insert() {
     // Réinsérer après suppression
     art.set(Bytes::from_static(b"user:bob"), Value::from_str("new"));
 
-    assert_eq!(art.get(Bytes::from_static(b"user:alice")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"user:alice")), None);
     assert_eq!(
-        art.get(Bytes::from_static(b"user:bob")),
+        art.get(&Bytes::from_static(b"user:bob")),
         Some(&Value::from_str("new"))
     );
 }
@@ -598,10 +598,10 @@ fn test_deln_partial_match() {
     let deleted = art.deln(Bytes::from_static(b"hel"));
 
     assert_eq!(deleted, 2);
-    assert_eq!(art.get(Bytes::from_static(b"hello")), None);
-    assert_eq!(art.get(Bytes::from_static(b"help")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"hello")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"help")), None);
     assert_eq!(
-        art.get(Bytes::from_static(b"world")),
+        art.get(&Bytes::from_static(b"world")),
         Some(&Value::from_str("3"))
     );
 }
@@ -635,24 +635,24 @@ fn test_ttl_expired_on_get() {
     art.set_now(50);
 
     // Expired key should return None and be cleaned up
-    assert_eq!(art.get(Bytes::from_static(b"expired")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"expired")), None);
     // Valid key should still work
     assert_eq!(
-        art.get(Bytes::from_static(b"valid")),
+        art.get(&Bytes::from_static(b"valid")),
         Some(&Value::from_str("new"))
     );
     // No expiry key should work
     assert_eq!(
-        art.get(Bytes::from_static(b"forever")),
+        art.get(&Bytes::from_static(b"forever")),
         Some(&Value::from_str("eternal"))
     );
 
     // Move time forward, valid should expire
     art.set_now(150);
-    assert_eq!(art.get(Bytes::from_static(b"valid")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"valid")), None);
     // No expiry still works
     assert_eq!(
-        art.get(Bytes::from_static(b"forever")),
+        art.get(&Bytes::from_static(b"forever")),
         Some(&Value::from_str("eternal"))
     );
 }
@@ -732,11 +732,11 @@ fn test_ttl_cleanup_on_expired_get() {
     art.set_now(50);
 
     // Get the expired key - should trigger cleanup
-    assert_eq!(art.get(Bytes::from_static(b"user")), None);
+    assert_eq!(art.get(&Bytes::from_static(b"user")), None);
 
     // The valid key should still work
     assert_eq!(
-        art.get(Bytes::from_static(b"username")),
+        art.get(&Bytes::from_static(b"username")),
         Some(&Value::from_str("valid"))
     );
 }
@@ -786,13 +786,13 @@ fn test_evict_expired_basic() {
     // Long TTL keys should still exist
     for i in 1..=10u8 {
         let key = Bytes::from(vec![b'l', i]);
-        assert_eq!(art.get(key), Some(&Value::from_str("val")));
+        assert_eq!(art.get(&key), Some(&Value::from_str("val")));
     }
 
     // No TTL keys should still exist
     for i in 1..=10u8 {
         let key = Bytes::from(vec![b'n', i]);
-        assert_eq!(art.get(key), Some(&Value::from_str("val")));
+        assert_eq!(art.get(&key), Some(&Value::from_str("val")));
     }
 }
 
@@ -827,3 +827,14 @@ fn test_evict_expired_partial() {
 }
 
 // ============ Tests avec dictionnaire français ============
+
+#[test]
+fn test_ensure() {
+    let mut art = OxidArt::new();
+    art.set_now(0);
+    const KEY: &[u8] = b"Hello, World!";
+    let idx = art.ensure_key(KEY);
+    let val = Value::String(Bytes::from_static(KEY));
+    art.get_node_mut(idx).val = Some((val.clone(), 1000000000000000000));
+    assert_eq!(art.get(KEY), Some(&val));
+}
