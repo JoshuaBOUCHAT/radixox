@@ -10,31 +10,35 @@ RadixOx is a high-performance in-memory key-value store that speaks the Redis pr
 
 Tested with [YCSB](https://github.com/brianfrankcooper/YCSB) (Yahoo! Cloud Serving Benchmark) - industry standard for NoSQL databases.
 
-**Configuration:** 1M records, Workload A (50% read, 50% update), 1 field per record, single-threaded
+**Configuration:** 1M records, Workload A (50% read / 50% update), fieldlength=100, 100 client threads, localhost
 
-### LOAD Phase (1,000,000 inserts):
+> **Note on fairness:** RadixOx uses io_uring + SQ_POLL which dedicates a kernel polling thread — effectively 2 CPU threads vs Redis's 1. The advantage is real but not strictly iso-resource. Comparison vs `redis-server` running natively (not Docker).
 
-| Metric | Redis 7.4 (optimized) | RadixOx | Improvement |
-|--------|----------------------|---------|-------------|
-| **Throughput** | 28,449 ops/sec | **34,578 ops/sec** | 🚀 **+21.5%** |
-| **Avg Latency** | 34.3 µs | **28.0 µs** | ⚡ **-18%** |
-| **P99 Latency** | 87 µs | **58 µs** | ✅ **-33%** |
+### LOAD Phase (1,000,000 HMSET inserts):
 
-### RUN Phase (1,000,000 operations):
+| Metric | Redis | RadixOx | Improvement |
+|--------|-------|---------|-------------|
+| **Throughput** | 40,538 ops/sec | **76,039 ops/sec** | 🚀 **+87%** |
+| **Avg Latency** | 2,449 µs | **1,309 µs** | ⚡ **-47%** |
+| **P95 Latency** | 4,671 µs | **1,383 µs** | ✅ **-70%** |
+| **P99 Latency** | 5,859 µs | **1,710 µs** | ✅ **-71%** |
 
-| Metric | Redis 7.4 (optimized) | RadixOx | Improvement |
-|--------|----------------------|---------|-------------|
-| **Throughput** | 63,028 ops/sec | **74,206 ops/sec** | 🚀 **+17.7%** |
-| **READ Avg** | 14.6 µs | **12.4 µs** | ⚡ **-15%** |
-| **READ P99** | 37 µs | **25 µs** | ✅ **-32%** |
-| **UPDATE Avg** | 15.2 µs | **12.7 µs** | ⚡ **-16%** |
-| **UPDATE P99** | 39 µs | **26 µs** | ✅ **-33%** |
+### RUN Phase (2,000,000 operations — 50% HGET / 50% HSET):
+
+| Metric | Redis | RadixOx | Improvement |
+|--------|-------|---------|-------------|
+| **Throughput** | 136,072 ops/sec | **152,079 ops/sec** | 🚀 **+12%** |
+| **READ Avg** | 725 µs | **655 µs** | ⚡ **-10%** |
+| **READ P95** | 1,527 µs | **712 µs** | ✅ **-53%** |
+| **READ P99** | 2,079 µs | **788 µs** | ✅ **-62%** |
+| **READ P99.9** | 3,097 µs | **1,822 µs** | ✅ **-41%** |
+| **READ P99.99** | 4,327 µs | **3,663 µs** | ✅ **-15%** |
 
 **Key Takeaways:**
-- 💪 **18-22% higher throughput** across all workloads
-- ⚡ **Sub-13µs average latency** - industry-leading
-- 🎯 **32-33% better P99** - exceptional tail latency for production workloads
-- 📈 **Scales better** with large datasets (1M+ keys)
+- 🎯 **Sub-millisecond P99** on reads — Redis is at 2ms
+- 💪 **P95 2x better** — RadixOx stays flat from avg to P95 (655→712µs), Redis spikes (725→1527µs)
+- 📈 **ART traversal is O(key_length)** — no hash collision, no rehash jitter
+- 🔥 **Load phase 87% faster** — no hashtable rehashing as dataset grows
 
 ---
 
@@ -230,8 +234,9 @@ radixox/
 
 | Feature | Redis | RadixOx | Winner |
 |---------|-------|---------|--------|
-| Throughput (1M ops) | 63k ops/sec | **74k ops/sec** | 🦀 **+18%** |
-| P99 Latency | 37-39 µs | **25-26 µs** | 🦀 **-33%** |
+| Throughput (run 2M ops) | 136k ops/sec | **152k ops/sec** | 🦀 **+12%** |
+| P99 Latency (read) | 2,079 µs | **788 µs** | 🦀 **-62%** |
+| P95 Latency (read) | 1,527 µs | **712 µs** | 🦀 **-53%** |
 | Prefix queries | O(N) scan | **O(k) native** | 🦀 |
 | Data structures | HashMap | **ART + BTree** | 🦀 |
 | Tail latency | Variable | **Predictable** | 🦀 |
