@@ -70,7 +70,9 @@ pub mod regex;
 #[cfg(test)]
 mod test;
 
-use std::str::from_utf8;
+#[cfg(test)]
+mod test_structures;
+
 use std::u32;
 
 use bytes::Bytes;
@@ -858,7 +860,9 @@ impl OxidArt {
                 )
             } else {
                 let new_node = Node::new_empty_leaf(new_compression, idx, new_radix);
-                self.insert(new_node)
+                let new_node_idx = self.insert(new_node);
+                self.push_child_idx(idx, new_node_idx, new_radix);
+                new_node_idx
             };
         }
 
