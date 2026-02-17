@@ -10,7 +10,7 @@ license = "MIT"
 
 [workspace.dependencies]
 radixox-common = { path = "radixox-common" }
-monoio = "0.2.4"
+monoio = { version = "0.2.4", features = ["iouring"] }
 prost = "0.14.3"
 serde = { version = "1.0.228", features = ["derive"] }
 bytes = { version = "1", features = ["serde"] }

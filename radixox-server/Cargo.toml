@@ -39,3 +39,4 @@ redis-protocol = { version = "5", default-features = false, features = [
     "bytes",
 ], optional = true }
 local-sync = "0.1.1"
+io-uring = "0.6.4"
