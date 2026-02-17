@@ -9,6 +9,8 @@ use bytes::{Bytes, BytesMut};
 use local_sync::mpsc::unbounded;
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt, Splitable};
 use monoio::net::{TcpListener, TcpStream};
+use monoio::time::TimeDriver;
+use monoio::{IoUringDriver, Runtime, RuntimeBuilder};
 use smallvec::SmallVec;
 
 use oxidart::counter::CounterError;
@@ -35,7 +37,7 @@ static PONG: Bytes = Bytes::from_static(b"PONG");
 static OK: Bytes = Bytes::from_static(b"OK");
 static ERR_EMPTY_CMD: &str = "ERR empty command";
 
-#[monoio::main(enable_timer = true)]
+/*#[monoio::main(enable_timer = true)]
 async fn main() -> IOResult<()> {
     let listener = TcpListener::bind("0.0.0.0:6379")?;
     println!("RadixOx RESP Server listening on 0.0.0.0:6379");
@@ -58,6 +60,49 @@ async fn main() -> IOResult<()> {
             conn_id,
         ));
     }
+}*/
+fn main() -> std::io::Result<()> {
+    let mut runtime = get_runtime()?;
+
+    runtime.block_on(async {
+        let listener = TcpListener::bind("0.0.0.0:6379")?;
+        println!("RadixOx RESP Server listening on 0.0.0.0:6379");
+
+        let shared_art =
+            OxidArt::shared_with_evictor(Duration::from_millis(100), Duration::from_secs(1));
+
+        let registry: SharedRegistry = Rc::new(RefCell::new(HashMap::new()));
+        let conn_counter: Rc<Cell<ConnId>> = Rc::new(Cell::new(0));
+
+        loop {
+            let (stream, addr) = listener.accept().await?;
+            println!("New connection from {}", addr);
+            let conn_id = conn_counter.get();
+            conn_counter.set(conn_id.wrapping_add(1));
+            monoio::spawn(handle_connection(
+                stream,
+                shared_art.clone(),
+                registry.clone(),
+                conn_id,
+            ));
+        }
+    })
+}
+fn get_runtime() -> std::io::Result<Runtime<TimeDriver<IoUringDriver>>> {
+    let mut uring_builder = io_uring::IoUring::builder();
+
+    // 2. Configurer SQPOLL (le kernel poll la queue de soumission)
+    // Paramètre : temps d'idle en millisecondes avant que le thread kernel s'endorme
+    uring_builder.setup_sqpoll(2000);
+
+    // Optionnel : on peut aussi binder le thread SQPOLL sur un cœur spécifique
+    //uring_builder.setup_sqpoll_cpu(8);
+
+    RuntimeBuilder::<monoio::IoUringDriver>::new()
+        .with_entries(1024)
+        .uring_builder(uring_builder) // C'est ici qu'on injecte notre config
+        .enable_timer()
+        .build()
 }
 
 struct Conn {
@@ -279,7 +324,7 @@ static COMMANDS: &[(&[u8], Handler)] = &[
     (b"SPOP", Handler::Data(cmd_spop)),
     // Hash commands
     (b"HSET", Handler::Data(cmd_hset)),
-    (b"HMSET", Handler::Data(cmd_hmset)),  // Legacy compatibility (YCSB)
+    (b"HMSET", Handler::Data(cmd_hmset)), // Legacy compatibility (YCSB)
     (b"HGET", Handler::Data(cmd_hget)),
     (b"HGETALL", Handler::Data(cmd_hgetall)),
     (b"HDEL", Handler::Data(cmd_hdel)),
