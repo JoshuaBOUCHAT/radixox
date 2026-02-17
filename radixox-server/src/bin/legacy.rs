@@ -3,6 +3,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use monoio::RuntimeBuilder;
 use monoio::io::{AsyncWriteRentExt, Splitable};
 use monoio::net::{TcpListener, TcpStream};
 
@@ -20,9 +21,29 @@ const MAX_MSG_SIZE: usize = 1024 * 1024 * 100;
 const HEADER_SIZE: usize = 10;
 
 type SharedART = Rc<RefCell<OxidArt>>;
-
 #[monoio::main(enable_timer = true)]
 async fn main() -> IOResult<()> {
+    // 1. Créer le builder natif de la crate io_uring
+    let mut uring_builder = io_uring::IoUring::builder();
+
+    // 2. Configurer SQPOLL (le kernel poll la queue de soumission)
+    // Paramètre : temps d'idle en millisecondes avant que le thread kernel s'endorme
+    uring_builder.setup_sqpoll(2000);
+
+    // Optionnel : on peut aussi binder le thread SQPOLL sur un cœur spécifique
+    // iouring_builder.setup_sqpoll_cpu(1);
+
+    let mut rt = RuntimeBuilder::<monoio::IoUringDriver>::new()
+        .with_entries(1024)
+        .uring_builder(uring_builder) // C'est ici qu'on injecte notre config
+        .enable_timer()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        println!("Runtime Monoio lancé avec SQPOLL (2000ms idle)");
+    });
+
     let listener = TcpListener::bind("0.0.0.0:8379")?;
     println!("RadixOx Legacy Server listening on 0.0.0.0:8379");
 
