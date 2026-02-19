@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "RadixOx server - Redis-like data store"
+default-run = "radixox-resp"
 
 [[bin]]
 name = "radixox-legacy"
