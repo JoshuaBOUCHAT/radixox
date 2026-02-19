@@ -21,14 +21,14 @@ const MAX_MSG_SIZE: usize = 1024 * 1024 * 100;
 const HEADER_SIZE: usize = 10;
 
 type SharedART = Rc<RefCell<OxidArt>>;
-#[monoio::main(enable_timer = true)]
-async fn main() -> IOResult<()> {
+
+fn main() -> IOResult<()> {
     // 1. Créer le builder natif de la crate io_uring
     let mut uring_builder = io_uring::IoUring::builder();
 
     // 2. Configurer SQPOLL (le kernel poll la queue de soumission)
     // Paramètre : temps d'idle en millisecondes avant que le thread kernel s'endorme
-    uring_builder.setup_sqpoll(2000);
+    uring_builder.setup_sqpoll(1);
 
     // Optionnel : on peut aussi binder le thread SQPOLL sur un cœur spécifique
     // iouring_builder.setup_sqpoll_cpu(1);
@@ -41,21 +41,21 @@ async fn main() -> IOResult<()> {
         .unwrap();
 
     rt.block_on(async {
-        println!("Runtime Monoio lancé avec SQPOLL (2000ms idle)");
+        let listener = TcpListener::bind("0.0.0.0:8379").expect("can't bind listener");
+        println!("RadixOx Legacy Server listening on 0.0.0.0:8379");
+
+        let shared_art = SharedART::new(RefCell::new(OxidArt::new()));
+        spawn_ticker(shared_art.clone(), Duration::from_millis(100));
+        spawn_evictor(shared_art.clone(), Duration::from_secs(1));
+        shared_art.borrow_mut().tick();
+
+        loop {
+            if let Ok((stream, _addr)) = listener.accept().await {
+                monoio::spawn(handle_connection(stream, shared_art.clone()));
+            }
+        }
     });
-
-    let listener = TcpListener::bind("0.0.0.0:8379")?;
-    println!("RadixOx Legacy Server listening on 0.0.0.0:8379");
-
-    let shared_art = SharedART::new(RefCell::new(OxidArt::new()));
-    spawn_ticker(shared_art.clone(), Duration::from_millis(100));
-    spawn_evictor(shared_art.clone(), Duration::from_secs(1));
-    shared_art.borrow_mut().tick();
-
-    loop {
-        let (stream, _addr) = listener.accept().await?;
-        monoio::spawn(handle_connection(stream, shared_art.clone()));
-    }
+    Ok(())
 }
 
 async fn handle_connection(stream: TcpStream, arena: SharedART) -> IOResult<()> {
