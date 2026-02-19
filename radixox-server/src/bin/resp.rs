@@ -240,14 +240,14 @@ async fn handle_connection(
         }
 
         // Flush (normal mode only — subscriber mode writes go through channel)
-        if let Some(w) = &mut write_half {
-            if !conn.write_buf.is_empty() {
-                let buf = std::mem::replace(&mut conn.write_buf, BytesMut::new());
-                let (res, ret) = w.write_all(buf).await;
-                conn.write_buf = ret;
-                res?;
-                conn.write_buf.clear();
-            }
+        if let Some(w) = &mut write_half
+            && !conn.write_buf.is_empty()
+        {
+            let buf = std::mem::replace(&mut conn.write_buf, BytesMut::new());
+            let (res, ret) = w.write_all(buf).await;
+            conn.write_buf = ret;
+            res?;
+            conn.write_buf.clear();
         }
     }
 
@@ -559,7 +559,7 @@ fn cmd_del(args: &[Bytes], art: &mut OxidArt) -> Frame {
 
     let mut count = 0i64;
     for key in args {
-        if art.del(&key).is_some() {
+        if art.del(key).is_some() {
             count += 1;
         }
     }
@@ -718,7 +718,7 @@ fn cmd_exists(args: &[Bytes], art: &mut OxidArt) -> Frame {
 
     let mut count = 0i64;
     for key in args {
-        if art.get(&key).is_some() {
+        if art.get(key).is_some() {
             count += 1;
         }
     }
@@ -732,7 +732,7 @@ fn cmd_mget(args: &[Bytes], art: &mut OxidArt) -> Frame {
 
     let results: Vec<Frame> = args
         .iter()
-        .map(|key| match art.get(&key) {
+        .map(|key| match art.get(key) {
             Some(val) => match val.as_bytes() {
                 Some(b) => Frame::BulkString(b),
                 None => Frame::Null,
@@ -745,7 +745,7 @@ fn cmd_mget(args: &[Bytes], art: &mut OxidArt) -> Frame {
 }
 
 fn cmd_mset(args: &[Bytes], art: &mut OxidArt) -> Frame {
-    if args.is_empty() || args.len() % 2 != 0 {
+    if args.is_empty() || !args.len().is_multiple_of(2) {
         return Frame::Error("ERR wrong number of arguments for 'MSET' command".into());
     }
 

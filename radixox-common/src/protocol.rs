@@ -324,10 +324,10 @@ where
 
         // Zero-copy decode via slicing
         let data = &buf[start + 4..start + total_len];
-        if let Ok(net_message) = T::decode(data) {
-            if let Ok(validated) = net_message.validate() {
-                res.push(validated);
-            }
+        if let Ok(net_message) = T::decode(data)
+            && let Ok(validated) = net_message.validate()
+        {
+            res.push(validated);
         }
 
         cursor += total_len;

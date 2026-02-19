@@ -10,14 +10,14 @@ use crate::value::Value;
 #[derive(Debug)]
 pub enum RegexError {
     /// The regex pattern failed to compile into a DFA.
-    Build(regex_automata::dfa::dense::BuildError),
+    Build(Box<regex_automata::dfa::dense::BuildError>),
     /// The DFA could not produce a start state.
     Start(MatchError),
 }
 
 impl From<regex_automata::dfa::dense::BuildError> for RegexError {
     fn from(e: regex_automata::dfa::dense::BuildError) -> Self {
-        RegexError::Build(e)
+        RegexError::Build(Box::new(e))
     }
 }
 
@@ -104,10 +104,10 @@ impl OxidArt {
 
             // Check if this node's key is a full match via EOI transition
             let eoi_state = dfa.next_eoi_state(state);
-            if dfa.is_match_state(eoi_state) {
-                if let Some(val) = node.get_value(self.now) {
-                    results.push((Bytes::from(key_path.clone()), val));
-                }
+            if dfa.is_match_state(eoi_state)
+                && let Some(val) = node.get_value(self.now)
+            {
+                results.push((Bytes::from(key_path.clone()), val));
             }
 
             // Push children onto stack, pruning dead branches at the radix byte

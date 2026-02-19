@@ -124,6 +124,7 @@ impl Value {
         *self = Value::Int(new_val);
         Ok(new_val)
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(string: &'static str) -> Self {
         Self::String(Bytes::from_static(string.as_bytes()))
     }

@@ -43,8 +43,7 @@ impl ZSetInner {
 
         // Insert new entry
         self.sorted.insert((score, member.clone()));
-        let is_new = self.scores.insert(member, score).is_none();
-        is_new
+        self.scores.insert(member, score).is_none()
     }
 
     /// Remove a member. Returns true if the member existed.

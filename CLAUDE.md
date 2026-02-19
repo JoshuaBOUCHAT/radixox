@@ -197,6 +197,53 @@ Port 8379. Length-prefixed protobuf messages (4-byte big-endian size + payload).
 - [x] ✅ Node size = 128 bytes (cache-line optimized)
 - [x] ✅ CompactStr with tinypointers (2byteid → 65k slots)
 
+## Bug Fix — `split_node` / `ensure_key` (2025-02)
+
+**Bug**: Dans `split_node` appelé depuis `ensure_key` avec `val=None`, le nouveau nœud
+était inséré dans le HiSlab mais **jamais enregistré comme enfant** de son parent
+(`push_child_idx` manquant). Résultat : toute clé dont le nom est un préfixe strict
+d'une autre clé insérée ensuite (ex: `user:1` → `user:10`) devenait inaccessible.
+Affectait uniquement HSET/SADD/ZADD (qui passent par `ensure_key`), pas les strings
+(qui utilisent `set_internal` avec `val=Some(...)`).
+
+**Fix** (`lib.rs`, fonction `split_node`, branche `else` de `!val_on_intermediate`) :
+```rust
+let new_node_idx = self.insert(new_node);
+self.push_child_idx(idx, new_node_idx, new_radix);  // ← ligne manquante
+new_node_idx
+```
+
+**Tests** : `oxidart/src/test_structures.rs` — 60 tests couvrant Hash/Set/ZSet avec
+clés à préfixes communs, isolation inter-clés, WRONGTYPE, double-index ZSet, cycles
+add/delete. Ces tests avaient détecté 7 failures avant le fix, 0 après.
+
+## Benchmarks YCSB réels (Workload A, 1M records, fieldlength=100, 100 threads)
+
+Comparaison fair-ish : RadixOx utilise io_uring + **SQ_POLL** (kernel polling thread
+dédié) donc consomme techniquement 2 cores CPU. Redis utilise epoll (1 thread). La
+comparaison n'est pas iso-ressource à strictement parler.
+
+### Load (HMSET)
+| | Redis | RadixOx |
+|--|--|--|
+| Throughput | 40 538 ops/sec | **76 039 ops/sec** |
+| Avg | 2 449 µs | **1 309 µs** |
+| p99 | 5 859 µs | **1 710 µs** |
+
+### Run (50% HGET / 50% HSET, 2M ops)
+| | Redis | RadixOx |
+|--|--|--|
+| Throughput | 136 072 ops/sec | **152 079 ops/sec** |
+| READ avg | 725 µs | **655 µs** |
+| READ p95 | 1 527 µs | **712 µs** |
+| READ p99 | 2 079 µs | **788 µs** |
+| READ p99.9 | 3 097 µs | **1 822 µs** |
+| READ p99.99 | 4 327 µs | **3 663 µs** |
+| READ p99.999 | 29 791 µs | 19 967 µs |
+
+Le p99.999 RadixOx (~20ms) est le point à améliorer — cause probable : head-of-line
+blocking single-thread + rare HiSlab growth pause + page faults sur mémoire froide.
+
 ## TODO / Future Work
 
 - [ ] List commands: LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN
@@ -213,3 +260,28 @@ Port 8379. Length-prefixed protobuf messages (4-byte big-endian size + payload).
 ### Future Features
 - [ ] Cluster mode
 - [ ] Persistence (RDB/AOF)
+
+## Next Perf: HiSlab → mmap + Huge Pages
+
+Le HiSlab est fait maison. Remplacer le backing store (actuellement Vec → allocateur
+système) par mmap + huge pages pour :
+
+- **TLB pressure** : 1M nœuds × 128 bytes = ~128 MB. Avec pages 4KB → ~32k TLB entries
+  (thrashing STLB). Avec huge pages 2MB → **64 pages**, tient entièrement dans le STLB.
+- **Zéro page faults au runtime** : `MAP_POPULATE` au boot pré-fault toutes les pages.
+- **Extension zero-copy** : `ftruncate` + `mmap MAP_FIXED` sur la plage suivante —
+  adresses u32 stables, pas de rebase des index.
+- **Réservation virtuelle large** : `mmap(MAP_NORESERVE|MAP_ANONYMOUS)` réserve 64GB
+  virtuel, on commit uniquement ce qui est utilisé.
+
+Architecture cible :
+```
+memfd_create("oxidart-slab", MFD_CLOEXEC)
++ ftruncate(fd, initial_committed)
++ mmap(huge_reservation, MAP_NORESERVE)  // adresses stables
++ mmap(ptr, initial, MAP_FIXED|MAP_HUGETLB|MAP_HUGE_2MB, fd)
+// extension: ftruncate + mmap(ptr+old, delta, MAP_FIXED|..., fd, old)
+```
+
+Vu que HiSlab est maison et fait déjà massivement de l'unsafe avec des raw ptr,
+le passage de `Vec` à des ptr mmap ne change pas grand chose structurellement.

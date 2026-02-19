@@ -28,10 +28,10 @@ impl OxidArt {
     /// If the key does not exist (or is expired), it is initialized to `Int(delta)`.
     /// Existing TTL is preserved.
     pub fn incrby(&mut self, key: Bytes, delta: i64) -> Result<i64, CounterError> {
-        if let Some(idx) = self.traverse_to_key(&key) {
-            if let Some(val) = self.node_value_mut(idx) {
-                return Ok(val.incr(delta)?);
-            }
+        if let Some(idx) = self.traverse_to_key(&key)
+            && let Some(val) = self.node_value_mut(idx)
+        {
+            return Ok(val.incr(delta)?);
         }
 
         // Key doesn't exist or expired — create as Int directly

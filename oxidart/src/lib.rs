@@ -73,8 +73,6 @@ mod test;
 #[cfg(test)]
 mod test_structures;
 
-use std::u32;
-
 use bytes::Bytes;
 use hislab::HiSlab;
 
@@ -307,7 +305,7 @@ impl OxidArt {
         let idx = self.get_idx(key)?;
         debug_assert!(key.is_ascii(), "key must be ASCII");
         let now = self.now;
-        return self.get_node_mut(idx).get_value_mut(now);
+        self.get_node_mut(idx).get_value_mut(now)
     }
     fn get_idx(&mut self, key: &[u8]) -> Option<u32> {
         debug_assert!(key.is_ascii(), "key must be ASCII");
@@ -1284,13 +1282,13 @@ impl OxidArt {
                 grandchild.parent_idx = node_idx;
             }
         }
-        if let Some(huge_idx) = child.get_huge_childs_idx() {
-            if let Some(huge_childs) = self.child_list.get(huge_idx) {
-                let indices: Vec<u32> = huge_childs.iter().map(|(_, idx)| idx).collect();
-                for grandchild_idx in indices {
-                    if let Some(grandchild) = self.map.get_mut(grandchild_idx) {
-                        grandchild.parent_idx = node_idx;
-                    }
+        if let Some(huge_idx) = child.get_huge_childs_idx()
+            && let Some(huge_childs) = self.child_list.get(huge_idx)
+        {
+            let indices: Vec<u32> = huge_childs.iter().map(|(_, idx)| idx).collect();
+            for grandchild_idx in indices {
+                if let Some(grandchild) = self.map.get_mut(grandchild_idx) {
+                    grandchild.parent_idx = node_idx;
                 }
             }
         }
@@ -1383,8 +1381,6 @@ struct Node {
 #[cfg(feature = "ttl")]
 impl Default for Node {
     fn default() -> Self {
-        use std::u32;
-
         Self {
             huge_childs_idx: u32::MAX,
             childs: Childs::default(),
@@ -1502,8 +1498,6 @@ impl Node {
         parent_idx: u32,
         parent_radix: u8,
     ) -> Self {
-        use std::u32;
-
         Node {
             huge_childs_idx: u32::MAX,
             compression: CompactStr::from_slice(compression),

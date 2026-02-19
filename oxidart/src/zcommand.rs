@@ -20,7 +20,7 @@ impl OxidArt {
             Some(ZSet(_)) => {}
             Some(_) => return Err(TypeError::ValueNotSet),
             None => {
-                node.val = Some((ZSet(Box::new(ZSetInner::new())), ttl.unwrap_or(NO_EXPIRY)));
+                node.val = Some((ZSet(Box::default()), ttl.unwrap_or(NO_EXPIRY)));
             }
         };
 

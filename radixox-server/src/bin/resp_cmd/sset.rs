@@ -76,7 +76,7 @@ pub fn cmd_smembers(args: &[Bytes], art: &mut OxidArt) -> Frame {
         Ok(members) => {
             let frames: Vec<Frame> = members
                 .into_iter()
-                .map(|b| Frame::BulkString(b))
+                .map(Frame::BulkString)
                 .collect();
             Frame::Array(frames)
         }
@@ -101,7 +101,7 @@ pub fn cmd_spop(args: &[Bytes], art: &mut OxidArt) -> Frame {
             None => Frame::Null,
         },
         Ok(oxidart::scommand::SPOPResult::Multiple(vec)) => {
-            let frames: Vec<Frame> = vec.into_iter().map(|b| Frame::BulkString(b)).collect();
+            let frames: Vec<Frame> = vec.into_iter().map(Frame::BulkString).collect();
             Frame::Array(frames)
         }
         Err(TypeError::ValueNotSet) => {

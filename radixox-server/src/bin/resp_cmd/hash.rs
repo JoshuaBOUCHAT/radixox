@@ -1,13 +1,13 @@
 use bytes::Bytes;
-use oxidart::error::TypeError;
 use oxidart::OxidArt;
+use oxidart::error::TypeError;
 use redis_protocol::resp2::types::BytesFrame as Frame;
 
 // Static OK response for HMSET
 static OK: Bytes = Bytes::from_static(b"OK");
 
 pub fn cmd_hset(args: &[Bytes], art: &mut OxidArt) -> Frame {
-    if args.len() < 3 || args.len() % 2 == 0 {
+    if args.len() < 3 || args.len().is_multiple_of(2) {
         return Frame::Error("ERR wrong number of arguments for 'HSET' command".into());
     }
     let key = &args[0];
@@ -29,7 +29,7 @@ pub fn cmd_hset(args: &[Bytes], art: &mut OxidArt) -> Frame {
 /// Sets multiple fields in a hash. Returns "OK" for compatibility with old clients.
 /// Identical to HSET but returns SimpleString "OK" instead of Integer count.
 pub fn cmd_hmset(args: &[Bytes], art: &mut OxidArt) -> Frame {
-    if args.len() < 3 || args.len() % 2 == 0 {
+    if args.len() < 3 || args.len().is_multiple_of(2) {
         return Frame::Error("ERR wrong number of arguments for 'HMSET' command".into());
     }
     let key = &args[0];
@@ -39,7 +39,7 @@ pub fn cmd_hmset(args: &[Bytes], art: &mut OxidArt) -> Frame {
         .collect();
 
     match art.cmd_hset(key, &field_values, None) {
-        Ok(_) => Frame::SimpleString(OK.clone()),  // Legacy: always return OK
+        Ok(_) => Frame::SimpleString(OK.clone()), // Legacy: always return OK
         Err(TypeError::ValueNotSet) => {
             Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
         }
@@ -74,7 +74,7 @@ pub fn cmd_hgetall(args: &[Bytes], art: &mut OxidArt) -> Frame {
         Ok(flat_pairs) => {
             let frames: Vec<Frame> = flat_pairs
                 .into_iter()
-                .map(|b| Frame::BulkString(b))
+                .map(Frame::BulkString)
                 .collect();
             Frame::Array(frames)
         }
@@ -140,7 +140,7 @@ pub fn cmd_hkeys(args: &[Bytes], art: &mut OxidArt) -> Frame {
 
     match art.cmd_hkeys(key) {
         Ok(keys) => {
-            let frames: Vec<Frame> = keys.into_iter().map(|b| Frame::BulkString(b)).collect();
+            let frames: Vec<Frame> = keys.into_iter().map(Frame::BulkString).collect();
             Frame::Array(frames)
         }
         Err(redis_type) => Frame::Error(format!(
@@ -158,7 +158,7 @@ pub fn cmd_hvals(args: &[Bytes], art: &mut OxidArt) -> Frame {
 
     match art.cmd_hvals(key) {
         Ok(vals) => {
-            let frames: Vec<Frame> = vals.into_iter().map(|b| Frame::BulkString(b)).collect();
+            let frames: Vec<Frame> = vals.into_iter().map(Frame::BulkString).collect();
             Frame::Array(frames)
         }
         Err(redis_type) => Frame::Error(format!(

@@ -57,12 +57,12 @@ impl CompactStr {
     }
 
     pub fn push(&mut self, byte: u8) {
-        if let CompactStr::Inline(ts) = self {
-            if (ts.len as usize) < INLINE_LEN {
-                ts.data[ts.len as usize] = byte;
-                ts.len += 1;
-                return;
-            }
+        if let CompactStr::Inline(ts) = self
+            && (ts.len as usize) < INLINE_LEN
+        {
+            ts.data[ts.len as usize] = byte;
+            ts.len += 1;
+            return;
         }
         // Spill to heap or grow heap
         let mut new_data = ThinVec::with_capacity(self.len() + 1);

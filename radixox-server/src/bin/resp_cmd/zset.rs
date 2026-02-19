@@ -1,10 +1,10 @@
 use bytes::Bytes;
-use oxidart::error::TypeError;
 use oxidart::OxidArt;
+use oxidart::error::TypeError;
 use redis_protocol::resp2::types::BytesFrame as Frame;
 
 pub fn cmd_zadd(args: &[Bytes], art: &mut OxidArt) -> Frame {
-    if args.len() < 3 || args.len() % 2 == 0 {
+    if args.len() < 3 || args.len().is_multiple_of(2) {
         return Frame::Error("ERR wrong number of arguments for 'ZADD' command".into());
     }
     let key = &args[0];
@@ -58,11 +58,13 @@ pub fn cmd_zrange(args: &[Bytes], art: &mut OxidArt) -> Frame {
     };
 
     // Check for WITHSCORES option
-    let with_scores = args.get(3).map_or(false, |opt| opt.eq_ignore_ascii_case(b"WITHSCORES"));
+    let with_scores = args
+        .get(3)
+        .is_some_and(|opt| opt.eq_ignore_ascii_case(b"WITHSCORES"));
 
     match art.cmd_zrange(key, start, stop, with_scores) {
         Ok(result) => {
-            let frames: Vec<Frame> = result.into_iter().map(|b| Frame::BulkString(b)).collect();
+            let frames: Vec<Frame> = result.into_iter().map(Frame::BulkString).collect();
             Frame::Array(frames)
         }
         Err(redis_type) => Frame::Error(format!(
