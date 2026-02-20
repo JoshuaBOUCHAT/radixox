@@ -1409,18 +1409,17 @@ enum CompResult {
 impl Node {
     fn compare_compression_key(&self, key_rest: &[u8]) -> CompResult {
         use std::cmp::Ordering::*;
+        let common_len = self.get_common_len(key_rest);
         match self.compression.len().cmp(&key_rest.len()) {
             Equal => {
-                let common_len = self.get_common_len(key_rest);
                 if common_len == key_rest.len() {
                     CompResult::Final
                 } else {
                     CompResult::Partial(common_len)
                 }
             }
-            Greater => CompResult::Partial(self.get_common_len(key_rest)),
+            Greater => CompResult::Partial(common_len),
             Less => {
-                let common_len = self.get_common_len(key_rest);
                 if common_len == self.compression.len() {
                     CompResult::Path
                 } else {
@@ -1429,16 +1428,12 @@ impl Node {
             }
         }
     }
-    #[allow(clippy::needless_range_loop)]
     fn get_common_len(&self, key_rest: &[u8]) -> usize {
-        let len = self.compression.len().min(key_rest.len());
-
-        for i in 0..len {
-            if self.compression[i] != key_rest[i] {
-                return i;
-            }
-        }
-        len
+        self.compression
+            .iter()
+            .zip(key_rest)
+            .position(|(a, b)| a != b)
+            .unwrap_or_else(|| self.compression.len().min(key_rest.len()))
     }
     #[cfg(feature = "ttl")]
     fn set_val(&mut self, val: Value, ttl: u64) {
