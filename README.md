@@ -18,27 +18,28 @@ Tested with [YCSB](https://github.com/brianfrankcooper/YCSB) (Yahoo! Cloud Servi
 
 | Metric | Redis | RadixOx | Improvement |
 |--------|-------|---------|-------------|
-| **Throughput** | 40,538 ops/sec | **76,039 ops/sec** | 🚀 **+87%** |
-| **Avg Latency** | 2,449 µs | **1,309 µs** | ⚡ **-47%** |
-| **P95 Latency** | 4,671 µs | **1,383 µs** | ✅ **-70%** |
-| **P99 Latency** | 5,859 µs | **1,710 µs** | ✅ **-71%** |
+| **Throughput** | 90,318 ops/sec | **115,754 ops/sec** | 🚀 **+28%** |
+| **Avg Latency** | 1,096 µs | **857 µs** | ⚡ **-22%** |
+| **P95 Latency** | 1,288 µs | **1,245 µs** | ✅ **-3%** |
+| **P99 Latency** | 2,125 µs | **1,559 µs** | ✅ **-27%** |
 
-### RUN Phase (2,000,000 operations — 50% HGET / 50% HSET):
+### RUN Phase (2,000,000 operations — 50% READ / 50% UPDATE):
 
 | Metric | Redis | RadixOx | Improvement |
 |--------|-------|---------|-------------|
-| **Throughput** | 136,072 ops/sec | **152,079 ops/sec** | 🚀 **+12%** |
-| **READ Avg** | 725 µs | **655 µs** | ⚡ **-10%** |
-| **READ P95** | 1,527 µs | **712 µs** | ✅ **-53%** |
-| **READ P99** | 2,079 µs | **788 µs** | ✅ **-62%** |
-| **READ P99.9** | 3,097 µs | **1,822 µs** | ✅ **-41%** |
-| **READ P99.99** | 4,327 µs | **3,663 µs** | ✅ **-15%** |
+| **Throughput** | 157,332 ops/sec | **238,464 ops/sec** | 🚀 **+52%** |
+| **READ Avg** | 631 µs | **416 µs** | ⚡ **-34%** |
+| **READ P95** | 1,003 µs | **619 µs** | ✅ **-38%** |
+| **READ P99** | 1,346 µs | **697 µs** | ✅ **-48%** |
+| **READ P99.9** | 1,722 µs | **1,383 µs** | ✅ **-20%** |
+| **READ P99.99** | 5,091 µs | **2,329 µs** | ✅ **-54%** |
 
 **Key Takeaways:**
-- 🎯 **Sub-millisecond P99** on reads — Redis is at 2ms
-- 💪 **P95 2x better** — RadixOx stays flat from avg to P95 (655→712µs), Redis spikes (725→1527µs)
+- 🎯 **Sub-millisecond P99** on reads — Redis is at 1.3ms
+- 💪 **52% more throughput** — 238k vs 157k ops/sec on same workload
 - 📈 **ART traversal is O(key_length)** — no hash collision, no rehash jitter
-- 🔥 **Load phase 87% faster** — no hashtable rehashing as dataset grows
+- 🔥 **Load phase 28% faster** — no hashtable rehashing as dataset grows
+- ⚡ **Vec-first Hash** — small hashes stay in cache-friendly Vec before promoting to BTreeMap
 
 ---
 
@@ -106,7 +107,7 @@ Full Redis RESP2 protocol support with all major data structures:
 ### 🗂️ Hash
 `HSET` `HMSET` `HGET` `HGETALL` `HDEL` `HEXISTS` `HLEN` `HKEYS` `HVALS` `HMGET` `HINCRBY`
 
-**BTreeMap-based:** O(log n) operations, deterministic ordering, excellent tail latency
+**Vec → BTreeMap adaptive:** small hashes stay in cache-friendly Vec (≤16 fields), promote to BTreeMap for larger sets
 
 ### 📦 Set
 `SADD` `SREM` `SISMEMBER` `SCARD` `SMEMBERS` `SPOP`
@@ -116,7 +117,7 @@ Full Redis RESP2 protocol support with all major data structures:
 ### 📊 Sorted Set (ZSet)
 `ZADD` `ZCARD` `ZRANGE` `ZSCORE` `ZREM` `ZINCRBY`
 
-**Double-indexed:** BTreeSet for range queries + HashMap for O(1) score lookups
+**Vec → double-index adaptive:** small ZSets stay in sorted Vec (≤16 members), promote to BTreeSet+HashMap with pre-allocated capacity
 
 ### 📡 Pub/Sub
 `SUBSCRIBE` `UNSUBSCRIBE` `PUBLISH`
@@ -147,9 +148,9 @@ Full Redis RESP2 protocol support with all major data structures:
 |------|----------------|------------|----------|
 | **String** | `Bytes` | O(1) | Raw data, hot path |
 | **Int** | `i64` | O(1) | Counters (INCR zero-parse) |
-| **Hash** | `BTreeMap<Bytes, Bytes>` | O(log n) | Field-value pairs, YCSB workloads |
+| **Hash** | `Vec` (small) → `BTreeMap` (large) | O(n) / O(log n) | Field-value pairs, YCSB workloads |
 | **Set** | `BTreeSet<Bytes>` | O(log n) | Unique members, ordered |
-| **ZSet** | `BTreeSet + HashMap` | O(log n) + O(1) | Leaderboards, double-indexed |
+| **ZSet** | `Vec` (small) → `BTreeSet + HashMap` (large) | O(n) / O(log n)+O(1) | Leaderboards, double-indexed |
 | **List** | `VecDeque<Bytes>` | O(1) push/pop | Queues (planned) |
 
 ### OxidArt Engine
@@ -234,9 +235,9 @@ radixox/
 
 | Feature | Redis | RadixOx | Winner |
 |---------|-------|---------|--------|
-| Throughput (run 2M ops) | 136k ops/sec | **152k ops/sec** | 🦀 **+12%** |
-| P99 Latency (read) | 2,079 µs | **788 µs** | 🦀 **-62%** |
-| P95 Latency (read) | 1,527 µs | **712 µs** | 🦀 **-53%** |
+| Throughput (run 2M ops) | 157k ops/sec | **238k ops/sec** | 🦀 **+52%** |
+| P99 Latency (read) | 1,346 µs | **697 µs** | 🦀 **-48%** |
+| P95 Latency (read) | 1,003 µs | **619 µs** | 🦀 **-38%** |
 | Prefix queries | O(N) scan | **O(k) native** | 🦀 |
 | Data structures | HashMap | **ART + BTree** | 🦀 |
 | Tail latency | Variable | **Predictable** | 🦀 |
