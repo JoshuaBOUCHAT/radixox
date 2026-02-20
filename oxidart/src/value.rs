@@ -1,8 +1,8 @@
 use bytes::Bytes;
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 
-use crate::zset_inner::ZSetInner;
+use crate::{hcommand::InnerHCommand, zcommand::InnerZCommand};
 
 // ---------------------------------------------------------------------------
 // Value enum — replaces Bytes as the stored type in OxidArt
@@ -21,15 +21,15 @@ pub enum Value {
     /// Transparent: TYPE returns "string", GET formats on the fly.
     Int(i64),
     /// Hash: field → value pairs. BTreeMap for predictable O(log n) and ordered iteration.
-    Hash(BTreeMap<Bytes, Bytes>),
+    Hash(InnerHCommand),
     /// List: ordered collection, push/pop both ends.
     List(VecDeque<Bytes>),
     /// Set: unique members. BTreeSet for ordered iteration.
     Set(BTreeSet<Bytes>),
     /// Sorted set: members with f64 scores, sorted by (score, member).
-    /// Uses ZSetInner with double indexing (BTreeSet + HashMap) for optimal performance.
-    /// Boxed because ZSetInner is much larger than 32 bytes.
-    ZSet(Box<ZSetInner>),
+    /// Uses InnerZCommand with Small/Large dynamic dispatch.
+    /// InnerZCommand is ≤32 bytes (Small=Vec 24B, Large=Box 8B) — no outer Box needed.
+    ZSet(InnerZCommand),
 }
 
 // ---------------------------------------------------------------------------
@@ -135,14 +135,14 @@ impl Value {
 // ---------------------------------------------------------------------------
 
 impl Value {
-    pub fn as_hash_mut(&mut self) -> Result<&mut BTreeMap<Bytes, Bytes>, RedisType> {
+    pub fn as_hash_mut(&mut self) -> Result<&mut InnerHCommand, RedisType> {
         match self {
             Value::Hash(h) => Ok(h),
             other => Err(other.redis_type()),
         }
     }
 
-    pub fn as_hash(&self) -> Result<&BTreeMap<Bytes, Bytes>, RedisType> {
+    pub fn as_hash(&self) -> Result<&InnerHCommand, RedisType> {
         match self {
             Value::Hash(h) => Ok(h),
             other => Err(other.redis_type()),
@@ -195,14 +195,14 @@ impl Value {
 // ---------------------------------------------------------------------------
 
 impl Value {
-    pub fn as_zset_mut(&mut self) -> Result<&mut ZSetInner, RedisType> {
+    pub fn as_zset_mut(&mut self) -> Result<&mut InnerZCommand, RedisType> {
         match self {
             Value::ZSet(z) => Ok(z),
             other => Err(other.redis_type()),
         }
     }
 
-    pub fn as_zset(&self) -> Result<&ZSetInner, RedisType> {
+    pub fn as_zset(&self) -> Result<&InnerZCommand, RedisType> {
         match self {
             Value::ZSet(z) => Ok(z),
             other => Err(other.redis_type()),
