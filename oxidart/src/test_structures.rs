@@ -68,8 +68,10 @@ fn hash_hgetall_order() {
     let mut art = OxidArt::new();
     art.cmd_hset(b"k", &fv(&[("z", "1"), ("a", "2"), ("m", "3")]), None).unwrap();
     let all = art.cmd_hgetall(b"k").unwrap();
-    // BTreeMap → lexicographic order: a, m, z
-    assert_eq!(all, vec![b("a"), b("2"), b("m"), b("3"), b("z"), b("1")]);
+    // Sort pairs before comparing — HGETALL order is unspecified (Vec insertion order for Small).
+    let mut pairs: Vec<_> = all.chunks(2).map(|c| (c[0].clone(), c[1].clone())).collect();
+    pairs.sort();
+    assert_eq!(pairs, vec![(b("a"), b("2")), (b("m"), b("3")), (b("z"), b("1"))]);
 }
 
 #[test]
