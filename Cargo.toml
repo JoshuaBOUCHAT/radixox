@@ -17,3 +17,8 @@ bytes = { version = "1", features = ["serde"] }
 slotmap = "1.1.1"
 oxidart = { path = "oxidart", features = ["monoio", "regex"] }
 smallvec = "1.15.1"
+
+[profile.lto]
+inherits = "release"
+lto = true
+debug = false
