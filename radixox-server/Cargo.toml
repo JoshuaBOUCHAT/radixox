@@ -33,7 +33,7 @@ prost = { workspace = true, optional = true }
 radixox-common = { path = "../radixox-common", optional = true }
 
 # Redis protocol (RESP)
-redis-protocol = { version = "5", default-features = false, features = [
+redis-protocol = { version = "6.0.0", default-features = false, features = [
     "std",
     "resp2",
     "resp3",

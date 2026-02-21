@@ -16,7 +16,8 @@
       "Bash(git log:*)",
       "Bash(ls:*)",
       "WebFetch(domain:docs.rs)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "WebFetch(domain:crates.io)"
     ]
   }
 }

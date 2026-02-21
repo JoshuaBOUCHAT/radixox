@@ -223,26 +223,23 @@ Comparaison fair-ish : RadixOx utilise io_uring + **SQ_POLL** (kernel polling th
 dédié) donc consomme techniquement 2 cores CPU. Redis utilise epoll (1 thread). La
 comparaison n'est pas iso-ressource à strictement parler.
 
-### Load (HMSET)
+### Load (HMSET, 1M inserts)
 | | Redis | RadixOx |
 |--|--|--|
-| Throughput | 40 538 ops/sec | **76 039 ops/sec** |
-| Avg | 2 449 µs | **1 309 µs** |
-| p99 | 5 859 µs | **1 710 µs** |
+| Throughput | 90 318 ops/sec | **115 754 ops/sec** |
+| Avg | 1 096 µs | **857 µs** |
+| p95 | 1 288 µs | **1 245 µs** |
+| p99 | 2 125 µs | **1 559 µs** |
 
-### Run (50% HGET / 50% HSET, 2M ops)
+### Run (50% READ / 50% UPDATE, 2M ops)
 | | Redis | RadixOx |
 |--|--|--|
-| Throughput | 136 072 ops/sec | **152 079 ops/sec** |
-| READ avg | 725 µs | **655 µs** |
-| READ p95 | 1 527 µs | **712 µs** |
-| READ p99 | 2 079 µs | **788 µs** |
-| READ p99.9 | 3 097 µs | **1 822 µs** |
-| READ p99.99 | 4 327 µs | **3 663 µs** |
-| READ p99.999 | 29 791 µs | 19 967 µs |
-
-Le p99.999 RadixOx (~20ms) est le point à améliorer — cause probable : head-of-line
-blocking single-thread + rare HiSlab growth pause + page faults sur mémoire froide.
+| Throughput | 157 332 ops/sec | **238 464 ops/sec** |
+| READ avg | 631 µs | **416 µs** |
+| READ p95 | 1 003 µs | **619 µs** |
+| READ p99 | 1 346 µs | **697 µs** |
+| READ p99.9 | 1 722 µs | **1 383 µs** |
+| READ p99.99 | 5 091 µs | **2 329 µs** |
 
 ## TODO / Future Work
 
@@ -260,6 +257,12 @@ blocking single-thread + rare HiSlab growth pause + page faults sur mémoire fro
 ### Future Features
 - [ ] Cluster mode
 - [ ] Persistence (RDB/AOF)
+
+## Benchmarks YCSB (résumé — dernière run 2026-02-21)
+- **Load RadixOx**: 115 754 ops/sec, avg 857 µs, p99 1 559 µs
+- **Load Redis**: 90 318 ops/sec, avg 1 096 µs, p99 2 125 µs
+- **Run RadixOx**: 238 464 ops/sec, p95 619 µs, p99 697 µs, p99.9 1 383 µs, p99.99 2 329 µs
+- **Run Redis**: 157 332 ops/sec, p95 1 003 µs, p99 1 346 µs, p99.9 1 722 µs, p99.99 5 091 µs
 
 ## Next Perf: HiSlab → mmap + Huge Pages
 

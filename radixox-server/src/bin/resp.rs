@@ -93,7 +93,7 @@ fn get_runtime() -> std::io::Result<Runtime<TimeDriver<IoUringDriver>>> {
 
     // 2. Configurer SQPOLL (le kernel poll la queue de soumission)
     // Paramètre : temps d'idle en millisecondes avant que le thread kernel s'endorme
-    uring_builder.setup_sqpoll(2000);
+    uring_builder.setup_sqpoll(2);
 
     // Optionnel : on peut aussi binder le thread SQPOLL sur un cœur spécifique
     //uring_builder.setup_sqpoll_cpu(8);
@@ -128,7 +128,7 @@ impl Conn {
         if let Some(tx) = &self.sub_tx {
             send_via_tx(tx, frame);
         } else {
-            extend_encode(&mut self.write_buf, &frame).expect("encode should not fail");
+            extend_encode(&mut self.write_buf, &frame, false).expect("encode should not fail");
         }
     }
 
@@ -854,7 +854,7 @@ fn encode_pubsub_push(channel: &Bytes, message: &Bytes) -> Bytes {
         Frame::BulkString(message.clone()),
     ]);
     let mut buf = BytesMut::new();
-    extend_encode(&mut buf, &frame).expect("encode should not fail");
+    extend_encode(&mut buf, &frame, false).expect("encode should not fail");
     buf.freeze()
 }
 
@@ -929,7 +929,7 @@ fn handle_unsubscribe(
 #[inline]
 fn send_via_tx(tx: &unbounded::Tx<Bytes>, frame: Frame) {
     let mut buf = BytesMut::new();
-    extend_encode(&mut buf, &frame).expect("encode should not fail");
+    extend_encode(&mut buf, &frame, false).expect("encode should not fail");
     let _ = tx.send(buf.freeze());
 }
 
