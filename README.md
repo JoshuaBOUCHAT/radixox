@@ -8,38 +8,39 @@ RadixOx is a high-performance in-memory key-value store that speaks the Redis pr
 
 ## 🚀 Performance Benchmarks
 
-Tested with [YCSB](https://github.com/brianfrankcooper/YCSB) (Yahoo! Cloud Serving Benchmark) - industry standard for NoSQL databases.
+Tested with [YCSB](https://github.com/brianfrankcooper/YCSB) (Yahoo! Cloud Serving Benchmark) — industry standard for NoSQL databases.
 
-**Configuration:** 1M records, Workload A (50% read / 50% update), fieldlength=100, 100 client threads, localhost
+**Configuration:** 5M records, Workload A (50% read / 50% update), fieldlength=100, 100 client threads, localhost *(2026-02-28)*
 
 > **Note on fairness:** RadixOx uses io_uring + SQ_POLL which dedicates a kernel polling thread — effectively 2 CPU threads vs Redis's 1. The advantage is real but not strictly iso-resource. Comparison vs `redis-server` running natively (not Docker).
+>
+> HiSlab backing store: anonymous `mmap` + `MADV_HUGEPAGE` (THP) + pre-fault of 10K nodes (1.25 MB). The load phase serves as a natural THP warm-up, which explains the excellent tail latency in the run phase.
 
-### LOAD Phase (1,000,000 HMSET inserts):
-
-| Metric | Redis | RadixOx | Improvement |
-|--------|-------|---------|-------------|
-| **Throughput** | 90,318 ops/sec | **115,754 ops/sec** | 🚀 **+28%** |
-| **Avg Latency** | 1,096 µs | **857 µs** | ⚡ **-22%** |
-| **P95 Latency** | 1,288 µs | **1,245 µs** | ✅ **-3%** |
-| **P99 Latency** | 2,125 µs | **1,559 µs** | ✅ **-27%** |
-
-### RUN Phase (2,000,000 operations — 50% READ / 50% UPDATE):
+### LOAD Phase (5,000,000 HMSET inserts)
 
 | Metric | Redis | RadixOx | Improvement |
 |--------|-------|---------|-------------|
-| **Throughput** | 157,332 ops/sec | **238,464 ops/sec** | 🚀 **+52%** |
-| **READ Avg** | 631 µs | **416 µs** | ⚡ **-34%** |
-| **READ P95** | 1,003 µs | **619 µs** | ✅ **-38%** |
-| **READ P99** | 1,346 µs | **697 µs** | ✅ **-48%** |
-| **READ P99.9** | 1,722 µs | **1,383 µs** | ✅ **-20%** |
-| **READ P99.99** | 5,091 µs | **2,329 µs** | ✅ **-54%** |
+| **Throughput** | 77,227 ops/sec | **128,939 ops/sec** | 🚀 **+67%** |
+| **P99 Latency** | 2,447 µs | **878 µs** | ✅ **-64%** |
+
+### RUN Phase (10,000,000 operations — 50% READ / 50% UPDATE)
+
+| Metric | Redis | RadixOx | Improvement |
+|--------|-------|---------|-------------|
+| **Throughput** | 201,930 ops/sec | **263,622 ops/sec** | 🚀 **+31%** |
+| **READ Avg** | 490 µs | **377 µs** | ⚡ **-23%** |
+| **READ P95** | 500 µs | **388 µs** | ✅ **-22%** |
+| **READ P99** | 964 µs | **446 µs** | ✅ **-54%** |
+| **READ P99.9** | 986 µs | **485 µs** | ✅ **-51%** |
+| **READ P99.99** | 1,046 µs | **936 µs** | ✅ **-11%** |
+| **UPDATE P99** | 964 µs | **456 µs** | ✅ **-53%** |
 
 **Key Takeaways:**
-- 🎯 **Sub-millisecond P99** on reads — Redis is at 1.3ms
-- 💪 **52% more throughput** — 238k vs 157k ops/sec on same workload
-- 📈 **ART traversal is O(key_length)** — no hash collision, no rehash jitter
-- 🔥 **Load phase 28% faster** — no hashtable rehashing as dataset grows
-- ⚡ **Vec-first Hash** — small hashes stay in cache-friendly Vec before promoting to BTreeMap
+- 🎯 **Sub-millisecond P99** on reads at 5M records — Redis is at 964 µs
+- 💪 **+67% load throughput** — 129k vs 77k ops/sec, no hashtable rehashing jitter
+- 📈 **ART is O(key_length)** — latency doesn't grow with dataset size
+- 🔥 **P99.9 = 485 µs** — Redis is at 986 µs, 2× better tail latency
+- ⚡ **THP warm-up effect** — p99.99 improves further as dataset grows and huge pages are promoted
 
 ---
 
@@ -235,9 +236,11 @@ radixox/
 
 | Feature | Redis | RadixOx | Winner |
 |---------|-------|---------|--------|
-| Throughput (run 2M ops) | 157k ops/sec | **238k ops/sec** | 🦀 **+52%** |
-| P99 Latency (read) | 1,346 µs | **697 µs** | 🦀 **-48%** |
-| P95 Latency (read) | 1,003 µs | **619 µs** | 🦀 **-38%** |
+| Load throughput (5M inserts) | 77k ops/sec | **129k ops/sec** | 🦀 **+67%** |
+| Run throughput (10M ops) | 202k ops/sec | **264k ops/sec** | 🦀 **+31%** |
+| READ P99 (5M records) | 964 µs | **446 µs** | 🦀 **-54%** |
+| READ P99.9 | 986 µs | **485 µs** | 🦀 **-51%** |
+| Load P99 | 2,447 µs | **878 µs** | 🦀 **-64%** |
 | Prefix queries | O(N) scan | **O(k) native** | 🦀 |
 | Data structures | HashMap | **ART + BTree** | 🦀 |
 | Tail latency | Variable | **Predictable** | 🦀 |

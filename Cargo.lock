@@ -231,7 +231,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hislab"
-version = "0.1.3"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9bdbb8ab4c6f94a3600f8a1d9a54b8d0aa93eb92b3c702c537c19b53a66ec58"
 dependencies = [
  "libc",
  "memmap2",
@@ -450,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "oxidart"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "arrayvec",
  "bytes",
