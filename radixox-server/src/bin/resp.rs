@@ -76,7 +76,7 @@ fn main() -> std::io::Result<()> {
 
         loop {
             let (stream, addr) = listener.accept().await?;
-            println!("New connection from {}", addr);
+            //println!("New connection from {}", addr);
             let conn_id = conn_counter.get();
             conn_counter.set(conn_id.wrapping_add(1));
             monoio::spawn(handle_connection(

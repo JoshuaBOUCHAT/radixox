@@ -223,23 +223,24 @@ Comparaison fair-ish : RadixOx utilise io_uring + **SQ_POLL** (kernel polling th
 dédié) donc consomme techniquement 2 cores CPU. Redis utilise epoll (1 thread). La
 comparaison n'est pas iso-ressource à strictement parler.
 
-### Load (HMSET, 1M inserts)
-| | Redis | RadixOx |
-|--|--|--|
-| Throughput | 90 318 ops/sec | **115 754 ops/sec** |
-| Avg | 1 096 µs | **857 µs** |
-| p95 | 1 288 µs | **1 245 µs** |
-| p99 | 2 125 µs | **1 559 µs** |
+HiSlab backing store : `mmap` anonyme + `MADV_HUGEPAGE` (THP) + pre-fault 10K nœuds (1.25 MB).
 
-### Run (50% READ / 50% UPDATE, 2M ops)
+### Load (HMSET, 5M inserts)
 | | Redis | RadixOx |
 |--|--|--|
-| Throughput | 157 332 ops/sec | **238 464 ops/sec** |
-| READ avg | 631 µs | **416 µs** |
-| READ p95 | 1 003 µs | **619 µs** |
-| READ p99 | 1 346 µs | **697 µs** |
-| READ p99.9 | 1 722 µs | **1 383 µs** |
-| READ p99.99 | 5 091 µs | **2 329 µs** |
+| Throughput | 77 227 ops/sec | **128 939 ops/sec** |
+| p99 | 2 447 µs | **878 µs** |
+
+### Run (50% READ / 50% UPDATE, 10M ops)
+| | Redis | RadixOx |
+|--|--|--|
+| Throughput | 201 930 ops/sec | **263 622 ops/sec** |
+| READ avg | 490 µs | **377 µs** |
+| READ p95 | 500 µs | **388 µs** |
+| READ p99 | 964 µs | **446 µs** |
+| READ p99.9 | 986 µs | **485 µs** |
+| READ p99.99 | 1 046 µs | **936 µs** |
+| UPDATE p99 | 964 µs | **456 µs** |
 
 ## TODO / Future Work
 
@@ -258,33 +259,32 @@ comparaison n'est pas iso-ressource à strictement parler.
 - [ ] Cluster mode
 - [ ] Persistence (RDB/AOF)
 
-## Benchmarks YCSB (résumé — dernière run 2026-02-21)
-- **Load RadixOx**: 115 754 ops/sec, avg 857 µs, p99 1 559 µs
-- **Load Redis**: 90 318 ops/sec, avg 1 096 µs, p99 2 125 µs
-- **Run RadixOx**: 238 464 ops/sec, p95 619 µs, p99 697 µs, p99.9 1 383 µs, p99.99 2 329 µs
-- **Run Redis**: 157 332 ops/sec, p95 1 003 µs, p99 1 346 µs, p99.9 1 722 µs, p99.99 5 091 µs
+## Benchmarks YCSB (résumé — dernière run 2026-02-28, 5M records)
+- **Load RadixOx**: 128 939 ops/sec, p99 878 µs
+- **Load Redis**: 77 227 ops/sec, p99 2 447 µs
+- **Run RadixOx**: 263 622 ops/sec, avg 377 µs, p95 388 µs, p99 446 µs, p99.9 485 µs, p99.99 936 µs
+- **Run Redis**: 201 930 ops/sec, avg 490 µs, p95 500 µs, p99 964 µs, p99.9 986 µs, p99.99 1 046 µs
 
-## Next Perf: HiSlab → mmap + Huge Pages
+## HiSlab — mmap + Transparent Huge Pages (implémenté)
 
-Le HiSlab est fait maison. Remplacer le backing store (actuellement Vec → allocateur
-système) par mmap + huge pages pour :
+Le backing store de HiSlab est passé de `Vec` à `mmap` anonyme avec hint THP :
 
-- **TLB pressure** : 1M nœuds × 128 bytes = ~128 MB. Avec pages 4KB → ~32k TLB entries
-  (thrashing STLB). Avec huge pages 2MB → **64 pages**, tient entièrement dans le STLB.
-- **Zéro page faults au runtime** : `MAP_POPULATE` au boot pré-fault toutes les pages.
-- **Extension zero-copy** : `ftruncate` + `mmap MAP_FIXED` sur la plage suivante —
-  adresses u32 stables, pas de rebase des index.
-- **Réservation virtuelle large** : `mmap(MAP_NORESERVE|MAP_ANONYMOUS)` réserve 64GB
-  virtuel, on commit uniquement ce qui est utilisé.
-
-Architecture cible :
+**Architecture implémentée** (`hislab/src/lib.rs`) :
 ```
-memfd_create("oxidart-slab", MFD_CLOEXEC)
-+ ftruncate(fd, initial_committed)
-+ mmap(huge_reservation, MAP_NORESERVE)  // adresses stables
-+ mmap(ptr, initial, MAP_FIXED|MAP_HUGETLB|MAP_HUGE_2MB, fd)
-// extension: ftruncate + mmap(ptr+old, delta, MAP_FIXED|..., fd, old)
+MmapMut::map_anon(virtual_capacity * size_of::<T>())   // réservation virtuelle totale
++ madvise(MADV_HUGEPAGE, ptr, virtual_bytes)            // hint THP pour toute la région
++ madvise(MADV_POPULATE_WRITE, ptr, initial_bytes)      // pre-fault ~10K nœuds (1.25 MB)
 ```
 
-Vu que HiSlab est maison et fait déjà massivement de l'unsafe avec des raw ptr,
-le passage de `Vec` à des ptr mmap ne change pas grand chose structurellement.
+**Pourquoi ça marche** :
+- `MADV_HUGEPAGE` : le kernel (`khugepaged`) promeut les pages actives en 2 MB au fil des
+  accès. Pendant la load phase (1M inserts), les ~64 huge pages couvrant les 128 MB chauds
+  sont promues. À l'entrée de la run phase, le STLB couvre toute la zone → p99.9 propre.
+- Pre-fault minimal (10K nœuds = 1.25 MB) : évite les page faults au démarrage sans coût
+  upfront sur les 128 MB totaux. Pas de pression TLB à l'init.
+- Adresses stables : le `virtual_capacity` est réservé d'un coup, les index u32 ne rebased
+  jamais — même sémantique que l'ancien Vec mais sans realloc/copy.
+
+**Vs MAP_HUGETLB explicite** : THP ne nécessite pas de pool kernel pré-alloué
+(`/proc/sys/vm/nr_hugepages`). Fonctionne sur n'importe quelle machine Linux avec THP
+activé (défaut sur la plupart des distros).
