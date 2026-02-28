@@ -31,7 +31,7 @@ smallvec.workspace = true
 
 # Legacy protocol (protobuf)
 prost = { workspace = true, optional = true }
-radixox-common = { path = "../radixox-common", optional = true }
+radixox-common = { workspace = true, optional = true }
 
 # Redis protocol (RESP)
 redis-protocol = { version = "6.0.0", default-features = false, features = [
