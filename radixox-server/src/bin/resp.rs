@@ -75,8 +75,8 @@ fn main() -> std::io::Result<()> {
         let conn_counter: Rc<Cell<ConnId>> = Rc::new(Cell::new(0));
 
         loop {
-            let (stream, addr) = listener.accept().await?;
-            println!("New connection from {}", addr);
+            let (stream, _addr) = listener.accept().await?;
+            //println!("New connection from {}", addr);
             let conn_id = conn_counter.get();
             conn_counter.set(conn_id.wrapping_add(1));
             monoio::spawn(handle_connection(
@@ -93,10 +93,10 @@ fn get_runtime() -> std::io::Result<Runtime<TimeDriver<IoUringDriver>>> {
 
     // 2. Configurer SQPOLL (le kernel poll la queue de soumission)
     // Paramètre : temps d'idle en millisecondes avant que le thread kernel s'endorme
-    uring_builder.setup_sqpoll(2);
+    //uring_builder.setup_sqpoll(2);
 
-    // Optionnel : on peut aussi binder le thread SQPOLL sur un cœur spécifique
-    //uring_builder.setup_sqpoll_cpu(8);
+    // Binder le thread SQPOLL sur un cœur spécifique (évite la contention avec les clients)
+    //uring_builder.setup_sqpoll_cpu(0);
 
     RuntimeBuilder::<monoio::IoUringDriver>::new()
         .with_entries(1024)
