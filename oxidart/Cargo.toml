@@ -1,9 +1,11 @@
 [package]
 name = "oxidart"
-version.workspace = true
+version = "0.4.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "High-performance Adaptive Radix Tree with TTL, DFA pattern matching, and atomic counters"
 
 [dependencies]
 bytes.workspace = true
