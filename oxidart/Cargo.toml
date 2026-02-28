@@ -20,7 +20,7 @@ tokio = { version = "1", features = [
     "rt",
     "macros",
 ], optional = true }
-hislab = { path="../../hislab",optional=true }
+hislab = { version="0.2.0",optional=true }
 rand = { version = "0.8", optional = true }
 regex-automata = { version = "0.4", optional = true, default-features = false, features = [
     "dfa-build",
