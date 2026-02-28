@@ -1,3 +1,6 @@
+#[cfg(not(target_os = "linux"))]
+compile_error!("RadixOx requires Linux to run (io_uring and mmap support).");
+
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;

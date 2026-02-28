@@ -22,3 +22,9 @@ smallvec = "1.15.1"
 inherits = "release"
 lto = true
 debug = false
+[profile.release]
+lto = "fat"          # LTO maximal (analyse tout le graphe de dépendances)
+codegen-units = 1    # Force une seule unité de compilation pour plus d'optimisations
+panic = "abort"      # Réduit la taille du binaire et accélère les perfs (pas de stack unwinding)
+strip = true         # Retire les symboles de debug pour un binaire plus léger
+opt-level = 3        # Optimisation maximale

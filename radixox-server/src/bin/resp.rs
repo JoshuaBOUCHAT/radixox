@@ -1,3 +1,7 @@
+#[cfg(not(target_os = "linux"))]
+compile_error!("RadixOx requires Linux to run (io_uring and mmap support).");
+
+
 mod resp_cmd;
 
 use std::cell::{Cell, RefCell};
@@ -37,30 +41,7 @@ static PONG: Bytes = Bytes::from_static(b"PONG");
 static OK: Bytes = Bytes::from_static(b"OK");
 static ERR_EMPTY_CMD: &str = "ERR empty command";
 
-/*#[monoio::main(enable_timer = true)]
-async fn main() -> IOResult<()> {
-    let listener = TcpListener::bind("0.0.0.0:6379")?;
-    println!("RadixOx RESP Server listening on 0.0.0.0:6379");
 
-    let shared_art =
-        OxidArt::shared_with_evictor(Duration::from_millis(100), Duration::from_secs(1));
-
-    let registry: SharedRegistry = Rc::new(RefCell::new(HashMap::new()));
-    let conn_counter: Rc<Cell<ConnId>> = Rc::new(Cell::new(0));
-
-    loop {
-        let (stream, addr) = listener.accept().await?;
-        println!("New connection from {}", addr);
-        let conn_id = conn_counter.get();
-        conn_counter.set(conn_id.wrapping_add(1));
-        monoio::spawn(handle_connection(
-            stream,
-            shared_art.clone(),
-            registry.clone(),
-            conn_id,
-        ));
-    }
-}*/
 fn main() -> std::io::Result<()> {
     let mut runtime = get_runtime()?;
 
@@ -75,7 +56,7 @@ fn main() -> std::io::Result<()> {
         let conn_counter: Rc<Cell<ConnId>> = Rc::new(Cell::new(0));
 
         loop {
-            let (stream, addr) = listener.accept().await?;
+            let (stream, _addr) = listener.accept().await?;
             //println!("New connection from {}", addr);
             let conn_id = conn_counter.get();
             conn_counter.set(conn_id.wrapping_add(1));
