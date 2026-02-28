@@ -20,7 +20,7 @@ tokio = { version = "1", features = [
     "rt",
     "macros",
 ], optional = true }
-hislab = { version = "0.1.3" }
+hislab = { path="../../hislab",optional=true }
 rand = { version = "0.8", optional = true }
 regex-automata = { version = "0.4", optional = true, default-features = false, features = [
     "dfa-build",
@@ -31,7 +31,7 @@ thin-vec = "0.2.14"
 
 [features]
 default = ["ttl"]
-ttl = ["hislab/tagged", "hislab/rand", "dep:rand"]
+ttl = ["hislab", "hislab/rand", "dep:rand"]
 monoio = ["dep:monoio", "ttl"]
 tokio = ["dep:tokio", "ttl"]
 regex = ["dep:regex-automata", "ttl"]

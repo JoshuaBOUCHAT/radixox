@@ -75,6 +75,7 @@ mod test_structures;
 
 use bytes::Bytes;
 use hislab::HiSlab;
+use hislab::TaggedHiSlab;
 
 use crate::compact_str::CompactStr;
 use crate::node_childs::ChildAble;
@@ -116,7 +117,7 @@ pub enum TtlResult {
 /// ```
 ///
 pub struct OxidArt {
-    pub(crate) map: HiSlab<Node>,
+    pub(crate) map: TaggedHiSlab<Node>,
     pub(crate) child_list: HiSlab<HugeChilds>,
     /// Current timestamp (seconds since UNIX epoch).
     /// The server is responsible for updating this via `set_now()`.
@@ -143,9 +144,9 @@ impl OxidArt {
     /// let tree = OxidArt::new();
     /// ```
     pub fn new() -> Self {
-        let mut map = HiSlab::new();
+        let mut map = TaggedHiSlab::new(20000,25000000).expect("Can't allocate oxidart");
         let root_idx = map.insert(Node::default());
-        let child_list = HiSlab::new();
+        let child_list = HiSlab::new(1000,25000000).expect("Can't allocate oxidart");
 
         Self {
             map,
