@@ -125,7 +125,7 @@ fn execute_command(cmd: Command, arena: &mut OxidArt) -> NetResponse {
             multi_response(values, cmd.command_id)
         }
         CommandAction::DelN(action) => {
-            let _count = arena.deln(action.into_parts());
+            let _count = arena.deln(&action.into_parts());
             success_response(None, cmd.command_id)
         }
     }

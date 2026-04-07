@@ -1,7 +1,6 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("RadixOx requires Linux to run (io_uring and mmap support).");
 
-
 mod resp_cmd;
 
 use std::cell::{Cell, RefCell};
@@ -29,6 +28,8 @@ use resp_cmd::{
     cmd_srem, cmd_zadd, cmd_zcard, cmd_zincrby, cmd_zrange, cmd_zrem, cmd_zscore,
 };
 
+use crate::resp_cmd::delayed::{AsyncFrame, cmd_keys, cmd_unlink};
+
 type IOResult<T> = std::io::Result<T>;
 type SharedART = Rc<RefCell<OxidArt>>;
 type ConnId = u64;
@@ -41,13 +42,17 @@ static PONG: Bytes = Bytes::from_static(b"PONG");
 static OK: Bytes = Bytes::from_static(b"OK");
 static ERR_EMPTY_CMD: &str = "ERR empty command";
 
-
 fn main() -> std::io::Result<()> {
     let mut runtime = get_runtime()?;
 
     runtime.block_on(async {
-        let listener = TcpListener::bind("0.0.0.0:6379")?;
-        println!("RadixOx RESP Server listening on 0.0.0.0:6379");
+        let port: u16 = std::env::var("RADIXOX_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(6379);
+        let addr = format!("0.0.0.0:{port}");
+        let listener = TcpListener::bind(&addr)?;
+        println!("RadixOx RESP Server listening on {addr}");
 
         let shared_art =
             OxidArt::shared_with_evictor(Duration::from_millis(100), Duration::from_secs(1));
@@ -70,11 +75,11 @@ fn main() -> std::io::Result<()> {
     })
 }
 fn get_runtime() -> std::io::Result<Runtime<TimeDriver<IoUringDriver>>> {
-    let mut uring_builder = io_uring::IoUring::builder();
+    let uring_builder = io_uring::IoUring::builder();
 
     // 2. Configurer SQPOLL (le kernel poll la queue de soumission)
     // Paramètre : temps d'idle en millisecondes avant que le thread kernel s'endorme
-    uring_builder.setup_sqpoll(2);
+    //uring_builder.setup_sqpoll(2);
 
     // Optionnel : on peut aussi binder le thread SQPOLL sur un cœur spécifique
     //uring_builder.setup_sqpoll_cpu(8);
@@ -114,7 +119,7 @@ impl Conn {
     }
 
     /// Dispatch a non-SUBSCRIBE command.
-    fn handle_cmd(
+    async fn handle_cmd(
         &mut self,
         cmd: &[u8],
         args: &[Bytes],
@@ -140,7 +145,18 @@ impl Conn {
             }
         } else {
             // Normal mode (or unsubscribed back to normal)
-            self.send(dispatch_command(cmd, args, &mut art.borrow_mut()));
+            if let Some(frame) = dispatch_command(cmd, args, &mut art.borrow_mut()) {
+                self.send(frame);
+                return;
+            }
+
+            if let Some(frame) = dispatch_async_command(cmd, args, art.clone()).await {
+                self.send(frame);
+                return;
+            }
+            self.send(Frame::Error(
+                format!("ERR unknown command '{}'", String::from_utf8_lossy(cmd)).into(),
+            ));
         }
     }
 }
@@ -216,7 +232,7 @@ async fn handle_connection(
                     conn.sub_tx.as_ref().unwrap(),
                 );
             } else {
-                conn.handle_cmd(cmd, &args[1..], &art, &registry);
+                conn.handle_cmd(cmd, &args[1..], &art, &registry).await;
             }
         }
 
@@ -269,7 +285,6 @@ fn resp_ok() -> Frame {
 }
 
 static COMMANDS: &[(&[u8], Handler)] = &[
-    // Meta commands - no data access
     (b"GET", Handler::Data(cmd_get)),
     (b"SET", Handler::Data(cmd_set)),
     (b"INCR", Handler::Data(cmd_incr)),
@@ -282,7 +297,6 @@ static COMMANDS: &[(&[u8], Handler)] = &[
     (b"ECHO", Handler::Args(cmd_echo)),
     // Data commands - need OxidArt
     (b"DEL", Handler::Data(cmd_del)),
-    (b"KEYS", Handler::Data(cmd_keys)),
     (b"TTL", Handler::Data(cmd_ttl)),
     (b"PTTL", Handler::Data(cmd_pttl)),
     (b"EXPIRE", Handler::Data(cmd_expire)),
@@ -324,19 +338,30 @@ static COMMANDS: &[(&[u8], Handler)] = &[
     (b"ZINCRBY", Handler::Data(cmd_zincrby)),
 ];
 
-fn dispatch_command(cmd: &[u8], args: &[Bytes], art: &mut OxidArt) -> Frame {
+static ASYNC_COMMANDS: &[(&[u8], fn(&[Bytes], SharedART) -> AsyncFrame)] =
+    &[(b"UNLINK", cmd_unlink), (b"KEYS", cmd_keys)];
+
+fn dispatch_command(cmd: &[u8], args: &[Bytes], art: &mut OxidArt) -> Option<Frame> {
     for (name, handler) in COMMANDS {
         if cmd.eq_ignore_ascii_case(name) {
-            return match handler {
+            let frame = match handler {
                 Handler::Static(f) => f(),
                 Handler::Args(f) => f(args),
                 Handler::Data(f) => f(args, art),
                 Handler::DataOnly(f) => f(art),
             };
+            return Some(frame);
         }
     }
-
-    Frame::Error(format!("ERR unknown command '{}'", String::from_utf8_lossy(cmd)).into())
+    return None;
+}
+async fn dispatch_async_command(cmd: &[u8], args: &[Bytes], art: SharedART) -> Option<Frame> {
+    for (name, handler) in ASYNC_COMMANDS {
+        if cmd.eq_ignore_ascii_case(name) {
+            return Some(handler(args, art).await);
+        }
+    }
+    None
 }
 
 fn frame_to_args(frame: Frame) -> Option<SmallVec<[Bytes; 3]>> {
@@ -547,107 +572,6 @@ fn cmd_del(args: &[Bytes], art: &mut OxidArt) -> Frame {
     Frame::Integer(count)
 }
 
-fn cmd_keys(args: &[Bytes], art: &mut OxidArt) -> Frame {
-    if args.is_empty() {
-        // No pattern = all keys
-        let keys: Vec<Frame> = art
-            .getn(Bytes::new())
-            .into_iter()
-            .map(|(k, _)| Frame::BulkString(k))
-            .collect();
-        return Frame::Array(keys);
-    }
-
-    let pattern = &args[0];
-
-    // Fast path: simple "prefix*" or bare prefix with no glob chars → getn
-    if is_simple_prefix(pattern) {
-        let prefix = if pattern.ends_with(b"*") {
-            pattern.slice(..pattern.len() - 1)
-        } else {
-            pattern.clone()
-        };
-        let keys: Vec<Frame> = art
-            .getn(prefix)
-            .into_iter()
-            .map(|(k, _)| Frame::BulkString(k))
-            .collect();
-        return Frame::Array(keys);
-    }
-
-    // Slow path: complex glob → convert to regex → DFA traversal
-    let regex = glob_to_regex(pattern);
-    match art.getn_regex(&regex) {
-        Ok(pairs) => {
-            let keys: Vec<Frame> = pairs
-                .into_iter()
-                .map(|(k, _)| Frame::BulkString(k))
-                .collect();
-            Frame::Array(keys)
-        }
-        Err(_) => Frame::Error("ERR invalid pattern".into()),
-    }
-}
-
-/// Returns true if the pattern is a simple prefix (no glob chars except a trailing *)
-fn is_simple_prefix(pattern: &[u8]) -> bool {
-    let end = if pattern.ends_with(b"*") {
-        pattern.len() - 1
-    } else {
-        pattern.len()
-    };
-    !pattern[..end]
-        .iter()
-        .any(|&b| b == b'*' || b == b'?' || b == b'[' || b == b']')
-}
-
-/// Converts a Redis glob pattern to an anchored regex.
-///
-/// Redis glob rules:
-///   *      → .*       (match any sequence)
-///   ?      → .        (match one char)
-///   [abc]  → [abc]    (character class, passed through)
-///   \x     → \x       (escape, passed through)
-///   other  → escaped literal
-fn glob_to_regex(pattern: &[u8]) -> String {
-    let mut regex = String::with_capacity(pattern.len() * 2);
-    regex.push('^');
-
-    let mut i = 0;
-    while i < pattern.len() {
-        match pattern[i] {
-            b'*' => regex.push_str(".*"),
-            b'?' => regex.push('.'),
-            b'[' => {
-                regex.push('[');
-                i += 1;
-                while i < pattern.len() && pattern[i] != b']' {
-                    regex.push(pattern[i] as char);
-                    i += 1;
-                }
-                if i < pattern.len() {
-                    regex.push(']');
-                }
-            }
-            b'\\' if i + 1 < pattern.len() => {
-                regex.push('\\');
-                i += 1;
-                regex.push(pattern[i] as char);
-            }
-            // Escape regex metacharacters
-            b'.' | b'+' | b'^' | b'$' | b'{' | b'}' | b'(' | b')' | b'|' | b'#' | b'&' | b'~' => {
-                regex.push('\\');
-                regex.push(pattern[i] as char);
-            }
-            b => regex.push(b as char),
-        }
-        i += 1;
-    }
-
-    regex.push('$');
-    regex
-}
-
 fn cmd_ttl(args: &[Bytes], art: &mut OxidArt) -> Frame {
     if args.is_empty() {
         return Frame::Error("ERR wrong number of arguments for 'TTL' command".into());
@@ -809,7 +733,7 @@ fn cmd_dbsize(art: &mut OxidArt) -> Frame {
 }
 
 fn cmd_flushdb(art: &mut OxidArt) -> Frame {
-    art.deln(Bytes::new());
+    art.deln(b"");
     Frame::SimpleString(OK.clone())
 }
 
