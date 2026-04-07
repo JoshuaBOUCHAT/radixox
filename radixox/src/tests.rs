@@ -6,7 +6,7 @@ use monoio::time::Instant;
 use crate::ArtClient;
 use crate::monoio_client::monoio_art::SharedMonoIOClient;
 
-const SERVER_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8379));
+const SERVER_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 6379));
 
 // ============================================================================
 // BASIC OPERATIONS
