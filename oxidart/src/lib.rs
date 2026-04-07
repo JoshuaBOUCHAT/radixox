@@ -43,6 +43,7 @@
 //!
 //! Keys must be valid ASCII bytes. Non-ASCII keys will trigger a debug assertion.
 
+pub mod async_command;
 mod compact_str;
 pub mod error;
 pub mod hcommand;
@@ -76,6 +77,7 @@ mod test_structures;
 use bytes::Bytes;
 use hislab::HiSlab;
 use hislab::TaggedHiSlab;
+use rand::rngs::ThreadRng;
 
 use crate::compact_str::CompactStr;
 use crate::node_childs::ChildAble;
@@ -144,9 +146,9 @@ impl OxidArt {
     /// let tree = OxidArt::new();
     /// ```
     pub fn new() -> Self {
-        let mut map = TaggedHiSlab::new(20000,25000000).expect("Can't allocate oxidart");
+        let map = TaggedHiSlab::new(20000, 25000000).expect("Can't allocate oxidart");
         let root_idx = map.insert(Node::default());
-        let child_list = HiSlab::new(1000,25000000).expect("Can't allocate oxidart");
+        let child_list = HiSlab::new(1000, 25000000).expect("Can't allocate oxidart");
 
         Self {
             map,
@@ -163,6 +165,9 @@ impl OxidArt {
     pub fn set_now(&mut self, now: u64) {
         self.now = now;
     }
+    const MAX_SAMPLE: usize = 20;
+    const SAMPLE_SIZE: usize = 20;
+    const THRESHOLD: usize = Self::SAMPLE_SIZE / 4; // 25% of 20
 
     /// Evicts expired entries using Redis-style probabilistic sampling.
     ///
@@ -175,47 +180,46 @@ impl OxidArt {
     /// Returns the total number of evicted entries.
     #[cfg(feature = "ttl")]
     pub fn evict_expired(&mut self) -> usize {
-        const SAMPLE_SIZE: usize = 20;
-        const THRESHOLD: usize = 5; // 25% of 20
-
         let mut rng = rand::thread_rng();
         let mut total_evicted = 0;
 
-        loop {
-            let mut evicted_this_round = 0;
-            let mut sampled = 0;
-
-            // Sample up to SAMPLE_SIZE tagged nodes
-            for _ in 0..SAMPLE_SIZE {
-                let Some((idx, node)) = self.map.random_tagged(&mut rng) else {
-                    // No more tagged entries
-                    break;
-                };
-                sampled += 1;
-
-                // Check if expired
-                if node.is_expired(self.now) {
-                    let parent_idx = node.parent_idx;
-                    let parent_radix = node.parent_radix;
-
-                    // Don't try to delete root
-                    if parent_idx != u32::MAX {
-                        self.delete_node_for_eviction(idx, parent_idx, parent_radix);
-                        evicted_this_round += 1;
-                    }
-                }
-            }
+        for _ in 0..Self::MAX_SAMPLE {
+            let (evicted_this_round, sampled) = self.evict_cycle(&mut rng);
 
             total_evicted += evicted_this_round;
 
             // Stop if we sampled less than SAMPLE_SIZE (not enough entries)
             // or if less than 25% were expired
-            if sampled < SAMPLE_SIZE || evicted_this_round < THRESHOLD {
+            if sampled < Self::SAMPLE_SIZE || evicted_this_round < Self::THRESHOLD {
                 break;
             }
         }
 
         total_evicted
+    }
+    fn evict_cycle(&mut self, rng: &mut ThreadRng) -> (usize, usize) {
+        let mut evicted_this_round = 0;
+        let mut sampled = 0;
+        for _ in 0..Self::SAMPLE_SIZE {
+            let Some((idx, node)) = self.map.random_tagged(rng) else {
+                // No more tagged entries
+                break;
+            };
+            sampled += 1;
+
+            // Check if expired
+            if node.is_expired(self.now) {
+                let parent_idx = node.parent_idx;
+                let parent_radix = node.parent_radix;
+
+                // Don't try to delete root
+                if parent_idx != u32::MAX {
+                    self.delete_node_for_eviction(idx, parent_idx, parent_radix);
+                    evicted_this_round += 1;
+                }
+            }
+        }
+        (evicted_this_round, sampled)
     }
 
     /// Delete a node during TTL eviction (similar to delete_node_inline but uses stored parent info)
@@ -1122,7 +1126,7 @@ impl OxidArt {
     /// // Only post entries remain
     /// assert_eq!(tree.getn(Bytes::from_static(b"")).len(), 1);
     /// ```
-    pub fn deln(&mut self, prefix: Bytes) -> usize {
+    pub fn deln(&mut self, prefix: &[u8]) -> usize {
         debug_assert!(prefix.is_ascii(), "prefix must be ASCII");
         let prefix_len = prefix.len();
 

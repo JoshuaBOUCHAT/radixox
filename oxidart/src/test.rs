@@ -438,7 +438,7 @@ fn test_deln_basic() {
     );
     art.set(Bytes::from_static(b"post:1"), Value::from_str("post_1"));
 
-    let deleted = art.deln(Bytes::from_static(b"user:"));
+    let deleted = art.deln(b"user:");
 
     assert_eq!(deleted, 3);
     assert_eq!(art.get(&Bytes::from_static(b"user:alice")), None);
@@ -459,7 +459,7 @@ fn test_deln_empty_prefix() {
     art.set(Bytes::from_static(b"b"), Value::from_str("2"));
     art.set(Bytes::from_static(b"c"), Value::from_str("3"));
 
-    let deleted = art.deln(Bytes::from_static(b""));
+    let deleted = art.deln(b"");
 
     assert_eq!(deleted, 3);
     assert_eq!(art.get(&Bytes::from_static(b"a")), None);
@@ -473,7 +473,7 @@ fn test_deln_no_match() {
 
     art.set(Bytes::from_static(b"user:alice"), Value::from_str("data"));
 
-    let deleted = art.deln(Bytes::from_static(b"post:"));
+    let deleted = art.deln(b"post:");
 
     assert_eq!(deleted, 0);
     // user:alice doit toujours exister
@@ -495,7 +495,7 @@ fn test_deln_exact_key_with_children() {
     art.set(Bytes::from_static(b"user:bob"), Value::from_str("bob_val"));
 
     // Supprimer "user" et tous ses descendants
-    let deleted = art.deln(Bytes::from_static(b"user"));
+    let deleted = art.deln(b"user");
 
     assert_eq!(deleted, 3);
     assert_eq!(art.get(&Bytes::from_static(b"user")), None);
@@ -514,7 +514,7 @@ fn test_deln_prefix_in_compression() {
     art.set(Bytes::from_static(b"apple"), Value::from_str("apple_val"));
 
     // "app" est un préfixe commun
-    let deleted = art.deln(Bytes::from_static(b"app"));
+    let deleted = art.deln(b"app");
 
     assert_eq!(deleted, 2);
     assert_eq!(art.get(&Bytes::from_static(b"application")), None);
@@ -532,7 +532,7 @@ fn test_deln_with_nested_keys() {
     art.set(Bytes::from_static(b"abd"), Value::from_str("5"));
     art.set(Bytes::from_static(b"b"), Value::from_str("6"));
 
-    let deleted = art.deln(Bytes::from_static(b"ab"));
+    let deleted = art.deln(b"ab");
 
     assert_eq!(deleted, 4); // ab, abc, abcd, abd
     assert_eq!(
@@ -558,7 +558,7 @@ fn test_deln_many_children() {
         art.set(key, val);
     }
 
-    let deleted = art.deln(Bytes::from_static(b"x:"));
+    let deleted = art.deln(b"x:");
 
     assert_eq!(deleted, 20);
 
@@ -574,7 +574,7 @@ fn test_deln_then_insert() {
     let mut art = OxidArt::new();
 
     art.set(Bytes::from_static(b"user:alice"), Value::from_str("old"));
-    art.deln(Bytes::from_static(b"user:"));
+    art.deln(b"user:");
 
     // Réinsérer après suppression
     art.set(Bytes::from_static(b"user:bob"), Value::from_str("new"));
@@ -595,7 +595,7 @@ fn test_deln_partial_match() {
     art.set(Bytes::from_static(b"world"), Value::from_str("3"));
 
     // "hel" matche "hello" et "help"
-    let deleted = art.deln(Bytes::from_static(b"hel"));
+    let deleted = art.deln(b"hel");
 
     assert_eq!(deleted, 2);
     assert_eq!(art.get(&Bytes::from_static(b"hello")), None);
@@ -772,7 +772,7 @@ fn test_evict_expired_basic() {
 
     // Evict expired entries (may need multiple calls due to probabilistic sampling)
     let mut total_evicted = 0;
-    for _ in 0..10 {
+    for _ in 0..30 {
         let evicted = art.evict_expired();
         total_evicted += evicted;
         if evicted == 0 {

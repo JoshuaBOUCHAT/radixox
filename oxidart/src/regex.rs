@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use regex_automata::dfa::{dense::DFA, Automaton};
+use regex_automata::dfa::{Automaton, dense::DFA};
 use regex_automata::util::primitives::StateID;
 use regex_automata::{Anchored, Input, MatchError};
 
@@ -83,23 +83,20 @@ impl OxidArt {
         // Stack entries: (node_idx, key_path, dfa_state after radix byte)
         let mut stack: Vec<(u32, Vec<u8>, StateID)> = vec![(root_idx, Vec::new(), start_state)];
 
-        while let Some((node_idx, mut key_path, mut state)) = stack.pop() {
+        'loo: while let Some((node_idx, mut key_path, mut state)) = stack.pop() {
             let Some(node) = self.try_get_node(node_idx) else {
                 continue;
             };
 
             // Feed compression bytes into the DFA
-            let mut dead = false;
+
             for &b in node.compression.iter() {
                 state = dfa.next_state(state, b);
                 if dfa.is_dead_state(state) {
-                    dead = true;
-                    break;
+                    continue 'loo;
                 }
             }
-            if dead {
-                continue; // Prune
-            }
+
             key_path.extend_from_slice(&node.compression);
 
             // Check if this node's key is a full match via EOI transition
@@ -129,14 +126,38 @@ mod tests {
 
     fn make_tree() -> OxidArt {
         let mut tree = OxidArt::new();
-        tree.set(Bytes::from_static(b"user:1:admin:alice"), Value::String(Bytes::from_static(b"a")));
-        tree.set(Bytes::from_static(b"user:2:viewer:bob"), Value::String(Bytes::from_static(b"b")));
-        tree.set(Bytes::from_static(b"user:3:admin:charlie"), Value::String(Bytes::from_static(b"c")));
-        tree.set(Bytes::from_static(b"user:4:editor:dave"), Value::String(Bytes::from_static(b"d")));
-        tree.set(Bytes::from_static(b"post:1:title"), Value::String(Bytes::from_static(b"hello")));
-        tree.set(Bytes::from_static(b"post:2:title"), Value::String(Bytes::from_static(b"world")));
-        tree.set(Bytes::from_static(b"config:db:host"), Value::String(Bytes::from_static(b"localhost")));
-        tree.set(Bytes::from_static(b"config:db:port"), Value::String(Bytes::from_static(b"5432")));
+        tree.set(
+            Bytes::from_static(b"user:1:admin:alice"),
+            Value::String(Bytes::from_static(b"a")),
+        );
+        tree.set(
+            Bytes::from_static(b"user:2:viewer:bob"),
+            Value::String(Bytes::from_static(b"b")),
+        );
+        tree.set(
+            Bytes::from_static(b"user:3:admin:charlie"),
+            Value::String(Bytes::from_static(b"c")),
+        );
+        tree.set(
+            Bytes::from_static(b"user:4:editor:dave"),
+            Value::String(Bytes::from_static(b"d")),
+        );
+        tree.set(
+            Bytes::from_static(b"post:1:title"),
+            Value::String(Bytes::from_static(b"hello")),
+        );
+        tree.set(
+            Bytes::from_static(b"post:2:title"),
+            Value::String(Bytes::from_static(b"world")),
+        );
+        tree.set(
+            Bytes::from_static(b"config:db:host"),
+            Value::String(Bytes::from_static(b"localhost")),
+        );
+        tree.set(
+            Bytes::from_static(b"config:db:port"),
+            Value::String(Bytes::from_static(b"5432")),
+        );
         tree
     }
 
@@ -167,7 +188,10 @@ mod tests {
         let results = tree.getn_regex("config:db:host").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.as_ref(), b"config:db:host");
-        assert_eq!(results[0].1, &Value::String(Bytes::from_static(b"localhost")));
+        assert_eq!(
+            results[0].1,
+            &Value::String(Bytes::from_static(b"localhost"))
+        );
     }
 
     #[test]
@@ -210,7 +234,10 @@ mod tests {
             std::time::Duration::from_secs(10),
             Value::String(Bytes::from_static(b"val")),
         );
-        tree.set(Bytes::from_static(b"user:2:admin:y"), Value::String(Bytes::from_static(b"val2")));
+        tree.set(
+            Bytes::from_static(b"user:2:admin:y"),
+            Value::String(Bytes::from_static(b"val2")),
+        );
 
         // Before expiry
         let results = tree.getn_regex("user:.*:admin:.*").unwrap();
