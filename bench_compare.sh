@@ -50,7 +50,6 @@ kill_port() {
   if [ -n "$pid" ]; then
     echo "  Stopping server (pid $pid)..."
     kill "$pid" 2>/dev/null || true
-    # Wait until port is free
     for i in $(seq 1 20); do
       if ! ss -tlnp "sport = :$PORT" 2>/dev/null | grep -q ":$PORT"; then
         return 0
@@ -59,6 +58,12 @@ kill_port() {
     done
     kill -9 "$pid" 2>/dev/null || true
   fi
+}
+
+# Read peak RSS (VmHWM) from /proc/<pid>/status, returns value in MB
+peak_rss_mb() {
+  local pid=$1
+  awk '/VmHWM/ {printf "%.0f", $2/1024}' "/proc/$pid/status" 2>/dev/null || echo "N/A"
 }
 
 run_ycsb() {
@@ -95,8 +100,6 @@ parse_stat() {
   grep -F "$metric" "$file" 2>/dev/null | awk '{print $3}' | head -1 || true
 }
 
-# Parse p99.9 / p99.99 from the inline status line:
-# "... [READ: Count=N, ..., 99.9=740, 99.99=4591] ..."
 parse_inline_pct() {
   local file=$1
   local op=$2  # READ, UPDATE, INSERT
@@ -109,7 +112,7 @@ parse_inline_pct() {
 # Build RadixOx
 # ============================================
 echo "═══════════════════════════════════════════════════"
-echo "  YCSB Benchmark: RadixOx vs Redis"
+echo "  YCSB Benchmark: RadixOx vs Valkey"
 echo "  Workload A: 50% read / 50% update"
 echo "  Records: $RECORDS | Ops: $OPS | Threads: $THREADS"
 echo "  Field length: $FIELDLENGTH bytes"
@@ -149,37 +152,45 @@ RADIXOX_READ_P999=$(parse_inline_pct /tmp/radixox_run.txt READ 99.9)
 RADIXOX_READ_P9999=$(parse_inline_pct /tmp/radixox_run.txt READ 99.99)
 RADIXOX_UPDATE_P99=$(parse_stat /tmp/radixox_run.txt "[UPDATE], 99thPercentileLatency")
 echo "  Run: $RADIXOX_RUN_OPS ops/sec"
+
+# Read peak RSS before killing
+RADIXOX_PEAK_MB=$(peak_rss_mb "$RADIXOX_PID")
+echo "  Peak RSS: ${RADIXOX_PEAK_MB} MB"
 echo ""
 
 kill_port
 
 # ============================================
-# Redis Benchmark
+# Valkey Benchmark
 # ============================================
-echo "[3/4] Starting Redis on :$PORT..."
-taskset -c 0-1 redis-server --port "$PORT" --daemonize no --save "" --appendonly no --dir /tmp &
-REDIS_PID=$!
+echo "[3/4] Starting Valkey on :$PORT..."
+taskset -c 0-1 valkey-server --port "$PORT" --daemonize no --save "" --appendonly no --dir /tmp &
+VALKEY_PID=$!
 wait_for_server
 
-echo "[4/4] Benchmarking Redis..."
+echo "[4/4] Benchmarking Valkey..."
 echo "  Loading $RECORDS records..."
-CURRENT_LOG=/tmp/redis_load.txt
-run_ycsb load /tmp/redis_load.txt
-REDIS_LOAD_OPS=$(parse_stat /tmp/redis_load.txt "Throughput(ops/sec)")
-REDIS_LOAD_P99=$(parse_stat /tmp/redis_load.txt "[INSERT], 99thPercentileLatency")
-echo "  Load: $REDIS_LOAD_OPS ops/sec | P99: $REDIS_LOAD_P99 µs"
+CURRENT_LOG=/tmp/valkey_load.txt
+run_ycsb load /tmp/valkey_load.txt
+VALKEY_LOAD_OPS=$(parse_stat /tmp/valkey_load.txt "Throughput(ops/sec)")
+VALKEY_LOAD_P99=$(parse_stat /tmp/valkey_load.txt "[INSERT], 99thPercentileLatency")
+echo "  Load: $VALKEY_LOAD_OPS ops/sec | P99: $VALKEY_LOAD_P99 µs"
 
 echo "  Running $OPS operations..."
-CURRENT_LOG=/tmp/redis_run.txt
-run_ycsb run /tmp/redis_run.txt
-REDIS_RUN_OPS=$(parse_stat /tmp/redis_run.txt "Throughput(ops/sec)")
-REDIS_READ_AVG=$(parse_stat /tmp/redis_run.txt "[READ], AverageLatency")
-REDIS_READ_P95=$(parse_stat /tmp/redis_run.txt "[READ], 95thPercentileLatency")
-REDIS_READ_P99=$(parse_stat /tmp/redis_run.txt "[READ], 99thPercentileLatency")
-REDIS_READ_P999=$(parse_inline_pct /tmp/redis_run.txt READ 99.9)
-REDIS_READ_P9999=$(parse_inline_pct /tmp/redis_run.txt READ 99.99)
-REDIS_UPDATE_P99=$(parse_stat /tmp/redis_run.txt "[UPDATE], 99thPercentileLatency")
-echo "  Run: $REDIS_RUN_OPS ops/sec"
+CURRENT_LOG=/tmp/valkey_run.txt
+run_ycsb run /tmp/valkey_run.txt
+VALKEY_RUN_OPS=$(parse_stat /tmp/valkey_run.txt "Throughput(ops/sec)")
+VALKEY_READ_AVG=$(parse_stat /tmp/valkey_run.txt "[READ], AverageLatency")
+VALKEY_READ_P95=$(parse_stat /tmp/valkey_run.txt "[READ], 95thPercentileLatency")
+VALKEY_READ_P99=$(parse_stat /tmp/valkey_run.txt "[READ], 99thPercentileLatency")
+VALKEY_READ_P999=$(parse_inline_pct /tmp/valkey_run.txt READ 99.9)
+VALKEY_READ_P9999=$(parse_inline_pct /tmp/valkey_run.txt READ 99.99)
+VALKEY_UPDATE_P99=$(parse_stat /tmp/valkey_run.txt "[UPDATE], 99thPercentileLatency")
+echo "  Run: $VALKEY_RUN_OPS ops/sec"
+
+# Read peak RSS before killing
+VALKEY_PEAK_MB=$(peak_rss_mb "$VALKEY_PID")
+echo "  Peak RSS: ${VALKEY_PEAK_MB} MB"
 echo ""
 
 kill_port
@@ -194,45 +205,48 @@ winner() {
     return
   fi
   if [ "$higher" = "1" ]; then
-    echo "$a $b" | awk '{print ($1 > $2) ? "RadixOx" : "Redis"}'
+    echo "$a $b" | awk '{print ($1 > $2) ? "RadixOx" : "Valkey"}'
   else
-    echo "$a $b" | awk '{print ($1 < $2) ? "RadixOx" : "Redis"}'
+    echo "$a $b" | awk '{print ($1 < $2) ? "RadixOx" : "Valkey"}'
   fi
 }
 
 echo "═══════════════════════════════════════════════════"
 echo "  RESULTS COMPARISON"
 echo "═══════════════════════════════════════════════════"
-printf "%-28s %12s %12s %10s\n" "Metric" "RadixOx" "Redis" "Winner"
+printf "%-28s %12s %12s %10s\n" "Metric" "RadixOx" "Valkey" "Winner"
 echo "-----------------------------------------------------------"
 printf "%-28s %12s %12s %10s\n" "Load throughput (ops/sec)" \
-  "$RADIXOX_LOAD_OPS" "$REDIS_LOAD_OPS" \
-  "$(winner "$RADIXOX_LOAD_OPS" "$REDIS_LOAD_OPS" 1)"
+  "$RADIXOX_LOAD_OPS" "$VALKEY_LOAD_OPS" \
+  "$(winner "$RADIXOX_LOAD_OPS" "$VALKEY_LOAD_OPS" 1)"
 printf "%-28s %12s %12s %10s\n" "Load P99 (µs)" \
-  "$RADIXOX_LOAD_P99" "$REDIS_LOAD_P99" \
-  "$(winner "$RADIXOX_LOAD_P99" "$REDIS_LOAD_P99" 0)"
+  "$RADIXOX_LOAD_P99" "$VALKEY_LOAD_P99" \
+  "$(winner "$RADIXOX_LOAD_P99" "$VALKEY_LOAD_P99" 0)"
 echo ""
 printf "%-28s %12s %12s %10s\n" "Run throughput (ops/sec)" \
-  "$RADIXOX_RUN_OPS" "$REDIS_RUN_OPS" \
-  "$(winner "$RADIXOX_RUN_OPS" "$REDIS_RUN_OPS" 1)"
+  "$RADIXOX_RUN_OPS" "$VALKEY_RUN_OPS" \
+  "$(winner "$RADIXOX_RUN_OPS" "$VALKEY_RUN_OPS" 1)"
 printf "%-28s %12s %12s %10s\n" "READ avg (µs)" \
-  "$RADIXOX_READ_AVG" "$REDIS_READ_AVG" \
-  "$(winner "$RADIXOX_READ_AVG" "$REDIS_READ_AVG" 0)"
+  "$RADIXOX_READ_AVG" "$VALKEY_READ_AVG" \
+  "$(winner "$RADIXOX_READ_AVG" "$VALKEY_READ_AVG" 0)"
 printf "%-28s %12s %12s %10s\n" "READ P95 (µs)" \
-  "$RADIXOX_READ_P95" "$REDIS_READ_P95" \
-  "$(winner "$RADIXOX_READ_P95" "$REDIS_READ_P95" 0)"
+  "$RADIXOX_READ_P95" "$VALKEY_READ_P95" \
+  "$(winner "$RADIXOX_READ_P95" "$VALKEY_READ_P95" 0)"
 printf "%-28s %12s %12s %10s\n" "READ P99 (µs)" \
-  "$RADIXOX_READ_P99" "$REDIS_READ_P99" \
-  "$(winner "$RADIXOX_READ_P99" "$REDIS_READ_P99" 0)"
+  "$RADIXOX_READ_P99" "$VALKEY_READ_P99" \
+  "$(winner "$RADIXOX_READ_P99" "$VALKEY_READ_P99" 0)"
 printf "%-28s %12s %12s %10s\n" "READ P99.9 (µs)" \
-  "$RADIXOX_READ_P999" "$REDIS_READ_P999" \
-  "$(winner "$RADIXOX_READ_P999" "$REDIS_READ_P999" 0)"
+  "$RADIXOX_READ_P999" "$VALKEY_READ_P999" \
+  "$(winner "$RADIXOX_READ_P999" "$VALKEY_READ_P999" 0)"
 printf "%-28s %12s %12s %10s\n" "READ P99.99 (µs)" \
-  "$RADIXOX_READ_P9999" "$REDIS_READ_P9999" \
-  "$(winner "$RADIXOX_READ_P9999" "$REDIS_READ_P9999" 0)"
+  "$RADIXOX_READ_P9999" "$VALKEY_READ_P9999" \
+  "$(winner "$RADIXOX_READ_P9999" "$VALKEY_READ_P9999" 0)"
 printf "%-28s %12s %12s %10s\n" "UPDATE P99 (µs)" \
-  "$RADIXOX_UPDATE_P99" "$REDIS_UPDATE_P99" \
-  "$(winner "$RADIXOX_UPDATE_P99" "$REDIS_UPDATE_P99" 0)"
+  "$RADIXOX_UPDATE_P99" "$VALKEY_UPDATE_P99" \
+  "$(winner "$RADIXOX_UPDATE_P99" "$VALKEY_UPDATE_P99" 0)"
 echo ""
-echo "Full logs: /tmp/radixox_{load,run}.txt  /tmp/redis_{load,run}.txt"
-
+printf "%-28s %12s %12s %10s\n" "Peak RSS (MB)" \
+  "${RADIXOX_PEAK_MB}" "${VALKEY_PEAK_MB}" \
+  "$(winner "$RADIXOX_PEAK_MB" "$VALKEY_PEAK_MB" 0)"
+echo ""
+echo "Full logs: /tmp/radixox_{load,run}.txt  /tmp/valkey_{load,run}.txt"
