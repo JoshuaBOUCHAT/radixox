@@ -608,7 +608,6 @@ fn test_deln_partial_match() {
 
 // ============ Tests TTL ============
 
-#[cfg(feature = "ttl")]
 #[test]
 fn test_ttl_expired_on_get() {
     use std::time::Duration;
@@ -657,7 +656,6 @@ fn test_ttl_expired_on_get() {
     );
 }
 
-#[cfg(feature = "ttl")]
 #[test]
 fn test_ttl_getn_filters_expired() {
     use std::time::Duration;
@@ -707,7 +705,6 @@ fn test_ttl_getn_filters_expired() {
     );
 }
 
-#[cfg(feature = "ttl")]
 #[test]
 fn test_ttl_cleanup_on_expired_get() {
     use std::time::Duration;
@@ -741,7 +738,6 @@ fn test_ttl_cleanup_on_expired_get() {
     );
 }
 
-#[cfg(feature = "ttl")]
 #[test]
 fn test_evict_expired_basic() {
     use std::time::Duration;
@@ -796,7 +792,6 @@ fn test_evict_expired_basic() {
     }
 }
 
-#[cfg(feature = "ttl")]
 #[test]
 fn test_evict_expired_partial() {
     use std::time::Duration;

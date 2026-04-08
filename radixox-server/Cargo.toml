@@ -1,45 +1,28 @@
 [package]
-name = "radixox-server"
+name = "radixox"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "RadixOx server - Redis-like data store"
-default-run = "radixox-resp"
+description = "RadixOx — Redis-compatible in-memory key-value store"
 
 [[bin]]
-name = "radixox-legacy"
-path = "src/bin/legacy.rs"
-required-features = ["legacy"]
-
-[[bin]]
-name = "radixox-resp"
+name = "radixox"
 path = "src/bin/resp.rs"
-required-features = ["resp"]
-
-[features]
-default = ["legacy", "resp"]
-legacy = ["dep:prost", "dep:radixox-common"]
-resp = ["dep:redis-protocol"]
 
 [dependencies]
 monoio.workspace = true
 bytes.workspace = true
-oxidart.workspace = true
+oxidart = { workspace = true, features = ["regex"] }
+radixox-lib = { workspace = true }
 smallvec.workspace = true
-
-# Legacy protocol (protobuf)
-prost = { workspace = true, optional = true }
-radixox-common = { workspace = true, optional = true }
-
-# Redis protocol (RESP)
 redis-protocol = { version = "6.0.0", default-features = false, features = [
     "std",
     "resp2",
     "resp3",
     "bytes",
-], optional = true }
+] }
 local-sync = "0.1.1"
 io-uring = "0.6.4"
 

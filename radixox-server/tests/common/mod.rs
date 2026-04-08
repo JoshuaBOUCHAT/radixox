@@ -16,7 +16,7 @@ pub fn start_server(port: u16) {
     // Give the OS a moment to release the port.
     std::thread::sleep(Duration::from_millis(150));
 
-    let bin = env!("CARGO_BIN_EXE_radixox-resp");
+    let bin = "../../../target/release/radixox-resp";
     let child = Command::new(bin)
         .env("RADIXOX_PORT", port.to_string())
         .stdout(Stdio::null())

@@ -10,7 +10,7 @@ OPS=10000000
 THREADS=100
 FIELDLENGTH=100
 
-RADIXOX_BIN="$SCRIPT_DIR/target/lto/radixox-resp"
+RADIXOX_BIN="$SCRIPT_DIR/target/lto/radixox"
 CURRENT_LOG=""
 
 # ============================================

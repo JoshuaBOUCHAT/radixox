@@ -12,18 +12,9 @@ bytes.workspace = true
 arrayvec = "0.7.6"
 smallvec.workspace = true
 ordered-float = "5.1.0"
-
-monoio = { optional = true, workspace = true }
-
-
-tokio = { version = "1", features = [
-    "time",
-    "sync",
-    "rt",
-    "macros",
-], optional = true }
-hislab = { path="../../hislab",optional=true }
-rand = { version = "0.8", optional = true }
+monoio.workspace = true
+hislab = { path = "../../hislab", features = ["rand"] }
+rand = "0.8"
 regex-automata = { version = "0.4", optional = true, default-features = false, features = [
     "dfa-build",
     "dfa-search",
@@ -32,8 +23,4 @@ regex-automata = { version = "0.4", optional = true, default-features = false, f
 thin-vec = "0.2.14"
 
 [features]
-default = ["ttl"]
-ttl = ["hislab", "hislab/rand", "dep:rand"]
-monoio = ["dep:monoio", "ttl"]
-tokio = ["dep:tokio", "ttl"]
-regex = ["dep:regex-automata", "ttl"]
+regex = ["dep:regex-automata"]

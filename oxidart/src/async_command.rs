@@ -312,7 +312,7 @@ impl OxidArtAsync for Rc<RefCell<OxidArt>> {
     }
 }
 
-#[cfg(all(test, feature = "monoio"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::value::Value;

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use local_sync::mpsc::unbounded;
-use monoio::io::{AsyncReadRent, AsyncWriteRentExt, Splitable};
+use monoio::io::{AsyncReadRent, AsyncWriteRentExt, OwnedWriteHalf, Splitable};
 use monoio::net::{TcpListener, TcpStream};
 use monoio::time::TimeDriver;
 use monoio::{IoUringDriver, Runtime, RuntimeBuilder};
@@ -189,52 +189,15 @@ async fn handle_connection(
         read_buf.extend_from_slice(&io_buf[..n]);
         io_buf.clear();
 
-        loop {
-            let frame = match decode_bytes_mut(&mut read_buf) {
-                Ok(Some((frame, _, _))) => frame,
-                Ok(None) => break,
-                Err(e) => {
-                    eprintln!("Parse error: {:?}", e);
-                    conn.send(Frame::Error(format!("ERR parse error: {:?}", e).into()));
-                    break;
-                }
-            };
-
-            let args = match frame_to_args(frame) {
-                Some(args) if !args.is_empty() => args,
-                _ => {
-                    conn.send(Frame::Error(ERR_EMPTY_CMD.into()));
-                    continue;
-                }
-            };
-
-            let cmd = &args[0];
-
-            if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") {
-                if conn.sub_tx.is_none() {
-                    let (tx, rx) = unbounded::channel::<Bytes>();
-                    let mut w = write_half.take().unwrap();
-                    if !conn.write_buf.is_empty() {
-                        let buf = std::mem::replace(&mut conn.write_buf, BytesMut::new());
-                        let (res, ret) = w.write_all(buf).await;
-                        conn.write_buf = ret;
-                        res?;
-                        conn.write_buf.clear();
-                    }
-                    monoio::spawn(pubsub_writer(rx, w));
-                    conn.sub_tx = Some(tx);
-                }
-                handle_subscribe(
-                    &args[1..],
-                    &registry,
-                    conn_id,
-                    &mut conn.sub_channels,
-                    conn.sub_tx.as_ref().unwrap(),
-                );
-            } else {
-                conn.handle_cmd(cmd, &args[1..], &art, &registry).await;
-            }
-        }
+        handle_buffer(
+            &mut read_buf,
+            &mut conn,
+            &mut write_half,
+            &registry,
+            conn_id,
+            art.clone(),
+        )
+        .await?;
 
         // Flush (normal mode only — subscriber mode writes go through channel)
         if let Some(w) = &mut write_half
@@ -250,6 +213,61 @@ async fn handle_connection(
 
     cleanup_subscriptions(&registry, conn_id, &conn.sub_channels);
     Ok(())
+}
+async fn handle_buffer(
+    read_buf: &mut BytesMut,
+    conn: &mut Conn,
+    write_half: &mut Option<OwnedWriteHalf<TcpStream>>,
+    registry: &SharedRegistry,
+    conn_id: ConnId,
+    art: SharedART,
+) -> IOResult<()> {
+    loop {
+        let frame = match decode_bytes_mut(read_buf) {
+            Ok(Some((frame, _, _))) => frame,
+            Ok(None) => break Ok(()),
+            Err(e) => {
+                eprintln!("Parse error: {:?}", e);
+                conn.send(Frame::Error(format!("ERR parse error: {:?}", e).into()));
+                break Ok(());
+            }
+        };
+
+        let args = match frame_to_args(frame) {
+            Some(args) if !args.is_empty() => args,
+            _ => {
+                conn.send(Frame::Error(ERR_EMPTY_CMD.into()));
+                continue;
+            }
+        };
+
+        let cmd = &args[0];
+
+        if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") {
+            if conn.sub_tx.is_none() {
+                let (tx, rx) = unbounded::channel::<Bytes>();
+                let mut w = write_half.take().unwrap();
+                if !conn.write_buf.is_empty() {
+                    let buf = std::mem::replace(&mut conn.write_buf, BytesMut::new());
+                    let (res, ret) = w.write_all(buf).await;
+                    conn.write_buf = ret;
+                    res?;
+                    conn.write_buf.clear();
+                }
+                monoio::spawn(pubsub_writer(rx, w));
+                conn.sub_tx = Some(tx);
+            }
+            handle_subscribe(
+                &args[1..],
+                &registry,
+                conn_id,
+                &mut conn.sub_channels,
+                conn.sub_tx.as_ref().unwrap(),
+            );
+        } else {
+            conn.handle_cmd(cmd, &args[1..], &art, &registry).await;
+        }
+    }
 }
 
 /// Writer task spawned per subscriber. Owns the write half exclusively.

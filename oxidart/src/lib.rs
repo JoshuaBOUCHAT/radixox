@@ -53,15 +53,8 @@ pub mod value;
 pub mod zcommand;
 pub mod zset_inner;
 
-// Prevent enabling both async runtimes at once
-#[cfg(all(feature = "monoio", feature = "tokio"))]
-compile_error!("Features 'monoio' and 'tokio' are mutually exclusive. Please enable only one.");
-
-#[cfg(feature = "monoio")]
 pub mod monoio;
 
-#[cfg(feature = "tokio")]
-pub mod tokio;
 
 pub mod counter;
 
@@ -86,11 +79,9 @@ use crate::node_childs::HugeChilds;
 use crate::value::Value;
 
 /// Internal sentinel value indicating no expiration (never expires)
-#[cfg(feature = "ttl")]
 const NO_EXPIRY: u64 = u64::MAX;
 
 /// Result of a TTL lookup operation.
-#[cfg(feature = "ttl")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TtlResult {
     /// The key does not exist.
@@ -123,7 +114,6 @@ pub struct OxidArt {
     pub(crate) child_list: HiSlab<HugeChilds>,
     /// Current timestamp (seconds since UNIX epoch).
     /// The server is responsible for updating this via `set_now()`.
-    #[cfg(feature = "ttl")]
     pub now: u64,
     root_idx: u32,
 }
@@ -154,13 +144,11 @@ impl OxidArt {
             map,
             root_idx,
             child_list,
-            #[cfg(feature = "ttl")]
             now: 0,
         }
     }
 
     /// Updates the current timestamp. Call this periodically from your async runtime.
-    #[cfg(feature = "ttl")]
     #[inline]
     pub fn set_now(&mut self, now: u64) {
         self.now = now;
@@ -178,7 +166,6 @@ impl OxidArt {
     /// 4. Stop when < 25% expired or no more entries
     ///
     /// Returns the total number of evicted entries.
-    #[cfg(feature = "ttl")]
     pub fn evict_expired(&mut self) -> usize {
         let mut rng = rand::thread_rng();
         let mut total_evicted = 0;
@@ -223,7 +210,6 @@ impl OxidArt {
     }
 
     /// Delete a node during TTL eviction (similar to delete_node_inline but uses stored parent info)
-    #[cfg(feature = "ttl")]
     fn delete_node_for_eviction(&mut self, target_idx: u32, parent_idx: u32, parent_radix: u8) {
         let has_children = {
             let Some(node) = self.try_get_node(target_idx) else {
@@ -255,7 +241,6 @@ impl OxidArt {
     }
 
     /// Insert a node with TTL tag (for random sampling during expiration)
-    #[cfg(feature = "ttl")]
     #[inline]
     fn insert_tagged(&mut self, node: Node) -> u32 {
         self.map.insert_tagged(node)
@@ -301,10 +286,7 @@ impl OxidArt {
     pub fn get(&mut self, key: &[u8]) -> Option<&Value> {
         let idx = self.get_idx(key)?;
         debug_assert!(key.is_ascii(), "key must be ASCII");
-        #[cfg(feature = "ttl")]
         return self.get_node(idx).get_value(self.now);
-        #[cfg(not(feature = "ttl"))]
-        return self.get_node(idx).get_value();
     }
     pub(crate) fn get_mut(&mut self, key: &[u8]) -> Option<&mut Value> {
         let idx = self.get_idx(key)?;
@@ -316,21 +298,15 @@ impl OxidArt {
         debug_assert!(key.is_ascii(), "key must be ASCII");
         let key_len = key.len();
         if key_len == 0 {
-            #[cfg(feature = "ttl")]
             if self.get_node(self.root_idx).is_expired(self.now) {
                 self.get_node_mut(self.root_idx).val = None;
                 self.try_recompress(self.root_idx);
                 return None;
             }
-            #[cfg(feature = "ttl")]
             return Some(self.root_idx);
-            #[cfg(not(feature = "ttl"))]
-            return self.get_node(self.root_idx).get_value();
         }
 
-        #[cfg(feature = "ttl")]
         let mut parent_idx = self.root_idx;
-        #[cfg(feature = "ttl")]
         let mut parent_radix = key[0];
         let mut idx = self.find(self.root_idx, key[0])?;
         let mut cursor = 1;
@@ -339,22 +315,17 @@ impl OxidArt {
             let node = self.try_get_node(idx)?;
             match node.compare_compression_key(&key[cursor..]) {
                 CompResult::Final => {
-                    #[cfg(feature = "ttl")]
                     if node.is_expired(self.now) {
                         self.delete_node_inline(idx, parent_idx, parent_radix);
                         return None;
                     }
-                    #[cfg(feature = "ttl")]
                     return Some(idx);
-                    #[cfg(not(feature = "ttl"))]
-                    return self.get_node(idx).get_value();
                 }
                 CompResult::Partial(_) => return None,
                 CompResult::Path => {
                     cursor += node.compression.len();
                 }
             }
-            #[cfg(feature = "ttl")]
             {
                 parent_idx = idx;
                 parent_radix = key[cursor];
@@ -371,7 +342,6 @@ impl OxidArt {
     /// - `TtlResult::KeyNotExist` - The key does not exist or is expired
     /// - `TtlResult::KeyWithTtl(remaining)` - The key exists with remaining seconds until expiration
     /// - `TtlResult::KeyWithoutTtl` - The key exists but has no TTL (permanent)
-    #[cfg(feature = "ttl")]
     pub fn get_ttl(&self, key: Bytes) -> TtlResult {
         debug_assert!(key.is_ascii(), "key must be ASCII");
 
@@ -392,7 +362,6 @@ impl OxidArt {
     /// Sets a TTL on an existing key.
     ///
     /// Returns `true` if the key exists and the TTL was set, `false` otherwise.
-    #[cfg(feature = "ttl")]
     pub fn expire(&mut self, key: Bytes, ttl: std::time::Duration) -> bool {
         debug_assert!(key.is_ascii(), "key must be ASCII");
 
@@ -422,7 +391,6 @@ impl OxidArt {
     /// Removes the TTL from a key, making it permanent.
     ///
     /// Returns `true` if the key exists and had a TTL, `false` otherwise.
-    #[cfg(feature = "ttl")]
     pub fn persist(&mut self, key: Bytes) -> bool {
         debug_assert!(key.is_ascii(), "key must be ASCII");
 
@@ -447,7 +415,6 @@ impl OxidArt {
     }
 
     /// Traverses to a key and returns the node index if found.
-    #[cfg(feature = "ttl")]
     pub(crate) fn traverse_to_key(&self, key: &[u8]) -> Option<u32> {
         let key_len = key.len();
         if key_len == 0 {
@@ -514,7 +481,6 @@ impl OxidArt {
     /// Returns a mutable reference to the value at a node index.
     /// Returns `None` if the node has no value or the value is expired.
     /// TTL is preserved — only the value bytes can be modified.
-    #[cfg(feature = "ttl")]
     pub(crate) fn node_value_mut(&mut self, idx: u32) -> Option<&mut Value> {
         let now = self.now;
         let (val, ttl) = self.get_node_mut(idx).val.as_mut()?;
@@ -525,7 +491,6 @@ impl OxidArt {
     }
 
     /// Deletes a node inline (used for TTL expiration cleanup)
-    #[cfg(feature = "ttl")]
     fn delete_node_inline(&mut self, target_idx: u32, parent_idx: u32, parent_radix: u8) {
         let has_children = {
             let node = self.get_node(target_idx);
@@ -633,12 +598,7 @@ impl OxidArt {
             return;
         };
 
-        #[cfg(feature = "ttl")]
         if let Some(val) = node.get_value(self.now) {
-            results.push((Bytes::from(key_path.clone()), val));
-        }
-        #[cfg(not(feature = "ttl"))]
-        if let Some(val) = node.get_value() {
             results.push((Bytes::from(key_path.clone()), val));
         }
 
@@ -662,12 +622,7 @@ impl OxidArt {
 
         key_prefix.extend_from_slice(&node.compression);
 
-        #[cfg(feature = "ttl")]
         if let Some(val) = node.get_value(self.now) {
-            results.push((Bytes::from(key_prefix.clone()), val));
-        }
-        #[cfg(not(feature = "ttl"))]
-        if let Some(val) = node.get_value() {
             results.push((Bytes::from(key_prefix.clone()), val));
         }
 
@@ -726,10 +681,7 @@ impl OxidArt {
     /// assert_eq!(tree.get(Bytes::from_static(b"key")), Some(Bytes::from_static(b"value2")));
     /// ```
     pub fn set(&mut self, key: Bytes, val: Value) {
-        #[cfg(feature = "ttl")]
         self.set_internal(key, NO_EXPIRY, val);
-        #[cfg(not(feature = "ttl"))]
-        self.set_internal(key, val);
     }
 
     /// Inserts or updates a key-value pair with a time-to-live duration.
@@ -758,13 +710,11 @@ impl OxidArt {
     ///
     /// // Key expires at timestamp 1060
     /// ```
-    #[cfg(feature = "ttl")]
     pub fn set_ttl(&mut self, key: Bytes, ttl: std::time::Duration, val: Value) {
         let expires_at = self.now.saturating_add(ttl.as_secs());
         self.set_internal(key, expires_at, val);
     }
 
-    #[cfg(feature = "ttl")]
     fn set_internal(&mut self, key: Bytes, ttl: u64, val: Value) {
         debug_assert!(key.is_ascii(), "key must be ASCII");
         let key_len = key.len();
@@ -872,78 +822,7 @@ impl OxidArt {
         idx
     }
 
-    #[cfg(not(feature = "ttl"))]
-    fn set_internal(&mut self, key: Bytes, val: Value) {
-        debug_assert!(key.is_ascii(), "key must be ASCII");
-        let key_len = key.len();
-        if key_len == 0 {
-            self.get_node_mut(self.root_idx).set_val(val);
-            return;
-        }
-        let mut idx = self.root_idx;
-        let mut cursor = 0;
 
-        loop {
-            let Some(child_idx) = self.find(idx, key[cursor]) else {
-                self.create_node_with_val(idx, key[cursor], val, &key[(cursor + 1)..]);
-                return;
-            };
-            idx = child_idx;
-            cursor += 1;
-            let node_comparaison = self.get_node(idx).compare_compression_key(&key[cursor..]);
-            let common_len = match node_comparaison {
-                CompResult::Final => {
-                    self.get_node_mut(idx).set_val(val);
-                    return;
-                }
-                CompResult::Path => {
-                    cursor += self.get_node(idx).compression.len();
-                    continue;
-                }
-                CompResult::Partial(common_len) => common_len,
-            };
-
-            // Split: node compression only partially matches the key
-            let key_rest = &key[cursor..];
-            let val_on_intermediate = common_len == key_rest.len();
-
-            // Extract old state and configure intermediate in one pass
-            let (old_compression, old_val, old_childs) = {
-                let node = self.get_node_mut(idx);
-                let old_compression = std::mem::take(&mut node.compression);
-                let old_val = node.val.take();
-                let old_childs = std::mem::take(&mut node.childs);
-
-                node.compression = CompactStr::from_slice(&old_compression[..common_len]);
-                if val_on_intermediate {
-                    node.val = Some(val.clone());
-                }
-
-                (old_compression, old_val, old_childs)
-            };
-
-            // Create a node for the old content
-            let old_radix = old_compression[common_len];
-            let old_child = Node {
-                compression: CompactStr::from_slice(&old_compression[common_len + 1..]),
-                val: old_val,
-                childs: old_childs,
-            };
-            let old_child_idx = self.insert(old_child);
-            self.push_child_idx(idx, old_child_idx, old_radix);
-
-            // If the value doesn't go on the intermediate node, create a new leaf
-            if !val_on_intermediate {
-                let new_radix = key_rest[common_len];
-                let new_compression = &key_rest[common_len + 1..];
-                self.create_node_with_val(idx, new_radix, val, new_compression);
-            }
-
-            return;
-        }
-    }
-
-    #[cfg(feature = "ttl")]
     fn create_node_with_val(
         &mut self,
         parent_idx: u32,
@@ -985,31 +864,6 @@ impl OxidArt {
         inserted_idx
     }
 
-    #[cfg(not(feature = "ttl"))]
-    fn create_node_with_val(&mut self, idx: u32, radix: u8, val: Value, compression: &[u8]) {
-        let (is_full, huge_child_idx) = {
-            let father_node = self.get_node(idx);
-            (
-                father_node.childs.is_full(),
-                father_node.get_huge_childs_idx(),
-            )
-        };
-        let new_leaf = Node::new_leaf(compression, val);
-        let inserted_idx = self.insert(new_leaf);
-        match (is_full, huge_child_idx) {
-            (false, _) => self.push_child_idx(idx, inserted_idx, radix),
-            (true, None) => {
-                let new_child_idx = self.intiate_new_huge_child(radix, inserted_idx);
-                self.get_node_mut(idx).childs.set_new_childs(new_child_idx);
-            }
-            (true, Some(huge_idx)) => {
-                self.child_list
-                    .get_mut(huge_idx)
-                    .expect("if key exist childs should too")
-                    .push(radix, inserted_idx);
-            }
-        }
-    }
 
     /// Deletes a key from the tree and returns its value.
     ///
@@ -1041,10 +895,7 @@ impl OxidArt {
         if key_len == 0 {
             let old_val = self.get_node_mut(self.root_idx).val.take();
             self.try_recompress(self.root_idx);
-            #[cfg(feature = "ttl")]
             return old_val.map(|(v, _)| v);
-            #[cfg(not(feature = "ttl"))]
-            return old_val;
         }
 
         // Traverse like get, keeping track of the immediate parent
@@ -1080,10 +931,7 @@ impl OxidArt {
             // Node with children: keep the node, just remove the value
             let old_val = self.get_node_mut(target_idx).val.take()?;
             self.try_recompress(target_idx);
-            #[cfg(feature = "ttl")]
             return Some(old_val.0);
-            #[cfg(not(feature = "ttl"))]
-            Some(old_val)
         } else {
             // Node without children (leaf): completely remove from the slab
             let node = self.map.remove(target_idx)?;
@@ -1092,10 +940,7 @@ impl OxidArt {
             if parent_idx != self.root_idx {
                 self.try_recompress(parent_idx);
             }
-            #[cfg(feature = "ttl")]
             return Some(old_val.0);
-            #[cfg(not(feature = "ttl"))]
-            Some(old_val)
         }
     }
 
@@ -1263,7 +1108,6 @@ impl OxidArt {
     }
 
     /// If the node has exactly 1 child and no value, absorb the child
-    #[cfg(feature = "ttl")]
     fn try_recompress(&mut self, node_idx: u32) {
         let Some(node) = self.try_get_node(node_idx) else {
             return;
@@ -1306,28 +1150,6 @@ impl OxidArt {
     }
 
     /// If the node has exactly 1 child and no value, absorb the child
-    #[cfg(not(feature = "ttl"))]
-    fn try_recompress(&mut self, node_idx: u32) {
-        let node = self.get_node(node_idx);
-        if node.val.is_some() {
-            return;
-        }
-
-        let Some((child_radix, child_idx)) = node.childs.get_single_child() else {
-            return;
-        };
-
-        // Absorb the child: compression = current + radix + child.compression
-        let Some(child) = self.map.remove(child_idx) else {
-            return;
-        };
-        let node = self.get_node_mut(node_idx);
-
-        node.compression.push(child_radix);
-        node.compression.extend_from_slice(&child.compression);
-        node.val = child.val;
-        node.childs = child.childs;
-    }
 
     fn remove_child(&mut self, parent_idx: u32, radix: u8) {
         let Some(parent) = self.try_get_node_mut(parent_idx) else {
@@ -1371,7 +1193,6 @@ impl OxidArt {
 }
 
 #[repr(C, align(128))]
-#[cfg(feature = "ttl")]
 struct Node {
     childs: Childs,
     compression: CompactStr,
@@ -1383,7 +1204,6 @@ struct Node {
     parent_radix: u8,
 }
 
-#[cfg(feature = "ttl")]
 impl Default for Node {
     fn default() -> Self {
         Self {
@@ -1397,13 +1217,6 @@ impl Default for Node {
     }
 }
 
-#[cfg(not(feature = "ttl"))]
-#[derive(Default)]
-struct Node {
-    compression: CompactStr,
-    val: Option<Value>,
-    childs: Childs,
-}
 enum CompResult {
     ///The compresion completely part of the key need travel for more
     Path,
@@ -1440,18 +1253,12 @@ impl Node {
             .position(|(a, b)| a != b)
             .unwrap_or_else(|| self.compression.len().min(key_rest.len()))
     }
-    #[cfg(feature = "ttl")]
     fn set_val(&mut self, val: Value, ttl: u64) {
         self.val = Some((val, ttl));
     }
 
-    #[cfg(not(feature = "ttl"))]
-    fn set_val(&mut self, val: Value) {
-        self.val = Some(val);
-    }
 
     /// Returns the value if present and not expired
-    #[cfg(feature = "ttl")]
     fn get_value(&self, now: u64) -> Option<&Value> {
         let (val, ttl) = self.val.as_ref()?;
         if *ttl != NO_EXPIRY && *ttl < now {
@@ -1467,13 +1274,8 @@ impl Node {
         Some(val)
     }
 
-    #[cfg(not(feature = "ttl"))]
-    fn get_value(&self) -> Option<&Value> {
-        self.val.as_ref()
-    }
 
     /// Check if value exists and is expired
-    #[cfg(feature = "ttl")]
     fn is_expired(&self, now: u64) -> bool {
         if let Some((_, ttl)) = &self.val {
             *ttl != NO_EXPIRY && *ttl < now
@@ -1490,7 +1292,6 @@ impl Node {
         }
     }
 
-    #[cfg(feature = "ttl")]
     fn new_leaf(
         compression: &[u8],
         val: Value,
@@ -1518,14 +1319,6 @@ impl Node {
         }
     }
 
-    #[cfg(not(feature = "ttl"))]
-    fn new_leaf(compression: &[u8], val: Value) -> Self {
-        Node {
-            compression: CompactStr::from_slice(compression),
-            val: Some(val),
-            childs: Childs::default(),
-        }
-    }
     pub(crate) fn set_new_childs(&mut self, idx: u32) {
         assert!(self.huge_childs_idx == u32::MAX);
         self.huge_childs_idx = idx
