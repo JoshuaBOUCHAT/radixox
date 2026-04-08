@@ -365,20 +365,23 @@ async fn dispatch_async_command(cmd: &[u8], args: &[Bytes], art: SharedART) -> O
 }
 
 fn frame_to_args(frame: Frame) -> Option<SmallVec<[Bytes; 3]>> {
+    // `decode_bytes_mut` returns Bytes that are shared views into the network
+    // read buffer. Copy each arg here — the single network/application boundary —
+    // so stored values never pin the 64 KB read buffer for the key's lifetime.
     match frame {
         Frame::Array(arr) => {
             let mut args = SmallVec::with_capacity(arr.len());
             for f in arr {
                 match f {
-                    Frame::BulkString(b) => args.push(b),
-                    Frame::SimpleString(s) => args.push(s),
+                    Frame::BulkString(b) => args.push(Bytes::copy_from_slice(&b)),
+                    Frame::SimpleString(s) => args.push(Bytes::copy_from_slice(&s)),
                     _ => return None,
                 }
             }
             Some(args)
         }
-        Frame::BulkString(b) => Some(smallvec::smallvec![b]),
-        Frame::SimpleString(s) => Some(smallvec::smallvec![s]),
+        Frame::BulkString(b) => Some(smallvec::smallvec![Bytes::copy_from_slice(&b)]),
+        Frame::SimpleString(s) => Some(smallvec::smallvec![Bytes::copy_from_slice(&s)]),
         _ => None,
     }
 }
