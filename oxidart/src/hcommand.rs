@@ -37,6 +37,11 @@ impl InnerHCommand {
                     map.insert(field, value);
                     *self = InnerHCommand::Large(map);
                 } else {
+                    // Avoid Vec's default MIN_NON_ZERO_CAP=4 growth: allocate exactly 1 slot.
+                    // For small hashes (YCSB: 1 field), this saves ~144 bytes per hash × 5M = ~720 MB.
+                    if vec.len() == vec.capacity() {
+                        vec.reserve_exact(1);
+                    }
                     vec.push((field, value));
                 }
                 true

@@ -82,6 +82,10 @@ impl InnerZCommand {
                 } else {
                     let pos = vec
                         .partition_point(|(s, m)| (*s, m.as_ref()) < (score, member.as_ref()));
+                    // Avoid Vec's default MIN_NON_ZERO_CAP=4 growth: allocate exactly 1 slot.
+                    if vec.len() == vec.capacity() {
+                        vec.reserve_exact(1);
+                    }
                     vec.insert(pos, (score, member));
                 }
                 true
