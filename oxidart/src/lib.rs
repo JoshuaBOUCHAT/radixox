@@ -60,11 +60,15 @@ pub mod counter;
 #[cfg(feature = "regex")]
 pub mod regex;
 
+mod temporay;
+
 #[cfg(test)]
 mod test;
 
 #[cfg(test)]
 mod test_structures;
+
+use std::mem::ManuallyDrop;
 
 use hislab::HiSlab;
 use hislab::TaggedHiSlab;
@@ -72,6 +76,7 @@ use radixox_lib::shared_byte::SharedByte;
 use rand::rngs::ThreadRng;
 
 use crate::compact_str::CompactStr;
+use crate::node_childs::CHILDS_SIZE;
 use crate::node_childs::ChildAble;
 use crate::node_childs::Childs;
 use crate::node_childs::HugeChilds;
@@ -152,6 +157,21 @@ impl OxidArt {
     pub fn set_now(&mut self, now: u64) {
         self.now = now;
     }
+
+    /// Returns the number of HugeChilds blocks currently allocated.
+    pub fn huge_childs_count(&self) -> usize {
+        self.child_list.count_occupied()
+    }
+
+    /// Returns the number of nodes currently allocated.
+    pub fn node_count(&self) -> usize {
+        {
+            let mut n = 0usize;
+            self.map.for_each_occupied(|_, _| n += 1);
+            n
+        }
+    }
+
     const MAX_SAMPLE: usize = 20;
     const SAMPLE_SIZE: usize = 20;
     const THRESHOLD: usize = Self::SAMPLE_SIZE / 4; // 25% of 20
@@ -1191,14 +1211,21 @@ impl OxidArt {
 
 #[repr(C, align(128))]
 struct Node {
-    childs: Childs,
     compression: CompactStr,
+    childs: Childs,
+
     val: Option<(Value, u64)>,
     huge_childs_idx: u32,
     /// Parent node index (for TTL eviction)
     parent_idx: u32,
     /// Radix used to reach this node from parent (for TTL eviction)
     parent_radix: u8,
+}
+
+enum TValue {
+    String(SharedByte),
+    Int(i64),
+    Index(u32),
 }
 
 impl Default for Node {

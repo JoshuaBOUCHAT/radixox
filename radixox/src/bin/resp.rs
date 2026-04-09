@@ -5,6 +5,7 @@ mod resp_cmd;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::io::ErrorKind;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ use smallvec::SmallVec;
 use oxidart::counter::CounterError;
 use oxidart::value::Value;
 use oxidart::{OxidArt, TtlResult};
+use oxidart::monoio::spawn_stats_logger;
 use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::shared_frame::{SharedFrame as Frame, extend_encode};
 
@@ -43,6 +45,8 @@ const BUFFER_SIZE: usize = 64 * 1024;
 
 static ERR_EMPTY_CMD: &str = "ERR empty command";
 
+const NB_ACCEPTOR: usize = 16;
+
 fn main() -> std::io::Result<()> {
     let mut runtime = get_runtime()?;
 
@@ -52,20 +56,63 @@ fn main() -> std::io::Result<()> {
             .and_then(|p| p.parse().ok())
             .unwrap_or(6379);
         let addr = format!("0.0.0.0:{port}");
-        let listener = TcpListener::bind(&addr)?;
+        let listener = Rc::new(TcpListener::bind(&addr)?);
         println!("RadixOx RESP Server listening on {addr}");
 
         let shared_art =
             OxidArt::shared_with_evictor(Duration::from_millis(100), Duration::from_secs(1));
+        spawn_stats_logger(shared_art.clone(), Duration::from_secs(5));
 
         let registry: SharedRegistry = Rc::new(RefCell::new(HashMap::new()));
         let conn_counter: Rc<Cell<ConnId>> = Rc::new(Cell::new(0));
 
+        let mut handles = Vec::with_capacity(NB_ACCEPTOR);
+        for _ in 0..NB_ACCEPTOR {
+            let handle = spawn_acceptor(
+                shared_art.clone(),
+                listener.clone(),
+                conn_counter.clone(),
+                registry.clone(),
+            );
+            handles.push(handle);
+        }
+        for handle in handles {
+            handle.await;
+        }
+
+        Ok(())
+    })
+}
+
+fn spawn_acceptor(
+    shared_art: SharedART,
+    listener: Rc<TcpListener>,
+    conn_counter: Rc<Cell<ConnId>>,
+    registry: SharedRegistry,
+) -> monoio::task::JoinHandle<()> {
+    monoio::spawn(async move {
         loop {
-            let (stream, _addr) = listener.accept().await?;
+            let (stream, _) = match listener.accept().await {
+                Ok((stream, addr)) => (stream, addr),
+                Err(e) => match e.kind() {
+                    ErrorKind::WouldBlock => continue,
+                    ErrorKind::Interrupted => continue,
+                    ErrorKind::ConnectionAborted => continue,
+                    ErrorKind::OutOfMemory => {
+                        // trop de connexions — attendre que ça se libère
+                        monoio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    _ => {
+                        // EBADF, EINVAL etc — fatal
+                        panic!("accept fatal: {}", e);
+                    }
+                },
+            };
             //println!("New connection from {}", addr);
             let conn_id = conn_counter.get();
             conn_counter.set(conn_id.wrapping_add(1));
+
             monoio::spawn(handle_connection(
                 stream,
                 shared_art.clone(),
@@ -75,18 +122,19 @@ fn main() -> std::io::Result<()> {
         }
     })
 }
+
 fn get_runtime() -> std::io::Result<Runtime<TimeDriver<IoUringDriver>>> {
-    let uring_builder = io_uring::IoUring::builder();
+    let mut uring_builder = io_uring::IoUring::builder();
 
     // 2. Configurer SQPOLL (le kernel poll la queue de soumission)
     // Paramètre : temps d'idle en millisecondes avant que le thread kernel s'endorme
-    //uring_builder.setup_sqpoll(2);
+    uring_builder.setup_sqpoll(2);
 
     // Optionnel : on peut aussi binder le thread SQPOLL sur un cœur spécifique
-    //uring_builder.setup_sqpoll_cpu(8);
+    uring_builder.setup_sqpoll_cpu(8);
 
     RuntimeBuilder::<monoio::IoUringDriver>::new()
-        .with_entries(1024)
+        .with_entries(4096)
         .uring_builder(uring_builder) // C'est ici qu'on injecte notre config
         .enable_timer()
         .build()

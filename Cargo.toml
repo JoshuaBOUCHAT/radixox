@@ -23,6 +23,11 @@ redis-protocol = { version = "6.0.0", default-features = false, features = [
 
 ] }
 
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = true
+
 [profile.lto]
 inherits = "release"
 lto = true
