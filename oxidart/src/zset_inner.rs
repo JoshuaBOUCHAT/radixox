@@ -1,5 +1,5 @@
-use bytes::Bytes;
 use ordered_float::OrderedFloat;
+use radixox_lib::shared_byte::SharedByte;
 use std::collections::{BTreeSet, HashMap};
 
 /// ZSet internal representation with double indexing for optimal performance.
@@ -11,9 +11,9 @@ use std::collections::{BTreeSet, HashMap};
 #[derive(Clone, Debug, PartialEq)]
 pub struct ZSetInner {
     /// Sorted index: (score, member) tuples ordered by score, then lexicographically.
-    pub(crate) sorted: BTreeSet<(OrderedFloat<f64>, Bytes)>,
+    pub(crate) sorted: BTreeSet<(OrderedFloat<f64>, SharedByte)>,
     /// Score lookup: member -> score mapping for O(1) access.
-    pub(crate) scores: HashMap<Bytes, OrderedFloat<f64>>,
+    pub(crate) scores: HashMap<SharedByte, OrderedFloat<f64>>,
 }
 
 impl ZSetInner {
@@ -27,7 +27,7 @@ impl ZSetInner {
 
     /// Insert or update a member with a score.
     /// Returns true if this is a new member (not an update).
-    pub fn insert(&mut self, score: f64, member: Bytes) -> bool {
+    pub fn insert(&mut self, score: f64, member: SharedByte) -> bool {
         let score = OrderedFloat(score);
 
         // Remove old entry if exists (score might have changed)
@@ -47,9 +47,9 @@ impl ZSetInner {
     }
 
     /// Remove a member. Returns true if the member existed.
-    pub fn remove(&mut self, member: &Bytes) -> bool {
-        if let Some(score) = self.scores.remove(member) {
-            self.sorted.remove(&(score, member.clone()));
+    pub fn remove(&mut self, member: SharedByte) -> bool {
+        if let Some(score) = self.scores.remove(&member) {
+            self.sorted.remove(&(score, member));
             true
         } else {
             false
@@ -57,7 +57,7 @@ impl ZSetInner {
     }
 
     /// Get the score of a member. O(1) via HashMap.
-    pub fn score(&self, member: &[u8]) -> Option<f64> {
+    pub fn score(&self, member: &SharedByte) -> Option<f64> {
         self.scores.get(member).map(|s| s.into_inner())
     }
 
@@ -72,7 +72,7 @@ impl ZSetInner {
     }
 
     /// Iterate over members in score order (ascending).
-    pub fn iter(&self) -> impl Iterator<Item = &(OrderedFloat<f64>, Bytes)> {
+    pub fn iter(&self) -> impl Iterator<Item = &(OrderedFloat<f64>, SharedByte)> {
         self.sorted.iter()
     }
 }

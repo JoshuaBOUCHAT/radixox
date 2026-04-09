@@ -119,7 +119,7 @@ echo "  Field length: $FIELDLENGTH bytes"
 echo "═══════════════════════════════════════════════════"
 echo ""
 echo "[0/4] Building RadixOx (release)..."
-RUSTFLAGS="-C target-cpu=native" cargo build -p radixox-server --profile lto --manifest-path "$SCRIPT_DIR/Cargo.toml" 2>&1 |
+RUSTFLAGS="-C target-cpu=native" cargo build -p radixox --profile lto --manifest-path "$SCRIPT_DIR/Cargo.toml" 2>&1 |
   tail -3
 echo "  Build done: $RADIXOX_BIN"
 echo ""

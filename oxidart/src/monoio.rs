@@ -49,9 +49,9 @@ impl OxidArt {
     ///     let tree = OxidArt::shared_with_ticker(Duration::from_millis(100));
     ///
     ///     tree.borrow_mut().set_ttl(
-    ///         Bytes::from_static(b"key"),
+    ///         SharedByte::from_str("key"),
     ///         Duration::from_secs(60),
-    ///         Bytes::from_static(b"value"),
+    ///         SharedByte::from_str("value"),
     ///     );
     /// }
     /// ```
@@ -88,9 +88,9 @@ impl OxidArt {
     ///     );
     ///
     ///     tree.borrow_mut().set_ttl(
-    ///         Bytes::from_static(b"key"),
+    ///         SharedByte::from_str("key"),
     ///         Duration::from_secs(60),
-    ///         Bytes::from_static(b"value"),
+    ///         SharedByte::from_str("value"),
     ///     );
     /// }
     /// ```
@@ -197,7 +197,7 @@ pub fn spawn_evictor(art: Rc<RefCell<OxidArt>>, interval: Duration) {
 mod tests {
     use super::*;
     use crate::value::Value;
-    use bytes::Bytes;
+    use radixox_lib::shared_byte::SharedByte;
 
     #[monoio::test(enable_timer = true)]
     async fn test_ttl_expiration_with_ticker() {
@@ -211,20 +211,20 @@ mod tests {
 
         // batch:1 expires in 1 second
         art.borrow_mut().set_ttl(
-            Bytes::from_static(b"batch:1"),
+            SharedByte::from_str("batch:1"),
             Duration::from_secs(1),
-            Value::String(Bytes::from_static(b"expires_soon")),
+            Value::String(SharedByte::from_str("expires_soon")),
         );
 
         // batch:2 never expires
         art.borrow_mut().set(
-            Bytes::from_static(b"batch:2"),
-            Value::String(Bytes::from_static(b"forever")),
+            SharedByte::from_str("batch:2"),
+            Value::String(SharedByte::from_str("forever")),
         );
 
         // Both should exist initially
         let guard = art.borrow();
-        let results = guard.getn(Bytes::from_static(b"batch:"));
+        let results = guard.getn(SharedByte::from_str("batch:"));
         assert_eq!(results.len(), 2, "should have 2 entries before expiration");
         drop(results);
         drop(guard);
@@ -237,13 +237,13 @@ mod tests {
 
         // Only batch:2 should remain
         let guard = art.borrow();
-        let results = guard.getn(Bytes::from_static(b"batch:"));
+        let results = guard.getn(SharedByte::from_str("batch:"));
         assert_eq!(results.len(), 1, "should have 1 entry after expiration");
         assert_eq!(
             results[0],
             (
-                Bytes::from_static(b"batch:2"),
-                &Value::String(Bytes::from_static(b"forever"))
+                SharedByte::from_str("batch:2"),
+                &Value::String(SharedByte::from_str("forever"))
             )
         );
     }
@@ -255,9 +255,9 @@ mod tests {
 
         // Set a key with TTL
         art.borrow_mut().set_ttl(
-            Bytes::from_static(b"test"),
+            SharedByte::from_str("test"),
             Duration::from_secs(1),
-            Value::String(Bytes::from_static(b"value")),
+            Value::String(SharedByte::from_str("value")),
         );
 
         // Should exist initially
@@ -280,14 +280,14 @@ mod tests {
 
         // Create 100 entries with TTL of 10 seconds (expire at t=1010)
         for i in 0..100 {
-            let key = Bytes::from(format!("key:{:03}", i));
-            let val = Value::String(Bytes::from(format!("value:{:03}", i)));
+            let key = SharedByte::from_slice(format!("key:{:03}", i));
+            let val = Value::String(SharedByte::from_str(&format!("value:{:03}", i)));
             art.borrow_mut().set_ttl(key, Duration::from_secs(10), val);
         }
 
         // Verify all 100 entries exist
         let guard = art.borrow();
-        let all_entries = guard.getn(Bytes::from_static(b"key:"));
+        let all_entries = guard.getn(SharedByte::from_str("key:"));
         assert_eq!(all_entries.len(), 100, "should have 100 entries initially");
         drop(all_entries);
         drop(guard);
@@ -298,7 +298,7 @@ mod tests {
         // Let evictor run a bit - nothing should be evicted yet (time hasn't moved)
         monoio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
-            art.borrow().getn(Bytes::from_static(b"key:")).len(),
+            art.borrow().getn(SharedByte::from_str("key:")).len(),
             100,
             "no entries should be evicted yet"
         );
@@ -312,7 +312,7 @@ mod tests {
 
         // All should be evicted now
         let guard = art.borrow();
-        let remaining = guard.getn(Bytes::from_static(b"key:"));
+        let remaining = guard.getn(SharedByte::from_str("key:"));
         assert_eq!(
             remaining.len(),
             0,
@@ -329,20 +329,20 @@ mod tests {
 
         // 50 entries expire at t=1010
         for i in 1..=50 {
-            let key = Bytes::from(format!("short:{:03}", i));
-            let val = Value::String(Bytes::from(format!("value:{:03}", i)));
+            let key = SharedByte::from_slice(format!("short:{:03}", i));
+            let val = Value::String(SharedByte::from_slice(format!("value:{:03}", i)));
             art.borrow_mut().set_ttl(key, Duration::from_secs(10), val);
         }
 
         // 50 entries expire at t=1100
         for i in 1..=50 {
-            let key = Bytes::from(format!("long:{:03}", i));
-            let val = Value::String(Bytes::from(format!("value:{:03}", i)));
+            let key = SharedByte::from_slice(format!("long:{:03}", i));
+            let val = Value::String(SharedByte::from_slice(format!("value:{:03}", i)));
             art.borrow_mut().set_ttl(key, Duration::from_secs(100), val);
         }
 
         // Verify all 100 entries exist
-        assert_eq!(art.borrow().getn(Bytes::from_static(b"")).len(), 100);
+        assert_eq!(art.borrow().getn(SharedByte::from_str("")).len(), 100);
 
         // Spawn evictor with 1ms interval
         spawn_evictor(art.clone(), Duration::from_millis(1));
@@ -356,7 +356,7 @@ mod tests {
 
         // Should have evicted the 50 short ones
         let guard = art.borrow();
-        let remaining = guard.getn(Bytes::from_static(b""));
+        let remaining = guard.getn(SharedByte::from_str(""));
         assert_eq!(remaining.len(), 50, "50 long entries should remain");
 
         // All remaining should be "long:" entries
@@ -377,6 +377,6 @@ mod tests {
         monoio::time::sleep(Duration::from_millis(100)).await;
 
         // All should be gone
-        assert_eq!(art.borrow().getn(Bytes::from_static(b"")).len(), 0);
+        assert_eq!(art.borrow().getn(SharedByte::from_str("")).len(), 0);
     }
 }

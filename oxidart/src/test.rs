@@ -1,5 +1,6 @@
 use crate::value::Value;
-use bytes::Bytes;
+
+use radixox_lib::shared_byte::SharedByte;
 
 use crate::OxidArt;
 
@@ -13,7 +14,7 @@ fn test_node_size() {
 #[test]
 fn test_get_set_basic() {
     let mut art = OxidArt::new();
-    let key = Bytes::from_static(b"Joshua");
+    let key = SharedByte::from_str("Joshua");
     let val = Value::from_str("BOUCHAT");
     art.set(key.clone(), val.clone());
     assert_eq!(art.get(&key), Some(&val));
@@ -22,7 +23,7 @@ fn test_get_set_basic() {
 #[test]
 fn test_empty_key() {
     let mut art = OxidArt::new();
-    let key = Bytes::from_static(b"");
+    let key = SharedByte::from_str("");
     let val = Value::from_str("root_value");
     art.set(key.clone(), val.clone());
     assert_eq!(art.get(&key), Some(&val));
@@ -31,13 +32,13 @@ fn test_empty_key() {
 #[test]
 fn test_get_nonexistent() {
     let mut art = OxidArt::new();
-    assert_eq!(art.get(&Bytes::from_static(b"missing")), None);
+    assert_eq!(art.get(&SharedByte::from_str("missing")), None);
 }
 
 #[test]
 fn test_overwrite_value() {
     let mut art = OxidArt::new();
-    let key = Bytes::from_static(b"key");
+    let key = SharedByte::from_str("key");
     let val1 = Value::from_str("value1");
     let val2 = Value::from_str("value2");
 
@@ -53,19 +54,19 @@ fn test_common_prefix_split() {
     // Test le split: "user" et "uso" partagent "us"
     let mut art = OxidArt::new();
 
-    art.set(Bytes::from_static(b"user"), Value::from_str("val_user"));
-    art.set(Bytes::from_static(b"uso"), Value::from_str("val_uso"));
+    art.set(SharedByte::from_str("user"), Value::from_str("val_user"));
+    art.set(SharedByte::from_str("uso"), Value::from_str("val_uso"));
 
     assert_eq!(
-        art.get(&Bytes::from_static(b"user")),
+        art.get(&SharedByte::from_str("user")),
         Some(&Value::from_str("val_user"))
     );
     assert_eq!(
-        art.get(&Bytes::from_static(b"uso")),
+        art.get(&SharedByte::from_str("uso")),
         Some(&Value::from_str("val_uso"))
     );
     // "us" n'a pas de valeur
-    assert_eq!(art.get(&Bytes::from_static(b"us")), None);
+    assert_eq!(art.get(&SharedByte::from_str("us")), None);
 }
 
 #[test]
@@ -73,15 +74,15 @@ fn test_prefix_is_also_key() {
     // "us" est un préfixe de "user" mais aussi une clé
     let mut art = OxidArt::new();
 
-    art.set(Bytes::from_static(b"user"), Value::from_str("val_user"));
-    art.set(Bytes::from_static(b"us"), Value::from_str("val_us"));
+    art.set(SharedByte::from_str("user"), Value::from_str("val_user"));
+    art.set(SharedByte::from_str("us"), Value::from_str("val_us"));
 
     assert_eq!(
-        art.get(&Bytes::from_static(b"user")),
+        art.get(&SharedByte::from_str("user")),
         Some(&Value::from_str("val_user"))
     );
     assert_eq!(
-        art.get(&Bytes::from_static(b"us")),
+        art.get(&SharedByte::from_str("us")),
         Some(&Value::from_str("val_us"))
     );
 }
@@ -90,37 +91,37 @@ fn test_prefix_is_also_key() {
 fn test_multiple_branches() {
     let mut art = OxidArt::new();
 
-    art.set(Bytes::from_static(b"apple"), Value::from_str("1"));
-    art.set(Bytes::from_static(b"application"), Value::from_str("2"));
-    art.set(Bytes::from_static(b"banana"), Value::from_str("3"));
-    art.set(Bytes::from_static(b"band"), Value::from_str("4"));
+    art.set(SharedByte::from_str("apple"), Value::from_str("1"));
+    art.set(SharedByte::from_str("application"), Value::from_str("2"));
+    art.set(SharedByte::from_str("banana"), Value::from_str("3"));
+    art.set(SharedByte::from_str("band"), Value::from_str("4"));
 
     assert_eq!(
-        art.get(&Bytes::from_static(b"apple")),
+        art.get(&SharedByte::from_str("apple")),
         Some(&Value::from_str("1"))
     );
     assert_eq!(
-        art.get(&Bytes::from_static(b"application")),
+        art.get(&SharedByte::from_str("application")),
         Some(&Value::from_str("2"))
     );
     assert_eq!(
-        art.get(&Bytes::from_static(b"banana")),
+        art.get(&SharedByte::from_str("banana")),
         Some(&Value::from_str("3"))
     );
     assert_eq!(
-        art.get(&Bytes::from_static(b"band")),
+        art.get(&SharedByte::from_str("band")),
         Some(&Value::from_str("4"))
     );
 
     // Clés partielles qui n'existent pas
-    assert_eq!(art.get(&Bytes::from_static(b"app")), None);
-    assert_eq!(art.get(&Bytes::from_static(b"ban")), None);
+    assert_eq!(art.get(&SharedByte::from_str("app")), None);
+    assert_eq!(art.get(&SharedByte::from_str("ban")), None);
 }
 
 #[test]
 fn test_del_basic() {
     let mut art = OxidArt::new();
-    let key = Bytes::from_static(b"hello");
+    let key = SharedByte::from_str("hello");
     let val = Value::from_str("world");
 
     art.set(key.clone(), val.clone());
@@ -142,9 +143,9 @@ fn test_del_empty_key() {
     let mut art = OxidArt::new();
     let val = Value::from_str("root");
 
-    art.set(Bytes::from_static(b""), val.clone());
+    art.set(SharedByte::from_str(""), val.clone());
     assert_eq!(art.del(b""), Some(val));
-    assert_eq!(art.get(&Bytes::from_static(b"")), None);
+    assert_eq!(art.get(&SharedByte::from_str("")), None);
 }
 
 #[test]
@@ -152,8 +153,8 @@ fn test_del_with_recompression() {
     // us -> {er, o}  après del("uso") -> "user"
     let mut art = OxidArt::new();
 
-    art.set(Bytes::from_static(b"user"), Value::from_str("val_user"));
-    art.set(Bytes::from_static(b"uso"), Value::from_str("val_uso"));
+    art.set(SharedByte::from_str("user"), Value::from_str("val_user"));
+    art.set(SharedByte::from_str("uso"), Value::from_str("val_uso"));
 
     // Supprimer "uso"
     let deleted = art.del(b"uso");
@@ -161,11 +162,11 @@ fn test_del_with_recompression() {
 
     // "user" doit toujours exister
     assert_eq!(
-        art.get(&Bytes::from_static(b"user")),
+        art.get(&SharedByte::from_str("user")),
         Some(&Value::from_str("val_user"))
     );
     // "uso" n'existe plus
-    assert_eq!(art.get(&Bytes::from_static(b"uso")), None);
+    assert_eq!(art.get(&SharedByte::from_str("uso")), None);
 }
 
 #[test]
@@ -173,9 +174,9 @@ fn test_del_intermediate_node_with_children() {
     // Supprimer un node intermédiaire qui a des enfants
     let mut art = OxidArt::new();
 
-    art.set(Bytes::from_static(b"a"), Value::from_str("val_a"));
-    art.set(Bytes::from_static(b"ab"), Value::from_str("val_ab"));
-    art.set(Bytes::from_static(b"abc"), Value::from_str("val_abc"));
+    art.set(SharedByte::from_str("a"), Value::from_str("val_a"));
+    art.set(SharedByte::from_str("ab"), Value::from_str("val_ab"));
+    art.set(SharedByte::from_str("abc"), Value::from_str("val_abc"));
 
     // Supprimer "ab" qui est intermédiaire
     let deleted = art.del(b"ab");
@@ -183,14 +184,14 @@ fn test_del_intermediate_node_with_children() {
 
     // "a" et "abc" doivent toujours exister
     assert_eq!(
-        art.get(&Bytes::from_static(b"a")),
+        art.get(&SharedByte::from_str("a")),
         Some(&Value::from_str("val_a"))
     );
     assert_eq!(
-        art.get(&Bytes::from_static(b"abc")),
+        art.get(&SharedByte::from_str("abc")),
         Some(&Value::from_str("val_abc"))
     );
-    assert_eq!(art.get(&Bytes::from_static(b"ab")), None);
+    assert_eq!(art.get(&SharedByte::from_str("ab")), None);
 }
 
 #[test]
@@ -199,14 +200,14 @@ fn test_many_keys_same_prefix() {
 
     // Beaucoup de clés avec le même préfixe pour tester les huge_childs
     for i in 1..=20u8 {
-        let key = Bytes::from(vec![b'x', i]);
-        let val = Value::String(Bytes::from(vec![i]));
+        let key = SharedByte::from_byte(vec![b'x', i]);
+        let val = Value::String(SharedByte::from_byte(vec![i]));
         art.set(key, val);
     }
 
     for i in 1..=20u8 {
-        let key = Bytes::from(vec![b'x', i]);
-        let expected = Value::String(Bytes::from(vec![i]));
+        let key = SharedByte::from_byte(vec![b'x', i]);
+        let expected = Value::String(SharedByte::from_byte(vec![i]));
         assert_eq!(art.get(&key), Some(&expected));
     }
 }
@@ -215,8 +216,8 @@ fn test_many_keys_same_prefix() {
 fn test_long_keys() {
     let mut art = OxidArt::new();
 
-    let key1 = Bytes::from(vec![b'a'; 100]);
-    let key2 = Bytes::from(vec![b'a'; 50]);
+    let key1 = SharedByte::from_byte(vec![b'a'; 100]);
+    let key2 = SharedByte::from_byte(vec![b'a'; 50]);
     let val1 = Value::from_str("long");
     let val2 = Value::from_str("medium");
 
@@ -230,7 +231,7 @@ fn test_long_keys() {
 #[test]
 fn test_del_then_reinsert() {
     let mut art = OxidArt::new();
-    let key = Bytes::from_static(b"key");
+    let key = SharedByte::from_str("key");
     let val1 = Value::from_str("val1");
     let val2 = Value::from_str("val2");
 
@@ -245,31 +246,31 @@ fn test_del_then_reinsert() {
 fn test_del_all_keys() {
     let mut art = OxidArt::new();
 
-    art.set(Bytes::from_static(b"a"), Value::from_str("1"));
-    art.set(Bytes::from_static(b"b"), Value::from_str("2"));
-    art.set(Bytes::from_static(b"c"), Value::from_str("3"));
+    art.set(SharedByte::from_str("a"), Value::from_str("1"));
+    art.set(SharedByte::from_str("b"), Value::from_str("2"));
+    art.set(SharedByte::from_str("c"), Value::from_str("3"));
 
     art.del(b"a");
     art.del(b"b");
     art.del(b"c");
 
-    assert_eq!(art.get(&Bytes::from_static(b"a")), None);
-    assert_eq!(art.get(&Bytes::from_static(b"b")), None);
-    assert_eq!(art.get(&Bytes::from_static(b"c")), None);
+    assert_eq!(art.get(&SharedByte::from_str("a")), None);
+    assert_eq!(art.get(&SharedByte::from_str("b")), None);
+    assert_eq!(art.get(&SharedByte::from_str("c")), None);
 }
 
 #[test]
 fn test_partial_key_not_found() {
     let mut art = OxidArt::new();
 
-    art.set(Bytes::from_static(b"hello_world"), Value::from_str("val"));
+    art.set(SharedByte::from_str("hello_world"), Value::from_str("val"));
 
     // Clés partielles ne doivent pas matcher
-    assert_eq!(art.get(&Bytes::from_static(b"hello")), None);
-    assert_eq!(art.get(&Bytes::from_static(b"hello_")), None);
-    assert_eq!(art.get(&Bytes::from_static(b"hello_worl")), None);
+    assert_eq!(art.get(&SharedByte::from_str("hello")), None);
+    assert_eq!(art.get(&SharedByte::from_str("hello_")), None);
+    assert_eq!(art.get(&SharedByte::from_str("hello_worl")), None);
     // Clé trop longue non plus
-    assert_eq!(art.get(&Bytes::from_static(b"hello_world!")), None);
+    assert_eq!(art.get(&SharedByte::from_str("hello_world!")), None);
 }
 
 // ============ Tests pour getn ============
@@ -279,29 +280,32 @@ fn test_getn_basic() {
     let mut art = OxidArt::new();
 
     art.set(
-        Bytes::from_static(b"user:alice"),
+        SharedByte::from_str("user:alice"),
         Value::from_str("alice_data"),
     );
-    art.set(Bytes::from_static(b"user:bob"), Value::from_str("bob_data"));
     art.set(
-        Bytes::from_static(b"user:charlie"),
+        SharedByte::from_str("user:bob"),
+        Value::from_str("bob_data"),
+    );
+    art.set(
+        SharedByte::from_str("user:charlie"),
         Value::from_str("charlie_data"),
     );
-    art.set(Bytes::from_static(b"post:1"), Value::from_str("post_1"));
+    art.set(SharedByte::from_str("post:1"), Value::from_str("post_1"));
 
-    let results = art.getn(Bytes::from_static(b"user:"));
+    let results = art.getn(SharedByte::from_str("user:"));
 
     assert_eq!(results.len(), 3);
     assert!(results.contains(&(
-        Bytes::from_static(b"user:alice"),
+        SharedByte::from_str("user:alice"),
         &Value::from_str("alice_data")
     )));
     assert!(results.contains(&(
-        Bytes::from_static(b"user:bob"),
+        SharedByte::from_str("user:bob"),
         &Value::from_str("bob_data")
     )));
     assert!(results.contains(&(
-        Bytes::from_static(b"user:charlie"),
+        SharedByte::from_str("user:charlie"),
         &Value::from_str("charlie_data")
     )));
 }
@@ -310,11 +314,11 @@ fn test_getn_basic() {
 fn test_getn_empty_prefix() {
     let mut art = OxidArt::new();
 
-    art.set(Bytes::from_static(b"a"), Value::from_str("1"));
-    art.set(Bytes::from_static(b"b"), Value::from_str("2"));
-    art.set(Bytes::from_static(b"c"), Value::from_str("3"));
+    art.set(SharedByte::from_str("a"), Value::from_str("1"));
+    art.set(SharedByte::from_str("b"), Value::from_str("2"));
+    art.set(SharedByte::from_str("c"), Value::from_str("3"));
 
-    let results = art.getn(Bytes::from_static(b""));
+    let results = art.getn(SharedByte::from_str(""));
 
     assert_eq!(results.len(), 3);
 }
@@ -323,9 +327,9 @@ fn test_getn_empty_prefix() {
 fn test_getn_no_match() {
     let mut art = OxidArt::new();
 
-    art.set(Bytes::from_static(b"user:alice"), Value::from_str("data"));
+    art.set(SharedByte::from_str("user:alice"), Value::from_str("data"));
 
-    let results = art.getn(Bytes::from_static(b"post:"));
+    let results = art.getn(SharedByte::from_str("post:"));
 
     assert!(results.is_empty());
 }
@@ -334,19 +338,19 @@ fn test_getn_no_match() {
 fn test_getn_exact_key() {
     let mut art = OxidArt::new();
 
-    art.set(Bytes::from_static(b"user"), Value::from_str("user_val"));
+    art.set(SharedByte::from_str("user"), Value::from_str("user_val"));
     art.set(
-        Bytes::from_static(b"user:alice"),
+        SharedByte::from_str("user:alice"),
         Value::from_str("alice_val"),
     );
 
     // Préfixe exact "user" doit retourner "user" et "user:alice"
-    let results = art.getn(Bytes::from_static(b"user"));
+    let results = art.getn(SharedByte::from_str("user"));
 
     assert_eq!(results.len(), 2);
-    assert!(results.contains(&(Bytes::from_static(b"user"), &Value::from_str("user_val"))));
+    assert!(results.contains(&(SharedByte::from_str("user"), &Value::from_str("user_val"))));
     assert!(results.contains(&(
-        Bytes::from_static(b"user:alice"),
+        SharedByte::from_str("user:alice"),
         &Value::from_str("alice_val")
     )));
 }
@@ -357,16 +361,16 @@ fn test_getn_prefix_in_compression() {
     let mut art = OxidArt::new();
 
     art.set(
-        Bytes::from_static(b"application"),
+        SharedByte::from_str("application"),
         Value::from_str("app_val"),
     );
 
     // "app" est un préfixe de "application"
-    let results = art.getn(Bytes::from_static(b"app"));
+    let results = art.getn(SharedByte::from_str("app"));
 
     assert_eq!(results.len(), 1);
     assert!(results.contains(&(
-        Bytes::from_static(b"application"),
+        SharedByte::from_str("application"),
         &Value::from_str("app_val")
     )));
 }
@@ -375,34 +379,34 @@ fn test_getn_prefix_in_compression() {
 fn test_getn_with_nested_keys() {
     let mut art = OxidArt::new();
 
-    art.set(Bytes::from_static(b"a"), Value::from_str("1"));
-    art.set(Bytes::from_static(b"ab"), Value::from_str("2"));
-    art.set(Bytes::from_static(b"abc"), Value::from_str("3"));
-    art.set(Bytes::from_static(b"abcd"), Value::from_str("4"));
-    art.set(Bytes::from_static(b"abd"), Value::from_str("5"));
+    art.set(SharedByte::from_str("a"), Value::from_str("1"));
+    art.set(SharedByte::from_str("ab"), Value::from_str("2"));
+    art.set(SharedByte::from_str("abc"), Value::from_str("3"));
+    art.set(SharedByte::from_str("abcd"), Value::from_str("4"));
+    art.set(SharedByte::from_str("abd"), Value::from_str("5"));
 
-    let results = art.getn(Bytes::from_static(b"ab"));
+    let results = art.getn(SharedByte::from_str("ab"));
 
     assert_eq!(results.len(), 4); // ab, abc, abcd, abd
-    assert!(results.contains(&(Bytes::from_static(b"ab"), &Value::from_str("2"))));
-    assert!(results.contains(&(Bytes::from_static(b"abc"), &Value::from_str("3"))));
-    assert!(results.contains(&(Bytes::from_static(b"abcd"), &Value::from_str("4"))));
-    assert!(results.contains(&(Bytes::from_static(b"abd"), &Value::from_str("5"))));
+    assert!(results.contains(&(SharedByte::from_str("ab"), &Value::from_str("2"))));
+    assert!(results.contains(&(SharedByte::from_str("abc"), &Value::from_str("3"))));
+    assert!(results.contains(&(SharedByte::from_str("abcd"), &Value::from_str("4"))));
+    assert!(results.contains(&(SharedByte::from_str("abd"), &Value::from_str("5"))));
 }
 
 #[test]
 fn test_getn_single_char_prefix() {
     let mut art = OxidArt::new();
 
-    art.set(Bytes::from_static(b"aa"), Value::from_str("1"));
-    art.set(Bytes::from_static(b"ab"), Value::from_str("2"));
-    art.set(Bytes::from_static(b"ba"), Value::from_str("3"));
+    art.set(SharedByte::from_str("aa"), Value::from_str("1"));
+    art.set(SharedByte::from_str("ab"), Value::from_str("2"));
+    art.set(SharedByte::from_str("ba"), Value::from_str("3"));
 
-    let results = art.getn(Bytes::from_static(b"a"));
+    let results = art.getn(SharedByte::from_str("a"));
 
     assert_eq!(results.len(), 2);
-    assert!(results.contains(&(Bytes::from_static(b"aa"), &Value::from_str("1"))));
-    assert!(results.contains(&(Bytes::from_static(b"ab"), &Value::from_str("2"))));
+    assert!(results.contains(&(SharedByte::from_str("aa"), &Value::from_str("1"))));
+    assert!(results.contains(&(SharedByte::from_str("ab"), &Value::from_str("2"))));
 }
 
 #[test]
@@ -411,12 +415,12 @@ fn test_getn_many_children() {
 
     // Plus de 10 enfants pour tester huge_childs
     for i in 1..=20u8 {
-        let key = Bytes::from(vec![b'x', b':', i]);
-        let val = Value::String(Bytes::from(vec![i]));
+        let key = SharedByte::from_byte(vec![b'x', b':', i]);
+        let val = Value::String(SharedByte::from_byte(vec![i]));
         art.set(key, val);
     }
 
-    let results = art.getn(Bytes::from_static(b"x:"));
+    let results = art.getn(SharedByte::from_str("x:"));
 
     assert_eq!(results.len(), 20);
 }
@@ -428,25 +432,28 @@ fn test_deln_basic() {
     let mut art = OxidArt::new();
 
     art.set(
-        Bytes::from_static(b"user:alice"),
+        SharedByte::from_str("user:alice"),
         Value::from_str("alice_data"),
     );
-    art.set(Bytes::from_static(b"user:bob"), Value::from_str("bob_data"));
     art.set(
-        Bytes::from_static(b"user:charlie"),
+        SharedByte::from_str("user:bob"),
+        Value::from_str("bob_data"),
+    );
+    art.set(
+        SharedByte::from_str("user:charlie"),
         Value::from_str("charlie_data"),
     );
-    art.set(Bytes::from_static(b"post:1"), Value::from_str("post_1"));
+    art.set(SharedByte::from_str("post:1"), Value::from_str("post_1"));
 
     let deleted = art.deln(b"user:");
 
     assert_eq!(deleted, 3);
-    assert_eq!(art.get(&Bytes::from_static(b"user:alice")), None);
-    assert_eq!(art.get(&Bytes::from_static(b"user:bob")), None);
-    assert_eq!(art.get(&Bytes::from_static(b"user:charlie")), None);
+    assert_eq!(art.get(&SharedByte::from_str("user:alice")), None);
+    assert_eq!(art.get(&SharedByte::from_str("user:bob")), None);
+    assert_eq!(art.get(&SharedByte::from_str("user:charlie")), None);
     // post:1 doit toujours exister
     assert_eq!(
-        art.get(&Bytes::from_static(b"post:1")),
+        art.get(&SharedByte::from_str("post:1")),
         Some(&Value::from_str("post_1"))
     );
 }
@@ -455,30 +462,30 @@ fn test_deln_basic() {
 fn test_deln_empty_prefix() {
     let mut art = OxidArt::new();
 
-    art.set(Bytes::from_static(b"a"), Value::from_str("1"));
-    art.set(Bytes::from_static(b"b"), Value::from_str("2"));
-    art.set(Bytes::from_static(b"c"), Value::from_str("3"));
+    art.set(SharedByte::from_str("a"), Value::from_str("1"));
+    art.set(SharedByte::from_str("b"), Value::from_str("2"));
+    art.set(SharedByte::from_str("c"), Value::from_str("3"));
 
     let deleted = art.deln(b"");
 
     assert_eq!(deleted, 3);
-    assert_eq!(art.get(&Bytes::from_static(b"a")), None);
-    assert_eq!(art.get(&Bytes::from_static(b"b")), None);
-    assert_eq!(art.get(&Bytes::from_static(b"c")), None);
+    assert_eq!(art.get(&SharedByte::from_str("a")), None);
+    assert_eq!(art.get(&SharedByte::from_str("b")), None);
+    assert_eq!(art.get(&SharedByte::from_str("c")), None);
 }
 
 #[test]
 fn test_deln_no_match() {
     let mut art = OxidArt::new();
 
-    art.set(Bytes::from_static(b"user:alice"), Value::from_str("data"));
+    art.set(SharedByte::from_str("user:alice"), Value::from_str("data"));
 
     let deleted = art.deln(b"post:");
 
     assert_eq!(deleted, 0);
     // user:alice doit toujours exister
     assert_eq!(
-        art.get(&Bytes::from_static(b"user:alice")),
+        art.get(&SharedByte::from_str("user:alice")),
         Some(&Value::from_str("data"))
     );
 }
@@ -487,20 +494,20 @@ fn test_deln_no_match() {
 fn test_deln_exact_key_with_children() {
     let mut art = OxidArt::new();
 
-    art.set(Bytes::from_static(b"user"), Value::from_str("user_val"));
+    art.set(SharedByte::from_str("user"), Value::from_str("user_val"));
     art.set(
-        Bytes::from_static(b"user:alice"),
+        SharedByte::from_str("user:alice"),
         Value::from_str("alice_val"),
     );
-    art.set(Bytes::from_static(b"user:bob"), Value::from_str("bob_val"));
+    art.set(SharedByte::from_str("user:bob"), Value::from_str("bob_val"));
 
     // Supprimer "user" et tous ses descendants
     let deleted = art.deln(b"user");
 
     assert_eq!(deleted, 3);
-    assert_eq!(art.get(&Bytes::from_static(b"user")), None);
-    assert_eq!(art.get(&Bytes::from_static(b"user:alice")), None);
-    assert_eq!(art.get(&Bytes::from_static(b"user:bob")), None);
+    assert_eq!(art.get(&SharedByte::from_str("user")), None);
+    assert_eq!(art.get(&SharedByte::from_str("user:alice")), None);
+    assert_eq!(art.get(&SharedByte::from_str("user:bob")), None);
 }
 
 #[test]
@@ -508,41 +515,41 @@ fn test_deln_prefix_in_compression() {
     let mut art = OxidArt::new();
 
     art.set(
-        Bytes::from_static(b"application"),
+        SharedByte::from_str("application"),
         Value::from_str("app_val"),
     );
-    art.set(Bytes::from_static(b"apple"), Value::from_str("apple_val"));
+    art.set(SharedByte::from_str("apple"), Value::from_str("apple_val"));
 
     // "app" est un préfixe commun
     let deleted = art.deln(b"app");
 
     assert_eq!(deleted, 2);
-    assert_eq!(art.get(&Bytes::from_static(b"application")), None);
-    assert_eq!(art.get(&Bytes::from_static(b"apple")), None);
+    assert_eq!(art.get(&SharedByte::from_str("application")), None);
+    assert_eq!(art.get(&SharedByte::from_str("apple")), None);
 }
 
 #[test]
 fn test_deln_with_nested_keys() {
     let mut art = OxidArt::new();
 
-    art.set(Bytes::from_static(b"a"), Value::from_str("1"));
-    art.set(Bytes::from_static(b"ab"), Value::from_str("2"));
-    art.set(Bytes::from_static(b"abc"), Value::from_str("3"));
-    art.set(Bytes::from_static(b"abcd"), Value::from_str("4"));
-    art.set(Bytes::from_static(b"abd"), Value::from_str("5"));
-    art.set(Bytes::from_static(b"b"), Value::from_str("6"));
+    art.set(SharedByte::from_str("a"), Value::from_str("1"));
+    art.set(SharedByte::from_str("ab"), Value::from_str("2"));
+    art.set(SharedByte::from_str("abc"), Value::from_str("3"));
+    art.set(SharedByte::from_str("abcd"), Value::from_str("4"));
+    art.set(SharedByte::from_str("abd"), Value::from_str("5"));
+    art.set(SharedByte::from_str("b"), Value::from_str("6"));
 
     let deleted = art.deln(b"ab");
 
     assert_eq!(deleted, 4); // ab, abc, abcd, abd
     assert_eq!(
-        art.get(&Bytes::from_static(b"a")),
+        art.get(&SharedByte::from_str("a")),
         Some(&Value::from_str("1"))
     );
-    assert_eq!(art.get(&Bytes::from_static(b"ab")), None);
-    assert_eq!(art.get(&Bytes::from_static(b"abc")), None);
+    assert_eq!(art.get(&SharedByte::from_str("ab")), None);
+    assert_eq!(art.get(&SharedByte::from_str("abc")), None);
     assert_eq!(
-        art.get(&Bytes::from_static(b"b")),
+        art.get(&SharedByte::from_str("b")),
         Some(&Value::from_str("6"))
     );
 }
@@ -553,8 +560,8 @@ fn test_deln_many_children() {
 
     // Plus de 10 enfants pour tester huge_childs
     for i in 1..=20u8 {
-        let key = Bytes::from(vec![b'x', b':', i]);
-        let val = Value::String(Bytes::from(vec![i]));
+        let key = SharedByte::from_byte(vec![b'x', b':', i]);
+        let val = Value::String(SharedByte::from_byte(vec![i]));
         art.set(key, val);
     }
 
@@ -564,7 +571,7 @@ fn test_deln_many_children() {
 
     // Vérifier qu'ils sont tous supprimés
     for i in 1..=20u8 {
-        let key = Bytes::from(vec![b'x', b':', i]);
+        let key = SharedByte::from_byte(vec![b'x', b':', i]);
         assert_eq!(art.get(&key), None);
     }
 }
@@ -573,15 +580,15 @@ fn test_deln_many_children() {
 fn test_deln_then_insert() {
     let mut art = OxidArt::new();
 
-    art.set(Bytes::from_static(b"user:alice"), Value::from_str("old"));
+    art.set(SharedByte::from_str("user:alice"), Value::from_str("old"));
     art.deln(b"user:");
 
     // Réinsérer après suppression
-    art.set(Bytes::from_static(b"user:bob"), Value::from_str("new"));
+    art.set(SharedByte::from_str("user:bob"), Value::from_str("new"));
 
-    assert_eq!(art.get(&Bytes::from_static(b"user:alice")), None);
+    assert_eq!(art.get(&SharedByte::from_str("user:alice")), None);
     assert_eq!(
-        art.get(&Bytes::from_static(b"user:bob")),
+        art.get(&SharedByte::from_str("user:bob")),
         Some(&Value::from_str("new"))
     );
 }
@@ -590,18 +597,18 @@ fn test_deln_then_insert() {
 fn test_deln_partial_match() {
     let mut art = OxidArt::new();
 
-    art.set(Bytes::from_static(b"hello"), Value::from_str("1"));
-    art.set(Bytes::from_static(b"help"), Value::from_str("2"));
-    art.set(Bytes::from_static(b"world"), Value::from_str("3"));
+    art.set(SharedByte::from_str("hello"), Value::from_str("1"));
+    art.set(SharedByte::from_str("help"), Value::from_str("2"));
+    art.set(SharedByte::from_str("world"), Value::from_str("3"));
 
     // "hel" matche "hello" et "help"
     let deleted = art.deln(b"hel");
 
     assert_eq!(deleted, 2);
-    assert_eq!(art.get(&Bytes::from_static(b"hello")), None);
-    assert_eq!(art.get(&Bytes::from_static(b"help")), None);
+    assert_eq!(art.get(&SharedByte::from_str("hello")), None);
+    assert_eq!(art.get(&SharedByte::from_str("help")), None);
     assert_eq!(
-        art.get(&Bytes::from_static(b"world")),
+        art.get(&SharedByte::from_str("world")),
         Some(&Value::from_str("3"))
     );
 }
@@ -617,41 +624,41 @@ fn test_ttl_expired_on_get() {
 
     // Insert with short TTL (1 second)
     art.set_ttl(
-        Bytes::from_static(b"expired"),
+        SharedByte::from_str("expired"),
         Duration::from_secs(1),
         Value::from_str("old"),
     );
     // Insert with longer TTL (100 seconds)
     art.set_ttl(
-        Bytes::from_static(b"valid"),
+        SharedByte::from_str("valid"),
         Duration::from_secs(100),
         Value::from_str("new"),
     );
     // Insert with no expiry
-    art.set(Bytes::from_static(b"forever"), Value::from_str("eternal"));
+    art.set(SharedByte::from_str("forever"), Value::from_str("eternal"));
 
     // Move time forward past first TTL
     art.set_now(50);
 
     // Expired key should return None and be cleaned up
-    assert_eq!(art.get(&Bytes::from_static(b"expired")), None);
+    assert_eq!(art.get(&SharedByte::from_str("expired")), None);
     // Valid key should still work
     assert_eq!(
-        art.get(&Bytes::from_static(b"valid")),
+        art.get(&SharedByte::from_str("valid")),
         Some(&Value::from_str("new"))
     );
     // No expiry key should work
     assert_eq!(
-        art.get(&Bytes::from_static(b"forever")),
+        art.get(&SharedByte::from_str("forever")),
         Some(&Value::from_str("eternal"))
     );
 
     // Move time forward, valid should expire
     art.set_now(150);
-    assert_eq!(art.get(&Bytes::from_static(b"valid")), None);
+    assert_eq!(art.get(&SharedByte::from_str("valid")), None);
     // No expiry still works
     assert_eq!(
-        art.get(&Bytes::from_static(b"forever")),
+        art.get(&SharedByte::from_str("forever")),
         Some(&Value::from_str("eternal"))
     );
 }
@@ -665,43 +672,43 @@ fn test_ttl_getn_filters_expired() {
 
     // Short TTL - will expire
     art.set_ttl(
-        Bytes::from_static(b"user:expired"),
+        SharedByte::from_str("user:expired"),
         Duration::from_secs(1),
         Value::from_str("old"),
     );
     // Longer TTL - won't expire
     art.set_ttl(
-        Bytes::from_static(b"user:valid"),
+        SharedByte::from_str("user:valid"),
         Duration::from_secs(100),
         Value::from_str("new"),
     );
     // No expiry
     art.set(
-        Bytes::from_static(b"user:forever"),
+        SharedByte::from_str("user:forever"),
         Value::from_str("eternal"),
     );
 
     // Move time forward past first TTL
     art.set_now(50);
 
-    let results = art.getn(Bytes::from_static(b"user:"));
+    let results = art.getn(SharedByte::from_str("user:"));
 
     // Should only return 2 (valid and forever), not the expired one
     assert_eq!(results.len(), 2);
     assert!(
         !results
             .iter()
-            .any(|(k, _)| k == &Bytes::from_static(b"user:expired"))
+            .any(|(k, _)| k == &SharedByte::from_str("user:expired"))
     );
     assert!(
         results
             .iter()
-            .any(|(k, _)| k == &Bytes::from_static(b"user:valid"))
+            .any(|(k, _)| k == &SharedByte::from_str("user:valid"))
     );
     assert!(
         results
             .iter()
-            .any(|(k, _)| k == &Bytes::from_static(b"user:forever"))
+            .any(|(k, _)| k == &SharedByte::from_str("user:forever"))
     );
 }
 
@@ -714,13 +721,13 @@ fn test_ttl_cleanup_on_expired_get() {
 
     // Create a path: user -> er (with short TTL)
     art.set_ttl(
-        Bytes::from_static(b"user"),
+        SharedByte::from_str("user"),
         Duration::from_secs(1),
         Value::from_str("expired_user"),
     );
     // Longer TTL
     art.set_ttl(
-        Bytes::from_static(b"username"),
+        SharedByte::from_str("username"),
         Duration::from_secs(100),
         Value::from_str("valid"),
     );
@@ -729,11 +736,11 @@ fn test_ttl_cleanup_on_expired_get() {
     art.set_now(50);
 
     // Get the expired key - should trigger cleanup
-    assert_eq!(art.get(&Bytes::from_static(b"user")), None);
+    assert_eq!(art.get(&SharedByte::from_str("user")), None);
 
     // The valid key should still work
     assert_eq!(
-        art.get(&Bytes::from_static(b"username")),
+        art.get(&SharedByte::from_str("username")),
         Some(&Value::from_str("valid"))
     );
 }
@@ -747,19 +754,19 @@ fn test_evict_expired_basic() {
 
     // Insert 50 keys with short TTL
     for i in 1..=50u8 {
-        let key = Bytes::from(vec![b'k', i]);
+        let key = SharedByte::from_byte(vec![b'k', i]);
         art.set_ttl(key, Duration::from_secs(1), Value::from_str("val"));
     }
 
     // Insert 10 keys with long TTL
     for i in 1..=10u8 {
-        let key = Bytes::from(vec![b'l', i]);
+        let key = SharedByte::from_byte(vec![b'l', i]);
         art.set_ttl(key, Duration::from_secs(1000), Value::from_str("val"));
     }
 
     // Insert 10 keys without TTL
     for i in 1..=10u8 {
-        let key = Bytes::from(vec![b'n', i]);
+        let key = SharedByte::from_byte(vec![b'n', i]);
         art.set(key, Value::from_str("val"));
     }
 
@@ -781,13 +788,13 @@ fn test_evict_expired_basic() {
 
     // Long TTL keys should still exist
     for i in 1..=10u8 {
-        let key = Bytes::from(vec![b'l', i]);
+        let key = SharedByte::from_byte(vec![b'l', i]);
         assert_eq!(art.get(&key), Some(&Value::from_str("val")));
     }
 
     // No TTL keys should still exist
     for i in 1..=10u8 {
-        let key = Bytes::from(vec![b'n', i]);
+        let key = SharedByte::from_byte(vec![b'n', i]);
         assert_eq!(art.get(&key), Some(&Value::from_str("val")));
     }
 }
@@ -801,13 +808,13 @@ fn test_evict_expired_partial() {
 
     // Insert 10 keys with short TTL (will expire)
     for i in 1..=10u8 {
-        let key = Bytes::from(vec![b'e', i]);
+        let key = SharedByte::from_byte(vec![b'e', i]);
         art.set_ttl(key, Duration::from_secs(1), Value::from_str("val"));
     }
 
     // Insert 90 keys with long TTL (won't expire)
     for i in 1..=90u8 {
-        let key = Bytes::from(vec![b'v', i]);
+        let key = SharedByte::from_byte(vec![b'v', i]);
         art.set_ttl(key, Duration::from_secs(1000), Value::from_str("val"));
     }
 
@@ -829,7 +836,7 @@ fn test_ensure() {
     art.set_now(0);
     const KEY: &[u8] = b"Hello, World!";
     let idx = art.ensure_key(KEY);
-    let val = Value::String(Bytes::from_static(KEY));
+    let val = Value::String(SharedByte::from_byte(KEY));
     art.get_node_mut(idx).val = Some((val.clone(), 1000000000000000000));
     assert_eq!(art.get(KEY), Some(&val));
 }

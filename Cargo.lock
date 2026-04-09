@@ -477,6 +477,7 @@ dependencies = [
  "hislab",
  "monoio",
  "ordered-float",
+ "radixox-lib",
  "rand",
  "regex-automata",
  "smallvec",
@@ -555,6 +556,10 @@ dependencies = [
 [[package]]
 name = "radixox-lib"
 version = "0.1.0"
+dependencies = [
+ "bytes",
+ "redis-protocol",
+]
 
 [[package]]
 name = "rand"

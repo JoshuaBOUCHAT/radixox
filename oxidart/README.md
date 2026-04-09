@@ -43,21 +43,21 @@ use bytes::Bytes;
 let mut tree = OxidArt::new();
 
 // Insert key-value pairs
-tree.set(Bytes::from_static(b"hello"), Bytes::from_static(b"world"));
-tree.set(Bytes::from_static(b"hello:foo"), Bytes::from_static(b"bar"));
+tree.set(SharedByte::from_str("hello"), SharedByte::from_str("world"));
+tree.set(SharedByte::from_str("hello:foo"), SharedByte::from_str("bar"));
 
 // Retrieve a value
-assert_eq!(tree.get(Bytes::from_static(b"hello")), Some(Bytes::from_static(b"world")));
+assert_eq!(tree.get(SharedByte::from_str("hello")), Some(SharedByte::from_str("world")));
 
 // Get all entries with a prefix
-let entries = tree.getn(Bytes::from_static(b"hello"));
+let entries = tree.getn(SharedByte::from_str("hello"));
 assert_eq!(entries.len(), 2);
 
 // Delete a key
-tree.del(Bytes::from_static(b"hello"));
+tree.del(SharedByte::from_str("hello"));
 
 // Delete all keys with a prefix
-tree.deln(Bytes::from_static(b"hello"));
+tree.deln(SharedByte::from_str("hello"));
 ```
 
 ## TTL Support
@@ -76,13 +76,13 @@ tree.set_now(current_timestamp_secs);
 
 // Insert with TTL - expires after 60 seconds
 tree.set_ttl(
-    Bytes::from_static(b"session:abc"),
+    SharedByte::from_str("session:abc"),
     Duration::from_secs(60),
-    Bytes::from_static(b"user_data")
+    SharedByte::from_str("user_data")
 );
 
 // Insert without TTL - never expires
-tree.set(Bytes::from_static(b"config:key"), Bytes::from_static(b"value"));
+tree.set(SharedByte::from_str("config:key"), SharedByte::from_str("value"));
 
 // Expired entries are automatically filtered on get/getn
 ```
@@ -110,9 +110,9 @@ async fn main() {
 
     // Use TTL
     tree.borrow_mut().set_ttl(
-        Bytes::from_static(b"session"),
+        SharedByte::from_str("session"),
         Duration::from_secs(3600),
-        Bytes::from_static(b"data"),
+        SharedByte::from_str("data"),
     );
 
     // Your server loop...
@@ -138,9 +138,9 @@ async fn main() {
 
     // Use TTL
     tree.lock().await.set_ttl(
-        Bytes::from_static(b"session"),
+        SharedByte::from_str("session"),
         Duration::from_secs(3600),
-        Bytes::from_static(b"data"),
+        SharedByte::from_str("data"),
     );
 
     // Your server loop...

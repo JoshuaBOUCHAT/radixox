@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use radixox_lib::shared_byte::SharedByte;
 
 use crate::OxidArt;
 use crate::value::{IntError, Value};
@@ -27,7 +28,7 @@ impl OxidArt {
     /// Single tree traversal: finds the node, uses Value::incr() in-place.
     /// If the key does not exist (or is expired), it is initialized to `Int(delta)`.
     /// Existing TTL is preserved.
-    pub fn incrby(&mut self, key: Bytes, delta: i64) -> Result<i64, CounterError> {
+    pub fn incrby(&mut self, key: SharedByte, delta: i64) -> Result<i64, CounterError> {
         if let Some(idx) = self.traverse_to_key(&key)
             && let Some(val) = self.node_value_mut(idx)
         {
@@ -41,19 +42,19 @@ impl OxidArt {
 
     /// Increments the integer value of a key by 1.
     #[inline]
-    pub fn incr(&mut self, key: Bytes) -> Result<i64, CounterError> {
+    pub fn incr(&mut self, key: SharedByte) -> Result<i64, CounterError> {
         self.incrby(key, 1)
     }
 
     /// Decrements the integer value of a key by 1.
     #[inline]
-    pub fn decr(&mut self, key: Bytes) -> Result<i64, CounterError> {
+    pub fn decr(&mut self, key: SharedByte) -> Result<i64, CounterError> {
         self.incrby(key, -1)
     }
 
     /// Decrements the integer value of a key by `delta`.
     #[inline]
-    pub fn decrby(&mut self, key: Bytes, delta: i64) -> Result<i64, CounterError> {
+    pub fn decrby(&mut self, key: SharedByte, delta: i64) -> Result<i64, CounterError> {
         self.incrby(key, delta.wrapping_neg())
     }
 }
@@ -65,60 +66,60 @@ mod tests {
     #[test]
     fn incr_new_key() {
         let mut tree = OxidArt::new();
-        assert_eq!(tree.incr(Bytes::from_static(b"counter")), Ok(1));
+        assert_eq!(tree.incr(SharedByte::from_str("counter")), Ok(1));
     }
 
     #[test]
     fn incr_existing() {
         let mut tree = OxidArt::new();
         tree.set(
-            Bytes::from_static(b"counter"),
-            Value::String(Bytes::from_static(b"10")),
+            SharedByte::from_str("counter"),
+            Value::String(SharedByte::from_str("10")),
         );
-        assert_eq!(tree.incr(Bytes::from_static(b"counter")), Ok(11));
-        assert_eq!(tree.incr(Bytes::from_static(b"counter")), Ok(12));
+        assert_eq!(tree.incr(SharedByte::from_str("counter")), Ok(11));
+        assert_eq!(tree.incr(SharedByte::from_str("counter")), Ok(12));
     }
 
     #[test]
     fn decr_below_zero() {
         let mut tree = OxidArt::new();
         tree.set(
-            Bytes::from_static(b"counter"),
-            Value::String(Bytes::from_static(b"1")),
+            SharedByte::from_str("counter"),
+            Value::String(SharedByte::from_str("1")),
         );
-        assert_eq!(tree.decr(Bytes::from_static(b"counter")), Ok(0));
-        assert_eq!(tree.decr(Bytes::from_static(b"counter")), Ok(-1));
+        assert_eq!(tree.decr(SharedByte::from_str("counter")), Ok(0));
+        assert_eq!(tree.decr(SharedByte::from_str("counter")), Ok(-1));
     }
 
     #[test]
     fn incrby_amount() {
         let mut tree = OxidArt::new();
         tree.set(
-            Bytes::from_static(b"counter"),
-            Value::String(Bytes::from_static(b"100")),
+            SharedByte::from_str("counter"),
+            Value::String(SharedByte::from_str("100")),
         );
-        assert_eq!(tree.incrby(Bytes::from_static(b"counter"), 50), Ok(150));
+        assert_eq!(tree.incrby(SharedByte::from_str("counter"), 50), Ok(150));
     }
 
     #[test]
     fn decrby_amount() {
         let mut tree = OxidArt::new();
         tree.set(
-            Bytes::from_static(b"counter"),
-            Value::String(Bytes::from_static(b"100")),
+            SharedByte::from_str("counter"),
+            Value::String(SharedByte::from_str("100")),
         );
-        assert_eq!(tree.decrby(Bytes::from_static(b"counter"), 30), Ok(70));
+        assert_eq!(tree.decrby(SharedByte::from_str("counter"), 30), Ok(70));
     }
 
     #[test]
     fn not_an_integer() {
         let mut tree = OxidArt::new();
         tree.set(
-            Bytes::from_static(b"name"),
-            Value::String(Bytes::from_static(b"alice")),
+            SharedByte::from_str("name"),
+            Value::String(SharedByte::from_str("alice")),
         );
         assert_eq!(
-            tree.incr(Bytes::from_static(b"name")),
+            tree.incr(SharedByte::from_str("name")),
             Err(CounterError::NotAnInteger)
         );
     }
@@ -127,11 +128,11 @@ mod tests {
     fn overflow() {
         let mut tree = OxidArt::new();
         tree.set(
-            Bytes::from_static(b"big"),
-            Value::String(Bytes::from(i64::MAX.to_string())),
+            SharedByte::from_str("big"),
+            Value::String(SharedByte::from_str(&i64::MAX.to_string())),
         );
         assert_eq!(
-            tree.incr(Bytes::from_static(b"big")),
+            tree.incr(SharedByte::from_str("big")),
             Err(CounterError::Overflow)
         );
     }
@@ -140,20 +141,20 @@ mod tests {
     fn negative_value() {
         let mut tree = OxidArt::new();
         tree.set(
-            Bytes::from_static(b"neg"),
-            Value::String(Bytes::from_static(b"-5")),
+            SharedByte::from_str("neg"),
+            Value::String(SharedByte::from_str("-5")),
         );
-        assert_eq!(tree.incr(Bytes::from_static(b"neg")), Ok(-4));
+        assert_eq!(tree.incr(SharedByte::from_str("neg")), Ok(-4));
     }
 
     #[test]
     fn incr_converts_to_int() {
         let mut tree = OxidArt::new();
         tree.set(
-            Bytes::from_static(b"counter"),
-            Value::String(Bytes::from_static(b"42")),
+            SharedByte::from_str("counter"),
+            Value::String(SharedByte::from_str("42")),
         );
-        assert_eq!(tree.incr(Bytes::from_static(b"counter")), Ok(43));
+        assert_eq!(tree.incr(SharedByte::from_str("counter")), Ok(43));
         // Should now be Value::Int internally
         let val = tree.get(b"counter").unwrap();
         assert!(matches!(val, &Value::Int(43)));
@@ -164,14 +165,14 @@ mod tests {
         let mut tree = OxidArt::new();
         tree.set_now(100);
         tree.set_ttl(
-            Bytes::from_static(b"counter"),
+            SharedByte::from_str("counter"),
             std::time::Duration::from_secs(10),
-            Value::String(Bytes::from_static(b"50")),
+            Value::String(SharedByte::from_str("50")),
         );
-        assert_eq!(tree.incr(Bytes::from_static(b"counter")), Ok(51));
+        assert_eq!(tree.incr(SharedByte::from_str("counter")), Ok(51));
 
         tree.set_now(200);
-        assert_eq!(tree.incr(Bytes::from_static(b"counter")), Ok(1));
+        assert_eq!(tree.incr(SharedByte::from_str("counter")), Ok(1));
     }
 
     #[test]
@@ -179,12 +180,12 @@ mod tests {
         let mut tree = OxidArt::new();
         tree.set_now(100);
         tree.set_ttl(
-            Bytes::from_static(b"counter"),
+            SharedByte::from_str("counter"),
             std::time::Duration::from_secs(60),
-            Value::String(Bytes::from_static(b"10")),
+            Value::String(SharedByte::from_str("10")),
         );
-        assert_eq!(tree.incr(Bytes::from_static(b"counter")), Ok(11));
-        let ttl = tree.get_ttl(Bytes::from_static(b"counter"));
+        assert_eq!(tree.incr(SharedByte::from_str("counter")), Ok(11));
+        let ttl = tree.get_ttl(SharedByte::from_str("counter"));
         assert!(matches!(ttl, crate::TtlResult::KeyWithTtl(_)));
     }
 }

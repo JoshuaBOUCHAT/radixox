@@ -1,10 +1,10 @@
-use bytes::Bytes;
 use regex_automata::dfa::{Automaton, dense::DFA};
 use regex_automata::util::primitives::StateID;
 use regex_automata::{Anchored, Input, MatchError};
 
 use crate::OxidArt;
 use crate::value::Value;
+use radixox_lib::shared_byte::SharedByte;
 
 /// Error type for regex-based operations.
 #[derive(Debug)]
@@ -48,17 +48,17 @@ impl OxidArt {
     /// use bytes::Bytes;
     ///
     /// let mut tree = OxidArt::new();
-    /// tree.set(Bytes::from_static(b"user:1:admin:x"), Bytes::from_static(b"a"));
-    /// tree.set(Bytes::from_static(b"user:2:viewer:y"), Bytes::from_static(b"b"));
-    /// tree.set(Bytes::from_static(b"user:3:admin:z"), Bytes::from_static(b"c"));
-    /// tree.set(Bytes::from_static(b"post:1"), Bytes::from_static(b"d"));
+    /// tree.set(SharedByte::from_str("user:1:admin:x"), SharedByte::from_str("a"));
+    /// tree.set(SharedByte::from_str("user:2:viewer:y"), SharedByte::from_str("b"));
+    /// tree.set(SharedByte::from_str("user:3:admin:z"), SharedByte::from_str("c"));
+    /// tree.set(SharedByte::from_str("post:1"), SharedByte::from_str("d"));
     ///
     /// let results = tree.getn_regex("user:.*:admin:.*").unwrap();
     /// // Only returns user:1:admin:x and user:3:admin:z
     /// // The "post:" subtree is pruned immediately (dead state on 'p')
     /// assert_eq!(results.len(), 2);
     /// ```
-    pub fn getn_regex(&self, pattern: &str) -> Result<Vec<(Bytes, &Value)>, RegexError> {
+    pub fn getn_regex(&self, pattern: &str) -> Result<Vec<(SharedByte, &Value)>, RegexError> {
         let dfa = DFA::new(pattern)?;
         let mut results = Vec::new();
         let start = dfa.start_state_forward(&Input::new(b"").anchored(Anchored::Yes))?;
@@ -78,7 +78,7 @@ impl OxidArt {
         dfa: &DFA<Vec<u32>>,
         root_idx: u32,
         start_state: StateID,
-        results: &mut Vec<(Bytes, &'a Value)>,
+        results: &mut Vec<(SharedByte, &'a Value)>,
     ) {
         // Stack entries: (node_idx, key_path, dfa_state after radix byte)
         let mut stack: Vec<(u32, Vec<u8>, StateID)> = vec![(root_idx, Vec::new(), start_state)];
@@ -104,7 +104,7 @@ impl OxidArt {
             if dfa.is_match_state(eoi_state)
                 && let Some(val) = node.get_value(self.now)
             {
-                results.push((Bytes::from(key_path.clone()), val));
+                results.push((SharedByte::from_slice(&key_path), val));
             }
 
             // Push children onto stack, pruning dead branches at the radix byte
@@ -122,41 +122,43 @@ impl OxidArt {
 
 #[cfg(test)]
 mod tests {
+    use radixox_lib::shared_byte::SharedByte;
+
     use super::*;
 
     fn make_tree() -> OxidArt {
         let mut tree = OxidArt::new();
         tree.set(
-            Bytes::from_static(b"user:1:admin:alice"),
-            Value::String(Bytes::from_static(b"a")),
+            SharedByte::from_str("user:1:admin:alice"),
+            Value::String(SharedByte::from_str("a")),
         );
         tree.set(
-            Bytes::from_static(b"user:2:viewer:bob"),
-            Value::String(Bytes::from_static(b"b")),
+            SharedByte::from_str("user:2:viewer:bob"),
+            Value::String(SharedByte::from_str("b")),
         );
         tree.set(
-            Bytes::from_static(b"user:3:admin:charlie"),
-            Value::String(Bytes::from_static(b"c")),
+            SharedByte::from_str("user:3:admin:charlie"),
+            Value::String(SharedByte::from_str("c")),
         );
         tree.set(
-            Bytes::from_static(b"user:4:editor:dave"),
-            Value::String(Bytes::from_static(b"d")),
+            SharedByte::from_str("user:4:editor:dave"),
+            Value::String(SharedByte::from_str("d")),
         );
         tree.set(
-            Bytes::from_static(b"post:1:title"),
-            Value::String(Bytes::from_static(b"hello")),
+            SharedByte::from_str("post:1:title"),
+            Value::String(SharedByte::from_str("hello")),
         );
         tree.set(
-            Bytes::from_static(b"post:2:title"),
-            Value::String(Bytes::from_static(b"world")),
+            SharedByte::from_str("post:2:title"),
+            Value::String(SharedByte::from_str("world")),
         );
         tree.set(
-            Bytes::from_static(b"config:db:host"),
-            Value::String(Bytes::from_static(b"localhost")),
+            SharedByte::from_str("config:db:host"),
+            Value::String(SharedByte::from_str("localhost")),
         );
         tree.set(
-            Bytes::from_static(b"config:db:port"),
-            Value::String(Bytes::from_static(b"5432")),
+            SharedByte::from_str("config:db:port"),
+            Value::String(SharedByte::from_str("5432")),
         );
         tree
     }
@@ -190,7 +192,7 @@ mod tests {
         assert_eq!(results[0].0.as_ref(), b"config:db:host");
         assert_eq!(
             results[0].1,
-            &Value::String(Bytes::from_static(b"localhost"))
+            &Value::String(SharedByte::from_str("localhost"))
         );
     }
 
@@ -222,7 +224,7 @@ mod tests {
         // Match config keys ending with specific values
         let results = tree.getn_regex("config:.*:port").unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].1, &Value::String(Bytes::from_static(b"5432")));
+        assert_eq!(results[0].1, &Value::String(SharedByte::from_str("5432")));
     }
 
     #[test]
@@ -230,13 +232,13 @@ mod tests {
         let mut tree = OxidArt::new();
         tree.set_now(100);
         tree.set_ttl(
-            Bytes::from_static(b"user:1:admin:x"),
+            SharedByte::from_str("user:1:admin:x"),
             std::time::Duration::from_secs(10),
-            Value::String(Bytes::from_static(b"val")),
+            Value::String(SharedByte::from_str("val")),
         );
         tree.set(
-            Bytes::from_static(b"user:2:admin:y"),
-            Value::String(Bytes::from_static(b"val2")),
+            SharedByte::from_str("user:2:admin:y"),
+            Value::String(SharedByte::from_str("val2")),
         );
 
         // Before expiry

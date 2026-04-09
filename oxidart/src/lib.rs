@@ -20,23 +20,23 @@
 //! let mut tree = OxidArt::new();
 //!
 //! // Insert key-value pairs
-//! tree.set(Bytes::from_static(b"hello"), Bytes::from_static(b"world"));
+//! tree.set(SharedByte::from_str("hello"), SharedByte::from_str("world"));
 //!
 //! // Insert with TTL (requires `ttl` feature, enabled by default)
 //! tree.set_now(1700000000); // Update internal clock
-//! tree.set_ttl(Bytes::from_static(b"session"), Duration::from_secs(3600), Bytes::from_static(b"data"));
+//! tree.set_ttl(SharedByte::from_str("session"), Duration::from_secs(3600), SharedByte::from_str("data"));
 //!
 //! // Retrieve a value
-//! assert_eq!(tree.get(Bytes::from_static(b"hello")), Some(Bytes::from_static(b"world")));
+//! assert_eq!(tree.get(SharedByte::from_str("hello")), Some(SharedByte::from_str("world")));
 //!
 //! // Get all entries with a prefix
-//! let entries = tree.getn(Bytes::from_static(b"hello"));
+//! let entries = tree.getn(SharedByte::from_str("hello"));
 //!
 //! // Delete a key
-//! let deleted = tree.del(Bytes::from_static(b"hello"));
+//! let deleted = tree.del(SharedByte::from_str("hello"));
 //!
 //! // Delete all keys with a prefix
-//! let count = tree.deln(Bytes::from_static(b"hello"));
+//! let count = tree.deln(SharedByte::from_str("hello"));
 //! ```
 //!
 //! ## Key Requirements
@@ -55,7 +55,6 @@ pub mod zset_inner;
 
 pub mod monoio;
 
-
 pub mod counter;
 
 #[cfg(feature = "regex")]
@@ -67,9 +66,9 @@ mod test;
 #[cfg(test)]
 mod test_structures;
 
-use bytes::Bytes;
 use hislab::HiSlab;
 use hislab::TaggedHiSlab;
+use radixox_lib::shared_byte::SharedByte;
 use rand::rngs::ThreadRng;
 
 use crate::compact_str::CompactStr;
@@ -104,9 +103,9 @@ pub enum TtlResult {
 /// use bytes::Bytes;
 ///
 /// let mut tree = OxidArt::new();
-/// tree.set(Bytes::from_static(b"key"), Bytes::from_static(b"value"));
+/// tree.set(SharedByte::from_str("key"), SharedByte::from_str("value"));
 ///
-/// assert_eq!(tree.get(Bytes::from_static(b"key")), Some(Bytes::from_static(b"value")));
+/// assert_eq!(tree.get(SharedByte::from_str("key")), Some(SharedByte::from_str("value")));
 /// ```
 ///
 pub struct OxidArt {
@@ -342,7 +341,7 @@ impl OxidArt {
     /// - `TtlResult::KeyNotExist` - The key does not exist or is expired
     /// - `TtlResult::KeyWithTtl(remaining)` - The key exists with remaining seconds until expiration
     /// - `TtlResult::KeyWithoutTtl` - The key exists but has no TTL (permanent)
-    pub fn get_ttl(&self, key: Bytes) -> TtlResult {
+    pub fn get_ttl(&self, key: SharedByte) -> TtlResult {
         debug_assert!(key.is_ascii(), "key must be ASCII");
 
         let idx = match self.traverse_to_key(&key) {
@@ -362,7 +361,7 @@ impl OxidArt {
     /// Sets a TTL on an existing key.
     ///
     /// Returns `true` if the key exists and the TTL was set, `false` otherwise.
-    pub fn expire(&mut self, key: Bytes, ttl: std::time::Duration) -> bool {
+    pub fn expire(&mut self, key: SharedByte, ttl: std::time::Duration) -> bool {
         debug_assert!(key.is_ascii(), "key must be ASCII");
 
         let Some(idx) = self.traverse_to_key(&key) else {
@@ -391,7 +390,7 @@ impl OxidArt {
     /// Removes the TTL from a key, making it permanent.
     ///
     /// Returns `true` if the key exists and had a TTL, `false` otherwise.
-    pub fn persist(&mut self, key: Bytes) -> bool {
+    pub fn persist(&mut self, key: SharedByte) -> bool {
         debug_assert!(key.is_ascii(), "key must be ASCII");
 
         let Some(idx) = self.traverse_to_key(&key) else {
@@ -528,14 +527,14 @@ impl OxidArt {
     /// use bytes::Bytes;
     ///
     /// let mut tree = OxidArt::new();
-    /// tree.set(Bytes::from_static(b"user:1"), Bytes::from_static(b"alice"));
-    /// tree.set(Bytes::from_static(b"user:2"), Bytes::from_static(b"bob"));
-    /// tree.set(Bytes::from_static(b"post:1"), Bytes::from_static(b"hello"));
+    /// tree.set(SharedByte::from_str("user:1"), SharedByte::from_str("alice"));
+    /// tree.set(SharedByte::from_str("user:2"), SharedByte::from_str("bob"));
+    /// tree.set(SharedByte::from_str("post:1"), SharedByte::from_str("hello"));
     ///
-    /// let users = tree.getn(Bytes::from_static(b"user:"));
+    /// let users = tree.getn(SharedByte::from_str("user:"));
     /// assert_eq!(users.len(), 2);
     /// ```
-    pub fn getn(&self, prefix: Bytes) -> Vec<(Bytes, &Value)> {
+    pub fn getn(&self, prefix: SharedByte) -> Vec<(SharedByte, &Value)> {
         debug_assert!(prefix.is_ascii(), "prefix must be ASCII");
         let mut results = Vec::new();
         let prefix_len = prefix.len();
@@ -592,14 +591,14 @@ impl OxidArt {
         &'a self,
         node_idx: u32,
         key_path: Vec<u8>,
-        results: &mut Vec<(Bytes, &'a Value)>,
+        results: &mut Vec<(SharedByte, &'a Value)>,
     ) {
         let Some(node) = self.try_get_node(node_idx) else {
             return;
         };
 
         if let Some(val) = node.get_value(self.now) {
-            results.push((Bytes::from(key_path.clone()), val));
+            results.push((SharedByte::from_slice(&key_path), val));
         }
 
         self.iter_all_children(node_idx, |radix, child_idx| {
@@ -614,7 +613,7 @@ impl OxidArt {
         &'a self,
         node_idx: u32,
         mut key_prefix: Vec<u8>,
-        results: &mut Vec<(Bytes, &'a Value)>,
+        results: &mut Vec<(SharedByte, &'a Value)>,
     ) {
         let Some(node) = self.try_get_node(node_idx) else {
             return;
@@ -623,7 +622,7 @@ impl OxidArt {
         key_prefix.extend_from_slice(&node.compression);
 
         if let Some(val) = node.get_value(self.now) {
-            results.push((Bytes::from(key_prefix.clone()), val));
+            results.push((SharedByte::from_slice(&key_prefix), val));
         }
 
         self.iter_all_children(node_idx, |radix, child_idx| {
@@ -673,14 +672,14 @@ impl OxidArt {
     /// let mut tree = OxidArt::new();
     ///
     /// // Insert a new key
-    /// tree.set(Bytes::from_static(b"key"), Bytes::from_static(b"value1"));
+    /// tree.set(SharedByte::from_str("key"), SharedByte::from_str("value1"));
     ///
     /// // Update an existing key
-    /// tree.set(Bytes::from_static(b"key"), Bytes::from_static(b"value2"));
+    /// tree.set(SharedByte::from_str("key"), SharedByte::from_str("value2"));
     ///
-    /// assert_eq!(tree.get(Bytes::from_static(b"key")), Some(Bytes::from_static(b"value2")));
+    /// assert_eq!(tree.get(SharedByte::from_str("key")), Some(SharedByte::from_str("value2")));
     /// ```
-    pub fn set(&mut self, key: Bytes, val: Value) {
+    pub fn set(&mut self, key: SharedByte, val: Value) {
         self.set_internal(key, NO_EXPIRY, val);
     }
 
@@ -706,16 +705,16 @@ impl OxidArt {
     /// tree.set_now(1000); // Set current time
     ///
     /// // Insert with 60 second TTL
-    /// tree.set_ttl(Bytes::from_static(b"session"), Duration::from_secs(60), Bytes::from_static(b"data"));
+    /// tree.set_ttl(SharedByte::from_str("session"), Duration::from_secs(60), SharedByte::from_str("data"));
     ///
     /// // Key expires at timestamp 1060
     /// ```
-    pub fn set_ttl(&mut self, key: Bytes, ttl: std::time::Duration, val: Value) {
+    pub fn set_ttl(&mut self, key: SharedByte, ttl: std::time::Duration, val: Value) {
         let expires_at = self.now.saturating_add(ttl.as_secs());
         self.set_internal(key, expires_at, val);
     }
 
-    fn set_internal(&mut self, key: Bytes, ttl: u64, val: Value) {
+    fn set_internal(&mut self, key: SharedByte, ttl: u64, val: Value) {
         debug_assert!(key.is_ascii(), "key must be ASCII");
         let key_len = key.len();
         if key_len == 0 {
@@ -822,7 +821,6 @@ impl OxidArt {
         idx
     }
 
-
     fn create_node_with_val(
         &mut self,
         parent_idx: u32,
@@ -864,7 +862,6 @@ impl OxidArt {
         inserted_idx
     }
 
-
     /// Deletes a key from the tree and returns its value.
     ///
     /// Returns `Some(value)` if the key existed, or `None` if it didn't.
@@ -881,13 +878,13 @@ impl OxidArt {
     /// use bytes::Bytes;
     ///
     /// let mut tree = OxidArt::new();
-    /// tree.set(Bytes::from_static(b"key"), Bytes::from_static(b"value"));
+    /// tree.set(SharedByte::from_str("key"), SharedByte::from_str("value"));
     ///
-    /// let deleted = tree.del(Bytes::from_static(b"key"));
-    /// assert_eq!(deleted, Some(Bytes::from_static(b"value")));
+    /// let deleted = tree.del(SharedByte::from_str("key"));
+    /// assert_eq!(deleted, Some(SharedByte::from_str("value")));
     ///
     /// // Key no longer exists
-    /// assert_eq!(tree.get(Bytes::from_static(b"key")), None);
+    /// assert_eq!(tree.get(SharedByte::from_str("key")), None);
     /// ```
     pub fn del(&mut self, key: &[u8]) -> Option<Value> {
         debug_assert!(key.is_ascii(), "key must be ASCII");
@@ -960,16 +957,16 @@ impl OxidArt {
     /// use bytes::Bytes;
     ///
     /// let mut tree = OxidArt::new();
-    /// tree.set(Bytes::from_static(b"user:1"), Bytes::from_static(b"alice"));
-    /// tree.set(Bytes::from_static(b"user:2"), Bytes::from_static(b"bob"));
-    /// tree.set(Bytes::from_static(b"post:1"), Bytes::from_static(b"hello"));
+    /// tree.set(SharedByte::from_str("user:1"), SharedByte::from_str("alice"));
+    /// tree.set(SharedByte::from_str("user:2"), SharedByte::from_str("bob"));
+    /// tree.set(SharedByte::from_str("post:1"), SharedByte::from_str("hello"));
     ///
     /// // Delete all user entries
-    /// let count = tree.deln(Bytes::from_static(b"user:"));
+    /// let count = tree.deln(SharedByte::from_str("user:"));
     /// assert_eq!(count, 2);
     ///
     /// // Only post entries remain
-    /// assert_eq!(tree.getn(Bytes::from_static(b"")).len(), 1);
+    /// assert_eq!(tree.getn(SharedByte::from_str("")).len(), 1);
     /// ```
     pub fn deln(&mut self, prefix: &[u8]) -> usize {
         debug_assert!(prefix.is_ascii(), "prefix must be ASCII");
@@ -1257,7 +1254,6 @@ impl Node {
         self.val = Some((val, ttl));
     }
 
-
     /// Returns the value if present and not expired
     fn get_value(&self, now: u64) -> Option<&Value> {
         let (val, ttl) = self.val.as_ref()?;
@@ -1273,7 +1269,6 @@ impl Node {
         }
         Some(val)
     }
-
 
     /// Check if value exists and is expired
     fn is_expired(&self, now: u64) -> bool {

@@ -17,12 +17,8 @@ bytes.workspace = true
 oxidart = { workspace = true, features = ["regex"] }
 radixox-lib = { workspace = true }
 smallvec.workspace = true
-redis-protocol = { version = "6.0.0", default-features = false, features = [
-    "std",
-    "resp2",
-    "resp3",
-    "bytes",
-] }
+redis-protocol = { workspace = true }
+
 local-sync = "0.1.1"
 io-uring = "0.6.4"
 

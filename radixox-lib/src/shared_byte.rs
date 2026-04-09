@@ -1,4 +1,5 @@
 use std::alloc::{Layout, alloc, dealloc};
+use std::borrow::Borrow;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::ptr::NonNull;
@@ -134,9 +135,26 @@ impl PartialEq for SharedByte {
         self.as_slice() == other.as_slice()
     }
 }
+impl Eq for SharedByte {}
 
 impl std::hash::Hash for SharedByte {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.as_slice().hash(state);
+    }
+}
+impl PartialOrd for SharedByte {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.as_slice().cmp(&other.as_slice()))
+    }
+}
+impl Ord for SharedByte {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_slice().cmp(&other.as_slice())
+    }
+}
+impl Borrow<[u8]> for SharedByte {
+    fn borrow(&self) -> &[u8] {
+        &self // si SharedByte: Deref<Target=[u8]>
+        // ou self.as_slice() selon ton API
     }
 }

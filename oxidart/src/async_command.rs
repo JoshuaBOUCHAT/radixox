@@ -5,6 +5,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
+use radixox_lib::shared_byte::SharedByte;
 
 use crate::OxidArt;
 use crate::node_childs::ChildAble;
@@ -93,14 +94,14 @@ impl OxidArt {
         &self,
         start_idx: u32,
         key_path: Vec<u8>,
-        keys: &mut Vec<Bytes>,
+        keys: &mut Vec<SharedByte>,
         stack: &mut Vec<(u32, Vec<u8>)>,
     ) {
         let Some(node) = self.try_get_node(start_idx) else {
             return;
         };
         if node.get_value(self.now).is_some() {
-            keys.push(Bytes::from(key_path.clone()));
+            keys.push(SharedByte::from_slice(&key_path));
         }
         self.iter_all_children(start_idx, |radix, child_idx| {
             let mut child_key = key_path.clone();
@@ -116,7 +117,7 @@ impl OxidArt {
     fn collect_keys_chunk(
         &self,
         stack: &mut Vec<(u32, Vec<u8>)>,
-        keys: &mut Vec<Bytes>,
+        keys: &mut Vec<SharedByte>,
         budget: usize,
     ) {
         let mut processed = 0;
@@ -130,7 +131,7 @@ impl OxidArt {
             let mut full_key = key_prefix;
             full_key.extend_from_slice(&node.compression);
             if node.get_value(self.now).is_some() {
-                keys.push(Bytes::from(full_key.clone()));
+                keys.push(SharedByte::from_slice(&full_key));
             }
             self.iter_all_children(node_idx, |radix, child_idx| {
                 let mut child_key = full_key.clone();
@@ -240,19 +241,19 @@ pub trait OxidArtAsync {
     /// Yields back to the event loop every `YIELD_BUDGET` nodes so that other
     /// connections are not starved during large prefix scans. The `RefCell`
     /// borrow is dropped before each yield point.
-    async fn getn_async(&self, prefix: Bytes) -> Vec<Bytes>;
+    async fn getn_async(&self, prefix: SharedByte) -> Vec<SharedByte>;
 
     /// Deletes all keys whose key starts with `prefix` and returns the count.
     ///
     /// Same cooperative-yield guarantee as `getn_async`. The mutable borrow is
     /// dropped before each yield so other tasks may still read the tree between
     /// chunks.
-    async fn deln_async(&self, prefix: Bytes) -> usize;
+    async fn deln_async(&self, prefix: SharedByte) -> usize;
 }
 
 impl OxidArtAsync for Rc<RefCell<OxidArt>> {
-    async fn getn_async(&self, prefix: Bytes) -> Vec<Bytes> {
-        let mut keys: Vec<Bytes> = Vec::new();
+    async fn getn_async(&self, prefix: SharedByte) -> Vec<SharedByte> {
+        let mut keys: Vec<SharedByte> = Vec::new();
 
         // Phase 1 — find the prefix node, seed the DFS stack (single borrow).
         let mut stack: Vec<(u32, Vec<u8>)> = {
@@ -278,7 +279,7 @@ impl OxidArtAsync for Rc<RefCell<OxidArt>> {
         keys
     }
 
-    async fn deln_async(&self, prefix: Bytes) -> usize {
+    async fn deln_async(&self, prefix: SharedByte) -> usize {
         // Phase 1 — traverse + sever subtree (single borrow_mut).
         let (mut free_stack, parent_idx, initial_count) = {
             let mut art = self.borrow_mut();
@@ -314,6 +315,8 @@ impl OxidArtAsync for Rc<RefCell<OxidArt>> {
 
 #[cfg(test)]
 mod tests {
+    use radixox_lib::shared_byte::SharedByte;
+
     use super::*;
     use crate::value::Value;
     use std::cell::RefCell;
@@ -323,36 +326,36 @@ mod tests {
         let art = Rc::new(RefCell::new(OxidArt::new()));
         let mut a = art.borrow_mut();
         a.set(
-            Bytes::from_static(b"user:1:name"),
-            Value::String(Bytes::from_static(b"alice")),
+            SharedByte::from_str("user:1:name"),
+            Value::String(SharedByte::from_str("alice")),
         );
         a.set(
-            Bytes::from_static(b"user:1:role"),
-            Value::String(Bytes::from_static(b"admin")),
+            SharedByte::from_str("user:1:role"),
+            Value::String(SharedByte::from_str("admin")),
         );
         a.set(
-            Bytes::from_static(b"user:2:name"),
-            Value::String(Bytes::from_static(b"bob")),
+            SharedByte::from_str("user:2:name"),
+            Value::String(SharedByte::from_str("bob")),
         );
         a.set(
-            Bytes::from_static(b"user:2:role"),
-            Value::String(Bytes::from_static(b"viewer")),
+            SharedByte::from_str("user:2:role"),
+            Value::String(SharedByte::from_str("viewer")),
         );
         a.set(
-            Bytes::from_static(b"user:3:name"),
-            Value::String(Bytes::from_static(b"carol")),
+            SharedByte::from_str("user:3:name"),
+            Value::String(SharedByte::from_str("carol")),
         );
         a.set(
-            Bytes::from_static(b"session:abc"),
-            Value::String(Bytes::from_static(b"tok1")),
+            SharedByte::from_str("session:abc"),
+            Value::String(SharedByte::from_str("tok1")),
         );
         a.set(
-            Bytes::from_static(b"session:def"),
-            Value::String(Bytes::from_static(b"tok2")),
+            SharedByte::from_str("session:def"),
+            Value::String(SharedByte::from_str("tok2")),
         );
         a.set(
-            Bytes::from_static(b"config:timeout"),
-            Value::String(Bytes::from_static(b"30")),
+            SharedByte::from_str("config:timeout"),
+            Value::String(SharedByte::from_str("30")),
         );
         drop(a);
         art
@@ -361,7 +364,7 @@ mod tests {
     #[monoio::test]
     async fn getn_async_prefix() {
         let art = make_art();
-        let mut keys = art.getn_async(Bytes::from_static(b"user:1:")).await;
+        let mut keys = art.getn_async(SharedByte::from_str("user:1:")).await;
         keys.sort();
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].as_ref(), b"user:1:name");
@@ -371,14 +374,14 @@ mod tests {
     #[monoio::test]
     async fn getn_async_empty_prefix_returns_all() {
         let art = make_art();
-        assert_eq!(art.getn_async(Bytes::new()).await.len(), 8);
+        assert_eq!(art.getn_async(SharedByte::from_str("")).await.len(), 8);
     }
 
     #[monoio::test]
     async fn getn_async_no_match() {
         let art = make_art();
         assert!(
-            art.getn_async(Bytes::from_static(b"notfound:"))
+            art.getn_async(SharedByte::from_str("notfound:"))
                 .await
                 .is_empty()
         );
@@ -387,18 +390,18 @@ mod tests {
     #[monoio::test]
     async fn deln_async_prefix() {
         let art = make_art();
-        assert_eq!(art.deln_async(Bytes::from_static(b"user:")).await, 5);
+        assert_eq!(art.deln_async(SharedByte::from_str("user:")).await, 5);
         assert!(
-            art.getn_async(Bytes::from_static(b"user:"))
+            art.getn_async(SharedByte::from_str("user:"))
                 .await
                 .is_empty()
         );
         assert_eq!(
-            art.getn_async(Bytes::from_static(b"session:")).await.len(),
+            art.getn_async(SharedByte::from_str("session:")).await.len(),
             2
         );
         assert_eq!(
-            art.getn_async(Bytes::from_static(b"config:")).await.len(),
+            art.getn_async(SharedByte::from_str("config:")).await.len(),
             1
         );
     }
@@ -406,34 +409,34 @@ mod tests {
     #[monoio::test]
     async fn deln_async_empty_prefix_flushdb() {
         let art = make_art();
-        assert_eq!(art.deln_async(Bytes::new()).await, 8);
-        assert!(art.getn_async(Bytes::new()).await.is_empty());
+        assert_eq!(art.deln_async(SharedByte::from_str("")).await, 8);
+        assert!(art.getn_async(SharedByte::from_str("")).await.is_empty());
     }
 
     #[monoio::test]
     async fn deln_async_no_match_returns_zero() {
         let art = make_art();
-        assert_eq!(art.deln_async(Bytes::from_static(b"ghost:")).await, 0);
-        assert_eq!(art.getn_async(Bytes::new()).await.len(), 8);
+        assert_eq!(art.deln_async(SharedByte::from_str("ghost:")).await, 0);
+        assert_eq!(art.getn_async(SharedByte::from_str("")).await.len(), 8);
     }
 
     #[monoio::test]
     async fn deln_async_partial_prefix() {
         let art = make_art();
-        assert_eq!(art.deln_async(Bytes::from_static(b"user:1:")).await, 2);
-        assert_eq!(art.getn_async(Bytes::from_static(b"user:")).await.len(), 3);
+        assert_eq!(art.deln_async(SharedByte::from_str("user:1:")).await, 2);
+        assert_eq!(art.getn_async(SharedByte::from_str("user:")).await.len(), 3);
     }
 
     #[monoio::test]
     async fn getn_then_deln_async_consistency() {
         let art = make_art();
         assert_eq!(
-            art.getn_async(Bytes::from_static(b"session:")).await.len(),
+            art.getn_async(SharedByte::from_str("session:")).await.len(),
             2
         );
-        assert_eq!(art.deln_async(Bytes::from_static(b"session:")).await, 2);
+        assert_eq!(art.deln_async(SharedByte::from_str("session:")).await, 2);
         assert!(
-            art.getn_async(Bytes::from_static(b"session:"))
+            art.getn_async(SharedByte::from_str("session:"))
                 .await
                 .is_empty()
         );
@@ -442,10 +445,10 @@ mod tests {
     #[monoio::test]
     async fn multiple_async_ops_leave_tree_consistent() {
         let art = make_art();
-        art.deln_async(Bytes::from_static(b"user:1:")).await;
-        art.deln_async(Bytes::from_static(b"session:")).await;
+        art.deln_async(SharedByte::from_str("user:1:")).await;
+        art.deln_async(SharedByte::from_str("session:")).await;
 
-        let remaining = art.getn_async(Bytes::new()).await;
+        let remaining = art.getn_async(SharedByte::from_str("")).await;
         assert_eq!(remaining.len(), 4); // user:2:name, user:2:role, user:3:name, config:timeout
         for key in &remaining {
             assert!(

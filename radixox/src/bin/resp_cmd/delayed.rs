@@ -1,7 +1,7 @@
 use std::pin::Pin;
 
-use bytes::Bytes;
-use redis_protocol::resp2::types::BytesFrame as Frame;
+use radixox_lib::shared_byte::SharedByte;
+use radixox_lib::shared_frame::SharedFrame as Frame;
 
 use crate::SharedART;
 use oxidart::async_command::OxidArtAsync;
@@ -12,17 +12,15 @@ pub(crate) type AsyncFrame = Pin<Box<dyn Future<Output = Frame>>>;
 
 // ─── UNLINK ───────────────────────────────────────────────────────────────────
 
-pub(crate) fn cmd_unlink(args: &[Bytes], art: SharedART) -> AsyncFrame {
+pub(crate) fn cmd_unlink(args: &[SharedByte], art: SharedART) -> AsyncFrame {
     Box::pin(handle_unlink(args.to_vec(), art))
 }
 
-async fn handle_unlink(args: Vec<Bytes>, art: SharedART) -> Frame {
+async fn handle_unlink(args: Vec<SharedByte>, art: SharedART) -> Frame {
     let mut count = 0i64;
     for arg in args {
-        // Support simple "prefix*" glob — strip trailing * for prefix match,
-        // same convention as KEYS uses. "user:*" → prefix "user:".
         let prefix = if arg.ends_with(b"*") {
-            arg.slice(..arg.len() - 1)
+            SharedByte::from_slice(&arg[..arg.len() - 1])
         } else {
             arg
         };
@@ -33,13 +31,13 @@ async fn handle_unlink(args: Vec<Bytes>, art: SharedART) -> Frame {
 
 // ─── KEYS ─────────────────────────────────────────────────────────────────────
 
-pub(crate) fn cmd_keys(args: &[Bytes], art: SharedART) -> AsyncFrame {
+pub(crate) fn cmd_keys(args: &[SharedByte], art: SharedART) -> AsyncFrame {
     Box::pin(handle_keys(args.to_vec(), art))
 }
 
-async fn handle_keys(args: Vec<Bytes>, art: SharedART) -> Frame {
+async fn handle_keys(args: Vec<SharedByte>, art: SharedART) -> Frame {
     if args.is_empty() {
-        let keys = art.getn_async(Bytes::new()).await;
+        let keys = art.getn_async(SharedByte::from_slice(b"")).await;
         return Frame::Array(keys.into_iter().map(Frame::BulkString).collect());
     }
 
@@ -48,7 +46,7 @@ async fn handle_keys(args: Vec<Bytes>, art: SharedART) -> Frame {
     // Fast path: simple prefix* or exact prefix → async getn
     if is_simple_prefix(&pattern) {
         let prefix = if pattern.ends_with(b"*") {
-            pattern.slice(..pattern.len() - 1)
+            SharedByte::from_slice(&pattern[..pattern.len() - 1])
         } else {
             pattern
         };
@@ -61,7 +59,10 @@ async fn handle_keys(args: Vec<Bytes>, art: SharedART) -> Frame {
     let borrowed = art.borrow();
     match borrowed.getn_regex(&regex) {
         Ok(pairs) => Frame::Array(
-            pairs.into_iter().map(|(k, _)| Frame::BulkString(k)).collect(),
+            pairs
+                .into_iter()
+                .map(|(k, _)| Frame::BulkString(k))
+                .collect(),
         ),
         Err(_) => Frame::Error("ERR invalid pattern".into()),
     }

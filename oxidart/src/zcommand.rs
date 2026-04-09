@@ -1,11 +1,11 @@
 use crate::value::Value::ZSet;
 use crate::zset_inner::ZSetInner;
 
-use bytes::Bytes;
 use ordered_float::OrderedFloat;
+use radixox_lib::shared_byte::SharedByte;
 use std::collections::{BTreeSet, HashMap};
 
-use crate::{error::TypeError, value::RedisType, OxidArt, NO_EXPIRY};
+use crate::{NO_EXPIRY, OxidArt, error::TypeError, value::RedisType};
 
 const THRESHOLD: usize = 16;
 
@@ -19,12 +19,12 @@ pub struct ZIter<'a> {
 }
 
 enum ZIterInner<'a> {
-    Small(std::slice::Iter<'a, (OrderedFloat<f64>, Bytes)>),
-    Large(std::collections::btree_set::Iter<'a, (OrderedFloat<f64>, Bytes)>),
+    Small(std::slice::Iter<'a, (OrderedFloat<f64>, SharedByte)>),
+    Large(std::collections::btree_set::Iter<'a, (OrderedFloat<f64>, SharedByte)>),
 }
 
 impl<'a> Iterator for ZIter<'a> {
-    type Item = &'a (OrderedFloat<f64>, Bytes);
+    type Item = &'a (OrderedFloat<f64>, SharedByte);
 
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.inner {
@@ -38,7 +38,7 @@ impl<'a> Iterator for ZIter<'a> {
 pub enum InnerZCommand {
     /// Small ZSet: sorted Vec<(score, member)> for sets below the threshold.
     /// Vec = 24 bytes — cache-friendly, no heap indirection.
-    Small(Vec<(OrderedFloat<f64>, Bytes)>),
+    Small(Vec<(OrderedFloat<f64>, SharedByte)>),
     /// Large ZSet: boxed double-indexed structure for O(1) score lookup + O(log n) range.
     /// Box = 8 bytes — keeps InnerZCommand ≤32 bytes total.
     Large(Box<ZSetInner>),
@@ -51,7 +51,7 @@ impl InnerZCommand {
 
     /// Insert or update a member with a score.
     /// Returns true if this is a new member (not an update).
-    pub(crate) fn insert(&mut self, score: f64, member: Bytes) -> bool {
+    pub(crate) fn insert(&mut self, score: f64, member: SharedByte) -> bool {
         let score = OrderedFloat(score);
         match self {
             InnerZCommand::Small(vec) => {
@@ -62,8 +62,8 @@ impl InnerZCommand {
                     }
                     vec.remove(pos);
                     // Re-insert at correct sorted position.
-                    let new_pos = vec
-                        .partition_point(|(s, m)| (*s, m.as_ref()) < (score, member.as_ref()));
+                    let new_pos =
+                        vec.partition_point(|(s, m)| (*s, m.as_ref()) < (score, member.as_ref()));
                     vec.insert(new_pos, (score, member));
                     return false; // existing member, score updated
                 }
@@ -80,8 +80,8 @@ impl InnerZCommand {
                     sorted.insert((score, member));
                     *self = InnerZCommand::Large(Box::new(ZSetInner { sorted, scores }));
                 } else {
-                    let pos = vec
-                        .partition_point(|(s, m)| (*s, m.as_ref()) < (score, member.as_ref()));
+                    let pos =
+                        vec.partition_point(|(s, m)| (*s, m.as_ref()) < (score, member.as_ref()));
                     // Avoid Vec's default MIN_NON_ZERO_CAP=4 growth: allocate exactly 1 slot.
                     if vec.len() == vec.capacity() {
                         vec.reserve_exact(1);
@@ -95,10 +95,10 @@ impl InnerZCommand {
     }
 
     /// Remove a member. Returns true if the member existed.
-    pub(crate) fn remove(&mut self, member: &Bytes) -> bool {
+    pub(crate) fn remove(&mut self, member: SharedByte) -> bool {
         match self {
             InnerZCommand::Small(vec) => {
-                if let Some(pos) = vec.iter().position(|(_, m)| m == member) {
+                if let Some(pos) = vec.iter().position(|(_, m)| m == &member) {
                     vec.remove(pos);
                     true
                 } else {
@@ -110,13 +110,13 @@ impl InnerZCommand {
     }
 
     /// Get the score of a member. O(n) for Small, O(1) for Large.
-    pub(crate) fn score(&self, member: &[u8]) -> Option<f64> {
+    pub(crate) fn score(&self, member: SharedByte) -> Option<f64> {
         match self {
             InnerZCommand::Small(vec) => vec
                 .iter()
-                .find(|(_, m)| m.as_ref() == member)
+                .find(|(_, m)| m == &member)
                 .map(|(s, _)| s.into_inner()),
-            InnerZCommand::Large(zset) => zset.score(member),
+            InnerZCommand::Large(zset) => zset.score(&member),
         }
     }
 
@@ -158,10 +158,10 @@ impl OxidArt {
     fn get_zset_mut<'a>(
         &'a mut self,
         ttl: Option<u64>,
-        key: &[u8],
+        key: SharedByte,
     ) -> Result<&'a mut InnerZCommand, TypeError> {
         let now = self.now;
-        let node_key = self.ensure_key(key);
+        let node_key = self.ensure_key(&key);
         let node = self.get_node_mut(node_key);
 
         match node.get_value_mut(now) {
@@ -181,8 +181,8 @@ impl OxidArt {
     /// Returns the number of new elements added (not including updates).
     pub fn cmd_zadd(
         &mut self,
-        key: &[u8],
-        score_members: &[(f64, Bytes)],
+        key: SharedByte,
+        score_members: &[(f64, SharedByte)],
         ttl: Option<u64>,
     ) -> Result<u32, TypeError> {
         debug_assert!(!score_members.is_empty());
@@ -216,7 +216,7 @@ impl OxidArt {
         start: i64,
         stop: i64,
         with_scores: bool,
-    ) -> Result<Vec<Bytes>, RedisType> {
+    ) -> Result<Vec<SharedByte>, RedisType> {
         let Some(val) = self.get(key) else {
             return Ok(Vec::new());
         };
@@ -247,14 +247,14 @@ impl OxidArt {
         for (score, member) in zset.iter().skip(start).take(stop - start + 1) {
             result.push(member.clone());
             if with_scores {
-                result.push(Bytes::from(score.into_inner().to_string()));
+                result.push(SharedByte::from_slice(&score.into_inner().to_string()));
             }
         }
         Ok(result)
     }
 
     /// ZSCORE - get the score of a member in a sorted set.
-    pub fn cmd_zscore(&mut self, key: &[u8], member: &[u8]) -> Result<Option<f64>, RedisType> {
+    pub fn cmd_zscore(&mut self, key: &[u8], member: SharedByte) -> Result<Option<f64>, RedisType> {
         let Some(val) = self.get(key) else {
             return Ok(None);
         };
@@ -264,7 +264,7 @@ impl OxidArt {
 
     /// ZREM - remove one or more members from a sorted set.
     /// Returns the number of members removed.
-    pub fn cmd_zrem(&mut self, key: &[u8], members: &[Bytes]) -> Result<u32, RedisType> {
+    pub fn cmd_zrem(&mut self, key: &[u8], members: &[SharedByte]) -> Result<u32, RedisType> {
         debug_assert!(!members.is_empty());
 
         let (removed, need_cleanup) = {
@@ -275,7 +275,7 @@ impl OxidArt {
             let mut removed = 0;
 
             for member in members {
-                if zset.remove(member) {
+                if zset.remove(member.clone()) {
                     removed += 1;
                 }
             }
@@ -294,18 +294,18 @@ impl OxidArt {
     /// Returns the new score.
     pub fn cmd_zincrby(
         &mut self,
-        key: &[u8],
+        key: SharedByte,
         increment: f64,
-        member: &[u8],
+        member: SharedByte,
     ) -> Result<f64, TypeError> {
         let zset = self.get_zset_mut(None, key)?;
 
-        let new_score = match zset.score(member) {
+        let new_score = match zset.score(member.clone()) {
             Some(current) => current + increment,
             None => increment,
         };
 
-        zset.insert(new_score, Bytes::copy_from_slice(member));
+        zset.insert(new_score, member);
         Ok(new_score)
     }
 }

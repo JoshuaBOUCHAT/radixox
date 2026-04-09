@@ -1,8 +1,8 @@
-use bytes::Bytes;
-
 use std::collections::{BTreeSet, VecDeque};
 
 use crate::{hcommand::InnerHCommand, zcommand::InnerZCommand};
+
+use radixox_lib::shared_byte::SharedByte;
 
 // ---------------------------------------------------------------------------
 // Value enum — replaces Bytes as the stored type in OxidArt
@@ -16,16 +16,16 @@ use crate::{hcommand::InnerHCommand, zcommand::InnerZCommand};
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     /// Raw string data.
-    String(Bytes),
+    String(SharedByte),
     /// Integer — INCR/DECR operate directly, zero parsing.
     /// Transparent: TYPE returns "string", GET formats on the fly.
     Int(i64),
     /// Hash: field → value pairs. BTreeMap for predictable O(log n) and ordered iteration.
     Hash(InnerHCommand),
     /// List: ordered collection, push/pop both ends.
-    List(VecDeque<Bytes>),
+    List(VecDeque<SharedByte>),
     /// Set: unique members. BTreeSet for ordered iteration.
-    Set(BTreeSet<Bytes>),
+    Set(BTreeSet<SharedByte>),
     /// Sorted set: members with f64 scores, sorted by (score, member).
     /// Uses InnerZCommand with Small/Large dynamic dispatch.
     /// InnerZCommand is ≤32 bytes (Small=Vec 24B, Large=Box 8B) — no outer Box needed.
@@ -90,10 +90,10 @@ pub enum IntError {
 
 impl Value {
     /// Get raw bytes. Int formats on the fly.
-    pub fn as_bytes(&self) -> Option<Bytes> {
+    pub fn as_bytes(&self) -> Option<SharedByte> {
         match self {
             Value::String(b) => Some(b.clone()),
-            Value::Int(n) => Some(Bytes::from(n.to_string())),
+            Value::Int(n) => Some(SharedByte::from_slice(n.to_string())),
             _ => None,
         }
     }
@@ -126,7 +126,7 @@ impl Value {
     }
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(string: &'static str) -> Self {
-        Self::String(Bytes::from_static(string.as_bytes()))
+        Self::String(SharedByte::from_slice(string.as_bytes()))
     }
 }
 
@@ -155,14 +155,14 @@ impl Value {
 // ---------------------------------------------------------------------------
 
 impl Value {
-    pub fn as_list_mut(&mut self) -> Result<&mut VecDeque<Bytes>, RedisType> {
+    pub fn as_list_mut(&mut self) -> Result<&mut VecDeque<SharedByte>, RedisType> {
         match self {
             Value::List(l) => Ok(l),
             other => Err(other.redis_type()),
         }
     }
 
-    pub fn as_list(&self) -> Result<&VecDeque<Bytes>, RedisType> {
+    pub fn as_list(&self) -> Result<&VecDeque<SharedByte>, RedisType> {
         match self {
             Value::List(l) => Ok(l),
             other => Err(other.redis_type()),
@@ -175,14 +175,14 @@ impl Value {
 // ---------------------------------------------------------------------------
 
 impl Value {
-    pub fn as_set_mut(&mut self) -> Result<&mut BTreeSet<Bytes>, RedisType> {
+    pub fn as_set_mut(&mut self) -> Result<&mut BTreeSet<SharedByte>, RedisType> {
         match self {
             Value::Set(s) => Ok(s),
             other => Err(other.redis_type()),
         }
     }
 
-    pub fn as_set(&self) -> Result<&BTreeSet<Bytes>, RedisType> {
+    pub fn as_set(&self) -> Result<&BTreeSet<SharedByte>, RedisType> {
         match self {
             Value::Set(s) => Ok(s),
             other => Err(other.redis_type()),

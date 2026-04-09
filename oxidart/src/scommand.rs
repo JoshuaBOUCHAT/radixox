@@ -1,20 +1,20 @@
 use crate::value::Value::Set;
 use std::collections::BTreeSet;
 
-use bytes::Bytes;
+use radixox_lib::shared_byte::SharedByte;
 
 use crate::{NO_EXPIRY, OxidArt, error::TypeError, value::RedisType};
 
 pub enum SPOPResult {
-    Single(Option<Bytes>),
-    Multiple(Vec<Bytes>),
+    Single(Option<SharedByte>),
+    Multiple(Vec<SharedByte>),
 }
 impl OxidArt {
     fn get_btree_set_mut<'a>(
         &'a mut self,
         ttl: Option<u64>,
         key: &[u8],
-    ) -> Result<&'a mut BTreeSet<Bytes>, TypeError> {
+    ) -> Result<&'a mut BTreeSet<SharedByte>, TypeError> {
         let now = self.now;
         let node_key = self.ensure_key(key);
         let node = self.get_node_mut(node_key);
@@ -68,7 +68,7 @@ impl OxidArt {
     pub fn cmd_sadd(
         &mut self,
         key: &[u8],
-        members: &[Bytes],
+        members: &[SharedByte],
         ttl: Option<u64>,
     ) -> Result<u32, TypeError> {
         debug_assert!(!members.is_empty());
@@ -84,7 +84,7 @@ impl OxidArt {
 
         Ok(count)
     }
-    pub fn cmd_srem(&mut self, key: &[u8], members: &[Bytes]) -> Result<u32, RedisType> {
+    pub fn cmd_srem(&mut self, key: &[u8], members: &[SharedByte]) -> Result<u32, RedisType> {
         debug_assert!(!members.is_empty());
 
         let (count, need_clean_up) = {
@@ -107,8 +107,8 @@ impl OxidArt {
 
         Ok(count)
     }
-    pub fn cmd_smembers(&mut self, key: &[u8]) -> Result<Vec<Bytes>, RedisType> {
-        let res: Vec<Bytes> = {
+    pub fn cmd_smembers(&mut self, key: &[u8]) -> Result<Vec<SharedByte>, RedisType> {
+        let res: Vec<_> = {
             let Some(val) = self.get(key) else {
                 return Ok(Vec::new());
             };
@@ -121,12 +121,12 @@ impl OxidArt {
         }
         Ok(res)
     }
-    pub fn cmd_sismember(&mut self, key: &[u8], member: &[u8]) -> Result<bool, RedisType> {
+    pub fn cmd_sismember(&mut self, key: &[u8], member: SharedByte) -> Result<bool, RedisType> {
         let Some(val) = self.get(key) else {
             return Ok(false);
         };
         let set = val.as_set()?;
-        Ok(set.contains(member))
+        Ok(set.contains(&member))
     }
     pub fn cmd_scard(&mut self, key: &[u8]) -> Result<u32, RedisType> {
         let len = {

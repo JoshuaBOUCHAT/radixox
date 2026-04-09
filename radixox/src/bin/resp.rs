@@ -14,14 +14,16 @@ use monoio::io::{AsyncReadRent, AsyncWriteRentExt, OwnedWriteHalf, Splitable};
 use monoio::net::{TcpListener, TcpStream};
 use monoio::time::TimeDriver;
 use monoio::{IoUringDriver, Runtime, RuntimeBuilder};
+use redis_protocol::resp2::decode::decode_bytes_mut;
+use redis_protocol::resp2::types::BytesFrame;
 use smallvec::SmallVec;
 
 use oxidart::counter::CounterError;
 use oxidart::value::Value;
 use oxidart::{OxidArt, TtlResult};
-use redis_protocol::resp2::decode::decode_bytes_mut;
-use redis_protocol::resp2::encode::extend_encode;
-use redis_protocol::resp2::types::BytesFrame as Frame;
+use radixox_lib::shared_byte::SharedByte;
+use radixox_lib::shared_frame::{SharedFrame as Frame, extend_encode};
+
 use resp_cmd::{
     cmd_hdel, cmd_hexists, cmd_hget, cmd_hgetall, cmd_hincrby, cmd_hkeys, cmd_hlen, cmd_hmget,
     cmd_hmset, cmd_hset, cmd_hvals, cmd_sadd, cmd_scard, cmd_sismember, cmd_smembers, cmd_spop,
@@ -33,13 +35,12 @@ use crate::resp_cmd::delayed::{AsyncFrame, cmd_keys, cmd_unlink};
 type IOResult<T> = std::io::Result<T>;
 type SharedART = Rc<RefCell<OxidArt>>;
 type ConnId = u64;
-type SharedRegistry = Rc<RefCell<HashMap<Bytes, HashMap<ConnId, unbounded::Tx<Bytes>>>>>;
+// Registry key: channel name (SharedByte). Value: map of conn_id → tx of encoded frames (Bytes).
+type SharedRegistry = Rc<RefCell<HashMap<SharedByte, HashMap<ConnId, unbounded::Tx<Bytes>>>>>;
+pub(crate) type CmdArgs = SmallVec<[SharedByte; 3]>;
 
 const BUFFER_SIZE: usize = 64 * 1024;
 
-// Static responses (avoid allocation)
-static PONG: Bytes = Bytes::from_static(b"PONG");
-static OK: Bytes = Bytes::from_static(b"OK");
 static ERR_EMPTY_CMD: &str = "ERR empty command";
 
 fn main() -> std::io::Result<()> {
@@ -94,7 +95,7 @@ fn get_runtime() -> std::io::Result<Runtime<TimeDriver<IoUringDriver>>> {
 struct Conn {
     write_buf: BytesMut,
     sub_tx: Option<unbounded::Tx<Bytes>>,
-    sub_channels: HashSet<Bytes>,
+    sub_channels: HashSet<SharedByte>,
     conn_id: ConnId,
 }
 
@@ -114,7 +115,7 @@ impl Conn {
         if let Some(tx) = &self.sub_tx {
             send_via_tx(tx, frame);
         } else {
-            extend_encode(&mut self.write_buf, &frame, false).expect("encode should not fail");
+            extend_encode(&mut self.write_buf, &frame);
         }
     }
 
@@ -122,7 +123,7 @@ impl Conn {
     async fn handle_cmd(
         &mut self,
         cmd: &[u8],
-        args: &[Bytes],
+        args: &[SharedByte],
         art: &SharedART,
         registry: &SharedRegistry,
     ) {
@@ -290,16 +291,16 @@ async fn pubsub_writer(mut rx: unbounded::Rx<Bytes>, mut write: impl AsyncWriteR
 
 enum Handler {
     Static(fn() -> Frame),
-    Args(fn(&[Bytes]) -> Frame),
-    Data(fn(&[Bytes], &mut OxidArt) -> Frame),
+    Args(fn(&[SharedByte]) -> Frame),
+    Data(fn(&[SharedByte], &mut OxidArt) -> Frame),
     DataOnly(fn(&mut OxidArt) -> Frame),
 }
 
 fn resp_pong() -> Frame {
-    Frame::SimpleString(PONG.clone())
+    Frame::SimpleString(SharedByte::from_slice(b"PONG"))
 }
 fn resp_ok() -> Frame {
-    Frame::SimpleString(OK.clone())
+    Frame::SimpleString(SharedByte::from_slice(b"OK"))
 }
 
 static COMMANDS: &[(&[u8], Handler)] = &[
@@ -356,10 +357,10 @@ static COMMANDS: &[(&[u8], Handler)] = &[
     (b"ZINCRBY", Handler::Data(cmd_zincrby)),
 ];
 
-static ASYNC_COMMANDS: &[(&[u8], fn(&[Bytes], SharedART) -> AsyncFrame)] =
+static ASYNC_COMMANDS: &[(&[u8], fn(&[SharedByte], SharedART) -> AsyncFrame)] =
     &[(b"UNLINK", cmd_unlink), (b"KEYS", cmd_keys)];
 
-fn dispatch_command(cmd: &[u8], args: &[Bytes], art: &mut OxidArt) -> Option<Frame> {
+fn dispatch_command(cmd: &[u8], args: &[SharedByte], art: &mut OxidArt) -> Option<Frame> {
     for (name, handler) in COMMANDS {
         if cmd.eq_ignore_ascii_case(name) {
             let frame = match handler {
@@ -371,9 +372,9 @@ fn dispatch_command(cmd: &[u8], args: &[Bytes], art: &mut OxidArt) -> Option<Fra
             return Some(frame);
         }
     }
-    return None;
+    None
 }
-async fn dispatch_async_command(cmd: &[u8], args: &[Bytes], art: SharedART) -> Option<Frame> {
+async fn dispatch_async_command(cmd: &[u8], args: &[SharedByte], art: SharedART) -> Option<Frame> {
     for (name, handler) in ASYNC_COMMANDS {
         if cmd.eq_ignore_ascii_case(name) {
             return Some(handler(args, art).await);
@@ -382,24 +383,24 @@ async fn dispatch_async_command(cmd: &[u8], args: &[Bytes], art: SharedART) -> O
     None
 }
 
-fn frame_to_args(frame: Frame) -> Option<SmallVec<[Bytes; 3]>> {
-    // `decode_bytes_mut` returns Bytes that are shared views into the network
-    // read buffer. Copy each arg here — the single network/application boundary —
+fn frame_to_args(frame: BytesFrame) -> Option<CmdArgs> {
+    // `decode_bytes_mut` returns Bytes views into the network read buffer.
+    // Copy each arg here — the single network/application boundary —
     // so stored values never pin the 64 KB read buffer for the key's lifetime.
     match frame {
-        Frame::Array(arr) => {
+        BytesFrame::Array(arr) => {
             let mut args = SmallVec::with_capacity(arr.len());
             for f in arr {
                 match f {
-                    Frame::BulkString(b) => args.push(Bytes::copy_from_slice(&b)),
-                    Frame::SimpleString(s) => args.push(Bytes::copy_from_slice(&s)),
+                    BytesFrame::BulkString(b) => args.push(SharedByte::from_slice(&b)),
+                    BytesFrame::SimpleString(s) => args.push(SharedByte::from_slice(&s)),
                     _ => return None,
                 }
             }
             Some(args)
         }
-        Frame::BulkString(b) => Some(smallvec::smallvec![Bytes::copy_from_slice(&b)]),
-        Frame::SimpleString(s) => Some(smallvec::smallvec![Bytes::copy_from_slice(&s)]),
+        BytesFrame::BulkString(b) => Some(smallvec::smallvec![SharedByte::from_slice(&b)]),
+        BytesFrame::SimpleString(s) => Some(smallvec::smallvec![SharedByte::from_slice(&s)]),
         _ => None,
     }
 }
@@ -433,7 +434,7 @@ impl Default for SetOptions {
 }
 
 /// Parse SET command options (EX, PX, NX, XX)
-fn parse_set_options(args: &[Bytes]) -> Result<SetOptions, Frame> {
+fn parse_set_options(args: &[SharedByte]) -> Result<SetOptions, Frame> {
     let mut opts = SetOptions::default();
     let mut i = 0;
 
@@ -469,7 +470,7 @@ fn parse_set_options(args: &[Bytes]) -> Result<SetOptions, Frame> {
 }
 
 /// Parse an integer argument from bytes
-fn parse_int<T: std::str::FromStr>(arg: &Bytes) -> Option<T> {
+fn parse_int<T: std::str::FromStr>(arg: &[u8]) -> Option<T> {
     std::str::from_utf8(arg).ok().and_then(|s| s.parse().ok())
 }
 
@@ -477,7 +478,7 @@ fn parse_int<T: std::str::FromStr>(arg: &Bytes) -> Option<T> {
 // Commands
 // =============================================================================
 
-fn cmd_get(args: &[Bytes], art: &mut OxidArt) -> Frame {
+fn cmd_get(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     if args.is_empty() {
         return Frame::Error("ERR wrong number of arguments for 'GET' command".into());
     }
@@ -492,7 +493,7 @@ fn cmd_get(args: &[Bytes], art: &mut OxidArt) -> Frame {
     }
 }
 
-fn cmd_set(args: &[Bytes], art: &mut OxidArt) -> Frame {
+fn cmd_set(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     if args.len() < 2 {
         return Frame::Error("ERR wrong number of arguments for 'SET' command".into());
     }
@@ -519,7 +520,7 @@ fn cmd_set(args: &[Bytes], art: &mut OxidArt) -> Frame {
         None => art.set(key, val),
     }
 
-    Frame::SimpleString(OK.clone())
+    Frame::SimpleString(SharedByte::from_slice(b"OK"))
 }
 
 fn counter_err(e: CounterError) -> Frame {
@@ -531,7 +532,7 @@ fn counter_err(e: CounterError) -> Frame {
     }
 }
 
-fn cmd_incr(args: &[Bytes], art: &mut OxidArt) -> Frame {
+fn cmd_incr(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     if args.is_empty() {
         return Frame::Error("ERR wrong number of arguments for 'INCR' command".into());
     }
@@ -541,7 +542,7 @@ fn cmd_incr(args: &[Bytes], art: &mut OxidArt) -> Frame {
     }
 }
 
-fn cmd_decr(args: &[Bytes], art: &mut OxidArt) -> Frame {
+fn cmd_decr(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     if args.is_empty() {
         return Frame::Error("ERR wrong number of arguments for 'DECR' command".into());
     }
@@ -551,7 +552,7 @@ fn cmd_decr(args: &[Bytes], art: &mut OxidArt) -> Frame {
     }
 }
 
-fn cmd_incrby(args: &[Bytes], art: &mut OxidArt) -> Frame {
+fn cmd_incrby(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     if args.len() < 2 {
         return Frame::Error("ERR wrong number of arguments for 'INCRBY' command".into());
     }
@@ -565,7 +566,7 @@ fn cmd_incrby(args: &[Bytes], art: &mut OxidArt) -> Frame {
     }
 }
 
-fn cmd_decrby(args: &[Bytes], art: &mut OxidArt) -> Frame {
+fn cmd_decrby(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     if args.len() < 2 {
         return Frame::Error("ERR wrong number of arguments for 'DECRBY' command".into());
     }
@@ -579,7 +580,7 @@ fn cmd_decrby(args: &[Bytes], art: &mut OxidArt) -> Frame {
     }
 }
 
-fn cmd_del(args: &[Bytes], art: &mut OxidArt) -> Frame {
+fn cmd_del(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     if args.is_empty() {
         return Frame::Error("ERR wrong number of arguments for 'DEL' command".into());
     }
@@ -593,7 +594,7 @@ fn cmd_del(args: &[Bytes], art: &mut OxidArt) -> Frame {
     Frame::Integer(count)
 }
 
-fn cmd_ttl(args: &[Bytes], art: &mut OxidArt) -> Frame {
+fn cmd_ttl(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     if args.is_empty() {
         return Frame::Error("ERR wrong number of arguments for 'TTL' command".into());
     }
@@ -605,7 +606,7 @@ fn cmd_ttl(args: &[Bytes], art: &mut OxidArt) -> Frame {
     }
 }
 
-fn cmd_expire(args: &[Bytes], art: &mut OxidArt) -> Frame {
+fn cmd_expire(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     if args.len() < 2 {
         return Frame::Error("ERR wrong number of arguments for 'EXPIRE' command".into());
     }
@@ -625,7 +626,7 @@ fn cmd_expire(args: &[Bytes], art: &mut OxidArt) -> Frame {
     }
 }
 
-fn cmd_persist(args: &[Bytes], art: &mut OxidArt) -> Frame {
+fn cmd_persist(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     if args.is_empty() {
         return Frame::Error("ERR wrong number of arguments for 'PERSIST' command".into());
     }
@@ -637,7 +638,7 @@ fn cmd_persist(args: &[Bytes], art: &mut OxidArt) -> Frame {
     }
 }
 
-fn cmd_exists(args: &[Bytes], art: &mut OxidArt) -> Frame {
+fn cmd_exists(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     if args.is_empty() {
         return Frame::Error("ERR wrong number of arguments for 'EXISTS' command".into());
     }
@@ -651,7 +652,7 @@ fn cmd_exists(args: &[Bytes], art: &mut OxidArt) -> Frame {
     Frame::Integer(count)
 }
 
-fn cmd_mget(args: &[Bytes], art: &mut OxidArt) -> Frame {
+fn cmd_mget(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     if args.is_empty() {
         return Frame::Error("ERR wrong number of arguments for 'MGET' command".into());
     }
@@ -670,7 +671,7 @@ fn cmd_mget(args: &[Bytes], art: &mut OxidArt) -> Frame {
     Frame::Array(results)
 }
 
-fn cmd_mset(args: &[Bytes], art: &mut OxidArt) -> Frame {
+fn cmd_mset(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     if args.is_empty() || !args.len().is_multiple_of(2) {
         return Frame::Error("ERR wrong number of arguments for 'MSET' command".into());
     }
@@ -679,10 +680,10 @@ fn cmd_mset(args: &[Bytes], art: &mut OxidArt) -> Frame {
         art.set(pair[0].clone(), Value::String(pair[1].clone()));
     }
 
-    Frame::SimpleString(OK.clone())
+    Frame::SimpleString(SharedByte::from_slice(b"OK"))
 }
 
-fn cmd_setnx(args: &[Bytes], art: &mut OxidArt) -> Frame {
+fn cmd_setnx(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     if args.len() < 2 {
         return Frame::Error("ERR wrong number of arguments for 'SETNX' command".into());
     }
@@ -696,7 +697,7 @@ fn cmd_setnx(args: &[Bytes], art: &mut OxidArt) -> Frame {
     Frame::Integer(1)
 }
 
-fn cmd_setex(args: &[Bytes], art: &mut OxidArt) -> Frame {
+fn cmd_setex(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     if args.len() < 3 {
         return Frame::Error("ERR wrong number of arguments for 'SETEX' command".into());
     }
@@ -709,10 +710,10 @@ fn cmd_setex(args: &[Bytes], art: &mut OxidArt) -> Frame {
     let val = Value::String(args[2].clone());
 
     art.set_ttl(key, Duration::from_secs(secs), val);
-    Frame::SimpleString(OK.clone())
+    Frame::SimpleString(SharedByte::from_slice(b"OK"))
 }
 
-fn cmd_pttl(args: &[Bytes], art: &mut OxidArt) -> Frame {
+fn cmd_pttl(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     if args.is_empty() {
         return Frame::Error("ERR wrong number of arguments for 'PTTL' command".into());
     }
@@ -724,7 +725,7 @@ fn cmd_pttl(args: &[Bytes], art: &mut OxidArt) -> Frame {
     }
 }
 
-fn cmd_pexpire(args: &[Bytes], art: &mut OxidArt) -> Frame {
+fn cmd_pexpire(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     if args.len() < 2 {
         return Frame::Error("ERR wrong number of arguments for 'PEXPIRE' command".into());
     }
@@ -741,7 +742,7 @@ fn cmd_pexpire(args: &[Bytes], art: &mut OxidArt) -> Frame {
     }
 }
 
-fn cmd_echo(args: &[Bytes]) -> Frame {
+fn cmd_echo(args: &[SharedByte]) -> Frame {
     if args.is_empty() {
         return Frame::Error("ERR wrong number of arguments for 'ECHO' command".into());
     }
@@ -749,23 +750,25 @@ fn cmd_echo(args: &[Bytes]) -> Frame {
 }
 
 fn cmd_dbsize(art: &mut OxidArt) -> Frame {
-    let count = art.getn(Bytes::new()).len() as i64;
+    let count = art.getn(SharedByte::from_slice(b"")).len() as i64;
     Frame::Integer(count)
 }
 
 fn cmd_flushdb(art: &mut OxidArt) -> Frame {
     art.deln(b"");
-    Frame::SimpleString(OK.clone())
+    Frame::SimpleString(SharedByte::from_slice(b"OK"))
 }
 
-fn cmd_type(args: &[Bytes], art: &mut OxidArt) -> Frame {
+fn cmd_type(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     if args.is_empty() {
         return Frame::Error("ERR wrong number of arguments for 'TYPE' command".into());
     }
 
     match art.get(&args[0]) {
-        Some(val) => Frame::SimpleString(Bytes::from_static(val.redis_type().as_str().as_bytes())),
-        None => Frame::SimpleString(Bytes::from_static(b"none")),
+        Some(val) => {
+            Frame::SimpleString(SharedByte::from_slice(val.redis_type().as_str().as_bytes()))
+        }
+        None => Frame::SimpleString(SharedByte::from_slice(b"none")),
     }
 }
 
@@ -773,22 +776,22 @@ fn cmd_type(args: &[Bytes], art: &mut OxidArt) -> Frame {
 // Pub/Sub
 // =============================================================================
 
-fn encode_pubsub_push(channel: &Bytes, message: &Bytes) -> Bytes {
+fn encode_pubsub_push(channel: &SharedByte, message: &SharedByte) -> Bytes {
     let frame = Frame::Array(vec![
-        Frame::BulkString(Bytes::from_static(b"message")),
+        Frame::BulkString(SharedByte::from_str("message")),
         Frame::BulkString(channel.clone()),
         Frame::BulkString(message.clone()),
     ]);
     let mut buf = BytesMut::new();
-    extend_encode(&mut buf, &frame, false).expect("encode should not fail");
+    extend_encode(&mut buf, &frame);
     buf.freeze()
 }
 
 fn handle_subscribe(
-    args: &[Bytes],
+    args: &[SharedByte],
     registry: &SharedRegistry,
     conn_id: ConnId,
-    sub_channels: &mut HashSet<Bytes>,
+    sub_channels: &mut HashSet<SharedByte>,
     tx: &unbounded::Tx<Bytes>,
 ) {
     if args.is_empty() {
@@ -809,7 +812,7 @@ fn handle_subscribe(
         send_via_tx(
             tx,
             Frame::Array(vec![
-                Frame::BulkString(Bytes::from_static(b"subscribe")),
+                Frame::BulkString(SharedByte::from_str("subscribe")),
                 Frame::BulkString(ch.clone()),
                 Frame::Integer(sub_channels.len() as i64),
             ]),
@@ -818,13 +821,13 @@ fn handle_subscribe(
 }
 
 fn handle_unsubscribe(
-    args: &[Bytes],
+    args: &[SharedByte],
     registry: &SharedRegistry,
     conn_id: ConnId,
-    sub_channels: &mut HashSet<Bytes>,
+    sub_channels: &mut HashSet<SharedByte>,
     tx: &unbounded::Tx<Bytes>,
 ) {
-    let channels_to_remove: Vec<Bytes> = if args.is_empty() {
+    let channels_to_remove: Vec<SharedByte> = if args.is_empty() {
         sub_channels.iter().cloned().collect()
     } else {
         args.to_vec()
@@ -843,7 +846,7 @@ fn handle_unsubscribe(
         send_via_tx(
             tx,
             Frame::Array(vec![
-                Frame::BulkString(Bytes::from_static(b"unsubscribe")),
+                Frame::BulkString(SharedByte::from_str("unsubscribe")),
                 Frame::BulkString(ch.clone()),
                 Frame::Integer(sub_channels.len() as i64),
             ]),
@@ -855,11 +858,11 @@ fn handle_unsubscribe(
 #[inline]
 fn send_via_tx(tx: &unbounded::Tx<Bytes>, frame: Frame) {
     let mut buf = BytesMut::new();
-    extend_encode(&mut buf, &frame, false).expect("encode should not fail");
+    extend_encode(&mut buf, &frame);
     let _ = tx.send(buf.freeze());
 }
 
-fn cmd_publish(args: &[Bytes], registry: &SharedRegistry) -> Frame {
+fn cmd_publish(args: &[SharedByte], registry: &SharedRegistry) -> Frame {
     if args.len() < 2 {
         return Frame::Error("ERR wrong number of arguments for 'PUBLISH' command".into());
     }
@@ -884,7 +887,11 @@ fn cmd_publish(args: &[Bytes], registry: &SharedRegistry) -> Frame {
     Frame::Integer(count)
 }
 
-fn cleanup_subscriptions(registry: &SharedRegistry, conn_id: ConnId, channels: &HashSet<Bytes>) {
+fn cleanup_subscriptions(
+    registry: &SharedRegistry,
+    conn_id: ConnId,
+    channels: &HashSet<SharedByte>,
+) {
     if channels.is_empty() {
         return;
     }

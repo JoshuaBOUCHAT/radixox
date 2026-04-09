@@ -1,3 +1,5 @@
+use std::mem::MaybeUninit;
+
 use crate::shared_byte::SharedByte;
 
 #[test]
@@ -13,3 +15,7 @@ fn verify_niche() {
         std::mem::size_of::<Option<SharedByte>>()
     );
 }
+const _: () =
+    assert!(std::mem::size_of::<Option<SharedByte>>() == std::mem::size_of::<SharedByte>());
+const _: () =
+    assert!(std::mem::size_of::<MaybeUninit<SharedByte>>() == std::mem::size_of::<SharedByte>());
