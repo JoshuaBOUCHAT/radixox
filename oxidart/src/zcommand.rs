@@ -5,7 +5,7 @@ use ordered_float::OrderedFloat;
 use radixox_lib::shared_byte::SharedByte;
 use std::collections::{BTreeSet, HashMap};
 
-use crate::{NO_EXPIRY, OxidArt, error::TypeError, value::RedisType};
+use crate::{OxidArt, error::TypeError, value::RedisType};
 
 const THRESHOLD: usize = 16;
 
@@ -162,18 +162,30 @@ impl OxidArt {
     ) -> Result<&'a mut InnerZCommand, TypeError> {
         let now = self.now;
         let node_key = self.ensure_key(&key);
-        let node = self.get_node_mut(node_key);
+        let node: &mut crate::Node = self.get_node_mut(node_key);
 
-        match node.get_value_mut(now) {
-            Some(ZSet(_)) => {}
+        let need_tag = match node.get_value_mut(now) {
+            Some(ZSet(_)) => false,
             Some(_) => return Err(TypeError::ValueNotSet),
             None => {
-                node.val = Some((ZSet(InnerZCommand::default()), ttl.unwrap_or(NO_EXPIRY)));
+                node.val = Some(ZSet(InnerZCommand::default()));
+                if let Some(ttl) = ttl {
+                    node.exp_and_radix.set_exp(ttl);
+                    true
+                } else {
+                    false
+                }
             }
         };
+        if need_tag {
+            self.map.tag(node_key);
+        }
+
+        let node: &mut crate::Node = self.get_node_mut(node_key);
 
         let val = node.get_value_mut(now).unwrap();
         let ZSet(zset) = val else { unreachable!() };
+
         Ok(zset)
     }
 

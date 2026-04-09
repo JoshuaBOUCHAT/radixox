@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 use radixox_lib::shared_byte::SharedByte;
 
-use crate::{NO_EXPIRY, OxidArt, error::TypeError, value::RedisType};
+use crate::{OxidArt, error::TypeError, value::RedisType};
 
 const THRESHOLD: usize = 16;
 
@@ -161,7 +161,10 @@ impl OxidArt {
             Some(Hash(_)) => {}
             Some(_) => return Err(TypeError::ValueNotSet),
             None => {
-                node.val = Some((Hash(InnerHCommand::new()), ttl.unwrap_or(NO_EXPIRY)));
+                node.val = Some(Hash(InnerHCommand::new()));
+                if let Some(ttl) = ttl {
+                    node.exp_and_radix.set_exp(ttl);
+                }
             }
         };
 

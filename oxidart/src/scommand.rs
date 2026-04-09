@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 
 use radixox_lib::shared_byte::SharedByte;
 
-use crate::{NO_EXPIRY, OxidArt, error::TypeError, value::RedisType};
+use crate::{OxidArt, error::TypeError, value::RedisType};
 
 pub enum SPOPResult {
     Single(Option<SharedByte>),
@@ -23,7 +23,10 @@ impl OxidArt {
             Some(Set(_)) => {}
             Some(_) => return Err(TypeError::ValueNotSet),
             None => {
-                node.val = Some((Set(BTreeSet::new()), ttl.unwrap_or(NO_EXPIRY)));
+                node.val = Some(Set(BTreeSet::new()));
+                if let Some(ttl) = ttl {
+                    node.exp_and_radix.set_exp(ttl);
+                }
             }
         };
 

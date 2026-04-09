@@ -1,6 +1,6 @@
 use arrayvec::ArrayVec;
 
-pub(crate) const CHILDS_SIZE: usize = 9;
+pub(crate) const CHILDS_SIZE: usize = 10;
 const ASCII_MAX_CHAR: usize = 127;
 pub(crate) const HUGE_CHILDS_SIZE: usize = ASCII_MAX_CHAR - CHILDS_SIZE;
 

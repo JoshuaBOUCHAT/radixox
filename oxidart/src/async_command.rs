@@ -4,7 +4,6 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
-use bytes::Bytes;
 use radixox_lib::shared_byte::SharedByte;
 
 use crate::OxidArt;

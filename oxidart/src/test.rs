@@ -736,12 +736,23 @@ fn test_ttl_cleanup_on_expired_get() {
     art.set_now(50);
 
     // Get the expired key - should trigger cleanup
-    assert_eq!(art.get(&SharedByte::from_str("user")), None);
+    let user = art.get(&SharedByte::from_str("user")).cloned();
+
+    assert_eq!(
+        user,
+        None,
+        "expiracy: {:?}",
+        art.get_ttl(SharedByte::from_str("user"))
+    );
 
     // The valid key should still work
+
+    let valid = art.get(&SharedByte::from_str("username")).cloned();
     assert_eq!(
-        art.get(&SharedByte::from_str("username")),
-        Some(&Value::from_str("valid"))
+        valid,
+        Some(Value::from_str("valid")),
+        "expiracy: {:?}",
+        art.get_ttl(SharedByte::from_str("username"))
     );
 }
 
@@ -837,6 +848,8 @@ fn test_ensure() {
     const KEY: &[u8] = b"Hello, World!";
     let idx = art.ensure_key(KEY);
     let val = Value::String(SharedByte::from_byte(KEY));
-    art.get_node_mut(idx).val = Some((val.clone(), 1000000000000000000));
+    let node = art.get_node_mut(idx);
+    node.val = Some(val.clone());
+    node.exp_and_radix.set_exp(1 << 50);
     assert_eq!(art.get(KEY), Some(&val));
 }

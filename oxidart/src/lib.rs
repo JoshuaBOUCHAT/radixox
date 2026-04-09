@@ -68,22 +68,19 @@ mod test;
 #[cfg(test)]
 mod test_structures;
 
-use std::mem::ManuallyDrop;
-
 use hislab::HiSlab;
 use hislab::TaggedHiSlab;
 use radixox_lib::shared_byte::SharedByte;
 use rand::rngs::ThreadRng;
 
 use crate::compact_str::CompactStr;
-use crate::node_childs::CHILDS_SIZE;
+
 use crate::node_childs::ChildAble;
 use crate::node_childs::Childs;
 use crate::node_childs::HugeChilds;
 use crate::value::Value;
 
 /// Internal sentinel value indicating no expiration (never expires)
-const NO_EXPIRY: u64 = u64::MAX;
 
 /// Result of a TTL lookup operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,7 +213,7 @@ impl OxidArt {
             // Check if expired
             if node.is_expired(self.now) {
                 let parent_idx = node.parent_idx;
-                let parent_radix = node.parent_radix;
+                let parent_radix = node.parent_radix();
 
                 // Don't try to delete root
                 if parent_idx != u32::MAX {
@@ -363,18 +360,21 @@ impl OxidArt {
     /// - `TtlResult::KeyWithoutTtl` - The key exists but has no TTL (permanent)
     pub fn get_ttl(&self, key: SharedByte) -> TtlResult {
         debug_assert!(key.is_ascii(), "key must be ASCII");
-
+        eprintln!("si test s'affiche pas la clé existe just pas");
         let idx = match self.traverse_to_key(&key) {
             Some(idx) => idx,
             None => return TtlResult::KeyNotExist,
         };
 
         let node = self.get_node(idx);
-        match &node.val {
-            None => TtlResult::KeyNotExist,
-            Some((_, expiry)) if *expiry == NO_EXPIRY => TtlResult::KeyWithoutTtl,
-            Some((_, expiry)) if *expiry <= self.now => TtlResult::KeyNotExist,
-            Some((_, expiry)) => TtlResult::KeyWithTtl(expiry - self.now),
+        eprintln!("test truc truc");
+        if node.is_expired(self.now) {
+            eprintln!("key not existe at all ");
+            return TtlResult::KeyNotExist;
+        }
+        match node.exp_and_radix.exp() {
+            Some(exp) => TtlResult::KeyWithTtl(exp - self.now),
+            None => TtlResult::KeyWithoutTtl,
         }
     }
 
@@ -383,28 +383,25 @@ impl OxidArt {
     /// Returns `true` if the key exists and the TTL was set, `false` otherwise.
     pub fn expire(&mut self, key: SharedByte, ttl: std::time::Duration) -> bool {
         debug_assert!(key.is_ascii(), "key must be ASCII");
-
+        let now = self.now;
         let Some(idx) = self.traverse_to_key(&key) else {
             return false;
         };
 
-        let now = self.now;
-        let new_expiry = now.saturating_add(ttl.as_secs());
-
         let node = self.get_node_mut(idx);
-        match &mut node.val {
-            None => false,
-            Some((_, expiry)) if *expiry != NO_EXPIRY && *expiry <= now => false,
-            Some((_, expiry)) => {
-                let was_permanent = *expiry == NO_EXPIRY;
-                *expiry = new_expiry;
-                // Tag the node if it wasn't already (was permanent)
-                if was_permanent {
-                    self.map.tag(idx);
-                }
-                true
-            }
+        if node.is_expired(now) {
+            return false;
         }
+
+        let new_expiry = now.saturating_add(ttl.as_secs());
+        let was_permanent = !node.does_expire();
+        node.exp_and_radix.set_exp(new_expiry);
+
+        if was_permanent {
+            self.map.tag(idx);
+        }
+
+        was_permanent
     }
 
     /// Removes the TTL from a key, making it permanent.
@@ -417,20 +414,16 @@ impl OxidArt {
             return false;
         };
 
-        let now = self.now;
-
         let node = self.get_node_mut(idx);
-        match &mut node.val {
-            None => false,
-            Some((_, expiry)) if *expiry == NO_EXPIRY => false, // Already permanent
-            Some((_, expiry)) if *expiry <= now => false,       // Expired
-            Some((_, expiry)) => {
-                *expiry = NO_EXPIRY;
-                // Untag the node since it no longer has TTL
-                self.map.untag(idx);
-                true
-            }
+        if !node.exp_and_radix.does_expire() {
+            return false;
         }
+        node.exp_and_radix.set_no_expiracy();
+        if node.val.is_none() {
+            return false;
+        }
+        self.map.untag(idx);
+        true
     }
 
     /// Traverses to a key and returns the node index if found.
@@ -502,11 +495,11 @@ impl OxidArt {
     /// TTL is preserved — only the value bytes can be modified.
     pub(crate) fn node_value_mut(&mut self, idx: u32) -> Option<&mut Value> {
         let now = self.now;
-        let (val, ttl) = self.get_node_mut(idx).val.as_mut()?;
-        if *ttl != NO_EXPIRY && *ttl < now {
+        let node = self.get_node_mut(idx);
+        if node.is_expired(now) {
             return None;
         }
-        Some(val)
+        node.val.as_mut()
     }
 
     /// Deletes a node inline (used for TTL expiration cleanup)
@@ -700,7 +693,7 @@ impl OxidArt {
     /// assert_eq!(tree.get(SharedByte::from_str("key")), Some(SharedByte::from_str("value2")));
     /// ```
     pub fn set(&mut self, key: SharedByte, val: Value) {
-        self.set_internal(key, NO_EXPIRY, val);
+        self.set_internal(key, ExpAndRadix::NO_EXPIRACY, val);
     }
 
     /// Inserts or updates a key-value pair with a time-to-live duration.
@@ -780,35 +773,37 @@ impl OxidArt {
         mut val: Option<Value>,
     ) -> u32 {
         let val_on_intermediate = common_len == key_rest.len();
-        let (old_compression, old_val, old_childs, old_huge_idx) = {
+        let (old_compression, old_val, old_childs, old_huge_idx, old_exp) = {
             let node = self.get_node_mut(idx);
             let old_compression = std::mem::take(&mut node.compression);
             let old_val = node.val.take();
+            let old_exp = node.exp_and_radix;
+            node.exp_and_radix.set_no_expiracy();
             let old_childs = std::mem::take(&mut node.childs);
             let old_huge_idx = std::mem::replace(&mut node.huge_childs_idx, u32::MAX);
 
             node.compression = CompactStr::from_slice(&old_compression[..common_len]);
             if val_on_intermediate && let Some(val) = val.take() {
-                node.val = Some((val, ttl.unwrap_or(NO_EXPIRY)));
+                node.val = Some(val);
+                if let Some(ttl) = ttl {
+                    node.exp_and_radix.set_exp(ttl);
+                }
             }
 
-            (old_compression, old_val, old_childs, old_huge_idx)
+            (old_compression, old_val, old_childs, old_huge_idx, old_exp)
         };
 
         // Create a node for the old content
         let old_radix = old_compression[common_len];
         // Check if old value had a TTL (needs to stay tagged)
-        let old_had_ttl = old_val
-            .as_ref()
-            .map(|(_, old_ttl)| *old_ttl != NO_EXPIRY)
-            .unwrap_or(false);
+        let old_had_ttl = old_exp.does_expire();
         let old_child = Node {
             huge_childs_idx: old_huge_idx,
             compression: CompactStr::from_slice(&old_compression[common_len + 1..]),
             val: old_val,
             childs: old_childs,
             parent_idx: idx,
-            parent_radix: old_radix,
+            exp_and_radix: old_exp,
         };
         let old_child_idx = if old_had_ttl {
             self.insert_tagged(old_child)
@@ -828,7 +823,7 @@ impl OxidArt {
                     new_radix,
                     val,
                     new_compression,
-                    ttl.unwrap_or(NO_EXPIRY),
+                    ttl.unwrap_or(ExpAndRadix::NO_EXPIRACY),
                 )
             } else {
                 let new_node = Node::new_empty_leaf(new_compression, idx, new_radix);
@@ -858,7 +853,7 @@ impl OxidArt {
         };
         let new_leaf = Node::new_leaf(compression, val, ttl, parent_idx, radix);
         // Tag the node if it has a real TTL (not NO_EXPIRY)
-        let inserted_idx = if ttl != NO_EXPIRY {
+        let inserted_idx = if ttl != ExpAndRadix::NO_EXPIRACY {
             self.insert_tagged(new_leaf)
         } else {
             self.insert(new_leaf)
@@ -912,7 +907,7 @@ impl OxidArt {
         if key_len == 0 {
             let old_val = self.get_node_mut(self.root_idx).val.take();
             self.try_recompress(self.root_idx);
-            return old_val.map(|(v, _)| v);
+            return old_val;
         }
 
         // Traverse like get, keeping track of the immediate parent
@@ -948,7 +943,7 @@ impl OxidArt {
             // Node with children: keep the node, just remove the value
             let old_val = self.get_node_mut(target_idx).val.take()?;
             self.try_recompress(target_idx);
-            return Some(old_val.0);
+            return Some(old_val);
         } else {
             // Node without children (leaf): completely remove from the slab
             let node = self.map.remove(target_idx)?;
@@ -957,7 +952,7 @@ impl OxidArt {
             if parent_idx != self.root_idx {
                 self.try_recompress(parent_idx);
             }
-            return Some(old_val.0);
+            return Some(old_val);
         }
     }
 
@@ -1163,6 +1158,7 @@ impl OxidArt {
         node.compression.push(child_radix);
         node.compression.extend_from_slice(&child.compression);
         node.val = child.val;
+        node.exp_and_radix = child.exp_and_radix;
         node.childs = child.childs;
     }
 
@@ -1213,19 +1209,55 @@ impl OxidArt {
 struct Node {
     compression: CompactStr,
     childs: Childs,
-
-    val: Option<(Value, u64)>,
+    val: Option<Value>,
+    exp_and_radix: ExpAndRadix,
     huge_childs_idx: u32,
     /// Parent node index (for TTL eviction)
     parent_idx: u32,
-    /// Radix used to reach this node from parent (for TTL eviction)
-    parent_radix: u8,
 }
-
-enum TValue {
-    String(SharedByte),
-    Int(i64),
-    Index(u32),
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct ExpAndRadix {
+    inner: u64,
+}
+impl ExpAndRadix {
+    const NO_EXPIRACY: u64 = 0x00FFFFFFFFFFFFFF;
+    const RADIX_MASK: u64 = !Self::NO_EXPIRACY;
+    const EXP_LENGTH: u64 = 56;
+    const fn no_expiracy(parent_radix: u8) -> Self {
+        Self {
+            inner: ((parent_radix as u64) << 56) | Self::NO_EXPIRACY,
+        }
+    }
+    fn exp(self) -> Option<u64> {
+        let exp = self.inner & Self::NO_EXPIRACY;
+        if exp == Self::NO_EXPIRACY {
+            None
+        } else {
+            Some(exp)
+        }
+    }
+    fn parent_radix(self) -> u8 {
+        ((self.inner & Self::RADIX_MASK) >> Self::EXP_LENGTH) as u8
+    }
+    fn does_expire(self) -> bool {
+        self.inner & Self::NO_EXPIRACY != Self::NO_EXPIRACY
+    }
+    ///this function panic if the 8 upper bit of the ttl provide is not at 0 because the niche is needed to store radix
+    fn set_exp(&mut self, exp: u64) {
+        assert!(exp & Self::RADIX_MASK == 0);
+        self.inner = self.inner & Self::RADIX_MASK | exp
+    }
+    fn set_no_expiracy(&mut self) {
+        self.inner |= Self::NO_EXPIRACY;
+    }
+    ///this function panic if the 8 upper bit of the ttl provide is not at 0 because the niche is needed to store radix
+    fn new(exp: u64, parent_radix: u8) -> Self {
+        assert!(exp & Self::RADIX_MASK == 0);
+        Self {
+            inner: ((parent_radix as u64) << Self::EXP_LENGTH) | exp,
+        }
+    }
 }
 
 impl Default for Node {
@@ -1236,7 +1268,7 @@ impl Default for Node {
             compression: CompactStr::new(),
             val: None,
             parent_idx: u32::MAX, // Root has no parent
-            parent_radix: 0,
+            exp_and_radix: ExpAndRadix::no_expiracy(0),
         }
     }
 }
@@ -1277,33 +1309,27 @@ impl Node {
             .position(|(a, b)| a != b)
             .unwrap_or_else(|| self.compression.len().min(key_rest.len()))
     }
-    fn set_val(&mut self, val: Value, ttl: u64) {
-        self.val = Some((val, ttl));
+    fn set_val(&mut self, val: Value, exp: u64) {
+        self.val = Some(val);
+        self.exp_and_radix.set_exp(exp);
     }
 
     /// Returns the value if present and not expired
     fn get_value(&self, now: u64) -> Option<&Value> {
-        let (val, ttl) = self.val.as_ref()?;
-        if *ttl != NO_EXPIRY && *ttl < now {
+        if self.is_expired(now) {
             return None;
         }
-        Some(val)
+        self.val.as_ref()
     }
     fn get_value_mut(&mut self, now: u64) -> Option<&mut Value> {
-        let (val, ttl) = self.val.as_mut()?;
-        if *ttl != NO_EXPIRY && *ttl < now {
+        if self.is_expired(now) {
             return None;
         }
-        Some(val)
+        self.val.as_mut()
     }
-
-    /// Check if value exists and is expired
+    /// Check if value expired
     fn is_expired(&self, now: u64) -> bool {
-        if let Some((_, ttl)) = &self.val {
-            *ttl != NO_EXPIRY && *ttl < now
-        } else {
-            false
-        }
+        self.exp_and_radix.exp().is_some_and(|exp| exp < now)
     }
 
     fn get_huge_childs_idx(&self) -> Option<u32> {
@@ -1324,10 +1350,10 @@ impl Node {
         Node {
             huge_childs_idx: u32::MAX,
             compression: CompactStr::from_slice(compression),
-            val: Some((val, ttl)),
+            val: Some(val),
             childs: Childs::default(),
             parent_idx,
-            parent_radix,
+            exp_and_radix: ExpAndRadix::new(ttl, parent_radix),
         }
     }
     fn new_empty_leaf(compression: &[u8], parent_idx: u32, parent_radix: u8) -> Self {
@@ -1337,7 +1363,7 @@ impl Node {
             val: None,
             huge_childs_idx: u32::MAX,
             parent_idx,
-            parent_radix,
+            exp_and_radix: ExpAndRadix::no_expiracy(parent_radix),
         }
     }
 
@@ -1352,5 +1378,13 @@ impl Node {
             return Some(ret);
         }
         None
+    }
+    #[inline]
+    fn does_expire(&self) -> bool {
+        self.exp_and_radix.does_expire()
+    }
+    #[inline]
+    fn parent_radix(&self) -> u8 {
+        self.exp_and_radix.parent_radix()
     }
 }
