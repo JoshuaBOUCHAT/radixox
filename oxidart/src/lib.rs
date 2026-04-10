@@ -60,8 +60,6 @@ pub mod counter;
 #[cfg(feature = "regex")]
 pub mod regex;
 
-mod temporay;
-
 #[cfg(test)]
 mod test;
 

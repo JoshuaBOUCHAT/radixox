@@ -20,9 +20,9 @@ use redis_protocol::resp2::types::BytesFrame;
 use smallvec::SmallVec;
 
 use oxidart::counter::CounterError;
+use oxidart::monoio::spawn_stats_logger;
 use oxidart::value::Value;
 use oxidart::{OxidArt, TtlResult};
-use oxidart::monoio::spawn_stats_logger;
 use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::shared_frame::{SharedFrame as Frame, extend_encode};
 
@@ -124,14 +124,14 @@ fn spawn_acceptor(
 }
 
 fn get_runtime() -> std::io::Result<Runtime<TimeDriver<IoUringDriver>>> {
-    let mut uring_builder = io_uring::IoUring::builder();
+    let uring_builder = io_uring::IoUring::builder();
 
     // 2. Configurer SQPOLL (le kernel poll la queue de soumission)
     // Paramètre : temps d'idle en millisecondes avant que le thread kernel s'endorme
-    uring_builder.setup_sqpoll(2);
+    //uring_builder.setup_sqpoll(2);
 
     // Optionnel : on peut aussi binder le thread SQPOLL sur un cœur spécifique
-    uring_builder.setup_sqpoll_cpu(8);
+    //uring_builder.setup_sqpoll_cpu(8);
 
     RuntimeBuilder::<monoio::IoUringDriver>::new()
         .with_entries(4096)
