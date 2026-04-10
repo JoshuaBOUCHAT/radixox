@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **À chaque nouvelle session** : lire `CONN_DESIGN.md` avant de toucher à
+> `radixox/src/bin/resp.rs` ou d'implémenter des commandes bloquantes (BLPOP,
+> BRPOP, etc.). Ce fichier contient les décisions architecturales actives
+> (ConnState, double-buffer, mode Blocking par transfert complet).
+
 ## Project Overview
 
 RadixOx is a high-performance in-memory key-value store built on OxidArt (Adaptive Radix Tree). It speaks the Redis RESP2 protocol (drop-in replacement) and also has a native protobuf protocol with a Rust client library. Requires **Linux 5.1+** (io_uring) and **Rust 2024 edition**.

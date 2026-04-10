@@ -11,6 +11,7 @@ pub use hash::{
 pub use sset::{cmd_sadd, cmd_scard, cmd_sismember, cmd_smembers, cmd_spop, cmd_srem};
 
 pub use zset::{cmd_zadd, cmd_zcard, cmd_zincrby, cmd_zrange, cmd_zrem, cmd_zscore};
+pub(crate) mod pub_sub;
 
 /// Returns true if the pattern is a simple prefix (no glob chars except a trailing `*`).
 pub(crate) fn is_simple_prefix(pattern: &[u8]) -> bool {

@@ -190,7 +190,7 @@ pub(crate) fn bytes_to_bool(b: &[u8]) -> Option<bool> {
 
 /// Stack buffer for integer-to-decimal conversion, no heap allocation.
 #[inline]
-fn write_usize(dst: &mut BytesMut, mut n: usize) {
+fn write_usize(dst: &mut Vec<u8>, mut n: usize) {
     if n == 0 {
         dst.extend_from_slice(b"0");
         return;
@@ -206,7 +206,7 @@ fn write_usize(dst: &mut BytesMut, mut n: usize) {
 }
 
 #[inline]
-fn write_i64(dst: &mut BytesMut, n: i64) {
+fn write_i64(dst: &mut Vec<u8>, n: i64) {
     if n < 0 {
         dst.extend_from_slice(b"-");
         write_usize(dst, n.unsigned_abs() as usize);
@@ -215,7 +215,7 @@ fn write_i64(dst: &mut BytesMut, n: i64) {
     }
 }
 
-fn encode_frame(dst: &mut BytesMut, frame: &SharedFrame) {
+fn encode_frame(dst: &mut Vec<u8>, frame: &SharedFrame) {
     match frame {
         SharedFrame::SimpleString(s) => {
             dst.extend_from_slice(b"+");
@@ -255,7 +255,7 @@ fn encode_frame(dst: &mut BytesMut, frame: &SharedFrame) {
 
 /// Encode `frame` into `dst`, extending it as needed.
 /// Equivalent to `redis_protocol::resp2::encode::extend_encode` but for `SharedFrame`.
-pub fn extend_encode(dst: &mut BytesMut, frame: &SharedFrame) {
+pub fn extend_encode(dst: &mut Vec<u8>, frame: &SharedFrame) {
     let needed = frame.encode_len(false);
     dst.reserve(needed);
     encode_frame(dst, frame);
