@@ -1,6 +1,7 @@
 pub(crate) mod delayed;
 mod hash;
 mod sset;
+pub(crate) mod string;
 mod zset;
 
 pub use hash::{
@@ -8,6 +9,7 @@ pub use hash::{
     cmd_hmset, cmd_hset, cmd_hvals,
 };
 pub use sset::{cmd_sadd, cmd_scard, cmd_sismember, cmd_smembers, cmd_spop, cmd_srem};
+
 pub use zset::{cmd_zadd, cmd_zcard, cmd_zincrby, cmd_zrange, cmd_zrem, cmd_zscore};
 
 /// Returns true if the pattern is a simple prefix (no glob chars except a trailing `*`).
@@ -54,8 +56,7 @@ pub(crate) fn glob_to_regex(pattern: &[u8]) -> String {
                 i += 1;
                 regex.push(pattern[i] as char);
             }
-            b'.' | b'+' | b'^' | b'$' | b'{' | b'}' | b'(' | b')' | b'|' | b'#' | b'&'
-            | b'~' => {
+            b'.' | b'+' | b'^' | b'$' | b'{' | b'}' | b'(' | b')' | b'|' | b'#' | b'&' | b'~' => {
                 regex.push('\\');
                 regex.push(pattern[i] as char);
             }
