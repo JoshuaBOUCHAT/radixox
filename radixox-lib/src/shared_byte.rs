@@ -79,6 +79,42 @@ impl SharedByte {
     pub fn rc(&self) -> u16 {
         unsafe { self.rc_ptr().read() }
     }
+
+    /// Uppercases the bytes in-place if `rc == 1`, otherwise allocates a new
+    /// buffer, copies uppercase in one pass, and decrements rc on the old allocation.
+    ///
+    /// After this call, `as_slice()` is guaranteed to be ASCII-uppercase.
+    pub fn to_uppercase(&mut self) {
+        let len = self.len();
+        if self.rc() == 1 {
+            unsafe {
+                let data = self.ptr.as_ptr().add(Self::HEADER_SIZE);
+                for i in 0..len {
+                    *data.add(i) = (*data.add(i)).to_ascii_uppercase();
+                }
+            }
+        } else {
+            let layout = Layout::from_size_align(Self::HEADER_SIZE + len, 4).unwrap();
+            unsafe {
+                let new_ptr = alloc(layout);
+                assert!(!new_ptr.is_null());
+                (new_ptr as *mut u32).write(len as u32);
+                (new_ptr.add(4) as *mut u16).write(1);
+                let src = self.ptr.as_ptr().add(Self::HEADER_SIZE);
+                let dst = new_ptr.add(Self::HEADER_SIZE);
+                for i in 0..len {
+                    *dst.add(i) = (*src.add(i)).to_ascii_uppercase();
+                }
+                // detach from old allocation
+                let rc = self.rc_ptr();
+                *rc -= 1;
+                if *rc == 0 {
+                    dealloc(self.ptr.as_ptr(), layout);
+                }
+                self.ptr = NonNull::new_unchecked(new_ptr);
+            }
+        }
+    }
 }
 
 impl Clone for SharedByte {
