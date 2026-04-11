@@ -5,7 +5,6 @@ use std::{
     task::{Poll, Waker},
 };
 
-use bytes::BytesMut;
 use monoio::{io::AsyncWriteRentExt, net::tcp::TcpOwnedWriteHalf};
 use radixox_lib::{
     gen_arena::{GenArena, Key},
@@ -13,7 +12,7 @@ use radixox_lib::{
     shared_frame::extend_encode,
 };
 
-use crate::{Frame, IOResult, SharedRegistry};
+use crate::{Frame, IOResult};
 
 // ── Conn ─────────────────────────────────────────────────────────────────────
 
@@ -28,7 +27,13 @@ pub(crate) struct Conn {
 impl Conn {
     fn new(write: TcpOwnedWriteHalf, io_buffer: Vec<u8>, cancelation: CancelationFutur) -> Self {
         let swap_buffer = Some(Vec::with_capacity(io_buffer.capacity()));
-        Self { write: Some(write), cancelation, io_buffer, swap_buffer, channel_count: 0 }
+        Self {
+            write: Some(write),
+            cancelation,
+            io_buffer,
+            swap_buffer,
+            channel_count: 0,
+        }
     }
 
     /// Swap io_buffer ↔ swap_buffer and take the write half.
@@ -61,7 +66,13 @@ impl ConnWriter {
     async fn write_all(mut self) -> (IOResult<()>, Self) {
         let (res, mut buffer) = self.write.write_all(self.buffer).await;
         buffer.clear();
-        (res.map(|_| ()), Self { write: self.write, buffer })
+        (
+            res.map(|_| ()),
+            Self {
+                write: self.write,
+                buffer,
+            },
+        )
     }
 }
 
@@ -152,7 +163,9 @@ impl SubRegistry {
         let sub_id = match conn_state {
             ConnState::Normal(_, _) => {
                 let old = conn_state.take();
-                let ConnState::Normal(write, io_buf) = old else { unreachable!() };
+                let ConnState::Normal(write, io_buf) = old else {
+                    unreachable!()
+                };
                 let cancelation = CancelationFutur::default();
                 let mut conn = Conn::new(write, io_buf, cancelation.clone());
                 conn.channel_count = 1;
@@ -173,7 +186,9 @@ impl SubRegistry {
         self.conn_map.entry(channel).or_default().push(sub_id);
 
         let count = self.conn_arena.get(sub_id.0).map_or(0, |c| c.channel_count);
-        let cancelation = self.conn_arena.get(sub_id.0)
+        let cancelation = self
+            .conn_arena
+            .get(sub_id.0)
             .map(|c| c.cancelation.clone())
             .unwrap_or_default();
 
@@ -187,7 +202,9 @@ impl SubRegistry {
         conn_state: &mut ConnState,
         channels: &[SharedByte],
     ) -> Vec<Frame> {
-        let ConnState::PubSub(sub_id) = *conn_state else { return vec![] };
+        let ConnState::PubSub(sub_id) = *conn_state else {
+            return vec![];
+        };
 
         let to_remove: Vec<SharedByte> = if channels.is_empty() {
             self.conn_map
@@ -216,17 +233,21 @@ impl SubRegistry {
         let frames: Vec<Frame> = to_remove
             .iter()
             .enumerate()
-            .map(|(i, ch)| Frame::Array(vec![
-                Frame::BulkString(SharedByte::from_str("unsubscribe")),
-                Frame::BulkString(ch.clone()),
-                Frame::Integer(remaining.saturating_sub(to_remove.len() - 1 - i) as i64),
-            ]))
+            .map(|(i, ch)| {
+                Frame::Array(vec![
+                    Frame::BulkString(SharedByte::from_str("unsubscribe")),
+                    Frame::BulkString(ch.clone()),
+                    Frame::Integer(remaining.saturating_sub(to_remove.len() - 1 - i) as i64),
+                ])
+            })
             .collect();
 
         // Transition back to Normal if fully unsubscribed and write half is free
         if remaining == 0 {
             let write_and_buf = self.conn_arena.get_mut(sub_id.0).and_then(|conn| {
-                conn.write.take().map(|w| (w, std::mem::take(&mut conn.io_buffer)))
+                conn.write
+                    .take()
+                    .map(|w| (w, std::mem::take(&mut conn.io_buffer)))
             });
             if let Some((write, io_buf)) = write_and_buf {
                 self.conn_arena.remove(sub_id.0);
@@ -266,7 +287,10 @@ impl SubRegistry {
 
     /// Trigger a write_task for sub_id if one isn't already running.
     pub(crate) fn trigger_write(shared: &Rc<RefCell<SubRegistry>>, sub_id: SubId) {
-        let maybe = shared.borrow_mut().get_mut(sub_id).and_then(|c| c.get_conn_writer());
+        let maybe = shared
+            .borrow_mut()
+            .get_mut(sub_id)
+            .and_then(|c| c.get_conn_writer());
         let Some(cw) = maybe else { return };
         monoio::spawn(write_task(cw, shared.clone(), sub_id));
     }
@@ -343,7 +367,9 @@ impl ConnState {
         let (res, cw) = cw.write_all().await;
 
         let mut reg = shared_registry.borrow_mut();
-        let Some(conn) = reg.get_mut(sub_id) else { return res };
+        let Some(conn) = reg.get_mut(sub_id) else {
+            return res;
+        };
 
         if res.is_err() {
             conn.cancelation.cancel(SharedByte::from_str("write error"));
@@ -361,14 +387,12 @@ impl ConnState {
 
 // ── write_task ────────────────────────────────────────────────────────────────
 
-async fn write_task(
-    mut cw: ConnWriter,
-    shared_registry: Rc<RefCell<SubRegistry>>,
-    sub_id: SubId,
-) {
+async fn write_task(mut cw: ConnWriter, shared_registry: Rc<RefCell<SubRegistry>>, sub_id: SubId) {
     {
         let mut reg = shared_registry.borrow_mut();
-        let Some(conn) = reg.get_mut(sub_id) else { return };
+        let Some(conn) = reg.get_mut(sub_id) else {
+            return;
+        };
         std::mem::swap(&mut cw.buffer, &mut conn.io_buffer);
     }
 

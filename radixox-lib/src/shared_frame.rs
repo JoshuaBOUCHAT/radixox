@@ -1,6 +1,5 @@
 use std::hash::{Hash, Hasher};
 
-use bytes::BytesMut;
 use redis_protocol::{
     digits_in_usize,
     resp2::types::{FrameKind, Resp2Frame},
