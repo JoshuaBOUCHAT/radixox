@@ -13,6 +13,7 @@ use monoio::io::{AsyncReadRent, Splitable};
 use monoio::net::{TcpListener, TcpStream};
 use monoio::time::TimeDriver;
 use monoio::{IoUringDriver, Runtime, RuntimeBuilder};
+use redis_protocol::bytes_utils::Str;
 use redis_protocol::resp2::decode::decode_bytes_mut;
 use redis_protocol::resp2::types::BytesFrame;
 use smallvec::SmallVec;
@@ -174,21 +175,14 @@ async fn handle_buffer(
             }
         };
 
-        let Some(args) = frame_to_args(frame) else {
+        let Some((mut cmd, args)) = frame_to_args(frame) else {
             conn_state
                 .send(Frame::Error(ERR_EMPTY_CMD.into()), registry)
                 .await?;
             continue;
         };
-        if args.is_empty() {
-            conn_state
-                .send(Frame::Error(ERR_EMPTY_CMD.into()), registry)
-                .await?;
-            continue;
-        }
-
-        let cmd = args[0].clone();
-        dispatch(&cmd, &args[1..], conn_state, registry, &art).await?;
+        cmd.to_uppercase();
+        dispatch(&cmd, &args, conn_state, registry, &art).await?;
     }
 }
 
@@ -200,34 +194,26 @@ async fn dispatch(
     art: &SharedART,
 ) -> IOResult<()> {
     match conn_state {
-        ConnState::PubSub(_) => {
-            if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") {
-                cmd_subscribe(args, conn_state, registry).await?;
-            } else if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") {
-                cmd_unsubscribe(args, conn_state, registry).await?;
-            } else if cmd.eq_ignore_ascii_case(b"PING") {
-                conn_state.send(resp_pong(), registry).await?;
-            } else if cmd.eq_ignore_ascii_case(b"QUIT") {
+        ConnState::PubSub(_) => match cmd.as_slice() {
+            b"SUBSCRIBE" => cmd_subscribe(args, conn_state, registry).await?,
+            b"UNSUBSCRIBE" => cmd_unsubscribe(args, conn_state, registry).await?,
+            b"PING" => conn_state.send(resp_pong(), registry).await?,
+            b"QUIT" => {
                 conn_state.send(resp_ok(), registry).await?;
                 return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
-            } else {
-                conn_state
-                    .send(
-                        Frame::Error(
-                            "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / PUBLISH allowed"
-                                .into(),
-                        ),
-                        registry,
-                    )
-                    .await?;
             }
-        }
-        ConnState::Normal(_, _) => {
-            if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") {
-                cmd_subscribe(args, conn_state, registry).await?;
-            } else if cmd.eq_ignore_ascii_case(b"PUBLISH") {
-                cmd_publish(args, conn_state, registry).await?;
-            } else {
+            _ => {
+                let frame = Frame::Error(String::from(
+                    "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / PUBLISH allowed",
+                ));
+
+                conn_state.send(frame, registry).await?;
+            }
+        },
+        ConnState::Normal(_, _) => match cmd.as_slice() {
+            b"SUBSCRIBE" => cmd_subscribe(args, conn_state, registry).await?,
+            b"PUBLISH" => cmd_publish(args, conn_state, registry).await?,
+            _ => {
                 let frame = if let Some(f) = dispatch_command(cmd, args, &mut art.borrow_mut()) {
                     f
                 } else if let Some(f) = dispatch_async_command(cmd, args, art.clone()).await {
@@ -239,7 +225,7 @@ async fn dispatch(
                 };
                 conn_state.send(frame, registry).await?;
             }
-        }
+        },
         _ => {}
     }
     Ok(())
@@ -316,7 +302,7 @@ static ASYNC_COMMANDS: &[(&[u8], fn(&[SharedByte], SharedART) -> AsyncFrame)] =
 
 fn dispatch_command(cmd: &[u8], args: &[SharedByte], art: &mut OxidArt) -> Option<Frame> {
     for (name, handler) in COMMANDS {
-        if cmd.eq_ignore_ascii_case(name) {
+        if cmd == *name {
             return Some(match handler {
                 Handler::Static(f) => f(),
                 Handler::Args(f) => f(args),
@@ -330,28 +316,34 @@ fn dispatch_command(cmd: &[u8], args: &[SharedByte], art: &mut OxidArt) -> Optio
 
 async fn dispatch_async_command(cmd: &[u8], args: &[SharedByte], art: SharedART) -> Option<Frame> {
     for (name, handler) in ASYNC_COMMANDS {
-        if cmd.eq_ignore_ascii_case(name) {
+        if cmd == *name {
             return Some(handler(args, art).await);
         }
     }
     None
 }
 
-fn frame_to_args(frame: BytesFrame) -> Option<CmdArgs> {
+fn frame_to_args(frame: BytesFrame) -> Option<(SharedByte, CmdArgs)> {
     match frame {
-        BytesFrame::Array(arr) => {
-            let mut args = SmallVec::with_capacity(arr.len());
-            for f in arr {
+        BytesFrame::Array(arr) if !arr.is_empty() => {
+            let mut iter = arr.into_iter();
+            let cmd = match iter.next().unwrap() {
+                BytesFrame::BulkString(b) => SharedByte::from_slice(&b),
+                BytesFrame::SimpleString(s) => SharedByte::from_slice(&s),
+                _ => return None,
+            };
+            let mut args = CmdArgs::with_capacity(iter.len());
+            for f in iter {
                 match f {
                     BytesFrame::BulkString(b) => args.push(SharedByte::from_slice(&b)),
                     BytesFrame::SimpleString(s) => args.push(SharedByte::from_slice(&s)),
                     _ => return None,
                 }
             }
-            Some(args)
+            Some((cmd, args))
         }
-        BytesFrame::BulkString(b) => Some(smallvec::smallvec![SharedByte::from_slice(&b)]),
-        BytesFrame::SimpleString(s) => Some(smallvec::smallvec![SharedByte::from_slice(&s)]),
+        BytesFrame::BulkString(b) => Some((SharedByte::from_slice(&b), CmdArgs::new())),
+        BytesFrame::SimpleString(s) => Some((SharedByte::from_slice(&s), CmdArgs::new())),
         _ => None,
     }
 }
