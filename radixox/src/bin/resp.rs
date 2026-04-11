@@ -24,13 +24,14 @@ use oxidart::{OxidArt, TtlResult};
 use radixox_lib::shared_byte::SharedByte;
 pub(crate) use radixox_lib::shared_frame::SharedFrame as Frame;
 
+use resp_cmd::delayed::{AsyncFrame, cmd_keys, cmd_unlink};
+use resp_cmd::pub_sub::{cmd_publish, cmd_subscribe, cmd_unsubscribe};
+use resp_cmd::string::*;
 use resp_cmd::{
     cmd_hdel, cmd_hexists, cmd_hget, cmd_hgetall, cmd_hincrby, cmd_hkeys, cmd_hlen, cmd_hmget,
     cmd_hmset, cmd_hset, cmd_hvals, cmd_sadd, cmd_scard, cmd_sismember, cmd_smembers, cmd_spop,
     cmd_srem, cmd_zadd, cmd_zcard, cmd_zincrby, cmd_zrange, cmd_zrem, cmd_zscore,
 };
-use resp_cmd::delayed::{AsyncFrame, cmd_keys, cmd_unlink};
-use resp_cmd::string::*;
 
 use crate::utils::{ConnState, SubRegistry};
 
@@ -65,9 +66,15 @@ fn main() -> std::io::Result<()> {
 
         let mut handles = Vec::with_capacity(NB_ACCEPTOR);
         for _ in 0..NB_ACCEPTOR {
-            handles.push(spawn_acceptor(shared_art.clone(), listener.clone(), registry.clone()));
+            handles.push(spawn_acceptor(
+                shared_art.clone(),
+                listener.clone(),
+                registry.clone(),
+            ));
         }
-        for h in handles { h.await; }
+        for h in handles {
+            h.await;
+        }
 
         Ok(())
     })
@@ -92,7 +99,9 @@ fn spawn_acceptor(
             let (stream, _) = match listener.accept().await {
                 Ok(v) => v,
                 Err(e) => match e.kind() {
-                    ErrorKind::WouldBlock | ErrorKind::Interrupted | ErrorKind::ConnectionAborted => continue,
+                    ErrorKind::WouldBlock
+                    | ErrorKind::Interrupted
+                    | ErrorKind::ConnectionAborted => continue,
                     ErrorKind::OutOfMemory => {
                         monoio::time::sleep(Duration::from_millis(100)).await;
                         continue;
@@ -100,7 +109,11 @@ fn spawn_acceptor(
                     _ => panic!("accept fatal: {e}"),
                 },
             };
-            monoio::spawn(handle_connection(stream, shared_art.clone(), registry.clone()));
+            monoio::spawn(handle_connection(
+                stream,
+                shared_art.clone(),
+                registry.clone(),
+            ));
         }
     })
 }
@@ -162,11 +175,15 @@ async fn handle_buffer(
         };
 
         let Some(args) = frame_to_args(frame) else {
-            conn_state.send(Frame::Error(ERR_EMPTY_CMD.into()), registry).await?;
+            conn_state
+                .send(Frame::Error(ERR_EMPTY_CMD.into()), registry)
+                .await?;
             continue;
         };
         if args.is_empty() {
-            conn_state.send(Frame::Error(ERR_EMPTY_CMD.into()), registry).await?;
+            conn_state
+                .send(Frame::Error(ERR_EMPTY_CMD.into()), registry)
+                .await?;
             continue;
         }
 
@@ -182,64 +199,48 @@ async fn dispatch(
     registry: &SharedRegistry,
     art: &SharedART,
 ) -> IOResult<()> {
-    if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") {
-        for channel in args {
-            let (_, _, count) =
-                registry.borrow_mut().subscribe(conn_state, channel.clone());
-            conn_state.send(
-                Frame::Array(vec![
-                    Frame::BulkString(SharedByte::from_str("subscribe")),
-                    Frame::BulkString(channel.clone()),
-                    Frame::Integer(count as i64),
-                ]),
-                registry,
-            ).await?;
+    match conn_state {
+        ConnState::PubSub(_) => {
+            if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") {
+                cmd_subscribe(args, conn_state, registry).await?;
+            } else if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") {
+                cmd_unsubscribe(args, conn_state, registry).await?;
+            } else if cmd.eq_ignore_ascii_case(b"PING") {
+                conn_state.send(resp_pong(), registry).await?;
+            } else if cmd.eq_ignore_ascii_case(b"QUIT") {
+                conn_state.send(resp_ok(), registry).await?;
+                return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+            } else {
+                conn_state
+                    .send(
+                        Frame::Error(
+                            "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / PUBLISH allowed"
+                                .into(),
+                        ),
+                        registry,
+                    )
+                    .await?;
+            }
         }
-    } else if cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE") {
-        let frames = registry.borrow_mut().unsubscribe(conn_state, args);
-        for frame in frames {
-            conn_state.send(frame, registry).await?;
-        }
-    } else if cmd.eq_ignore_ascii_case(b"PUBLISH") {
-        let (response, to_flush) = registry.borrow_mut().publish_encode(args);
-        conn_state.send(response, registry).await?;
-        for sub_id in to_flush {
-            SubRegistry::trigger_write(registry, sub_id);
-        }
-    } else {
-        match conn_state {
-            ConnState::PubSub(_) => {
-                let frame = if cmd.eq_ignore_ascii_case(b"PING") {
-                    resp_pong()
-                } else if cmd.eq_ignore_ascii_case(b"QUIT") {
-                    conn_state.send(resp_ok(), registry).await?;
-                    return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        ConnState::Normal(_, _) => {
+            if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") {
+                cmd_subscribe(args, conn_state, registry).await?;
+            } else if cmd.eq_ignore_ascii_case(b"PUBLISH") {
+                cmd_publish(args, conn_state, registry).await?;
+            } else {
+                let frame = if let Some(f) = dispatch_command(cmd, args, &mut art.borrow_mut()) {
+                    f
+                } else if let Some(f) = dispatch_async_command(cmd, args, art.clone()).await {
+                    f
                 } else {
                     Frame::Error(
-                        "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / PUBLISH allowed"
-                            .into(),
+                        format!("ERR unknown command '{}'", String::from_utf8_lossy(cmd)).into(),
                     )
                 };
                 conn_state.send(frame, registry).await?;
             }
-            ConnState::Normal(_, _) => {
-                let frame =
-                    if let Some(f) = dispatch_command(cmd, args, &mut art.borrow_mut()) {
-                        f
-                    } else if let Some(f) =
-                        dispatch_async_command(cmd, args, art.clone()).await
-                    {
-                        f
-                    } else {
-                        Frame::Error(
-                            format!("ERR unknown command '{}'", String::from_utf8_lossy(cmd))
-                                .into(),
-                        )
-                    };
-                conn_state.send(frame, registry).await?;
-            }
-            _ => {}
         }
+        _ => {}
     }
     Ok(())
 }
@@ -327,11 +328,7 @@ fn dispatch_command(cmd: &[u8], args: &[SharedByte], art: &mut OxidArt) -> Optio
     None
 }
 
-async fn dispatch_async_command(
-    cmd: &[u8],
-    args: &[SharedByte],
-    art: SharedART,
-) -> Option<Frame> {
+async fn dispatch_async_command(cmd: &[u8], args: &[SharedByte], art: SharedART) -> Option<Frame> {
     for (name, handler) in ASYNC_COMMANDS {
         if cmd.eq_ignore_ascii_case(name) {
             return Some(handler(args, art).await);
@@ -376,7 +373,10 @@ pub(crate) struct SetOptions {
 
 impl Default for SetOptions {
     fn default() -> Self {
-        Self { ttl: None, condition: SetCondition::Always }
+        Self {
+            ttl: None,
+            condition: SetCondition::Always,
+        }
     }
 }
 
@@ -386,15 +386,21 @@ pub(crate) fn parse_set_options(args: &[SharedByte]) -> Result<SetOptions, Frame
     while i < args.len() {
         if args[i].eq_ignore_ascii_case(b"EX") {
             i += 1;
-            if i >= args.len() { return Err(Frame::Error("ERR syntax error".into())); }
-            let secs: u64 = parse_int(&args[i])
-                .ok_or_else(|| Frame::Error("ERR value is not an integer or out of range".into()))?;
+            if i >= args.len() {
+                return Err(Frame::Error("ERR syntax error".into()));
+            }
+            let secs: u64 = parse_int(&args[i]).ok_or_else(|| {
+                Frame::Error("ERR value is not an integer or out of range".into())
+            })?;
             opts.ttl = Some(Duration::from_secs(secs));
         } else if args[i].eq_ignore_ascii_case(b"PX") {
             i += 1;
-            if i >= args.len() { return Err(Frame::Error("ERR syntax error".into())); }
-            let ms: u64 = parse_int(&args[i])
-                .ok_or_else(|| Frame::Error("ERR value is not an integer or out of range".into()))?;
+            if i >= args.len() {
+                return Err(Frame::Error("ERR syntax error".into()));
+            }
+            let ms: u64 = parse_int(&args[i]).ok_or_else(|| {
+                Frame::Error("ERR value is not an integer or out of range".into())
+            })?;
             opts.ttl = Some(Duration::from_millis(ms));
         } else if args[i].eq_ignore_ascii_case(b"NX") {
             opts.condition = SetCondition::IfNotExists;
