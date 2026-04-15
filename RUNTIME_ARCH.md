@@ -17,21 +17,28 @@ loop {
             TIMEOUT_UDATA => wake_timers(),
             CANCEL_UDATA  => { /* ignore */ },
             packed        => {
-                let (op_idx, gen) = unpack(packed);
-                if op_slab[op_idx].generation == gen {
-                    op_slab[op_idx].result = Some(cqe.result());
-                    task_queue.push(op_slab[op_idx].task_idx);
+                let (task_idx, syscall_nb) = decode(packed);
+                let task = &mut slab[task_idx];
+                if syscall_nb == task.syscall_nb {
+                    // CQE attendue : avancer le compteur puis poll
+                    task.syscall_nb = task.syscall_nb.wrapping_add(1);
+                    CURRENT_TASK.set(Some(CurrentTask {
+                        task_idx,
+                        result: cqe.result(),
+                    }));
+                    task.poll();
+                    CURRENT_TASK.set(None);
                 }
-                // sinon : stale CQE (zombie) → ignore
+                // rc décrémenté dans tous les cas — CQE stale ou non
+                slab[task_idx].rc -= 1;
+                if slab[task_idx].rc == 0 {
+                    slab.remove(task_idx);
+                }
             }
         }
     }
-
-    while let Some(task_idx) = task_queue.pop() {
-        poll_task(task_idx);
-        // les SQEs produits pendant poll() s'accumulent dans le SQ
-        // partent en batch au prochain io_uring_enter
-    }
+    // les SQEs produits pendant les polls s'accumulent dans le SQ
+    // partent en batch au prochain io_uring_enter
 }
 ```
 
@@ -44,86 +51,216 @@ Le batching CQ reste utile : drainer toutes les CQEs avant de re-poll
 
 ## 2. Task
 
-Une seule alloc : header + future inline.
+Une seule alloc : header + future inline. Pas de Waker / Context — le
+runtime livre les résultats via `CURRENT_TASK`.
+
+### Layout mémoire (RawTask)
+
+```
+[ fn_poll: *const () ][ fn_drop: *const () ][ alloc_size: u32 ][ rc: u16 ][ syscall_nb: u16 ][ future inline... ]
+```
 
 ```rust
-struct Task {
-    ptr_poll: Option<NonNull<fn(*mut (), *mut Context) -> Poll<()>>>,
-    //        └── None = poll déjà consommé
-    ptr_drop: fn(*mut ()),
-    rc:       u16,    // nb de SQEs en vol → 0 = libérer le slot
-    data:     *mut (), // pointe sur F inline après le header
+// header accédé via un pointeur brut — jamais instancié directement
+struct RawTask {
+    fn_poll:    unsafe fn(*mut ()) -> Poll<()>,
+    fn_drop:    unsafe fn(*mut ()),
+    alloc_size: u32,
+    rc:         u16,  // SQEs en vol + token spawn → 0 = libérer
+    syscall_nb: u16,  // prochaine CQE attendue ; wrapping_add sur match
 }
 ```
 
-États encodés sans discriminant :
+`fn_poll` et `fn_drop` ne sont jamais nuls — la détection de stale passe
+par `syscall_nb`, pas par un pointeur null.
 
-| `Option<NonNull<Task>>` | `ptr_poll` | `rc` | Signification              |
-|-------------------------|------------|------|----------------------------|
-| None                    | —          | —    | slot libre                 |
-| Some                    | Some       | > 0  | task vivante               |
-| Some                    | None       | > 0  | poll consommé, SQEs en vol |
-| Some                    | None       | 0    | → libérer                  |
+États du slot dans la slab :
+
+| `Option<NonNull<RawTask>>` | `rc` | Signification        |
+|----------------------------|------|----------------------|
+| None                       | —    | slot libre           |
+| Some                       | > 0  | task vivante         |
+| Some                       | 0    | → `slab.remove()`   |
 
 ### Construction (type erasure à la création)
 
 ```rust
-fn Task::new<F: Future<Output=()>>(f: F) -> *mut Task {
-    // Layout::extend → Task header + F inline, une seule alloc
+fn RawTask::new<F: Future<Output=()>>(f: F) -> NonNull<RawTask> {
+    // Layout::extend → RawTask header + F inline, une seule alloc
     // instancie poll_fn::<F> et drop_fn::<F> pendant que F est connu
     // après : type complètement effacé, stocké comme fn ptrs bruts
-    // cache locality : fn ptrs + future data dans la même alloc
+    // rc = 1 (token spawn), syscall_nb = 0
 }
 
-unsafe fn poll_fn<F: Future<Output=()>>(data: *mut (), cx: *mut Context) -> Poll<()>;
-unsafe fn drop_fn<F>(data: *mut ());
+unsafe fn poll_fn<F: Future<Output=()>>(data: *mut ()) -> Poll<()>;
+unsafe fn drop_fn<F: Future<Output=()>>(data: *mut ());
 ```
+
+### CURRENT_TASK — livraison des résultats CQE
+
+```rust
+struct CurrentTask {
+    task_idx: u32,
+    result:   i32,   // résultat CQE (0 au spawn)
+}
+
+thread_local! {
+    static CURRENT_TASK: Cell<Option<CurrentTask>> = Cell::new(None);
+}
+```
+
+Chaque poll pose `CurrentTask` avant d'appeler `fn_poll` :
+- au spawn : `result = 0`, la future lit `task_idx` pour stamper ses SQEs
+- sur CQE : `result = cqe.result()`, la future lit le résultat de son op
+
+La future lit `task.syscall_nb` (via `task_idx`) pour stamper ses SQEs avec
+le `syscall_nb` courant. Le runtime avance `syscall_nb` avant le poll.
 
 ### Slab de tasks
 
 ```rust
-// Option<NonNull<Task>> : niche NonNull → None = 0x0 = slot libre
-// pas de discriminant supplémentaire
-type TaskSlab = Slab<Option<NonNull<Task>>>;
+// niche NonNull → Option<NonNull<RawTask>> sans discriminant
+// task_idx : u32 → jusqu'à u32::MAX - 1 tasks simultanées
+type TaskSlab = HiSlab<Option<NonNull<RawTask>>>;
 ```
 
 ---
 
-## 3. Op Slots
+## 3. Tag — interface runtime / future
 
-Un slot par SQE en vol. `user_data` du SQE = valeur packée sur 64 bits.
-
-```
-u64 user_data :
-[ 32 bits : op_idx ][ 16 bits : generation ][ 16 bits : task_idx ]
-```
+`Tag` est le seul point de contact entre une future et le runtime. Ses
+champs sont privés — la future ne manipule jamais `task_idx` ni `syscall_nb`
+directement.
 
 ```rust
-struct OpSlot {
-    result:     Option<i32>,
-    task_idx:   u16,
-    generation: u16,  // incrémenté à chaque réutilisation du slot
-                      // → détecte les CQEs stale sans zombie flag
+// champs privés — opaque pour les futures
+pub struct Tag {
+    task_idx:   u32,
+    syscall_nb: u16,  // valeur brute (bit 15 = multi-send flag)
+}
+
+impl Tag {
+    /// Submit unique : une CQE → advance syscall_nb → un poll.
+    /// Si on sortait d'un multi-send (bit 15 set dans task.syscall_nb),
+    /// strip le flag et incrémente : 1<<15|5 → 6.
+    /// Les CQEs tardives du multi-send (nb=5) seront alors stales.
+    pub fn submit_sqe(task: &mut RawTask, sqe: SqeRef<'_>) {
+        if task.syscall_nb & 0x8000 != 0 {
+            task.syscall_nb = (task.syscall_nb & 0x7FFF).wrapping_add(1);
+        }
+        sqe.set_user_data(encode(task.task_idx, task.syscall_nb));
+    }
+
+    /// Fan-out : N SQEs, chaque CQE déclenche un poll sans avancer syscall_nb.
+    /// Pré-incrémente task.syscall_nb immédiatement (le handler ne sait pas
+    /// quand le lot se termine — c'est la future qui compte ses CQEs).
+    /// Contrainte : task.syscall_nb & 0x7FFF doit rester < 0x7FFF avant l'appel.
+    pub fn multi_send(task: &mut RawTask, sqes: &[SqeRef<'_>]) {
+        let nb = task.syscall_nb & 0x7FFF;
+        debug_assert!(nb < 0x7FFF, "syscall_nb overflow multi-send");
+        task.syscall_nb = 0x8000 | nb.wrapping_add(1);
+        let ud = encode(task.task_idx, task.syscall_nb);
+        for sqe in sqes {
+            sqe.set_user_data(ud);
+        }
+    }
 }
 ```
 
-### select! avec deux branches
+### user_data — packing 64 bits
 
 ```
-select! { read | timeout }
+u64 user_data :
+[ 32 bits : task_idx ][ 1 bit : multi-send ][ 15 bits : syscall_nb ][ 16 bits : libre ]
+```
 
-SQE read    → op_slab[42], user_data=pack(42, gen=1, task=7)
-SQE timeout → op_slab[43], user_data=pack(43, gen=1, task=7)
+```rust
+fn encode(task_idx: u32, raw_nb: u16) -> u64 {
+    (task_idx as u64) << 32 | (raw_nb as u64) << 16
+}
 
-CQE timeout arrive :
-  → op_slab[43].result = Some(0)
-  → task_queue.push(7)
-  → task 7 re-pollée
-  → select re-poll read    → op_slab[42].result == None → Pending
-  → select re-poll timeout → op_slab[43].result == Some → Ready ✓
-  → cancel SQE 42 : IORING_OP_ASYNC_CANCEL, user_data=pack(42,gen=1,task=7)
-  → op_slab[42].generation++ (slot réutilisable)
-  → CQE annulation arrive → generation mismatch → ignore
+fn decode(ud: u64) -> (u32, u16 /* raw_nb */) {
+    ((ud >> 32) as u32, (ud >> 16) as u16)
+}
+```
+
+`raw_nb & 0x8000` = flag multi-send. `raw_nb & 0x7FFF` = `syscall_nb` effectif.
+
+### CURRENT_TASK
+
+```rust
+struct CurrentTask {
+    tag:    Tag,
+    result: i32,
+}
+
+thread_local! {
+    static CURRENT_TASK: Cell<Option<CurrentTask>> = Cell::new(None);
+}
+```
+
+### CQE → Tag + résultat
+
+```rust
+let (task_idx, raw_nb) = decode(cqe.user_data);
+let task = &mut slab[task_idx];
+let is_multi = raw_nb & 0x8000 != 0;
+let nb       = raw_nb & 0x7FFF;
+
+if nb == task.syscall_nb {
+    if !is_multi {
+        // normal : avance le compteur → CQEs du même round deviennent stales
+        task.syscall_nb = task.syscall_nb.wrapping_add(1);
+    }
+    // multi-send : pas d'advance → toutes les CQEs du lot pollent
+    CURRENT_TASK.set(Some(CurrentTask {
+        tag: Tag { task_idx, syscall_nb: raw_nb },
+        result: cqe.result(),
+    }));
+    task.poll();
+    CURRENT_TASK.set(None);
+}
+// rc décrémenté dans tous les cas — stale ou non
+task.rc -= 1;
+if task.rc == 0 { slab.remove(task_idx); }
+```
+
+### Pattern future — submit unique
+
+```rust
+struct ReadFuture { tag: Option<Tag> }
+
+impl Future for ReadFuture {
+    fn poll(&mut self) -> Poll<i32> {
+        match &self.tag {
+            None => {
+                let tag = CURRENT_TASK.with(|ct| ct.get().unwrap().tag);
+                tag.submit_sqe(/* sqe read */);
+                self.tag = Some(tag);
+                Poll::Pending
+            }
+            Some(_) => {
+                // pollé uniquement si syscall_nb a matché → result est le nôtre
+                Poll::Ready(CURRENT_TASK.with(|ct| ct.get().unwrap().result))
+            }
+        }
+    }
+}
+```
+
+### Pattern future — fan-out (multi-send)
+
+```rust
+struct FanOutFuture { remaining: u32, errors: u32 }
+
+impl Future for FanOutFuture {
+    fn poll(&mut self) -> Poll<u32 /* nb errors */> {
+        let result = CURRENT_TASK.with(|ct| ct.get().unwrap().result);
+        if result < 0 { self.errors += 1; }
+        self.remaining -= 1;
+        if self.remaining == 0 { Poll::Ready(self.errors) } else { Poll::Pending }
+    }
+}
 ```
 
 ---
@@ -285,7 +422,17 @@ thread_local! {
 }
 
 pub fn spawn<F: Future<Output=()> + 'static>(f: F) {
-    RT.with(|rt| rt.borrow_mut().task_queue.push(Task::new(f)));
+    RT.with(|rt| {
+        let mut rt = rt.borrow_mut();
+        let task_idx = rt.slab.insert(RawTask::new(f));  // rc = 1
+        CURRENT_TASK.set(Some(CurrentTask { task_idx, result: 0 }));
+        rt.slab[task_idx].poll();
+        CURRENT_TASK.set(None);
+        rt.slab[task_idx].rc -= 1;  // consomme le token spawn
+        if rt.slab[task_idx].rc == 0 {
+            rt.slab.remove(task_idx);  // future terminée immédiatement
+        }
+    });
 }
 ```
 
@@ -299,10 +446,13 @@ Tout le runtime en thread-local → `Rc<RefCell<>>` partout, zéro `Arc`/`Mutex`
 ```rust
 const TIMEOUT_UDATA:  u64 = u64::MAX;
 const CANCEL_UDATA:   u64 = u64::MAX - 1;
-const WAKER_UDATA:    u64 = u64::MAX - 2;
+const WAKER_UDATA:    u64 = u64::MAX - 2;  // réservé, pas encore utilisé
 // MIN_RESERVED       u64 = u64::MAX - 2
-// tous les op_idx packés seront << u32::MAX << MIN_RESERVED
 ```
+
+Les valeurs packées légitimes ont `task_idx ≤ u32::MAX - 1`, donc
+`packed ≤ (u32::MAX - 1) << 32 | u16::MAX << 16 | u16::MAX`
+qui est bien inférieur à `u64::MAX - 2`.
 
 ---
 
@@ -314,9 +464,9 @@ const WAKER_UDATA:    u64 = u64::MAX - 2;
 |---|---|
 | `Runtime::new(max_conn)` | init ring, fixed files sparse, slabs, thread-locals |
 | `Runtime::run()` | event loop principal |
-| `Runtime::poll_task(idx)` | poll une task, gère Ready/Pending/drop |
-| `spawn<F>(f)` | enqueue une nouvelle task |
-| `pack/unpack(op_idx, gen, task_idx)` | encode/decode user_data u64 |
+| `spawn<F>(f)` | insère la task dans la slab, premier poll via CURRENT_TASK |
+| `encode(task_idx, gen, syscall_nb) -> u64` | packing user_data |
+| `decode(u64) -> (u32, u16, u16)` | dépacking user_data |
 
 ### Ops io_uring
 
