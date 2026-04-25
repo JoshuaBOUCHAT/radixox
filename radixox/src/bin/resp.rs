@@ -5,14 +5,16 @@ mod resp_cmd;
 mod utils;
 
 use std::cell::RefCell;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
 
 use bytes::BytesMut;
 use monoio::io::{AsyncReadRent, Splitable};
+use monoio::net::tcp::TcpOwnedReadHalf;
 use monoio::net::{TcpListener, TcpStream};
 use monoio::time::TimeDriver;
-use monoio::{IoUringDriver, Runtime, RuntimeBuilder};
+use monoio::{IoUringDriver, Runtime, RuntimeBuilder, select};
 
 use redis_protocol::resp2::decode::decode_bytes_mut;
 use redis_protocol::resp2::types::BytesFrame;
@@ -33,7 +35,7 @@ use resp_cmd::{
     cmd_srem, cmd_zadd, cmd_zcard, cmd_zincrby, cmd_zrange, cmd_zrem, cmd_zscore,
 };
 
-use crate::utils::{ConnState, SubRegistry};
+use crate::utils::{CancelationFutur, ConnState, SubRegistry};
 
 pub(crate) type IOResult<T> = std::io::Result<T>;
 type SharedART = Rc<RefCell<OxidArt>>;
@@ -46,7 +48,16 @@ const NB_ACCEPTOR: usize = 16;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+enum Task {
+    Alive(Pin<Box<dyn Future<Output = ()>>>),
+    Dead,
+}
+type Tr = Box<dyn Future<Output = ()>>;
+
 fn main() -> std::io::Result<()> {
+    let t1 = Box::new(1);
+    let t1: Option<Box<[u8]>> = None;
+
     let mut runtime = get_runtime()?;
 
     runtime.block_on(async {
@@ -127,31 +138,78 @@ async fn handle_connection(
 ) -> IOResult<()> {
     let (mut read, write) = stream.into_split();
     let mut conn_state = ConnState::Normal(write, Vec::with_capacity(BUFFER_SIZE));
-    let mut read_buf = BytesMut::with_capacity(BUFFER_SIZE);
-    let mut io_buf = BytesMut::with_capacity(BUFFER_SIZE);
+    let result = handle_loop(&mut read, &mut conn_state, &registry, &art).await;
 
-    let result = async {
-        loop {
-            let (res, returned) = read.read(io_buf).await;
-            io_buf = returned;
-            let n = match res {
-                Ok(0) => return Ok(()),
-                Ok(n) => n,
-                Err(e) => return Err(e),
-            };
-            read_buf.extend_from_slice(&io_buf[..n]);
-            io_buf.clear();
-            handle_buffer(&mut read_buf, &mut conn_state, &registry, art.clone()).await?;
+    // Cleanup
+    match conn_state {
+        ConnState::PubSub(sub_id) => {
+            registry.borrow_mut().cleanup(sub_id);
         }
-    }
-    .await;
 
-    // Cleanup pub/sub subscriptions on exit
-    if let ConnState::PubSub(sub_id) = conn_state {
-        registry.borrow_mut().cleanup(sub_id);
+        ConnState::Blocking => {
+            todo!()
+        }
+        ConnState::Normal(_, _) => {} //Nothing to clean
+        ConnState::None => {}         //Nothing too
     }
 
     result
+}
+async fn handle_loop(
+    read: &mut TcpOwnedReadHalf,
+    conn_state: &mut ConnState,
+    registry: &SharedRegistry,
+    art: &SharedART,
+) -> IOResult<()> {
+    let mut read_buf = BytesMut::with_capacity(BUFFER_SIZE);
+    let mut io_buf = BytesMut::with_capacity(BUFFER_SIZE);
+
+    loop {
+        let (n, returned) = read_with_conn_state(io_buf, conn_state, &registry, read).await?;
+        io_buf = returned;
+        if n == 0 {
+            return Ok(());
+        }
+        read_buf.extend_from_slice(&io_buf[..n]);
+        io_buf.clear();
+        handle_buffer(&mut read_buf, conn_state, &registry, art).await?;
+    }
+}
+
+async fn read_with_conn_state(
+    io_buf: BytesMut,
+    conn_state: &mut ConnState,
+    registry: &SharedRegistry,
+    read: &mut TcpOwnedReadHalf,
+) -> IOResult<(usize, BytesMut)> {
+    let (res, returned) = match conn_state {
+        ConnState::Normal(_, _) => read.read(io_buf).await,
+        ConnState::PubSub(sub_id) => {
+            let cancelation = registry
+                .borrow_mut()
+                .get(*sub_id)
+                .expect("can't get cancelation")
+                .cancelation
+                .clone();
+
+            select! {
+                err_msg =cancelation=>{
+                    let err=std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        String::from_utf8_lossy(&err_msg)
+                    );
+                    return Err(err);
+                }
+                res_tuple=read.read(io_buf)=>{
+                    res_tuple
+                }
+            }
+        }
+        ConnState::Blocking => todo!(),
+        ConnState::None => panic!("No read should occurs while conn state is None"),
+    };
+
+    Ok((res?, returned))
 }
 
 // ── Buffer parsing & dispatch ─────────────────────────────────────────────────
@@ -160,7 +218,7 @@ async fn handle_buffer(
     read_buf: &mut BytesMut,
     conn_state: &mut ConnState,
     registry: &SharedRegistry,
-    art: SharedART,
+    art: &SharedART,
 ) -> IOResult<()> {
     loop {
         let frame = match decode_bytes_mut(read_buf) {
@@ -192,36 +250,43 @@ async fn dispatch(
     registry: &SharedRegistry,
     art: &SharedART,
 ) -> IOResult<()> {
+    let handler = get_handler(cmd.as_slice());
     match conn_state {
-        ConnState::PubSub(_) => match cmd.as_slice() {
-            b"SUBSCRIBE" => cmd_subscribe(args, conn_state, registry).await?,
-            b"UNSUBSCRIBE" => cmd_unsubscribe(args, conn_state, registry).await?,
-            b"PING" => conn_state.send(resp_pong(), registry).await?,
-            b"QUIT" => {
+        ConnState::PubSub(_) => match handler {
+            Some(Handler::Subscribe) => cmd_subscribe(args, conn_state, registry).await?,
+            Some(Handler::Unsubscribe) => cmd_unsubscribe(args, conn_state, registry).await?,
+            Some(Handler::Ping) => conn_state.send(resp_pong(), registry).await?,
+            Some(Handler::Quit) => {
                 conn_state.send(resp_ok(), registry).await?;
                 return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
             }
             _ => {
                 let frame = Frame::Error(String::from(
-                    "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / PUBLISH allowed",
+                    "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allow",
                 ));
 
                 conn_state.send(frame, registry).await?;
             }
         },
-        ConnState::Normal(_, _) => match cmd.as_slice() {
-            b"SUBSCRIBE" => cmd_subscribe(args, conn_state, registry).await?,
-            b"PUBLISH" => cmd_publish(args, conn_state, registry).await?,
-            _ => {
-                let frame = if let Some(f) = dispatch_command(cmd, args, &mut art.borrow_mut()) {
-                    f
-                } else if let Some(f) = dispatch_async_command(cmd, args, art.clone()).await {
-                    f
-                } else {
-                    Frame::Error(
-                        format!("ERR unknown command '{}'", String::from_utf8_lossy(cmd)).into(),
-                    )
-                };
+        ConnState::Normal(_, _) => match handler {
+            Some(Handler::Subscribe) => cmd_subscribe(args, conn_state, registry).await?,
+            Some(Handler::Publish) => cmd_publish(args, conn_state, registry).await?,
+            Some(Handler::Ping) => conn_state.send(resp_pong(), registry).await?,
+            Some(Handler::Quit) => {
+                conn_state.send(resp_ok(), registry).await?;
+                return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+            }
+            Some(h) => {
+                conn_state
+                    .send(run_handler(h, args, art).await, registry)
+                    .await?
+            }
+            None => {
+                let frame = Frame::Error(format!(
+                    "ERR unknown command '{}'",
+                    String::from_utf8_lossy(cmd)
+                ));
+
                 conn_state.send(frame, registry).await?;
             }
         },
@@ -230,7 +295,7 @@ async fn dispatch(
     Ok(())
 }
 
-// ── Command tables ────────────────────────────────────────────────────────────
+// ── Command dispatch ──────────────────────────────────────────────────────────
 
 fn resp_pong() -> Frame {
     Frame::SimpleString(SharedByte::from_slice(b"PONG"))
@@ -240,86 +305,99 @@ fn resp_ok() -> Frame {
 }
 
 enum Handler {
+    // ── Data commands (state-free) ────────────────────────────────────────────
     Static(fn() -> Frame),
     Args(fn(&[SharedByte]) -> Frame),
     Data(fn(&[SharedByte], &mut OxidArt) -> Frame),
     DataOnly(fn(&mut OxidArt) -> Frame),
+    Async(fn(&[SharedByte], SharedART) -> AsyncFrame),
+    // ── State-sensitive commands ──────────────────────────────────────────────
+    Ping,
+    Quit,
+    Subscribe,
+    Unsubscribe,
+    Publish,
 }
 
-static COMMANDS: &[(&[u8], Handler)] = &[
-    (b"GET", Handler::Data(cmd_get)),
-    (b"SET", Handler::Data(cmd_set)),
-    (b"INCR", Handler::Data(cmd_incr)),
-    (b"DECR", Handler::Data(cmd_decr)),
-    (b"INCRBY", Handler::Data(cmd_incrby)),
-    (b"DECRBY", Handler::Data(cmd_decrby)),
-    (b"PING", Handler::Static(resp_pong)),
-    (b"QUIT", Handler::Static(resp_ok)),
-    (b"SELECT", Handler::Static(resp_ok)),
-    (b"ECHO", Handler::Args(cmd_echo)),
-    (b"DEL", Handler::Data(cmd_del)),
-    (b"TTL", Handler::Data(cmd_ttl)),
-    (b"PTTL", Handler::Data(cmd_pttl)),
-    (b"EXPIRE", Handler::Data(cmd_expire)),
-    (b"PEXPIRE", Handler::Data(cmd_pexpire)),
-    (b"PERSIST", Handler::Data(cmd_persist)),
-    (b"EXISTS", Handler::Data(cmd_exists)),
-    (b"MGET", Handler::Data(cmd_mget)),
-    (b"MSET", Handler::Data(cmd_mset)),
-    (b"SETNX", Handler::Data(cmd_setnx)),
-    (b"SETEX", Handler::Data(cmd_setex)),
-    (b"TYPE", Handler::Data(cmd_type)),
-    (b"DBSIZE", Handler::DataOnly(cmd_dbsize)),
-    (b"FLUSHDB", Handler::DataOnly(cmd_flushdb)),
-    (b"SADD", Handler::Data(cmd_sadd)),
-    (b"SREM", Handler::Data(cmd_srem)),
-    (b"SISMEMBER", Handler::Data(cmd_sismember)),
-    (b"SCARD", Handler::Data(cmd_scard)),
-    (b"SMEMBERS", Handler::Data(cmd_smembers)),
-    (b"SPOP", Handler::Data(cmd_spop)),
-    (b"HSET", Handler::Data(cmd_hset)),
-    (b"HMSET", Handler::Data(cmd_hmset)),
-    (b"HGET", Handler::Data(cmd_hget)),
-    (b"HGETALL", Handler::Data(cmd_hgetall)),
-    (b"HDEL", Handler::Data(cmd_hdel)),
-    (b"HEXISTS", Handler::Data(cmd_hexists)),
-    (b"HLEN", Handler::Data(cmd_hlen)),
-    (b"HKEYS", Handler::Data(cmd_hkeys)),
-    (b"HVALS", Handler::Data(cmd_hvals)),
-    (b"HMGET", Handler::Data(cmd_hmget)),
-    (b"HINCRBY", Handler::Data(cmd_hincrby)),
-    (b"ZADD", Handler::Data(cmd_zadd)),
-    (b"ZCARD", Handler::Data(cmd_zcard)),
-    (b"ZRANGE", Handler::Data(cmd_zrange)),
-    (b"ZSCORE", Handler::Data(cmd_zscore)),
-    (b"ZREM", Handler::Data(cmd_zrem)),
-    (b"ZINCRBY", Handler::Data(cmd_zincrby)),
-];
-
-static ASYNC_COMMANDS: &[(&[u8], fn(&[SharedByte], SharedART) -> AsyncFrame)] =
-    &[(b"UNLINK", cmd_unlink), (b"KEYS", cmd_keys)];
-
-fn dispatch_command(cmd: &[u8], args: &[SharedByte], art: &mut OxidArt) -> Option<Frame> {
-    for (name, handler) in COMMANDS {
-        if cmd == *name {
-            return Some(match handler {
-                Handler::Static(f) => f(),
-                Handler::Args(f) => f(args),
-                Handler::Data(f) => f(args, art),
-                Handler::DataOnly(f) => f(art),
-            });
-        }
-    }
-    None
+fn get_handler(cmd: &[u8]) -> Option<Handler> {
+    Some(match cmd {
+        // ── Connection ────────────────────────────────────────────────────────
+        b"PING" => Handler::Ping,
+        b"QUIT" => Handler::Quit,
+        b"SELECT" => Handler::Static(resp_ok),
+        b"ECHO" => Handler::Args(cmd_echo),
+        // ── Pub/Sub ───────────────────────────────────────────────────────────
+        b"SUBSCRIBE" => Handler::Subscribe,
+        b"UNSUBSCRIBE" => Handler::Unsubscribe,
+        b"PUBLISH" => Handler::Publish,
+        // ── Strings / Keys ────────────────────────────────────────────────────
+        b"GET" => Handler::Data(cmd_get),
+        b"SET" => Handler::Data(cmd_set),
+        b"SETNX" => Handler::Data(cmd_setnx),
+        b"SETEX" => Handler::Data(cmd_setex),
+        b"MGET" => Handler::Data(cmd_mget),
+        b"MSET" => Handler::Data(cmd_mset),
+        b"DEL" => Handler::Data(cmd_del),
+        b"EXISTS" => Handler::Data(cmd_exists),
+        b"TYPE" => Handler::Data(cmd_type),
+        b"KEYS" => Handler::Async(cmd_keys),
+        b"UNLINK" => Handler::Async(cmd_unlink),
+        // ── Counters ──────────────────────────────────────────────────────────
+        b"INCR" => Handler::Data(cmd_incr),
+        b"DECR" => Handler::Data(cmd_decr),
+        b"INCRBY" => Handler::Data(cmd_incrby),
+        b"DECRBY" => Handler::Data(cmd_decrby),
+        // ── TTL ───────────────────────────────────────────────────────────────
+        b"TTL" => Handler::Data(cmd_ttl),
+        b"PTTL" => Handler::Data(cmd_pttl),
+        b"EXPIRE" => Handler::Data(cmd_expire),
+        b"PEXPIRE" => Handler::Data(cmd_pexpire),
+        b"PERSIST" => Handler::Data(cmd_persist),
+        // ── Server ────────────────────────────────────────────────────────────
+        b"DBSIZE" => Handler::DataOnly(cmd_dbsize),
+        b"FLUSHDB" => Handler::DataOnly(cmd_flushdb),
+        // ── Hash ──────────────────────────────────────────────────────────────
+        b"HSET" => Handler::Data(cmd_hset),
+        b"HMSET" => Handler::Data(cmd_hmset),
+        b"HGET" => Handler::Data(cmd_hget),
+        b"HGETALL" => Handler::Data(cmd_hgetall),
+        b"HDEL" => Handler::Data(cmd_hdel),
+        b"HEXISTS" => Handler::Data(cmd_hexists),
+        b"HLEN" => Handler::Data(cmd_hlen),
+        b"HKEYS" => Handler::Data(cmd_hkeys),
+        b"HVALS" => Handler::Data(cmd_hvals),
+        b"HMGET" => Handler::Data(cmd_hmget),
+        b"HINCRBY" => Handler::Data(cmd_hincrby),
+        // ── Set ───────────────────────────────────────────────────────────────
+        b"SADD" => Handler::Data(cmd_sadd),
+        b"SREM" => Handler::Data(cmd_srem),
+        b"SISMEMBER" => Handler::Data(cmd_sismember),
+        b"SCARD" => Handler::Data(cmd_scard),
+        b"SMEMBERS" => Handler::Data(cmd_smembers),
+        b"SPOP" => Handler::Data(cmd_spop),
+        // ── ZSet ──────────────────────────────────────────────────────────────
+        b"ZADD" => Handler::Data(cmd_zadd),
+        b"ZCARD" => Handler::Data(cmd_zcard),
+        b"ZRANGE" => Handler::Data(cmd_zrange),
+        b"ZSCORE" => Handler::Data(cmd_zscore),
+        b"ZREM" => Handler::Data(cmd_zrem),
+        b"ZINCRBY" => Handler::Data(cmd_zincrby),
+        _ => return None,
+    })
 }
 
-async fn dispatch_async_command(cmd: &[u8], args: &[SharedByte], art: SharedART) -> Option<Frame> {
-    for (name, handler) in ASYNC_COMMANDS {
-        if cmd == *name {
-            return Some(handler(args, art).await);
-        }
+/// Executes a state-free handler and returns the response frame.
+/// State-sensitive variants (Ping, Quit, Subscribe, Unsubscribe, Publish)
+/// are handled in `dispatch` before this is ever called.
+async fn run_handler(handler: Handler, args: &[SharedByte], art: &SharedART) -> Frame {
+    match handler {
+        Handler::Static(f) => f(),
+        Handler::Args(f) => f(args),
+        Handler::Data(f) => f(args, &mut art.borrow_mut()),
+        Handler::DataOnly(f) => f(&mut art.borrow_mut()),
+        Handler::Async(f) => f(args, art.clone()).await,
+        _ => unreachable!("state-sensitive handler reached run_handler"),
     }
-    None
 }
 
 fn frame_to_args(frame: BytesFrame) -> Option<(SharedByte, CmdArgs)> {

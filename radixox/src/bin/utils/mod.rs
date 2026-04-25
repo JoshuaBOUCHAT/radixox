@@ -111,12 +111,15 @@ impl Future for CancelationFutur {
     type Output = SharedByte;
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let mut state = self.state.borrow_mut();
-        match &*state {
+        match &mut *state {
             CancelationState::Submit => {
                 *state = CancelationState::Running(cx.waker().clone());
                 Poll::Pending
             }
-            CancelationState::Running(_) => Poll::Pending,
+            CancelationState::Running(w) => {
+                *w = cx.waker().clone();
+                Poll::Pending
+            }
             CancelationState::Canceled(r) => Poll::Ready(r.clone()),
         }
     }
