@@ -79,7 +79,6 @@ use crate::node_childs::HugeChilds;
 use crate::value::Value;
 
 /// Internal sentinel value indicating no expiration (never expires)
-
 /// Result of a TTL lookup operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TtlResult {
@@ -300,7 +299,7 @@ impl OxidArt {
     pub fn get(&mut self, key: &[u8]) -> Option<&Value> {
         let idx = self.get_idx(key)?;
         debug_assert!(key.is_ascii(), "key must be ASCII");
-        return self.get_node(idx).get_value(self.now);
+        self.get_node(idx).get_value(self.now)
     }
     pub(crate) fn get_mut(&mut self, key: &[u8]) -> Option<&mut Value> {
         let idx = self.get_idx(key)?;
@@ -941,7 +940,7 @@ impl OxidArt {
             // Node with children: keep the node, just remove the value
             let old_val = self.get_node_mut(target_idx).val.take()?;
             self.try_recompress(target_idx);
-            return Some(old_val);
+            Some(old_val)
         } else {
             // Node without children (leaf): completely remove from the slab
             let node = self.map.remove(target_idx)?;
@@ -950,7 +949,7 @@ impl OxidArt {
             if parent_idx != self.root_idx {
                 self.try_recompress(parent_idx);
             }
-            return Some(old_val);
+            Some(old_val)
         }
     }
 
@@ -1161,7 +1160,6 @@ impl OxidArt {
     }
 
     /// If the node has exactly 1 child and no value, absorb the child
-
     fn remove_child(&mut self, parent_idx: u32, radix: u8) {
         let Some(parent) = self.try_get_node_mut(parent_idx) else {
             // Parent was absorbed/removed during recompression, nothing to do

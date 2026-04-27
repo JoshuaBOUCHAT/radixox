@@ -5,6 +5,9 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "RESP2/RESP3 protocol types and frame parsing for Redis-compatible servers"
+keywords = ["redis", "resp", "protocol", "bytes", "server"]
+categories = ["network-programming", "parser-implementations"]
 
 [dependencies]
 redis-protocol = { workspace = true }

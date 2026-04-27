@@ -5,7 +5,7 @@ mod resp_cmd;
 mod utils;
 
 use std::cell::RefCell;
-use std::pin::Pin;
+
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -35,7 +35,7 @@ use resp_cmd::{
     cmd_srem, cmd_zadd, cmd_zcard, cmd_zincrby, cmd_zrange, cmd_zrem, cmd_zscore,
 };
 
-use crate::utils::{CancelationFutur, ConnState, SubRegistry};
+use crate::utils::{ConnState, SubRegistry};
 
 pub(crate) type IOResult<T> = std::io::Result<T>;
 type SharedART = Rc<RefCell<OxidArt>>;
@@ -48,16 +48,7 @@ const NB_ACCEPTOR: usize = 16;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-enum Task {
-    Alive(Pin<Box<dyn Future<Output = ()>>>),
-    Dead,
-}
-type Tr = Box<dyn Future<Output = ()>>;
-
 fn main() -> std::io::Result<()> {
-    let t1 = Box::new(1);
-    let t1: Option<Box<[u8]>> = None;
-
     let mut runtime = get_runtime()?;
 
     runtime.block_on(async {
@@ -165,14 +156,14 @@ async fn handle_loop(
     let mut io_buf = BytesMut::with_capacity(BUFFER_SIZE);
 
     loop {
-        let (n, returned) = read_with_conn_state(io_buf, conn_state, &registry, read).await?;
+        let (n, returned) = read_with_conn_state(io_buf, conn_state, registry, read).await?;
         io_buf = returned;
         if n == 0 {
             return Ok(());
         }
         read_buf.extend_from_slice(&io_buf[..n]);
         io_buf.clear();
-        handle_buffer(&mut read_buf, conn_state, &registry, art).await?;
+        handle_buffer(&mut read_buf, conn_state, registry, art).await?;
     }
 }
 
@@ -239,7 +230,7 @@ async fn handle_buffer(
             continue;
         };
         cmd.to_uppercase();
-        dispatch(&cmd, &args, conn_state, registry, &art).await?;
+        dispatch(&cmd, &args, conn_state, registry, art).await?;
     }
 }
 

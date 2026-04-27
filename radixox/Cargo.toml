@@ -6,6 +6,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "RadixOx — Redis-compatible in-memory key-value store"
+readme = "../README.md"
+keywords = ["redis", "key-value", "database", "io-uring", "server"]
+categories = ["database-implementations", "network-programming"]
 
 [[bin]]
 name = "radixox"

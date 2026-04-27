@@ -34,8 +34,7 @@ pub fn cmd_zcard(args: &[SharedByte], art: &mut OxidArt) -> Frame {
             format!(
                 "WRONGTYPE Operation against a key holding the wrong kind of value (expected zset, got {})",
                 redis_type.as_str()
-            )
-            .into(),
+            ),
         ),
     }
 }
@@ -62,8 +61,7 @@ pub fn cmd_zrange(args: &[SharedByte], art: &mut OxidArt) -> Frame {
             format!(
                 "WRONGTYPE Operation against a key holding the wrong kind of value (expected zset, got {})",
                 redis_type.as_str()
-            )
-            .into(),
+            ),
         ),
     }
 }
@@ -79,8 +77,7 @@ pub fn cmd_zscore(args: &[SharedByte], art: &mut OxidArt) -> Frame {
             format!(
                 "WRONGTYPE Operation against a key holding the wrong kind of value (expected zset, got {})",
                 redis_type.as_str()
-            )
-            .into(),
+            ),
         ),
     }
 }
@@ -95,8 +92,7 @@ pub fn cmd_zrem(args: &[SharedByte], art: &mut OxidArt) -> Frame {
             format!(
                 "WRONGTYPE Operation against a key holding the wrong kind of value (expected zset, got {})",
                 redis_type.as_str()
-            )
-            .into(),
+            ),
         ),
     }
 }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["radixox", "oxidart", "radixox-lib", "onlyio"]
+members = ["radixox", "oxidart", "radixox-lib"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,7 +12,7 @@ repository = "https://github.com/JoshuaBOUCHAT/radixox"
 [workspace.dependencies]
 monoio = { version = "0.2.4", features = ["iouring"] }
 bytes = { version = "1", features = ["serde"] }
-oxidart = { path = "oxidart", version = "0.4.0" }
+oxidart = { path = "oxidart", version = "0.1.0" }
 radixox-lib = { path = "radixox-lib", version = "0.1.0" }
 smallvec = "1.15.1"
 redis-protocol = { version = "6.0.0", default-features = false, features = [

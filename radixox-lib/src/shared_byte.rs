@@ -56,6 +56,7 @@ impl SharedByte {
         Self::from_byte(data.as_ref())
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         Self::from_slice(s.as_bytes())
     }
@@ -180,17 +181,16 @@ impl std::hash::Hash for SharedByte {
 }
 impl PartialOrd for SharedByte {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.as_slice().cmp(&other.as_slice()))
+        Some(self.cmp(other))
     }
 }
 impl Ord for SharedByte {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.as_slice().cmp(&other.as_slice())
+        self.as_slice().cmp(other.as_slice())
     }
 }
 impl Borrow<[u8]> for SharedByte {
     fn borrow(&self) -> &[u8] {
-        &self // si SharedByte: Deref<Target=[u8]>
-        // ou self.as_slice() selon ton API
+        self
     }
 }

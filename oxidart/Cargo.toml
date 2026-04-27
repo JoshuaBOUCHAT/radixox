@@ -1,11 +1,14 @@
 [package]
 name = "oxidart"
-version = "0.4.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "High-performance Adaptive Radix Tree with TTL, DFA pattern matching, and atomic counters"
+readme = "README.md"
+keywords = ["art", "radix-tree", "trie", "data-structure", "ttl"]
+categories = ["data-structures"]
 
 [dependencies]
 bytes.workspace = true
@@ -13,7 +16,7 @@ arrayvec = "0.7.6"
 smallvec.workspace = true
 ordered-float = "5.1.0"
 monoio.workspace = true
-hislab = { path = "../../hislab", features = ["rand"] }
+hislab = { version = "0.2.1", features = ["rand"] }
 radixox-lib = { workspace = true }
 
 

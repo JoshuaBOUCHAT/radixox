@@ -26,8 +26,7 @@ pub fn cmd_srem(args: &[SharedByte], art: &mut OxidArt) -> Frame {
             format!(
                 "WRONGTYPE Operation against a key holding the wrong kind of value (expected set, got {})",
                 redis_type.as_str()
-            )
-            .into(),
+            ),
         ),
     }
 }
@@ -42,8 +41,7 @@ pub fn cmd_sismember(args: &[SharedByte], art: &mut OxidArt) -> Frame {
             format!(
                 "WRONGTYPE Operation against a key holding the wrong kind of value (expected set, got {})",
                 redis_type.as_str()
-            )
-            .into(),
+            ),
         ),
     }
 }
@@ -58,8 +56,7 @@ pub fn cmd_scard(args: &[SharedByte], art: &mut OxidArt) -> Frame {
             format!(
                 "WRONGTYPE Operation against a key holding the wrong kind of value (expected set, got {})",
                 redis_type.as_str()
-            )
-            .into(),
+            ),
         ),
     }
 }
@@ -74,8 +71,7 @@ pub fn cmd_smembers(args: &[SharedByte], art: &mut OxidArt) -> Frame {
             format!(
                 "WRONGTYPE Operation against a key holding the wrong kind of value (expected set, got {})",
                 redis_type.as_str()
-            )
-            .into(),
+            ),
         ),
     }
 }

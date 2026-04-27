@@ -171,7 +171,9 @@ dependencies = [
 
 [[package]]
 name = "hislab"
-version = "0.2.0"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f20f56d6fdcf6305fc06fae98e6187aa65131c0575b2aff063af2e2d22ef2fc"
 dependencies = [
  "libc",
  "memmap2",
@@ -460,10 +462,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "onlyio"
-version = "0.1.0"
-
-[[package]]
 name = "ordered-float"
 version = "5.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -474,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "oxidart"
-version = "0.4.0"
+version = "0.1.0"
 dependencies = [
  "arrayvec",
  "bytes",

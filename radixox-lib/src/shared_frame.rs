@@ -48,7 +48,7 @@ impl Resp2Frame for SharedFrame {
                 .fold(1 + digits_in_usize(frames.len()) + 2, |m, f| {
                     m + f.encode_len(int_as_bulkstring)
                 }),
-            SharedFrame::Null => NULL.as_bytes().len(),
+            SharedFrame::Null => NULL.len(),
             SharedFrame::SimpleString(s) => simplestring_encode_len(s),
             SharedFrame::Error(s) => error_encode_len(s),
             SharedFrame::Integer(i) => integer_encode_len(*i, int_as_bulkstring),
@@ -162,7 +162,7 @@ pub fn simplestring_encode_len(s: &[u8]) -> usize {
 }
 
 pub fn error_encode_len(s: &str) -> usize {
-    1 + s.as_bytes().len() + 2
+    1 + s.len() + 2
 }
 
 pub fn integer_encode_len(i: i64, int_as_bulkstring: bool) -> usize {

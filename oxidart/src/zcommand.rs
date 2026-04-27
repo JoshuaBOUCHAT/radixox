@@ -155,11 +155,11 @@ impl Default for InnerZCommand {
 
 impl OxidArt {
     /// Get or create a zset at the given key, ensuring type correctness.
-    fn get_zset_mut<'a>(
-        &'a mut self,
+    fn get_zset_mut(
+        &mut self,
         ttl: Option<u64>,
         key: SharedByte,
-    ) -> Result<&'a mut InnerZCommand, TypeError> {
+    ) -> Result<&mut InnerZCommand, TypeError> {
         let now = self.now;
         let node_key = self.ensure_key(&key);
         let node: &mut crate::Node = self.get_node_mut(node_key);
@@ -259,7 +259,7 @@ impl OxidArt {
         for (score, member) in zset.iter().skip(start).take(stop - start + 1) {
             result.push(member.clone());
             if with_scores {
-                result.push(SharedByte::from_slice(&score.into_inner().to_string()));
+                result.push(SharedByte::from_slice(score.into_inner().to_string()));
             }
         }
         Ok(result)

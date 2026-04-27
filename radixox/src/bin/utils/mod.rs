@@ -411,7 +411,7 @@ async fn write_task(mut cw: ConnWriter, shared_registry: Rc<RefCell<SubRegistry>
     let needs_more = shared_registry
         .borrow()
         .get(sub_id)
-        .map_or(false, |c| !c.io_buffer.is_empty());
+        .is_some_and(|c| !c.io_buffer.is_empty());
 
     if needs_more {
         monoio::spawn(write_task(cw, shared_registry, sub_id));
