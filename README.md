@@ -36,12 +36,12 @@ Tested with [YCSB](https://github.com/brianfrankcooper/YCSB) (Yahoo! Cloud Servi
 | **READ P99.9** | 1,091 µs | **629 µs** | ✅ **-42%** |
 | **READ P99.99** | 1,801 µs | **1,573 µs** | ✅ **-13%** |
 | **UPDATE P99** | 1,039 µs | **565 µs** | ✅ **-46%** |
-| **Peak RSS** | **2,049 MB** | 2,315 MB | — |
+| **Peak RSS** | **2,049 MB** | **2,084 MB** | ≈ **parity** |
 
 **Key Takeaways:**
 - 🚀 **+28% load throughput** — 94k vs 73k ops/sec, no hashtable rehashing jitter
 - 🎯 **-46% P99 on reads and updates** — Valkey at 1,039 µs, RadixOx at 564 µs
-- 💾 **RAM within 14% of Valkey** — thanks to `SharedByte` (custom `!Send` ref-counted buffer, drop-in for `bytes::Bytes` without atomic ops)
+- 💾 **RAM within 2% of Valkey** — `SharedByte` (custom `!Send` ref-counted buffer, no atomic ops) + mimalloc for `SharedByte` allocations (-10% RSS vs system allocator)
 - 📈 **ART is O(key_length)** — latency doesn't grow with dataset size
 - ⚡ **THP warm-up effect** — p99.99 improves further as dataset grows and huge pages are promoted
 
@@ -183,6 +183,7 @@ Heap layout: [ len: u32 | rc: u16 | data: u8... ]
 - **`!Send`** — single-threaded by design, no atomic ops
 - **u16 refcount** — 65k max clones, no `Arc` overhead
 - **Borrow<[u8]>** — zero-cost use in BTreeMap/BTreeSet without conversion
+- **mimalloc** — allocations backed by mimalloc instead of the system allocator, saving ~10% RSS (2,084 MB vs 2,315 MB at 5M records)
 
 ---
 
@@ -261,7 +262,7 @@ radixox/
 | READ P99.9 | 1,091 µs | **629 µs** | 🦀 **-42%** |
 | Load P99 | 2,597 µs | **1,488 µs** | 🦀 **-43%** |
 | Prefix queries | O(N) scan | **O(k) native** | 🦀 |
-| Peak RSS (5M records) | **2,049 MB** | 2,315 MB | 🔴 |
+| Peak RSS (5M records) | **2,049 MB** | **2,084 MB** | ≈ |
 | Data structures | HashMap flat | **ART + BTree** | 🦀 |
 | Tail latency | Variable | **Predictable** | 🦀 |
 | Multi-threaded | ✅ Optional | ❌ No | 🔴 |

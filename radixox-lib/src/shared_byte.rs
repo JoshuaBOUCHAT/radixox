@@ -1,4 +1,5 @@
-use std::alloc::{Layout, alloc, dealloc};
+use mimalloc::MiMalloc;
+use std::alloc::{GlobalAlloc, Layout};
 use std::borrow::Borrow;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -35,7 +36,7 @@ impl SharedByte {
         unsafe {
             let total = Self::HEADER_SIZE + data.len();
             let layout = Layout::from_size_align(total, 4).unwrap();
-            let ptr = alloc(layout);
+            let ptr = MiMalloc.alloc(layout);
             assert!(!ptr.is_null());
 
             // écrire len
@@ -97,7 +98,7 @@ impl SharedByte {
         } else {
             let layout = Layout::from_size_align(Self::HEADER_SIZE + len, 4).unwrap();
             unsafe {
-                let new_ptr = alloc(layout);
+                let new_ptr = MiMalloc.alloc(layout);
                 assert!(!new_ptr.is_null());
                 (new_ptr as *mut u32).write(len as u32);
                 (new_ptr.add(4) as *mut u16).write(1);
@@ -110,7 +111,7 @@ impl SharedByte {
                 let rc = self.rc_ptr();
                 *rc -= 1;
                 if *rc == 0 {
-                    dealloc(self.ptr.as_ptr(), layout);
+                    MiMalloc.dealloc(self.ptr.as_ptr(), layout);
                 }
                 self.ptr = NonNull::new_unchecked(new_ptr);
             }
@@ -143,7 +144,7 @@ impl Drop for SharedByte {
             if *rc == 0 {
                 let total = Self::HEADER_SIZE + self.len();
                 let layout = Layout::from_size_align(total, 4).unwrap();
-                dealloc(self.ptr.as_ptr(), layout);
+                MiMalloc.dealloc(self.ptr.as_ptr(), layout);
             }
         }
     }

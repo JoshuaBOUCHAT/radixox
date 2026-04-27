@@ -12,3 +12,4 @@ categories = ["network-programming", "parser-implementations"]
 [dependencies]
 redis-protocol = { workspace = true }
 bytes = { workspace = true }
+mimalloc = "0.1.50"
