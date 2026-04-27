@@ -19,7 +19,8 @@
       "Bash(cargo test:*)",
       "WebFetch(domain:crates.io)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "Bash(cargo check:*)"
+      "Bash(cargo check:*)",
+      "Bash(cargo clippy *)"
     ]
   }
 }

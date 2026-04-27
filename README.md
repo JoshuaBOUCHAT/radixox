@@ -10,11 +10,11 @@ RadixOx is a high-performance in-memory key-value store that speaks the Redis pr
 
 Tested with [YCSB](https://github.com/brianfrankcooper/YCSB) (Yahoo! Cloud Serving Benchmark) — industry standard for NoSQL databases.
 
-**Configuration:** 5M records, Workload A (50% read / 50% update), fieldlength=100, 100 client threads, localhost *(2026-04-09)*
+**Configuration:** 5M records, Workload A (50% read / 50% update), fieldlength=100, 100 client threads, localhost *(2026-04-27)*
 
 > **Opponent:** Valkey 9.0.3 — the actively maintained Redis fork, single-threaded event loop, same architecture class as RadixOx.
 >
-> **Fair comparison:** Both servers run single-threaded on the same machine. SQ_POLL is **disabled** — RadixOx uses standard io_uring without a dedicated kernel polling thread.
+> **Fair comparison:** Both servers run on a single thread. SQ_POLL is **disabled** — RadixOx uses standard io_uring without a dedicated kernel polling thread. True 1-thread vs 1-thread comparison.
 >
 > **Memory model:** HiSlab backing store uses anonymous `mmap` + `MADV_HUGEPAGE` (THP) + pre-fault of 10K nodes (1.25 MB). The load phase serves as natural THP warm-up.
 
@@ -22,26 +22,26 @@ Tested with [YCSB](https://github.com/brianfrankcooper/YCSB) (Yahoo! Cloud Servi
 
 | Metric | Valkey 9.0.3 | RadixOx | Improvement |
 |--------|-------------|---------|-------------|
-| **Throughput** | 69,722 ops/sec | **94,480 ops/sec** | 🚀 **+35%** |
-| **P99 Latency** | 2,723 µs | **1,313 µs** | ✅ **-52%** |
+| **Throughput** | 72,967 ops/sec | **93,679 ops/sec** | 🚀 **+28%** |
+| **P99 Latency** | 2,597 µs | **1,488 µs** | ✅ **-43%** |
 
 ### RUN Phase (10,000,000 operations — 50% READ / 50% UPDATE)
 
 | Metric | Valkey 9.0.3 | RadixOx | Improvement |
 |--------|-------------|---------|-------------|
-| **Throughput** | 170,978 ops/sec | **201,191 ops/sec** | 🚀 **+18%** |
-| **READ Avg** | 582 µs | **496 µs** | ⚡ **-15%** |
-| **READ P95** | 606 µs | **552 µs** | ✅ **-9%** |
-| **READ P99** | 1,137 µs | **711 µs** | ✅ **-37%** |
-| **READ P99.9** | 1,161 µs | **786 µs** | ✅ **-32%** |
-| **READ P99.99** | 1,230 µs | 1,251 µs | — |
-| **UPDATE P99** | 1,138 µs | **712 µs** | ✅ **-37%** |
-| **Peak RSS** | 2,049 MB | 2,362 MB | — |
+| **Throughput** | 187,361 ops/sec | **222,217 ops/sec** | 🚀 **+19%** |
+| **READ Avg** | 531 µs | **449 µs** | ⚡ **-15%** |
+| **READ P95** | 556 µs | **494 µs** | ✅ **-11%** |
+| **READ P99** | 1,039 µs | **564 µs** | ✅ **-46%** |
+| **READ P99.9** | 1,091 µs | **629 µs** | ✅ **-42%** |
+| **READ P99.99** | 1,801 µs | **1,573 µs** | ✅ **-13%** |
+| **UPDATE P99** | 1,039 µs | **565 µs** | ✅ **-46%** |
+| **Peak RSS** | **2,049 MB** | 2,315 MB | — |
 
 **Key Takeaways:**
-- 🚀 **+35% load throughput** — 94k vs 70k ops/sec, no hashtable rehashing jitter
-- 🎯 **-37% P99 on reads and updates** — Valkey at 1,137 µs, RadixOx at 711 µs
-- 💾 **RAM within 15% of Valkey** — thanks to `SharedByte` (custom `!Send` ref-counted buffer, replaces `Arc<Bytes>`)
+- 🚀 **+28% load throughput** — 94k vs 73k ops/sec, no hashtable rehashing jitter
+- 🎯 **-46% P99 on reads and updates** — Valkey at 1,039 µs, RadixOx at 564 µs
+- 💾 **RAM within 14% of Valkey** — thanks to `SharedByte` (custom `!Send` ref-counted buffer, drop-in for `bytes::Bytes` without atomic ops)
 - 📈 **ART is O(key_length)** — latency doesn't grow with dataset size
 - ⚡ **THP warm-up effect** — p99.99 improves further as dataset grows and huge pages are promoted
 
@@ -77,7 +77,10 @@ Perfect for workloads with hierarchical keys: `user:123:session`, `config:app:fe
 ## 🎯 Quick Start
 
 ```bash
-# Build and run (requires Linux 5.1+ for io_uring)
+# Install from crates.io (requires Linux 5.1+ for io_uring)
+cargo install radixox
+
+# Or build from source
 cargo build --bin radixox --release
 ./target/release/radixox
 
@@ -139,13 +142,13 @@ Full Redis RESP2 protocol support with all major data structures:
 │                                                                         │
 │   ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐      │
 │   │   monoio     │    │    RESP2     │    │      OxidArt         │      │
-│   │  (io_uring)  │──▶│   Parser     │──▶│  (Adaptive Radix     │      │
+│   │  (io_uring)  │──▶ │   Parser     │──▶ │  (Adaptive Radix     │      │
 │   │              │    │  zero-copy   │    │   Tree + TTL)        │      │
 │   └──────────────┘    └──────────────┘    └──────────────────────┘      │
 │                                                                         │
-│   io_buf ──▶ read_buf ──▶ BytesFrame ──▶ SharedByte args ──▶ OxidArt  │
+│   io_buf ──▶ read_buf ──▶ BytesFrame ──▶ SharedByte args ──▶ OxidArt    │
 │                                                    │                    │
-│                             write_buf ◀─ SharedFrame ◀─────────────────┘
+│                             write_buf ◀─ SharedFrame ◀──────────────────│
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -164,13 +167,13 @@ Full Redis RESP2 protocol support with all major data structures:
 
 **Node Structure:** 128 bytes exactly, cache-line optimized
 - Path compression for single-child chains
-- Two-tier child storage: inline (9 slots) + overflow (118 slots)
+- Two-tier child storage: inline (10 slots) + overflow (117 slots) — 10 inline slots cover all ASCII digits, making keys like `user:1234` extremely cache-efficient
 - HiSlab allocator with O(1) insert/remove, `mmap` + THP backing
 - Lazy TTL expiration + active eviction (Redis-style)
 
 ### SharedByte — Custom Reference-Counted Buffer
 
-`SharedByte` replaces `bytes::Bytes` (`Arc<[u8]>`) for all stored values:
+`SharedByte` replaces `bytes::Bytes` — which relies on atomic reference counting for zero-copy cloning — with a `!Send` equivalent that eliminates all atomic operations:
 
 ```
 Heap layout: [ len: u32 | rc: u16 | data: u8... ]
