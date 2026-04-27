@@ -255,13 +255,13 @@ radixox/
 
 | Feature | Valkey 9.0.3 | RadixOx | Winner |
 |---------|-------------|---------|--------|
-| Load throughput (5M inserts) | 70k ops/sec | **94k ops/sec** | 🦀 **+35%** |
-| Run throughput (10M ops) | 171k ops/sec | **201k ops/sec** | 🦀 **+18%** |
-| READ P99 (5M records) | 1,137 µs | **711 µs** | 🦀 **-37%** |
-| READ P99.9 | 1,161 µs | **786 µs** | 🦀 **-32%** |
-| Load P99 | 2,723 µs | **1,313 µs** | 🦀 **-52%** |
+| Load throughput (5M inserts) | 73k ops/sec | **94k ops/sec** | 🦀 **+28%** |
+| Run throughput (10M ops) | 187k ops/sec | **222k ops/sec** | 🦀 **+19%** |
+| READ P99 (5M records) | 1,039 µs | **564 µs** | 🦀 **-46%** |
+| READ P99.9 | 1,091 µs | **629 µs** | 🦀 **-42%** |
+| Load P99 | 2,597 µs | **1,488 µs** | 🦀 **-43%** |
 | Prefix queries | O(N) scan | **O(k) native** | 🦀 |
-| Peak RSS (5M records) | 2,049 MB | 2,362 MB | 🔴 |
+| Peak RSS (5M records) | **2,049 MB** | 2,315 MB | 🔴 |
 | Data structures | HashMap flat | **ART + BTree** | 🦀 |
 | Tail latency | Variable | **Predictable** | 🦀 |
 | Multi-threaded | ✅ Optional | ❌ No | 🔴 |
