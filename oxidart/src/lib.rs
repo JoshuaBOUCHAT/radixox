@@ -46,6 +46,7 @@
 pub mod async_command;
 mod compact_str;
 pub mod error;
+mod exp;
 pub mod hcommand;
 mod node_childs;
 pub mod scommand;
@@ -1152,8 +1153,8 @@ impl OxidArt {
         }
 
         let node = self.get_node_mut(node_idx);
-        node.compression.push(child_radix);
-        node.compression.extend_from_slice(&child.compression);
+        node.compression
+            .append_and_replace(child_radix, &child.compression);
         node.val = child.val;
         node.exp_and_radix = child.exp_and_radix;
         node.childs = child.childs;
