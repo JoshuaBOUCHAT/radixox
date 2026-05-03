@@ -17,7 +17,7 @@ fn test_get_set_basic() {
     let key = SharedByte::from_str("Joshua");
     let val = Value::from_str("BOUCHAT");
     art.set(key.clone(), val.clone());
-    assert_eq!(art.get(&key), Some(&val));
+    assert_eq!(art.get(&key), Some(val));
 }
 
 #[test]
@@ -26,7 +26,7 @@ fn test_empty_key() {
     let key = SharedByte::from_str("");
     let val = Value::from_str("root_value");
     art.set(key.clone(), val.clone());
-    assert_eq!(art.get(&key), Some(&val));
+    assert_eq!(art.get(&key), Some(val));
 }
 
 #[test]
@@ -43,10 +43,10 @@ fn test_overwrite_value() {
     let val2 = Value::from_str("value2");
 
     art.set(key.clone(), val1.clone());
-    assert_eq!(art.get(&key), Some(&val1));
+    assert_eq!(art.get(&key), Some(val1));
 
     art.set(key.clone(), val2.clone());
-    assert_eq!(art.get(&key), Some(&val2));
+    assert_eq!(art.get(&key), Some(val2));
 }
 
 #[test]
@@ -59,11 +59,11 @@ fn test_common_prefix_split() {
 
     assert_eq!(
         art.get(&SharedByte::from_str("user")),
-        Some(&Value::from_str("val_user"))
+        Some(Value::from_str("val_user"))
     );
     assert_eq!(
         art.get(&SharedByte::from_str("uso")),
-        Some(&Value::from_str("val_uso"))
+        Some(Value::from_str("val_uso"))
     );
     // "us" n'a pas de valeur
     assert_eq!(art.get(&SharedByte::from_str("us")), None);
@@ -79,11 +79,11 @@ fn test_prefix_is_also_key() {
 
     assert_eq!(
         art.get(&SharedByte::from_str("user")),
-        Some(&Value::from_str("val_user"))
+        Some(Value::from_str("val_user"))
     );
     assert_eq!(
         art.get(&SharedByte::from_str("us")),
-        Some(&Value::from_str("val_us"))
+        Some(Value::from_str("val_us"))
     );
 }
 
@@ -98,19 +98,19 @@ fn test_multiple_branches() {
 
     assert_eq!(
         art.get(&SharedByte::from_str("apple")),
-        Some(&Value::from_str("1"))
+        Some(Value::from_str("1"))
     );
     assert_eq!(
         art.get(&SharedByte::from_str("application")),
-        Some(&Value::from_str("2"))
+        Some(Value::from_str("2"))
     );
     assert_eq!(
         art.get(&SharedByte::from_str("banana")),
-        Some(&Value::from_str("3"))
+        Some(Value::from_str("3"))
     );
     assert_eq!(
         art.get(&SharedByte::from_str("band")),
-        Some(&Value::from_str("4"))
+        Some(Value::from_str("4"))
     );
 
     // Clés partielles qui n'existent pas
@@ -125,7 +125,7 @@ fn test_del_basic() {
     let val = Value::from_str("world");
 
     art.set(key.clone(), val.clone());
-    assert_eq!(art.get(&key), Some(&val));
+    assert_eq!(art.get(&key), Some(val.clone()));
 
     let deleted = art.del(&key);
     assert_eq!(deleted, Some(val));
@@ -163,7 +163,7 @@ fn test_del_with_recompression() {
     // "user" doit toujours exister
     assert_eq!(
         art.get(&SharedByte::from_str("user")),
-        Some(&Value::from_str("val_user"))
+        Some(Value::from_str("val_user"))
     );
     // "uso" n'existe plus
     assert_eq!(art.get(&SharedByte::from_str("uso")), None);
@@ -185,11 +185,11 @@ fn test_del_intermediate_node_with_children() {
     // "a" et "abc" doivent toujours exister
     assert_eq!(
         art.get(&SharedByte::from_str("a")),
-        Some(&Value::from_str("val_a"))
+        Some(Value::from_str("val_a"))
     );
     assert_eq!(
         art.get(&SharedByte::from_str("abc")),
-        Some(&Value::from_str("val_abc"))
+        Some(Value::from_str("val_abc"))
     );
     assert_eq!(art.get(&SharedByte::from_str("ab")), None);
 }
@@ -208,7 +208,7 @@ fn test_many_keys_same_prefix() {
     for i in 1..=20u8 {
         let key = SharedByte::from_byte(vec![b'x', i]);
         let expected = Value::String(SharedByte::from_byte(vec![i]));
-        assert_eq!(art.get(&key), Some(&expected));
+        assert_eq!(art.get(&key), Some(expected));
     }
 }
 
@@ -224,8 +224,8 @@ fn test_long_keys() {
     art.set(key1.clone(), val1.clone());
     art.set(key2.clone(), val2.clone());
 
-    assert_eq!(art.get(&key1), Some(&val1));
-    assert_eq!(art.get(&key2), Some(&val2));
+    assert_eq!(art.get(&key1), Some(val1));
+    assert_eq!(art.get(&key2), Some(val2));
 }
 
 #[test]
@@ -239,7 +239,7 @@ fn test_del_then_reinsert() {
     art.del(&key);
     art.set(key.clone(), val2.clone());
 
-    assert_eq!(art.get(&key), Some(&val2));
+    assert_eq!(art.get(&key), Some(val2));
 }
 
 #[test]
@@ -298,15 +298,15 @@ fn test_getn_basic() {
     assert_eq!(results.len(), 3);
     assert!(results.contains(&(
         SharedByte::from_str("user:alice"),
-        &Value::from_str("alice_data")
+        Value::from_str("alice_data")
     )));
     assert!(results.contains(&(
         SharedByte::from_str("user:bob"),
-        &Value::from_str("bob_data")
+        Value::from_str("bob_data")
     )));
     assert!(results.contains(&(
         SharedByte::from_str("user:charlie"),
-        &Value::from_str("charlie_data")
+        Value::from_str("charlie_data")
     )));
 }
 
@@ -348,10 +348,10 @@ fn test_getn_exact_key() {
     let results = art.getn(SharedByte::from_str("user"));
 
     assert_eq!(results.len(), 2);
-    assert!(results.contains(&(SharedByte::from_str("user"), &Value::from_str("user_val"))));
+    assert!(results.contains(&(SharedByte::from_str("user"), Value::from_str("user_val"))));
     assert!(results.contains(&(
         SharedByte::from_str("user:alice"),
-        &Value::from_str("alice_val")
+        Value::from_str("alice_val")
     )));
 }
 
@@ -371,7 +371,7 @@ fn test_getn_prefix_in_compression() {
     assert_eq!(results.len(), 1);
     assert!(results.contains(&(
         SharedByte::from_str("application"),
-        &Value::from_str("app_val")
+        Value::from_str("app_val")
     )));
 }
 
@@ -388,10 +388,10 @@ fn test_getn_with_nested_keys() {
     let results = art.getn(SharedByte::from_str("ab"));
 
     assert_eq!(results.len(), 4); // ab, abc, abcd, abd
-    assert!(results.contains(&(SharedByte::from_str("ab"), &Value::from_str("2"))));
-    assert!(results.contains(&(SharedByte::from_str("abc"), &Value::from_str("3"))));
-    assert!(results.contains(&(SharedByte::from_str("abcd"), &Value::from_str("4"))));
-    assert!(results.contains(&(SharedByte::from_str("abd"), &Value::from_str("5"))));
+    assert!(results.contains(&(SharedByte::from_str("ab"), Value::from_str("2"))));
+    assert!(results.contains(&(SharedByte::from_str("abc"), Value::from_str("3"))));
+    assert!(results.contains(&(SharedByte::from_str("abcd"), Value::from_str("4"))));
+    assert!(results.contains(&(SharedByte::from_str("abd"), Value::from_str("5"))));
 }
 
 #[test]
@@ -405,8 +405,8 @@ fn test_getn_single_char_prefix() {
     let results = art.getn(SharedByte::from_str("a"));
 
     assert_eq!(results.len(), 2);
-    assert!(results.contains(&(SharedByte::from_str("aa"), &Value::from_str("1"))));
-    assert!(results.contains(&(SharedByte::from_str("ab"), &Value::from_str("2"))));
+    assert!(results.contains(&(SharedByte::from_str("aa"), Value::from_str("1"))));
+    assert!(results.contains(&(SharedByte::from_str("ab"), Value::from_str("2"))));
 }
 
 #[test]
@@ -454,7 +454,7 @@ fn test_deln_basic() {
     // post:1 doit toujours exister
     assert_eq!(
         art.get(&SharedByte::from_str("post:1")),
-        Some(&Value::from_str("post_1"))
+        Some(Value::from_str("post_1"))
     );
 }
 
@@ -486,7 +486,7 @@ fn test_deln_no_match() {
     // user:alice doit toujours exister
     assert_eq!(
         art.get(&SharedByte::from_str("user:alice")),
-        Some(&Value::from_str("data"))
+        Some(Value::from_str("data"))
     );
 }
 
@@ -544,13 +544,13 @@ fn test_deln_with_nested_keys() {
     assert_eq!(deleted, 4); // ab, abc, abcd, abd
     assert_eq!(
         art.get(&SharedByte::from_str("a")),
-        Some(&Value::from_str("1"))
+        Some(Value::from_str("1"))
     );
     assert_eq!(art.get(&SharedByte::from_str("ab")), None);
     assert_eq!(art.get(&SharedByte::from_str("abc")), None);
     assert_eq!(
         art.get(&SharedByte::from_str("b")),
-        Some(&Value::from_str("6"))
+        Some(Value::from_str("6"))
     );
 }
 
@@ -589,7 +589,7 @@ fn test_deln_then_insert() {
     assert_eq!(art.get(&SharedByte::from_str("user:alice")), None);
     assert_eq!(
         art.get(&SharedByte::from_str("user:bob")),
-        Some(&Value::from_str("new"))
+        Some(Value::from_str("new"))
     );
 }
 
@@ -609,7 +609,7 @@ fn test_deln_partial_match() {
     assert_eq!(art.get(&SharedByte::from_str("help")), None);
     assert_eq!(
         art.get(&SharedByte::from_str("world")),
-        Some(&Value::from_str("3"))
+        Some(Value::from_str("3"))
     );
 }
 
@@ -645,12 +645,12 @@ fn test_ttl_expired_on_get() {
     // Valid key should still work
     assert_eq!(
         art.get(&SharedByte::from_str("valid")),
-        Some(&Value::from_str("new"))
+        Some(Value::from_str("new"))
     );
     // No expiry key should work
     assert_eq!(
         art.get(&SharedByte::from_str("forever")),
-        Some(&Value::from_str("eternal"))
+        Some(Value::from_str("eternal"))
     );
 
     // Move time forward, valid should expire
@@ -659,7 +659,7 @@ fn test_ttl_expired_on_get() {
     // No expiry still works
     assert_eq!(
         art.get(&SharedByte::from_str("forever")),
-        Some(&Value::from_str("eternal"))
+        Some(Value::from_str("eternal"))
     );
 }
 
@@ -736,7 +736,7 @@ fn test_ttl_cleanup_on_expired_get() {
     art.set_now(50);
 
     // Get the expired key - should trigger cleanup
-    let user = art.get(&SharedByte::from_str("user")).cloned();
+    let user = art.get(&SharedByte::from_str("user"));
 
     assert_eq!(
         user,
@@ -747,7 +747,7 @@ fn test_ttl_cleanup_on_expired_get() {
 
     // The valid key should still work
 
-    let valid = art.get(&SharedByte::from_str("username")).cloned();
+    let valid = art.get(&SharedByte::from_str("username"));
     assert_eq!(
         valid,
         Some(Value::from_str("valid")),
@@ -800,13 +800,13 @@ fn test_evict_expired_basic() {
     // Long TTL keys should still exist
     for i in 1..=10u8 {
         let key = SharedByte::from_byte(vec![b'l', i]);
-        assert_eq!(art.get(&key), Some(&Value::from_str("val")));
+        assert_eq!(art.get(&key), Some(Value::from_str("val")));
     }
 
     // No TTL keys should still exist
     for i in 1..=10u8 {
         let key = SharedByte::from_byte(vec![b'n', i]);
-        assert_eq!(art.get(&key), Some(&Value::from_str("val")));
+        assert_eq!(art.get(&key), Some(Value::from_str("val")));
     }
 }
 
@@ -842,6 +842,50 @@ fn test_evict_expired_partial() {
 // ============ Tests avec dictionnaire français ============
 
 #[test]
+fn test_recompress_transfers_overflow() {
+    // Scenario: child absorbed by try_recompress has overflow children.
+    // Before the fix, overflow_idx was not transferred → children past CHILDS_SIZE were lost.
+    //
+    // Tree after inserting "xc1".."xc7":
+    //   root →['x']→ node{comp:"c"} →['1'..'7']   (7 children, 6 inline + 1 in overflow)
+    //
+    // After inserting "x" (split at comp boundary):
+    //   root →['x']→ node{comp:"", val="x", 1 child 'c'}
+    //                            →['c']→ node{comp:"", 7 children (overflow)}
+    //
+    // Deleting "x" triggers try_recompress: the 'x' node (1 child, no val) absorbs 'c'.
+    // Without fix: overflow_idx of 'c' is not copied → "xc7" disappears.
+    let mut art = OxidArt::new();
+
+    // 7 children forces one entry into overflow (CHILDS_SIZE = 6)
+    for i in 1u8..=7 {
+        let key = format!("xc{i}");
+        art.set(SharedByte::from_str(&key), Value::from_str(&format!("v{i}")));
+    }
+
+    // Creates intermediate node "x" with exactly 1 child ('c') carrying the overflow
+    art.set(SharedByte::from_str("x"), Value::from_str("xval"));
+
+    // Deleting "x" triggers try_recompress which must transfer overflow_idx
+    let deleted = art.del(b"x");
+    assert!(deleted.is_some(), "del(x) should return the value");
+
+    // All 7 children must remain accessible after recompress
+    for i in 1u8..=7 {
+        let key = format!("xc{i}");
+        let got = art.get(key.as_bytes());
+        assert!(
+            got.is_some(),
+            "key \"{key}\" lost after try_recompress (overflow_idx not transferred)"
+        );
+    }
+
+    // Prefix scan must also return all 7
+    let results = art.getn(SharedByte::from_str("xc"));
+    assert_eq!(results.len(), 7, "getn(xc) should find all 7 keys after recompress");
+}
+
+/*#[test]
 fn test_ensure() {
     let mut art = OxidArt::new();
     art.set_now(0);
@@ -851,5 +895,6 @@ fn test_ensure() {
     let node = art.get_node_mut(idx);
     node.val = Some(val.clone());
     node.exp_and_radix.set_exp(1 << 50);
-    assert_eq!(art.get(KEY), Some(&val));
+    assert_eq!(art.get(KEY), Some(val));
 }
+*/

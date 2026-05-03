@@ -193,7 +193,7 @@ pub fn spawn_evictor(art: Rc<RefCell<OxidArt>>, interval: Duration) {
     });
 }
 
-/// Spawns a background task that periodically logs HugeChilds and node stats.
+/// Spawns a background task that periodically logs overflow and node stats.
 /// Useful for profiling inline child overflow frequency.
 pub fn spawn_stats_logger(art: Rc<RefCell<OxidArt>>, interval: Duration) {
     monoio::spawn(async move {
@@ -201,9 +201,9 @@ pub fn spawn_stats_logger(art: Rc<RefCell<OxidArt>>, interval: Duration) {
             monoio::time::sleep(interval).await;
             let art = art.borrow();
             let nodes = art.node_count();
-            let huge = art.huge_childs_count();
-            let ratio = if nodes > 0 { huge * 100 / nodes } else { 0 };
-            println!("[stats] nodes={nodes} huge_childs={huge} ({ratio}% of nodes have overflow)");
+            let overflow = art.overflow_count();
+            let ratio = if nodes > 0 { overflow * 100 / nodes } else { 0 };
+            println!("[stats]  nodes={nodes} overflow_slots={overflow} ({ratio}% of nodes have overflow)",);
         }
     });
 }
@@ -258,7 +258,7 @@ mod tests {
             results[0],
             (
                 SharedByte::from_str("batch:2"),
-                &Value::String(SharedByte::from_str("forever"))
+                Value::String(SharedByte::from_str("forever"))
             )
         );
     }

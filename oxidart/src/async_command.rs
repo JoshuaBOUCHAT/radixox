@@ -151,7 +151,12 @@ impl OxidArt {
         let prefix_len = prefix.len();
 
         if prefix_len == 0 {
-            let had_val = self.get_node_mut(self.root_idx).val.take().is_some();
+            let now = self.now;
+            let had_val = self
+                .get_node_mut(self.root_idx)
+                .get_value_mut(now)
+                .take()
+                .is_some();
             let childs = self.collect_child_indices(self.root_idx);
             self.get_node_mut(self.root_idx).childs = Default::default();
             return (childs, self.root_idx, usize::from(had_val));
@@ -196,7 +201,7 @@ impl OxidArt {
     }
 
     /// Pops up to `budget` node indices from `stack`, frees each one (and its
-    /// HugeChilds entry if present), returns the number of values deleted.
+    /// Overflow entry if present), returns the number of values deleted.
     fn free_chunk(&mut self, stack: &mut Vec<u32>, budget: usize) -> usize {
         let mut count = 0;
         let mut processed = 0;
@@ -204,25 +209,25 @@ impl OxidArt {
             let Some(node_idx) = stack.pop() else {
                 break;
             };
-            let (children, has_val, huge_idx) = {
+            let (children, has_val, overflow_idx) = {
                 let Some(node) = self.try_get_node(node_idx) else {
                     continue;
                 };
                 let mut children: Vec<u32> = node.childs.iter().map(|(_, idx)| idx).collect();
-                let huge_idx = node.get_huge_childs_idx();
-                if let Some(hi) = huge_idx
-                    && let Some(huge_childs) = self.child_list.get(hi)
+                let overflow_idx = node.get_overflow_idx();
+                if let Some(oi) = overflow_idx
+                    && let Some(overflow) = self.overflow_arena.get(oi)
                 {
-                    children.extend(huge_childs.iter().map(|(_, idx)| idx));
+                    children.extend(overflow.iter().map(|(_, idx)| idx));
                 }
-                (children, node.val.is_some(), huge_idx)
+                (children, node.has_val(), overflow_idx)
             };
             stack.extend(children);
             if has_val {
                 count += 1;
             }
-            if let Some(huge_idx) = huge_idx {
-                self.child_list.remove(huge_idx);
+            if let Some(oi) = overflow_idx {
+                self.overflow_arena.free(oi);
             }
             self.map.remove(node_idx);
             processed += 1;

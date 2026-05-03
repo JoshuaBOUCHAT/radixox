@@ -107,12 +107,7 @@ impl SharedByte {
                 for i in 0..len {
                     *dst.add(i) = (*src.add(i)).to_ascii_uppercase();
                 }
-                // detach from old allocation
-                let rc = self.rc_ptr();
-                *rc -= 1;
-                if *rc == 0 {
-                    MiMalloc.dealloc(self.ptr.as_ptr(), layout);
-                }
+
                 self.ptr = NonNull::new_unchecked(new_ptr);
             }
         }
