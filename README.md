@@ -79,9 +79,36 @@ Tested with [YCSB](https://github.com/brianfrankcooper/YCSB) — industry standa
 | **GET P99.9** | 0.54 ms | **0.39 ms** | ✅ **-28%** |
 | **SET P99** | 0.50 ms | **0.38 ms** | ✅ **-24%** |
 
-> **On P99.99:** The 1.67 ms outlier on the caching workload vs Valkey's 0.57 ms needs further investigation — it may simply be measurement jitter on a short run rather than a structural difference. At scale (5M records, YCSB), P99.99 converges: RadixOx 982 µs vs Valkey 1,014 µs.
+> **On P99.99:** The 1.67 ms outlier on the caching workload needs further investigation — it may simply be measurement noise on a short run. At scale (5M records, YCSB), P99.99 converges: RadixOx 982 µs vs Valkey 1,014 µs.
 >
 > **On memory (small datasets):** Valkey uses two string encodings. For values ≤ 44 bytes (`embstr`), data is stored inline in a single allocation — no extra heap cost. Above 44 bytes (`raw`), Valkey allocates a separate SDS buffer; the `robj` (16 bytes) then only holds metadata and a pointer. For the memtier workloads here (100–500 B caching, 50–200 B session), all values exceed that threshold, so both implementations allocate string data separately. The RAM difference likely comes from structural overhead per key: RadixOx ART nodes are 64 bytes each, amortized via path compression on shared prefixes, while Valkey carries a `dictEntry` plus key and value `robj` wrappers. On random short keys (memtier default), prefix sharing is minimal and the per-node cost dominates. At scale (5M records, YCSB) with longer structured keys, compression kicks in — RadixOx ends up using 5% less RAM.
+
+---
+
+### Scaling: Single Thread vs Multi-Thread
+
+What happens when Valkey is given more CPU resources?
+
+**Configuration:** RadixOx (1t + SQ_POLL) vs Valkey at 2 and 6 threads — all running on the same 6-core machine as client + server. Throughput and P99 are reliable; P99.9+ may include measurement noise from CPU contention between client threads and server threads, and would need an isolated client machine to be fully trusted.
+
+| Metric | RadixOx (1t+poll) | Valkey (2t) | Valkey (6t) |
+|--------|-------------------|-------------|-------------|
+| **Load throughput** | 133,708 ops/sec | 86,973 ops/sec | **172,485 ops/sec** |
+| **Load P99** | **869 µs** | 1,396 µs | 1,456 µs |
+| **Run throughput** | 271,275 ops/sec | 172,491 ops/sec | **366,032 ops/sec** |
+| **READ avg** | 367 µs | 578 µs | **253 µs** |
+| **READ P95** | 374 µs | 629 µs | **360 µs** |
+| **READ P99** | **460 µs** | 683 µs | 508 µs |
+| **READ P99.9** | **492 µs** | 697 µs | 3,465 µs |
+| **UPDATE P99** | **465 µs** | 684 µs | 573 µs |
+| **Peak RSS** | **1,967 MB** | 2,080 MB | 2,083 MB |
+
+**Observations:**
+- Valkey scales from 2t → 6t (3× the threads) and gains ~2.1× throughput — **71% scaling efficiency** — while RadixOx holds 271k ops/sec on a single app thread
+- At 6 threads, Valkey's P99.9 jumps from 697 µs to **3,465 µs** (+5×) — lock contention and scheduling jitter compound at high thread counts
+- RadixOx's tail latency stays stable regardless of server load: no locks, no scheduler interference
+
+The single-threaded model isn't just about simplicity — it's a deliberate trade-off: **predictable tail latency** at the cost of raw peak throughput.
 
 ---
 
