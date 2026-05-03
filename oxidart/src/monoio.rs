@@ -203,7 +203,7 @@ pub fn spawn_stats_logger(art: Rc<RefCell<OxidArt>>, interval: Duration) {
             let nodes = art.node_count();
             let huge = art.huge_childs_count();
             let ratio = if nodes > 0 { huge * 100 / nodes } else { 0 };
-            println!("[stats] nodes={nodes} huge_childs={huge} ({ratio}% of nodes have overflow)");
+            println!("[stats]  nodes={nodes} huge_childs={huge} ({ratio}% of nodes have overflow)",);
         }
     });
 }
@@ -258,7 +258,7 @@ mod tests {
             results[0],
             (
                 SharedByte::from_str("batch:2"),
-                &Value::String(SharedByte::from_str("forever"))
+                Value::String(SharedByte::from_str("forever"))
             )
         );
     }

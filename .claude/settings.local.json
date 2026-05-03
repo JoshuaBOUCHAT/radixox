@@ -20,7 +20,8 @@
       "WebFetch(domain:crates.io)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(cargo check:*)",
-      "Bash(cargo clippy *)"
+      "Bash(cargo clippy *)",
+      "Bash(memtier_benchmark --help)"
     ]
   }
 }

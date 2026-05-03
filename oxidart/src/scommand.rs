@@ -1,9 +1,12 @@
-use crate::value::Value::Set;
 use std::collections::BTreeSet;
 
 use radixox_lib::shared_byte::SharedByte;
 
-use crate::{OxidArt, error::TypeError, value::RedisType};
+use crate::{
+    OxidArt, Value,
+    error::TypeError,
+    value::{RedisType, Tag, value_into_raw},
+};
 
 pub enum SPOPResult {
     Single(Option<SharedByte>),
@@ -20,19 +23,22 @@ impl OxidArt {
         let node = self.get_node_mut(node_key);
 
         match node.get_value_mut(now) {
-            Some(Set(_)) => {}
+            Some(ref v) if *v.tag == Tag::Set => {}
             Some(_) => return Err(TypeError::ValueNotSet),
             None => {
-                node.val = Some(Set(BTreeSet::new()));
+                let (tag, val) = value_into_raw(Value::Set(BTreeSet::new()));
+                node.tag = tag;
+                node.val = val;
                 if let Some(ttl) = ttl {
                     node.exp_and_radix.set_exp(ttl);
                 }
             }
         };
 
-        let val = node.get_value_mut(now).unwrap();
-        let Set(set) = val else { unreachable!() };
-        Ok(set)
+        node.get_value_mut(now)
+            .unwrap()
+            .as_set_mut()
+            .map_err(|_| TypeError::ValueNotSet)
     }
 
     /// SPOP - remove and return one or more random members from a set.
@@ -91,7 +97,7 @@ impl OxidArt {
         debug_assert!(!members.is_empty());
 
         let (count, need_clean_up) = {
-            let Some(val) = self.get_mut(key) else {
+            let Some(mut val) = self.get_mut(key) else {
                 return Ok(0);
             };
             let set = val.as_set_mut()?;
@@ -112,12 +118,10 @@ impl OxidArt {
     }
     pub fn cmd_smembers(&mut self, key: &[u8]) -> Result<Vec<SharedByte>, RedisType> {
         let res: Vec<_> = {
-            let Some(val) = self.get(key) else {
+            let Some(val) = self.get_mut(key) else {
                 return Ok(Vec::new());
             };
-            let set = val.as_set()?;
-
-            set.iter().cloned().collect()
+            val.as_set()?.iter().cloned().collect()
         };
         if res.is_empty() {
             let _ = self.del(key);
@@ -125,20 +129,17 @@ impl OxidArt {
         Ok(res)
     }
     pub fn cmd_sismember(&mut self, key: &[u8], member: SharedByte) -> Result<bool, RedisType> {
-        let Some(val) = self.get(key) else {
+        let Some(val) = self.get_mut(key) else {
             return Ok(false);
         };
-        let set = val.as_set()?;
-        Ok(set.contains(&member))
+        Ok(val.as_set()?.contains(&member))
     }
     pub fn cmd_scard(&mut self, key: &[u8]) -> Result<u32, RedisType> {
         let len = {
-            let Some(val) = self.get(key) else {
+            let Some(val) = self.get_mut(key) else {
                 return Ok(0);
             };
-
-            let set = val.as_set()?;
-            set.len()
+            val.as_set()?.len()
         };
 
         if len == 0 {

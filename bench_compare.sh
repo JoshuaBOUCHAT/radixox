@@ -10,8 +10,14 @@ OPS=10000000
 THREADS=100
 FIELDLENGTH=100
 
-RADIXOX_BIN="$SCRIPT_DIR/target/lto/radixox"
+RADIXOX_BIN="$SCRIPT_DIR/target/release/radixox"
+VALKEY_IO_THREADS="${VALKEY_IO_THREADS:-1}"   # override: VALKEY_IO_THREADS=4 ./bench_compare.sh
 CURRENT_LOG=""
+
+NPROC=$(nproc)
+# Valkey MT gets the top N+1 cores (N io-threads + 1 main), away from YCSB (2-5) and RadixOx (0-1)
+VALKEY_MT_FIRST=$(( NPROC - VALKEY_IO_THREADS - 1 ))
+VALKEY_MT_LAST=$(( NPROC - 1 ))
 
 # ============================================
 # Helpers
@@ -116,10 +122,13 @@ echo "  YCSB Benchmark: RadixOx vs Valkey"
 echo "  Workload A: 50% read / 50% update"
 echo "  Records: $RECORDS | Ops: $OPS | Threads: $THREADS"
 echo "  Field length: $FIELDLENGTH bytes"
+if [ "$VALKEY_IO_THREADS" -gt 1 ]; then
+  echo "  Valkey io-threads: $VALKEY_IO_THREADS (cores ${VALKEY_MT_FIRST}-${VALKEY_MT_LAST})"
+fi
 echo "═══════════════════════════════════════════════════"
 echo ""
 echo "[0/4] Building RadixOx (release)..."
-RUSTFLAGS="-C target-cpu=native" cargo build -p radixox --profile lto --manifest-path "$SCRIPT_DIR/Cargo.toml" 2>&1 |
+RUSTFLAGS="-C target-cpu=native" cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml" 2>&1 |
   tail -3
 echo "  Build done: $RADIXOX_BIN"
 echo ""
@@ -163,8 +172,15 @@ kill_port
 # ============================================
 # Valkey Benchmark
 # ============================================
-echo "[3/4] Starting Valkey on :$PORT..."
-taskset -c 0-1 valkey-server --port "$PORT" --daemonize no --save "" --appendonly no --dir /tmp &
+if [ "$VALKEY_IO_THREADS" -gt 1 ]; then
+  echo "[3/4] Starting Valkey MT (io-threads=$VALKEY_IO_THREADS, cores ${VALKEY_MT_FIRST}-${VALKEY_MT_LAST}) on :$PORT..."
+  taskset -c "${VALKEY_MT_FIRST}-${VALKEY_MT_LAST}" valkey-server \
+    --port "$PORT" --daemonize no --save "" --appendonly no --dir /tmp \
+    --io-threads "$VALKEY_IO_THREADS" &
+else
+  echo "[3/4] Starting Valkey (single-thread) on :$PORT..."
+  taskset -c 0-1 valkey-server --port "$PORT" --daemonize no --save "" --appendonly no --dir /tmp &
+fi
 VALKEY_PID=$!
 wait_for_server
 
@@ -211,10 +227,13 @@ winner() {
   fi
 }
 
+VALKEY_LABEL="Valkey"
+[ "$VALKEY_IO_THREADS" -gt 1 ] && VALKEY_LABEL="Valkey MT(${VALKEY_IO_THREADS}t)"
+
 echo "═══════════════════════════════════════════════════"
 echo "  RESULTS COMPARISON"
 echo "═══════════════════════════════════════════════════"
-printf "%-28s %12s %12s %10s\n" "Metric" "RadixOx" "Valkey" "Winner"
+printf "%-28s %12s %12s %10s\n" "Metric" "RadixOx(1t)" "$VALKEY_LABEL" "Winner"
 echo "-----------------------------------------------------------"
 printf "%-28s %12s %12s %10s\n" "Load throughput (ops/sec)" \
   "$RADIXOX_LOAD_OPS" "$VALKEY_LOAD_OPS" \

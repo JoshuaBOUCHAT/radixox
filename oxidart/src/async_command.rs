@@ -151,7 +151,12 @@ impl OxidArt {
         let prefix_len = prefix.len();
 
         if prefix_len == 0 {
-            let had_val = self.get_node_mut(self.root_idx).val.take().is_some();
+            let now = self.now;
+            let had_val = self
+                .get_node_mut(self.root_idx)
+                .get_value_mut(now)
+                .take()
+                .is_some();
             let childs = self.collect_child_indices(self.root_idx);
             self.get_node_mut(self.root_idx).childs = Default::default();
             return (childs, self.root_idx, usize::from(had_val));
@@ -215,7 +220,7 @@ impl OxidArt {
                 {
                     children.extend(huge_childs.iter().map(|(_, idx)| idx));
                 }
-                (children, node.val.is_some(), huge_idx)
+                (children, node.has_val(), huge_idx)
             };
             stack.extend(children);
             if has_val {

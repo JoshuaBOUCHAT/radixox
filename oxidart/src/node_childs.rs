@@ -1,10 +1,10 @@
 use arrayvec::ArrayVec;
 
-pub(crate) const CHILDS_SIZE: usize = 10;
+pub(crate) const CHILDS_SIZE: usize = 6;
 const ASCII_MAX_CHAR: usize = 127;
 pub(crate) const HUGE_CHILDS_SIZE: usize = ASCII_MAX_CHAR - CHILDS_SIZE;
 
-#[repr(C)]
+#[repr(packed)]
 pub(crate) struct Childs {
     idxs: [u32; CHILDS_SIZE],
     radixs: [u8; CHILDS_SIZE],

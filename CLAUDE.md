@@ -224,9 +224,8 @@ add/delete. Ces tests avaient détecté 7 failures avant le fix, 0 après.
 
 ## Benchmarks YCSB réels (Workload A, 1M records, fieldlength=100, 100 threads)
 
-Comparaison fair-ish : RadixOx utilise io_uring + **SQ_POLL** (kernel polling thread
-dédié) donc consomme techniquement 2 cores CPU. Redis utilise epoll (1 thread). La
-comparaison n'est pas iso-ressource à strictement parler.
+Comparaison fair : RadixOx utilise io_uring standard (SQ_POLL désactivé, pas de kernel
+polling thread). 1 thread vs 1 thread, comparaison iso-ressource.
 
 HiSlab backing store : `mmap` anonyme + `MADV_HUGEPAGE` (THP) + pre-fault 10K nœuds (1.25 MB).
 

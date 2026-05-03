@@ -58,7 +58,7 @@ impl OxidArt {
     /// // The "post:" subtree is pruned immediately (dead state on 'p')
     /// assert_eq!(results.len(), 2);
     /// ```
-    pub fn getn_regex(&self, pattern: &str) -> Result<Vec<(SharedByte, &Value)>, RegexError> {
+    pub fn getn_regex(&self, pattern: &str) -> Result<Vec<(SharedByte, Value)>, RegexError> {
         let dfa = DFA::new(pattern)?;
         let mut results = Vec::new();
         let start = dfa.start_state_forward(&Input::new(b"").anchored(Anchored::Yes))?;
@@ -78,7 +78,7 @@ impl OxidArt {
         dfa: &DFA<Vec<u32>>,
         root_idx: u32,
         start_state: StateID,
-        results: &mut Vec<(SharedByte, &'a Value)>,
+        results: &mut Vec<(SharedByte, Value)>,
     ) {
         // Stack entries: (node_idx, key_path, dfa_state after radix byte)
         let mut stack: Vec<(u32, Vec<u8>, StateID)> = vec![(root_idx, Vec::new(), start_state)];
@@ -192,7 +192,7 @@ mod tests {
         assert_eq!(results[0].0.as_ref(), b"config:db:host");
         assert_eq!(
             results[0].1,
-            &Value::String(SharedByte::from_str("localhost"))
+            Value::String(SharedByte::from_str("localhost"))
         );
     }
 
@@ -224,7 +224,7 @@ mod tests {
         // Match config keys ending with specific values
         let results = tree.getn_regex("config:.*:port").unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].1, &Value::String(SharedByte::from_str("5432")));
+        assert_eq!(results[0].1, Value::String(SharedByte::from_str("5432")));
     }
 
     #[test]

@@ -694,7 +694,8 @@ fn zset_many_similar_keys_isolation() {
     for i in 0u32..50 {
         let key = format!("zs:{i}");
         let member = format!("m{i}");
-        art.cmd_zadd(b(&key), &[(i as f64, b(&member))], None).unwrap();
+        art.cmd_zadd(b(&key), &[(i as f64, b(&member))], None)
+            .unwrap();
     }
 
     for i in 0u32..50 {
@@ -817,7 +818,8 @@ fn cross_type_mixed_tree_deep() {
 
         art.cmd_hset(hk.as_bytes(), &fv(&[("n", &i.to_string())]), None)
             .unwrap();
-        art.cmd_sadd(sk.as_bytes(), &[b(&i.to_string())], None).unwrap();
+        art.cmd_sadd(sk.as_bytes(), &[b(&i.to_string())], None)
+            .unwrap();
         art.cmd_zadd(b(&zk), &[(i as f64, b("m"))], None).unwrap();
     }
 
@@ -882,7 +884,8 @@ fn set_add_delete_cycle_many_keys() {
 
     for i in 0u32..30 {
         let k = format!("k:{i}");
-        art.cmd_sadd(k.as_bytes(), &[b(&i.to_string())], None).unwrap();
+        art.cmd_sadd(k.as_bytes(), &[b(&i.to_string())], None)
+            .unwrap();
     }
     for i in (1u32..30).step_by(2) {
         let k = format!("k:{i}");

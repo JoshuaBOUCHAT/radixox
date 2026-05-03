@@ -46,7 +46,7 @@
 pub mod async_command;
 mod compact_str;
 pub mod error;
-mod exp;
+
 pub mod hcommand;
 mod node_childs;
 pub mod scommand;
@@ -77,7 +77,12 @@ use crate::compact_str::CompactStr;
 use crate::node_childs::ChildAble;
 use crate::node_childs::Childs;
 use crate::node_childs::HugeChilds;
-use crate::value::Value;
+
+pub use crate::value::Value;
+use crate::value::{
+    NodeValMut, Tag, ValUnion, drop_raw, init_slabs, value_from_raw_ref, value_into_raw,
+    value_take_raw,
+};
 
 /// Internal sentinel value indicating no expiration (never expires)
 /// Result of a TTL lookup operation.
@@ -135,6 +140,7 @@ impl OxidArt {
     /// let tree = OxidArt::new();
     /// ```
     pub fn new() -> Self {
+        init_slabs();
         let map = TaggedHiSlab::new(20000, 25000000).expect("Can't allocate oxidart");
         let root_idx = map.insert(Node::default());
         let child_list = HiSlab::new(1000, 25000000).expect("Can't allocate oxidart");
@@ -234,7 +240,7 @@ impl OxidArt {
 
         if has_children {
             // Node has children: just clear the value, keep the node
-            self.get_node_mut(target_idx).val = None;
+            self.get_node_mut(target_idx).clear_val();
             // Untag since it no longer has a TTL value
             self.map.untag(target_idx);
             self.try_recompress(target_idx);
@@ -297,12 +303,13 @@ impl OxidArt {
     /// # Arguments
     ///
     /// * `key` - The key to look up. Must be valid ASCII.
-    pub fn get(&mut self, key: &[u8]) -> Option<&Value> {
+    pub fn get(&mut self, key: &[u8]) -> Option<Value> {
         let idx = self.get_idx(key)?;
         debug_assert!(key.is_ascii(), "key must be ASCII");
-        self.get_node(idx).get_value(self.now)
+        let now = self.now;
+        self.get_node(idx).get_value(now)
     }
-    pub(crate) fn get_mut(&mut self, key: &[u8]) -> Option<&mut Value> {
+    pub(crate) fn get_mut(&mut self, key: &[u8]) -> Option<NodeValMut<'_>> {
         let idx = self.get_idx(key)?;
         debug_assert!(key.is_ascii(), "key must be ASCII");
         let now = self.now;
@@ -313,7 +320,7 @@ impl OxidArt {
         let key_len = key.len();
         if key_len == 0 {
             if self.get_node(self.root_idx).is_expired(self.now) {
-                self.get_node_mut(self.root_idx).val = None;
+                self.get_node_mut(self.root_idx).clear_val();
                 self.try_recompress(self.root_idx);
                 return None;
             }
@@ -417,7 +424,7 @@ impl OxidArt {
             return false;
         }
         node.exp_and_radix.set_no_expiracy();
-        if node.val.is_none() {
+        if !node.has_val() {
             return false;
         }
         self.map.untag(idx);
@@ -488,16 +495,11 @@ impl OxidArt {
         idx
     }
 
-    /// Returns a mutable reference to the value at a node index.
+    /// Returns a mutable accessor into the value at a node index.
     /// Returns `None` if the node has no value or the value is expired.
-    /// TTL is preserved — only the value bytes can be modified.
-    pub(crate) fn node_value_mut(&mut self, idx: u32) -> Option<&mut Value> {
+    pub(crate) fn node_value_mut(&mut self, idx: u32) -> Option<NodeValMut<'_>> {
         let now = self.now;
-        let node = self.get_node_mut(idx);
-        if node.is_expired(now) {
-            return None;
-        }
-        node.val.as_mut()
+        self.get_node_mut(idx).get_value_mut(now)
     }
 
     /// Deletes a node inline (used for TTL expiration cleanup)
@@ -508,7 +510,7 @@ impl OxidArt {
         };
 
         if has_children {
-            self.get_node_mut(target_idx).val = None;
+            self.get_node_mut(target_idx).clear_val();
             self.try_recompress(target_idx);
         } else {
             self.map.remove(target_idx);
@@ -545,7 +547,7 @@ impl OxidArt {
     /// let users = tree.getn(SharedByte::from_str("user:"));
     /// assert_eq!(users.len(), 2);
     /// ```
-    pub fn getn(&self, prefix: SharedByte) -> Vec<(SharedByte, &Value)> {
+    pub fn getn(&self, prefix: SharedByte) -> Vec<(SharedByte, Value)> {
         debug_assert!(prefix.is_ascii(), "prefix must be ASCII");
         let mut results = Vec::new();
         let prefix_len = prefix.len();
@@ -602,7 +604,7 @@ impl OxidArt {
         &'a self,
         node_idx: u32,
         key_path: Vec<u8>,
-        results: &mut Vec<(SharedByte, &'a Value)>,
+        results: &mut Vec<(SharedByte, Value)>,
     ) {
         let Some(node) = self.try_get_node(node_idx) else {
             return;
@@ -619,12 +621,11 @@ impl OxidArt {
         });
     }
 
-    /// Recursively collects, adding the node's compression
     fn collect_all<'a>(
         &'a self,
         node_idx: u32,
         mut key_prefix: Vec<u8>,
-        results: &mut Vec<(SharedByte, &'a Value)>,
+        results: &mut Vec<(SharedByte, Value)>,
     ) {
         let Some(node) = self.try_get_node(node_idx) else {
             return;
@@ -771,10 +772,11 @@ impl OxidArt {
         mut val: Option<Value>,
     ) -> u32 {
         let val_on_intermediate = common_len == key_rest.len();
-        let (old_compression, old_val, old_childs, old_huge_idx, old_exp) = {
+        let (old_compression, old_tag, old_val_bits, old_childs, old_huge_idx, old_exp) = {
             let node = self.get_node_mut(idx);
             let old_compression = std::mem::take(&mut node.compression);
-            let old_val = node.val.take();
+            // Take tag+val without dropping (ownership moves to old_child below)
+            let (old_tag, old_val_bits) = node.take_tag_val_raw();
             let old_exp = node.exp_and_radix;
             node.exp_and_radix.set_no_expiracy();
             let old_childs = std::mem::take(&mut node.childs);
@@ -782,13 +784,22 @@ impl OxidArt {
 
             node.compression = CompactStr::from_slice(&old_compression[..common_len]);
             if val_on_intermediate && let Some(val) = val.take() {
-                node.val = Some(val);
+                let (t, v) = value_into_raw(val);
+                node.tag = t;
+                node.val = v;
                 if let Some(ttl) = ttl {
                     node.exp_and_radix.set_exp(ttl);
                 }
             }
 
-            (old_compression, old_val, old_childs, old_huge_idx, old_exp)
+            (
+                old_compression,
+                old_tag,
+                old_val_bits,
+                old_childs,
+                old_huge_idx,
+                old_exp,
+            )
         };
 
         // Create a node for the old content
@@ -798,7 +809,8 @@ impl OxidArt {
         let old_child = Node {
             huge_childs_idx: old_huge_idx,
             compression: CompactStr::from_slice(&old_compression[common_len + 1..]),
-            val: old_val,
+            tag: old_tag,
+            val: old_val_bits,
             childs: old_childs,
             parent_idx: idx,
             exp_and_radix: old_exp,
@@ -903,7 +915,7 @@ impl OxidArt {
         debug_assert!(key.is_ascii(), "key must be ASCII");
         let key_len = key.len();
         if key_len == 0 {
-            let old_val = self.get_node_mut(self.root_idx).val.take();
+            let old_val = self.get_node_mut(self.root_idx).take_val();
             self.try_recompress(self.root_idx);
             return old_val;
         }
@@ -939,18 +951,18 @@ impl OxidArt {
 
         if has_children {
             // Node with children: keep the node, just remove the value
-            let old_val = self.get_node_mut(target_idx).val.take()?;
+            let old_val = self.get_node_mut(target_idx).take_val()?;
             self.try_recompress(target_idx);
             Some(old_val)
         } else {
             // Node without children (leaf): completely remove from the slab
-            let node = self.map.remove(target_idx)?;
-            let old_val = node.val?;
+            let mut node = self.map.remove(target_idx)?;
+            let old_val = node.take_val();
             self.remove_child(parent_idx, parent_radix);
             if parent_idx != self.root_idx {
                 self.try_recompress(parent_idx);
             }
-            Some(old_val)
+            old_val
         }
     }
 
@@ -988,7 +1000,7 @@ impl OxidArt {
         if prefix_len == 0 {
             // Delete everything from root (keep root node, clear its content)
             let root = self.get_node_mut(self.root_idx);
-            let had_val = root.val.take().is_some();
+            let had_val = root.take_val().is_some();
             let childs_to_free: Vec<u32> = self.collect_child_indices(self.root_idx);
 
             // Clear children of root (note: root's huge_childs not freed, negligible)
@@ -1094,7 +1106,7 @@ impl OxidArt {
                     children.extend(huge_childs.iter().map(|(_, idx)| idx));
                 }
 
-                (children, node.val.is_some(), huge_idx)
+                (children, node.has_val(), huge_idx)
             };
 
             // Add children to the stack
@@ -1117,12 +1129,12 @@ impl OxidArt {
         count
     }
 
-    /// If the node has exactly 1 child and no value, absorb the child
+    /// If the node has exactly 1 child and no value, absorb the child.
     fn try_recompress(&mut self, node_idx: u32) {
         let Some(node) = self.try_get_node(node_idx) else {
             return;
         };
-        if node.val.is_some() {
+        if node.has_val() {
             return;
         }
 
@@ -1130,12 +1142,16 @@ impl OxidArt {
             return;
         };
 
-        // Absorb the child: compression = current + radix + child.compression
-        let Some(child) = self.map.remove(child_idx) else {
-            return;
+        // Remove child from slab — we own it.
+        let mut child = match self.map.remove(child_idx) {
+            Some(c) => c,
+            None => return,
         };
 
-        // Update parent_idx for all grandchildren (they now point to node_idx)
+        // Transfer val ownership: prevent child's Drop from freeing it.
+        let (child_tag, child_val_bits) = child.take_tag_val_raw();
+
+        // Update grandchildren parent pointers.
         for (_, grandchild_idx) in child.childs.iter() {
             if let Some(grandchild) = self.map.get_mut(grandchild_idx) {
                 grandchild.parent_idx = node_idx;
@@ -1152,12 +1168,18 @@ impl OxidArt {
             }
         }
 
+        // Merge: parent absorbs child's compression, val, exp, childs.
+        // `child` is still in scope so &child.compression is valid.
         let node = self.get_node_mut(node_idx);
         node.compression
             .append_and_replace(child_radix, &child.compression);
-        node.val = child.val;
         node.exp_and_radix = child.exp_and_radix;
-        node.childs = child.childs;
+        std::mem::swap(&mut node.childs, &mut child.childs);
+
+        // Transfer val (parent had Tag::None so clear_val is no-op).
+        node.tag = child_tag;
+        node.val = child_val_bits;
+        // child drops here: compression freed, tag=None so val is not freed.
     }
 
     /// If the node has exactly 1 child and no value, absorb the child
@@ -1202,16 +1224,24 @@ impl OxidArt {
     }
 }
 
-#[repr(C, align(128))]
+#[repr(C, align(64))]
 struct Node {
     compression: CompactStr,
     childs: Childs,
-    val: Option<Value>,
+    tag: Tag,
+    val: ValUnion,
     exp_and_radix: ExpAndRadix,
     huge_childs_idx: u32,
     /// Parent node index (for TTL eviction)
     parent_idx: u32,
 }
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        unsafe { drop_raw(self.tag, &mut self.val) };
+    }
+}
+
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 struct ExpAndRadix {
@@ -1263,8 +1293,9 @@ impl Default for Node {
             huge_childs_idx: u32::MAX,
             childs: Childs::default(),
             compression: CompactStr::new(),
-            val: None,
-            parent_idx: u32::MAX, // Root has no parent
+            tag: Tag::None,
+            val: ValUnion { idx: 0 },
+            parent_idx: u32::MAX,
             exp_and_radix: ExpAndRadix::no_expiracy(0),
         }
     }
@@ -1307,22 +1338,59 @@ impl Node {
             .unwrap_or_else(|| self.compression.len().min(key_rest.len()))
     }
     fn set_val(&mut self, val: Value, exp: u64) {
-        self.val = Some(val);
+        self.clear_val();
+        let (tag, val_bits) = value_into_raw(val);
+        self.tag = tag;
+        self.val = val_bits;
         self.exp_and_radix.set_exp(exp);
     }
 
-    /// Returns the value if present and not expired
-    fn get_value(&self, now: u64) -> Option<&Value> {
-        if self.is_expired(now) {
-            return None;
-        }
-        self.val.as_ref()
+    /// Free the current value and reset to Tag::None.
+    fn clear_val(&mut self) {
+        unsafe { drop_raw(self.tag, &mut self.val) };
+        self.tag = Tag::None;
     }
-    fn get_value_mut(&mut self, now: u64) -> Option<&mut Value> {
-        if self.is_expired(now) {
+
+    fn has_val(&self) -> bool {
+        self.tag != Tag::None
+    }
+
+    /// Extract tag+val without dropping the val, resetting tag to None.
+    /// Used when transferring ownership to another node.
+    fn take_tag_val_raw(&mut self) -> (Tag, ValUnion) {
+        let tag = self.tag;
+        self.tag = Tag::None;
+        // Safety: bitwise copy; caller is responsible for eventual drop
+        let val = unsafe { std::ptr::read(&self.val) };
+        (tag, val)
+    }
+
+    /// Extract the value as an owned `Value`, freeing any slab slot.
+    /// Returns None if tag is None (no value).
+    fn take_val(&mut self) -> Option<Value> {
+        if self.tag == Tag::None {
             return None;
         }
-        self.val.as_mut()
+        let (tag, val_bits) = self.take_tag_val_raw();
+        Some(unsafe { value_take_raw(tag, val_bits) })
+    }
+
+    /// Returns an owned clone of the value if present and not expired.
+    fn get_value(&self, now: u64) -> Option<Value> {
+        if self.tag == Tag::None || self.is_expired(now) {
+            return None;
+        }
+        Some(unsafe { value_from_raw_ref(self.tag, &self.val) })
+    }
+
+    fn get_value_mut<'a>(&'a mut self, now: u64) -> Option<NodeValMut<'a>> {
+        if self.tag == Tag::None || self.is_expired(now) {
+            return None;
+        }
+        Some(NodeValMut {
+            tag: &mut self.tag,
+            val: &mut self.val,
+        })
     }
     /// Check if value expired
     fn is_expired(&self, now: u64) -> bool {
@@ -1344,10 +1412,12 @@ impl Node {
         parent_idx: u32,
         parent_radix: u8,
     ) -> Self {
+        let (tag, val_bits) = value_into_raw(val);
         Node {
             huge_childs_idx: u32::MAX,
             compression: CompactStr::from_slice(compression),
-            val: Some(val),
+            tag,
+            val: val_bits,
             childs: Childs::default(),
             parent_idx,
             exp_and_radix: ExpAndRadix::new(ttl, parent_radix),
@@ -1357,7 +1427,8 @@ impl Node {
         Self {
             childs: Childs::default(),
             compression: CompactStr::from_slice(compression),
-            val: None,
+            tag: Tag::None,
+            val: ValUnion { idx: 0 },
             huge_childs_idx: u32::MAX,
             parent_idx,
             exp_and_radix: ExpAndRadix::no_expiracy(parent_radix),

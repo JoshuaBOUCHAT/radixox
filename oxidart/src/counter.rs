@@ -29,7 +29,7 @@ impl OxidArt {
     /// Existing TTL is preserved.
     pub fn incrby(&mut self, key: SharedByte, delta: i64) -> Result<i64, CounterError> {
         if let Some(idx) = self.traverse_to_key(&key)
-            && let Some(val) = self.node_value_mut(idx)
+            && let Some(mut val) = self.node_value_mut(idx)
         {
             return Ok(val.incr(delta)?);
         }
@@ -156,7 +156,7 @@ mod tests {
         assert_eq!(tree.incr(SharedByte::from_str("counter")), Ok(43));
         // Should now be Value::Int internally
         let val = tree.get(b"counter").unwrap();
-        assert!(matches!(val, &Value::Int(43)));
+        assert!(matches!(&val, &Value::Int(43)));
     }
 
     #[test]

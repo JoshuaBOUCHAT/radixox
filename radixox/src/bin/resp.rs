@@ -6,6 +6,7 @@ mod utils;
 
 use std::cell::RefCell;
 
+use std::env;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -62,7 +63,7 @@ fn main() -> std::io::Result<()> {
 
         let shared_art =
             OxidArt::shared_with_evictor(Duration::from_millis(100), Duration::from_secs(1));
-        spawn_stats_logger(shared_art.clone(), Duration::from_secs(5));
+        //spawn_stats_logger(shared_art.clone(), Duration::from_secs(5));
 
         let registry: SharedRegistry = Rc::new(RefCell::new(SubRegistry::default()));
 
@@ -83,9 +84,17 @@ fn main() -> std::io::Result<()> {
 }
 
 fn get_runtime() -> std::io::Result<Runtime<TimeDriver<IoUringDriver>>> {
+    let mut builder = io_uring::IoUring::builder();
+    if let Ok(sq_val) = env::var("SQ_POLL")
+        && let Ok(idle) = sq_val.parse::<u32>()
+    {
+        builder.setup_sqpoll(idle);
+        println!("Radixox lauched starting with SQ_POLL idle: {}ms", idle)
+    }
+
     RuntimeBuilder::<monoio::IoUringDriver>::new()
         .with_entries(4096)
-        .uring_builder(io_uring::IoUring::builder())
+        .uring_builder(builder)
         .enable_timer()
         .build()
 }

@@ -1,9 +1,12 @@
-use crate::value::Value::Hash;
 use std::collections::BTreeMap;
 
 use radixox_lib::shared_byte::SharedByte;
 
-use crate::{OxidArt, error::TypeError, value::RedisType};
+use crate::{
+    OxidArt,
+    error::TypeError,
+    value::{RedisType, Tag, value_into_raw},
+};
 
 const THRESHOLD: usize = 16;
 
@@ -158,19 +161,20 @@ impl OxidArt {
         let node = self.get_node_mut(node_key);
 
         match node.get_value_mut(now) {
-            Some(Hash(_)) => {}
+            Some(ref v) if *v.tag == Tag::Hash => {}
             Some(_) => return Err(TypeError::ValueNotSet),
             None => {
-                node.val = Some(Hash(InnerHCommand::new()));
+                let (tag, val) = value_into_raw(crate::Value::Hash(InnerHCommand::new()));
+                node.tag = tag;
+                node.val = val;
                 if let Some(ttl) = ttl {
                     node.exp_and_radix.set_exp(ttl);
                 }
             }
         };
+        let mut node_val = node.get_value_mut(now).unwrap();
 
-        let val = node.get_value_mut(now).unwrap();
-        let Hash(inner) = val else { unreachable!() };
-        Ok(inner)
+        node_val.as_hash_mut().map_err(|_| TypeError::ValueNotSet)
     }
 
     /// HSET - set one or more field-value pairs in a hash.
@@ -197,21 +201,19 @@ impl OxidArt {
 
     /// HGET - get the value of a hash field.
     pub fn cmd_hget(&mut self, key: &[u8], field: &[u8]) -> Result<Option<SharedByte>, RedisType> {
-        let Some(val) = self.get(key) else {
+        let Some(val) = self.get_mut(key) else {
             return Ok(None);
         };
-        let inner = val.as_hash()?;
-        Ok(inner.get(field).cloned())
+        Ok(val.as_hash()?.get(field).cloned())
     }
 
     /// HGETALL - get all field-value pairs in a hash.
     /// Returns a flat vector: [field1, value1, field2, value2, ...]
     pub fn cmd_hgetall(&mut self, key: &[u8]) -> Result<Vec<SharedByte>, RedisType> {
-        let Some(val) = self.get(key) else {
+        let Some(val) = self.get_mut(key) else {
             return Ok(Vec::new());
         };
-        let inner = val.as_hash()?;
-        Ok(inner.all())
+        Ok(val.as_hash()?.all())
     }
 
     /// HDEL - delete one or more hash fields.
@@ -221,7 +223,7 @@ impl OxidArt {
         debug_assert!(!fields.is_empty());
 
         let (deleted, need_cleanup) = {
-            let Some(val) = self.get_mut(key) else {
+            let Some(mut val) = self.get_mut(key) else {
                 return Ok(0);
             };
             let inner = val.as_hash_mut()?;
@@ -244,38 +246,34 @@ impl OxidArt {
 
     /// HEXISTS - check if a field exists in a hash.
     pub fn cmd_hexists(&mut self, key: &[u8], field: &[u8]) -> Result<bool, RedisType> {
-        let Some(val) = self.get(key) else {
+        let Some(val) = self.get_mut(key) else {
             return Ok(false);
         };
-        let inner = val.as_hash()?;
-        Ok(inner.contains_key(field))
+        Ok(val.as_hash()?.contains_key(field))
     }
 
     /// HLEN - get the number of fields in a hash.
     pub fn cmd_hlen(&mut self, key: &[u8]) -> Result<u32, RedisType> {
-        let Some(val) = self.get(key) else {
+        let Some(val) = self.get_mut(key) else {
             return Ok(0);
         };
-        let inner = val.as_hash()?;
-        Ok(inner.len() as u32)
+        Ok(val.as_hash()?.len() as u32)
     }
 
     /// HKEYS - get all field names in a hash.
     pub fn cmd_hkeys(&mut self, key: &[u8]) -> Result<Vec<SharedByte>, RedisType> {
-        let Some(val) = self.get(key) else {
+        let Some(val) = self.get_mut(key) else {
             return Ok(Vec::new());
         };
-        let inner = val.as_hash()?;
-        Ok(inner.keys())
+        Ok(val.as_hash()?.keys())
     }
 
     /// HVALS - get all values in a hash.
     pub fn cmd_hvals(&mut self, key: &[u8]) -> Result<Vec<SharedByte>, RedisType> {
-        let Some(val) = self.get(key) else {
+        let Some(val) = self.get_mut(key) else {
             return Ok(Vec::new());
         };
-        let inner = val.as_hash()?;
-        Ok(inner.values())
+        Ok(val.as_hash()?.values())
     }
 
     /// HMGET - get the values of multiple hash fields.
@@ -285,7 +283,7 @@ impl OxidArt {
         key: &[u8],
         fields: &[SharedByte],
     ) -> Result<Vec<Option<SharedByte>>, RedisType> {
-        let Some(val) = self.get(key) else {
+        let Some(val) = self.get_mut(key) else {
             return Ok(vec![None; fields.len()]);
         };
         let inner = val.as_hash()?;
