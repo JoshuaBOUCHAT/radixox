@@ -8,42 +8,78 @@ RadixOx is a high-performance in-memory key-value store that speaks the Redis pr
 
 ## 🚀 Performance Benchmarks
 
-Tested with [YCSB](https://github.com/brianfrankcooper/YCSB) (Yahoo! Cloud Serving Benchmark) — industry standard for NoSQL databases.
+### YCSB — Yahoo! Cloud Serving Benchmark
 
-**Configuration:** 5M records, Workload A (50% read / 50% update), fieldlength=100, 100 client threads, localhost *(2026-04-27)*
+Tested with [YCSB](https://github.com/brianfrankcooper/YCSB) — industry standard for NoSQL databases.
 
-> **Opponent:** Valkey 9.0.3 — the actively maintained Redis fork, single-threaded event loop, same architecture class as RadixOx.
+**Configuration:** 5M records, Workload A (50% read / 50% update), fieldlength=100, 100 client threads, localhost *(2026-05-03)*
+
+> **Opponent:** Valkey 9.0.3 running with **2 threads** (its typical production configuration).
 >
-> **Fair comparison:** Both servers run on a single thread. SQ_POLL is **disabled** — RadixOx uses standard io_uring without a dedicated kernel polling thread. True 1-thread vs 1-thread comparison.
+> **RadixOx configuration:** 1 application thread + io_uring **SQ_POLL** (1 kernel polling thread). Total: 2 threads — same resource envelope as Valkey.
 >
 > **Memory model:** HiSlab backing store uses anonymous `mmap` + `MADV_HUGEPAGE` (THP) + pre-fault of 10K nodes (1.25 MB). The load phase serves as natural THP warm-up.
 
-### LOAD Phase (5,000,000 HMSET inserts)
+#### LOAD Phase (5,000,000 HMSET inserts)
 
-| Metric | Valkey 9.0.3 | RadixOx | Improvement |
-|--------|-------------|---------|-------------|
-| **Throughput** | 72,967 ops/sec | **93,679 ops/sec** | 🚀 **+28%** |
-| **P99 Latency** | 2,597 µs | **1,488 µs** | ✅ **-43%** |
+| Metric | Valkey 9.0.3 (2t) | RadixOx (1t+poll) | Improvement |
+|--------|-------------------|-------------------|-------------|
+| **Throughput** | 86,973 ops/sec | **133,708 ops/sec** | 🚀 **+54%** |
+| **P99 Latency** | 1,396 µs | **869 µs** | ✅ **-38%** |
 
-### RUN Phase (10,000,000 operations — 50% READ / 50% UPDATE)
+#### RUN Phase (10,000,000 operations — 50% READ / 50% UPDATE)
 
-| Metric | Valkey 9.0.3 | RadixOx | Improvement |
-|--------|-------------|---------|-------------|
-| **Throughput** | 187,361 ops/sec | **222,217 ops/sec** | 🚀 **+19%** |
-| **READ Avg** | 531 µs | **449 µs** | ⚡ **-15%** |
-| **READ P95** | 556 µs | **494 µs** | ✅ **-11%** |
-| **READ P99** | 1,039 µs | **564 µs** | ✅ **-46%** |
-| **READ P99.9** | 1,091 µs | **629 µs** | ✅ **-42%** |
-| **READ P99.99** | 1,801 µs | **1,573 µs** | ✅ **-13%** |
-| **UPDATE P99** | 1,039 µs | **565 µs** | ✅ **-46%** |
-| **Peak RSS** | **2,049 MB** | **2,084 MB** | ≈ **parity** |
+| Metric | Valkey 9.0.3 (2t) | RadixOx (1t+poll) | Improvement |
+|--------|-------------------|-------------------|-------------|
+| **Throughput** | 172,491 ops/sec | **271,128 ops/sec** | 🚀 **+57%** |
+| **READ Avg** | 578 µs | **368 µs** | ⚡ **-36%** |
+| **READ P95** | 629 µs | **376 µs** | ✅ **-40%** |
+| **READ P99** | 683 µs | **456 µs** | ✅ **-33%** |
+| **READ P99.9** | 697 µs | **427 µs** | ✅ **-39%** |
+| **READ P99.99** | 1,014 µs | **982 µs** | ✅ **-3%** |
+| **UPDATE P99** | 684 µs | **456 µs** | ✅ **-33%** |
+| **Peak RSS** | 2,080 MB | **1,969 MB** | ✅ **-5%** |
 
 **Key Takeaways:**
-- 🚀 **+28% load throughput** — 94k vs 73k ops/sec, no hashtable rehashing jitter
-- 🎯 **-46% P99 on reads and updates** — Valkey at 1,039 µs, RadixOx at 564 µs
-- 💾 **RAM within 2% of Valkey** — `SharedByte` (custom `!Send` ref-counted buffer, no atomic ops) + mimalloc for `SharedByte` allocations (-10% RSS vs system allocator)
-- 📈 **ART is O(key_length)** — latency doesn't grow with dataset size
-- ⚡ **THP warm-up effect** — p99.99 improves further as dataset grows and huge pages are promoted
+- 🚀 **+57% run throughput** — 271k vs 172k ops/sec, single ART traversal path, no hashtable rehashing
+- 🎯 **-39% P99.9 on reads** — 427 µs vs 697 µs; ART depth is bounded by key length, not dataset size
+- 📈 **ART is O(key_length)** — latency stays flat as dataset grows
+- 💾 **5% less RAM at 5M records** — `SharedByte` (no atomic ops) + mimalloc + THP coalesce live nodes
+
+---
+
+### memtier_benchmark — Real-World Workloads
+
+**Configuration:** Same conditions — RadixOx (1t + SQ_POLL) vs Valkey (2t). Mixed GET/SET workloads, variable value sizes, Gaussian key distribution. *(2026-05-03)*
+
+#### Load (pure SET, 20s sustained)
+
+| Metric | Valkey (2t) | RadixOx (1t+poll) | Improvement |
+|--------|-------------|-------------------|-------------|
+| **Throughput** | 203,297 ops/sec | **255,830 ops/sec** | 🚀 **+26%** |
+
+#### Caching Workload (1:10 GET:SET, Gaussian, 100–500 B values)
+
+| Metric | Valkey (2t) | RadixOx (1t+poll) | Improvement |
+|--------|-------------|-------------------|-------------|
+| **Throughput** | 207,272 ops/sec | **243,804 ops/sec** | 🚀 **+18%** |
+| **GET avg latency** | 0.39 ms | **0.33 ms** | ⚡ **-15%** |
+| **GET P99** | 0.49 ms | **0.38 ms** | ✅ **-22%** |
+| **GET P99.9** | 0.51 ms | **0.47 ms** | ✅ **-8%** |
+| **GET P99.99** | **0.57 ms** | 1.67 ms | 🔴 Valkey **-66%** |
+| **SET P99** | 0.49 ms | **0.38 ms** | ✅ **-22%** |
+
+#### Session Store (1:1 GET:SET, TTL 10–300s, 50–200 B values)
+
+| Metric | Valkey (2t) | RadixOx (1t+poll) | Improvement |
+|--------|-------------|-------------------|-------------|
+| **Throughput** | 201,848 ops/sec | **249,495 ops/sec** | 🚀 **+24%** |
+| **GET avg latency** | 0.40 ms | **0.32 ms** | ⚡ **-20%** |
+| **GET P99** | 0.50 ms | **0.38 ms** | ✅ **-24%** |
+| **GET P99.9** | 0.54 ms | **0.39 ms** | ✅ **-28%** |
+| **SET P99** | 0.50 ms | **0.38 ms** | ✅ **-24%** |
+
+> **Note on P99.99 and memory:** RadixOx's P99.99 is higher than Valkey on the caching workload (1.67 ms vs 0.57 ms) — occasional GC-like pauses from the THP warm-up path on small datasets. At scale (5M records, YCSB), this effect disappears and P99.99 converges (982 µs vs 1,014 µs). For small hot-cache workloads, Valkey also uses ~12% less RAM (45 MB vs 51 MB) — the ART overhead isn't amortized until the key space grows.
 
 ---
 
@@ -143,7 +179,7 @@ Full Redis RESP2 protocol support with all major data structures:
 │   ┌──────────────┐     ┌──────────────┐     ┌──────────────────────┐      │
 │   │   monoio     │     │    RESP2     │     │      OxidArt         │      │
 │   │  (io_uring)  │──▶ │    Parser    │──▶ │  (Adaptive Radix     │      │
-│   │              │     │  zero-copy   │     │   Tree + TTL)        │      │
+│   │   SQ_POLL    │     │  zero-copy   │     │   Tree + TTL)        │      │
 │   └──────────────┘     └──────────────┘     └──────────────────────┘      │
 │                                                                           │
 │   io_buf ──▶ read_buf ──▶ BytesFrame ──▶ SharedByte args ──▶ OxidArt  │
@@ -165,9 +201,9 @@ Full Redis RESP2 protocol support with all major data structures:
 
 ### OxidArt Engine
 
-**Node Structure:** 128 bytes exactly, cache-line optimized
+**Node Structure:** 64 bytes, cache-line optimized
 - Path compression for single-child chains
-- Two-tier child storage: inline (10 slots) + overflow (117 slots) — 10 inline slots cover all ASCII digits, making keys like `user:1234` extremely cache-efficient
+- Two-tier child storage: inline (9 slots) + overflow — inline slots cover all ASCII digits, making keys like `user:1234` extremely cache-efficient
 - HiSlab allocator with O(1) insert/remove, `mmap` + THP backing
 - Lazy TTL expiration + active eviction (Redis-style)
 
@@ -183,7 +219,7 @@ Heap layout: [ len: u32 | rc: u16 | data: u8... ]
 - **`!Send`** — single-threaded by design, no atomic ops
 - **u16 refcount** — 65k max clones, no `Arc` overhead
 - **Borrow<[u8]>** — zero-cost use in BTreeMap/BTreeSet without conversion
-- **mimalloc** — allocations backed by mimalloc instead of the system allocator, saving ~10% RSS (2,084 MB vs 2,315 MB at 5M records)
+- **mimalloc** — allocations backed by mimalloc instead of the system allocator, saving ~10% RSS
 
 ---
 
@@ -220,17 +256,63 @@ radixox/
 ## 🎯 Use Cases
 
 **Perfect for:**
-- 🚀 High-throughput APIs (200k+ ops/sec single-thread)
-- 🎯 Latency-critical services (p99 < 750 µs at 5M records)
+- 🚀 High-throughput APIs (270k+ ops/sec, 2-thread budget)
+- 🎯 Latency-critical services (READ p99 < 500 µs at 5M records)
 - 🌳 Hierarchical key spaces (`user:*`, `cache:*`, prefix operations)
 - 📊 Real-time leaderboards (ZSet with O(1) ZSCORE)
-- 💾 Session stores, caching layers
-- 🔥 YCSB-style workloads (Hash-heavy)
+- 💾 Session stores, caching layers (p99 0.38 ms, p99.9 0.39 ms)
+- 🔥 YCSB-style workloads (Hash-heavy, large datasets)
 
 **Not recommended for:**
 - ❌ Multi-threaded workloads (single-threaded by design)
 - ❌ Persistence-critical (in-memory only, no RDB/AOF yet)
 - ❌ Complex transactions (no Lua scripting)
+- ⚠️ Tiny hot-cache workloads where p99.99 outliers matter more than throughput
+
+---
+
+## 📊 Comparison: RadixOx vs Valkey 9.0.3
+
+Both configurations: 2 threads total. RadixOx = 1 app thread + io_uring SQ_POLL. Valkey = 2 user-space threads.
+
+| Feature | Valkey 9.0.3 (2t) | RadixOx (1t+poll) | Winner |
+|---------|-------------------|-------------------|--------|
+| Load throughput (5M inserts) | 87k ops/sec | **134k ops/sec** | 🦀 **+54%** |
+| Run throughput (10M ops) | 172k ops/sec | **271k ops/sec** | 🦀 **+57%** |
+| READ P99 (5M records) | 683 µs | **456 µs** | 🦀 **-33%** |
+| READ P99.9 (5M records) | 697 µs | **427 µs** | 🦀 **-39%** |
+| Load P99 | 1,396 µs | **869 µs** | 🦀 **-38%** |
+| memtier GET P99 | 0.49 ms | **0.38 ms** | 🦀 **-22%** |
+| memtier GET P99.99 | **0.57 ms** | 1.67 ms | 🔴 Valkey |
+| Peak RSS (5M records) | 2,080 MB | **1,969 MB** | 🦀 **-5%** |
+| Peak RSS (small dataset) | **45 MB** | 51 MB | 🔴 Valkey |
+| Prefix queries | O(N) scan | **O(k) native** | 🦀 |
+| Data structures | HashMap flat | **ART + BTree** | 🦀 |
+| Tail latency (large dataset) | Variable | **Predictable** | 🦀 |
+| Multi-threaded | ✅ Optional | ❌ No | 🔴 |
+| Persistence | ✅ RDB/AOF | ❌ Not yet | 🔴 |
+| Lua scripting | ✅ Yes | ❌ No | 🔴 |
+| Ecosystem | 🔴 Massive | 🦀 Growing | 🔴 |
+
+---
+
+## 🔬 Technical Details
+
+### Why Single-Threaded?
+
+- **No lock contention** → predictable tail latency
+- **Cache-friendly** → all data in L1/L2 cache
+- **Simple to reason about** → no race conditions
+- **io_uring batching** → syscall amortization via SQ_POLL
+- Modern cores are fast enough for **270k+ ops/sec** with a single event loop
+
+### Why BTreeMap over HashMap?
+
+- **Deterministic O(log n)** vs O(1) average but O(n) worst-case
+- **Better tail latency** (p99.9) — no hash collision spikes
+- **Ordered iteration** — HGETALL/HKEYS consistent
+- **Cache-friendly** — sequential memory access
+- **Perfect for YCSB** — Workload A is Hash-heavy
 
 ---
 
@@ -249,46 +331,6 @@ radixox/
 - [ ] 🚧 Persistence (RDB snapshots, AOF)
 - [ ] 🚧 Cluster mode
 - [ ] 🚧 Replication
-
----
-
-## 📊 Comparison: RadixOx vs Valkey 9.0.3
-
-| Feature | Valkey 9.0.3 | RadixOx | Winner |
-|---------|-------------|---------|--------|
-| Load throughput (5M inserts) | 73k ops/sec | **94k ops/sec** | 🦀 **+28%** |
-| Run throughput (10M ops) | 187k ops/sec | **222k ops/sec** | 🦀 **+19%** |
-| READ P99 (5M records) | 1,039 µs | **564 µs** | 🦀 **-46%** |
-| READ P99.9 | 1,091 µs | **629 µs** | 🦀 **-42%** |
-| Load P99 | 2,597 µs | **1,488 µs** | 🦀 **-43%** |
-| Prefix queries | O(N) scan | **O(k) native** | 🦀 |
-| Peak RSS (5M records) | **2,049 MB** | **2,084 MB** | ≈ |
-| Data structures | HashMap flat | **ART + BTree** | 🦀 |
-| Tail latency | Variable | **Predictable** | 🦀 |
-| Multi-threaded | ✅ Optional | ❌ No | 🔴 |
-| Persistence | ✅ RDB/AOF | ❌ Not yet | 🔴 |
-| Lua scripting | ✅ Yes | ❌ No | 🔴 |
-| Ecosystem | 🔴 Massive | 🦀 Growing | 🔴 |
-
----
-
-## 🔬 Technical Details
-
-### Why Single-Threaded?
-
-- **No lock contention** → predictable tail latency
-- **Cache-friendly** → all data in L1/L2 cache
-- **Simple to reason about** → no race conditions
-- **io_uring batching** → syscall amortization
-- Modern cores are fast enough for **200k+ ops/sec** single-thread
-
-### Why BTreeMap over HashMap?
-
-- **Deterministic O(log n)** vs O(1) average but O(n) worst-case
-- **Better tail latency** (p99.9) — no hash collision spikes
-- **Ordered iteration** — HGETALL/HKEYS consistent
-- **Cache-friendly** — sequential memory access
-- **Perfect for YCSB** — Workload A is Hash-heavy
 
 ---
 

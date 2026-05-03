@@ -841,6 +841,50 @@ fn test_evict_expired_partial() {
 
 // ============ Tests avec dictionnaire français ============
 
+#[test]
+fn test_recompress_transfers_overflow() {
+    // Scenario: child absorbed by try_recompress has overflow children.
+    // Before the fix, overflow_idx was not transferred → children past CHILDS_SIZE were lost.
+    //
+    // Tree after inserting "xc1".."xc7":
+    //   root →['x']→ node{comp:"c"} →['1'..'7']   (7 children, 6 inline + 1 in overflow)
+    //
+    // After inserting "x" (split at comp boundary):
+    //   root →['x']→ node{comp:"", val="x", 1 child 'c'}
+    //                            →['c']→ node{comp:"", 7 children (overflow)}
+    //
+    // Deleting "x" triggers try_recompress: the 'x' node (1 child, no val) absorbs 'c'.
+    // Without fix: overflow_idx of 'c' is not copied → "xc7" disappears.
+    let mut art = OxidArt::new();
+
+    // 7 children forces one entry into overflow (CHILDS_SIZE = 6)
+    for i in 1u8..=7 {
+        let key = format!("xc{i}");
+        art.set(SharedByte::from_str(&key), Value::from_str(&format!("v{i}")));
+    }
+
+    // Creates intermediate node "x" with exactly 1 child ('c') carrying the overflow
+    art.set(SharedByte::from_str("x"), Value::from_str("xval"));
+
+    // Deleting "x" triggers try_recompress which must transfer overflow_idx
+    let deleted = art.del(b"x");
+    assert!(deleted.is_some(), "del(x) should return the value");
+
+    // All 7 children must remain accessible after recompress
+    for i in 1u8..=7 {
+        let key = format!("xc{i}");
+        let got = art.get(key.as_bytes());
+        assert!(
+            got.is_some(),
+            "key \"{key}\" lost after try_recompress (overflow_idx not transferred)"
+        );
+    }
+
+    // Prefix scan must also return all 7
+    let results = art.getn(SharedByte::from_str("xc"));
+    assert_eq!(results.len(), 7, "getn(xc) should find all 7 keys after recompress");
+}
+
 /*#[test]
 fn test_ensure() {
     let mut art = OxidArt::new();

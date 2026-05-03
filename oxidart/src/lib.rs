@@ -67,7 +67,6 @@ mod test;
 #[cfg(test)]
 mod test_structures;
 
-use hislab::HiSlab;
 use hislab::TaggedHiSlab;
 use radixox_lib::shared_byte::SharedByte;
 use rand::rngs::ThreadRng;
@@ -76,7 +75,7 @@ use crate::compact_str::CompactStr;
 
 use crate::node_childs::ChildAble;
 use crate::node_childs::Childs;
-use crate::node_childs::HugeChilds;
+use crate::node_childs::OverflowArena;
 
 pub use crate::value::Value;
 use crate::value::{
@@ -115,7 +114,7 @@ pub enum TtlResult {
 ///
 pub struct OxidArt {
     pub(crate) map: TaggedHiSlab<Node>,
-    pub(crate) child_list: HiSlab<HugeChilds>,
+    pub(crate) overflow_arena: OverflowArena,
     /// Current timestamp (seconds since UNIX epoch).
     /// The server is responsible for updating this via `set_now()`.
     pub now: u64,
@@ -143,12 +142,11 @@ impl OxidArt {
         init_slabs();
         let map = TaggedHiSlab::new(20000, 25000000).expect("Can't allocate oxidart");
         let root_idx = map.insert(Node::default());
-        let child_list = HiSlab::new(1000, 25000000).expect("Can't allocate oxidart");
 
         Self {
             map,
             root_idx,
-            child_list,
+            overflow_arena: OverflowArena::new(),
             now: 0,
         }
     }
@@ -159,9 +157,9 @@ impl OxidArt {
         self.now = now;
     }
 
-    /// Returns the number of HugeChilds blocks currently allocated.
-    pub fn huge_childs_count(&self) -> usize {
-        self.child_list.count_occupied()
+    /// Returns the number of Overflow slots currently allocated.
+    pub fn overflow_count(&self) -> usize {
+        self.overflow_arena.count()
     }
 
     /// Returns the number of nodes currently allocated.
@@ -235,7 +233,7 @@ impl OxidArt {
             let Some(node) = self.try_get_node(target_idx) else {
                 return;
             };
-            !node.childs.is_empty() || node.get_huge_childs_idx().is_some()
+            !node.childs.is_empty() || node.get_overflow_idx().is_some()
         };
 
         if has_children {
@@ -286,12 +284,18 @@ impl OxidArt {
         if let Some(index) = node.childs.find(radix) {
             return Some(index);
         }
-        self.child_list
-            .get(node.get_huge_childs_idx()?)?
+        self.overflow_arena
+            .get(node.get_overflow_idx()?)?
             .find(radix)
     }
-    fn intiate_new_huge_child(&mut self, radix: u8, idx: u32) -> u32 {
-        self.child_list.insert(HugeChilds::new(radix, idx))
+
+    fn alloc_overflow_with_first(&mut self, radix: u8, idx: u32) -> u32 {
+        let slot = self.overflow_arena.alloc();
+        self.overflow_arena
+            .get_mut(slot)
+            .expect("just allocated")
+            .push(radix, idx);
+        slot
     }
 }
 impl OxidArt {
@@ -506,7 +510,7 @@ impl OxidArt {
     fn delete_node_inline(&mut self, target_idx: u32, parent_idx: u32, parent_radix: u8) {
         let has_children = {
             let node = self.get_node(target_idx);
-            !node.childs.is_empty() || node.get_huge_childs_idx().is_some()
+            !node.childs.is_empty() || node.get_overflow_idx().is_some()
         };
 
         if has_children {
@@ -657,10 +661,10 @@ impl OxidArt {
             f(radix, child_idx);
         }
 
-        if let Some(huge_idx) = node.get_huge_childs_idx()
-            && let Some(huge_childs) = self.child_list.get(huge_idx)
+        if let Some(overflow_idx) = node.get_overflow_idx()
+            && let Some(overflow) = self.overflow_arena.get(overflow_idx)
         {
-            for (radix, child_idx) in huge_childs.iter() {
+            for (radix, child_idx) in overflow.iter() {
                 f(radix, child_idx);
             }
         }
@@ -772,7 +776,7 @@ impl OxidArt {
         mut val: Option<Value>,
     ) -> u32 {
         let val_on_intermediate = common_len == key_rest.len();
-        let (old_compression, old_tag, old_val_bits, old_childs, old_huge_idx, old_exp) = {
+        let (old_compression, old_tag, old_val_bits, old_childs, old_overflow_idx, old_exp) = {
             let node = self.get_node_mut(idx);
             let old_compression = std::mem::take(&mut node.compression);
             // Take tag+val without dropping (ownership moves to old_child below)
@@ -780,7 +784,7 @@ impl OxidArt {
             let old_exp = node.exp_and_radix;
             node.exp_and_radix.set_no_expiracy();
             let old_childs = std::mem::take(&mut node.childs);
-            let old_huge_idx = std::mem::replace(&mut node.huge_childs_idx, u32::MAX);
+            let old_overflow_idx = std::mem::replace(&mut node.overflow_idx, u32::MAX);
 
             node.compression = CompactStr::from_slice(&old_compression[..common_len]);
             if val_on_intermediate && let Some(val) = val.take() {
@@ -797,7 +801,7 @@ impl OxidArt {
                 old_tag,
                 old_val_bits,
                 old_childs,
-                old_huge_idx,
+                old_overflow_idx,
                 old_exp,
             )
         };
@@ -807,7 +811,7 @@ impl OxidArt {
         // Check if old value had a TTL (needs to stay tagged)
         let old_had_ttl = old_exp.does_expire();
         let old_child = Node {
-            huge_childs_idx: old_huge_idx,
+            overflow_idx: old_overflow_idx,
             compression: CompactStr::from_slice(&old_compression[common_len + 1..]),
             tag: old_tag,
             val: old_val_bits,
@@ -854,12 +858,9 @@ impl OxidArt {
         compression: &[u8],
         ttl: u64,
     ) -> u32 {
-        let (is_full, huge_child_idx) = {
+        let (is_full, overflow_idx) = {
             let father_node = self.get_node(parent_idx);
-            (
-                father_node.childs.is_full(),
-                father_node.get_huge_childs_idx(),
-            )
+            (father_node.childs.is_full(), father_node.get_overflow_idx())
         };
         let new_leaf = Node::new_leaf(compression, val, ttl, parent_idx, radix);
         // Tag the node if it has a real TTL (not NO_EXPIRY)
@@ -868,19 +869,19 @@ impl OxidArt {
         } else {
             self.insert(new_leaf)
         };
-        match (is_full, huge_child_idx) {
+        match (is_full, overflow_idx) {
             (false, _) => self
                 .get_node_mut(parent_idx)
                 .childs
                 .push(radix, inserted_idx),
             (true, None) => {
-                let new_child_idx = self.intiate_new_huge_child(radix, inserted_idx);
-                self.get_node_mut(parent_idx).set_new_childs(new_child_idx);
+                let new_overflow_idx = self.alloc_overflow_with_first(radix, inserted_idx);
+                self.get_node_mut(parent_idx).set_overflow_idx(new_overflow_idx);
             }
-            (true, Some(huge_idx)) => {
-                self.child_list
-                    .get_mut(huge_idx)
-                    .expect("if key exist childs should too")
+            (true, Some(oi)) => {
+                self.overflow_arena
+                    .get_mut(oi)
+                    .expect("overflow_idx must be valid")
                     .push(radix, inserted_idx);
             }
         }
@@ -946,7 +947,7 @@ impl OxidArt {
         // Check if the node has children
         let has_children = {
             let node = self.get_node(target_idx);
-            !node.childs.is_empty() || node.get_huge_childs_idx().is_some()
+            !node.childs.is_empty() || node.get_overflow_idx().is_some()
         };
 
         if has_children {
@@ -1074,10 +1075,10 @@ impl OxidArt {
             indices.push(child_idx);
         }
 
-        if let Some(huge_idx) = node.get_huge_childs_idx()
-            && let Some(huge_childs) = self.child_list.get(huge_idx)
+        if let Some(overflow_idx) = node.get_overflow_idx()
+            && let Some(overflow) = self.overflow_arena.get(overflow_idx)
         {
-            for (_, child_idx) in huge_childs.iter() {
+            for (_, child_idx) in overflow.iter() {
                 indices.push(child_idx);
             }
         }
@@ -1092,21 +1093,21 @@ impl OxidArt {
 
         while let Some(node_idx) = stack.pop() {
             // Collect children before removing the node
-            let (children, has_val, huge_child_idx) = {
+            let (children, has_val, overflow_idx) = {
                 let Some(node) = self.try_get_node(node_idx) else {
                     continue;
                 };
 
                 let mut children: Vec<u32> = node.childs.iter().map(|(_, idx)| idx).collect();
 
-                let huge_idx = node.get_huge_childs_idx();
-                if let Some(hi) = huge_idx
-                    && let Some(huge_childs) = self.child_list.get(hi)
+                let overflow_idx = node.get_overflow_idx();
+                if let Some(oi) = overflow_idx
+                    && let Some(overflow) = self.overflow_arena.get(oi)
                 {
-                    children.extend(huge_childs.iter().map(|(_, idx)| idx));
+                    children.extend(overflow.iter().map(|(_, idx)| idx));
                 }
 
-                (children, node.has_val(), huge_idx)
+                (children, node.has_val(), overflow_idx)
             };
 
             // Add children to the stack
@@ -1117,9 +1118,9 @@ impl OxidArt {
                 count += 1;
             }
 
-            // Remove huge_childs if present
-            if let Some(huge_idx) = huge_child_idx {
-                self.child_list.remove(huge_idx);
+            // Free overflow slot (also drops HugeOverflow if present)
+            if let Some(oi) = overflow_idx {
+                self.overflow_arena.free(oi);
             }
 
             // Remove the node from the slab
@@ -1157,10 +1158,10 @@ impl OxidArt {
                 grandchild.parent_idx = node_idx;
             }
         }
-        if let Some(huge_idx) = child.get_huge_childs_idx()
-            && let Some(huge_childs) = self.child_list.get(huge_idx)
+        if let Some(overflow_idx) = child.get_overflow_idx()
+            && let Some(overflow) = self.overflow_arena.get(overflow_idx)
         {
-            let indices: Vec<u32> = huge_childs.iter().map(|(_, idx)| idx).collect();
+            let indices: Vec<u32> = overflow.iter().map(|(_, idx)| idx).collect();
             for grandchild_idx in indices {
                 if let Some(grandchild) = self.map.get_mut(grandchild_idx) {
                     grandchild.parent_idx = node_idx;
@@ -1168,13 +1169,15 @@ impl OxidArt {
             }
         }
 
-        // Merge: parent absorbs child's compression, val, exp, childs.
+        // Merge: parent absorbs child's compression, val, exp, childs, overflow.
         // `child` is still in scope so &child.compression is valid.
+        let child_overflow_idx = child.overflow_idx;
         let node = self.get_node_mut(node_idx);
         node.compression
             .append_and_replace(child_radix, &child.compression);
         node.exp_and_radix = child.exp_and_radix;
         std::mem::swap(&mut node.childs, &mut child.childs);
+        node.overflow_idx = child_overflow_idx;
 
         // Transfer val (parent had Tag::None so clear_val is no-op).
         node.tag = child_tag;
@@ -1185,42 +1188,48 @@ impl OxidArt {
     /// If the node has exactly 1 child and no value, absorb the child
     fn remove_child(&mut self, parent_idx: u32, radix: u8) {
         let Some(parent) = self.try_get_node_mut(parent_idx) else {
-            // Parent was absorbed/removed during recompression, nothing to do
             return;
         };
         if parent.childs.remove(radix).is_some() {
             return;
         }
-        // Otherwise it's in huge_childs
-
-        if let Some(huge_idx) = parent.get_huge_childs_idx() {
-            self.child_list
-                .get_mut(huge_idx)
-                .expect("huge_childs should exist")
-                .remove(radix);
+        let Some(overflow_idx) = parent.get_overflow_idx() else {
+            return;
+        };
+        let is_now_empty = self
+            .overflow_arena
+            .get_mut(overflow_idx)
+            .map(|o| {
+                o.remove(radix);
+                o.is_empty()
+            })
+            .unwrap_or(false);
+        if is_now_empty {
+            self.overflow_arena.free(overflow_idx);
+            self.get_node_mut(parent_idx).overflow_idx = u32::MAX;
         }
     }
+
     fn push_child_idx(&mut self, parent_idx: u32, idx: u32, radix: u8) {
-        let huge_idx = {
+        let overflow_idx = {
             let node = self.get_node_mut(parent_idx);
             if !node.childs.is_full() {
                 node.childs.push(radix, idx);
                 return;
             }
-            node.get_huge_childs_idx()
+            node.get_overflow_idx()
         };
 
-        let Some(huge_idx) = huge_idx else {
-            let new_huge_idx = self.intiate_new_huge_child(radix, idx);
-            self.get_node_mut(parent_idx).huge_childs_idx = new_huge_idx;
+        let Some(overflow_idx) = overflow_idx else {
+            let new_overflow_idx = self.alloc_overflow_with_first(radix, idx);
+            self.get_node_mut(parent_idx).overflow_idx = new_overflow_idx;
             return;
         };
 
-        let huge = self
-            .child_list
-            .get_mut(huge_idx)
-            .expect("expect id exist so huge childs should");
-        huge.push(radix, idx);
+        self.overflow_arena
+            .get_mut(overflow_idx)
+            .expect("overflow_idx must be valid")
+            .push(radix, idx);
     }
 }
 
@@ -1231,7 +1240,7 @@ struct Node {
     tag: Tag,
     val: ValUnion,
     exp_and_radix: ExpAndRadix,
-    huge_childs_idx: u32,
+    overflow_idx: u32,
     /// Parent node index (for TTL eviction)
     parent_idx: u32,
 }
@@ -1290,7 +1299,7 @@ impl ExpAndRadix {
 impl Default for Node {
     fn default() -> Self {
         Self {
-            huge_childs_idx: u32::MAX,
+            overflow_idx: u32::MAX,
             childs: Childs::default(),
             compression: CompactStr::new(),
             tag: Tag::None,
@@ -1397,11 +1406,11 @@ impl Node {
         self.exp_and_radix.exp().is_some_and(|exp| exp < now)
     }
 
-    fn get_huge_childs_idx(&self) -> Option<u32> {
-        if self.huge_childs_idx == u32::MAX {
+    fn get_overflow_idx(&self) -> Option<u32> {
+        if self.overflow_idx == u32::MAX {
             None
         } else {
-            Some(self.huge_childs_idx)
+            Some(self.overflow_idx)
         }
     }
 
@@ -1414,7 +1423,7 @@ impl Node {
     ) -> Self {
         let (tag, val_bits) = value_into_raw(val);
         Node {
-            huge_childs_idx: u32::MAX,
+            overflow_idx: u32::MAX,
             compression: CompactStr::from_slice(compression),
             tag,
             val: val_bits,
@@ -1429,19 +1438,19 @@ impl Node {
             compression: CompactStr::from_slice(compression),
             tag: Tag::None,
             val: ValUnion { idx: 0 },
-            huge_childs_idx: u32::MAX,
+            overflow_idx: u32::MAX,
             parent_idx,
             exp_and_radix: ExpAndRadix::no_expiracy(parent_radix),
         }
     }
 
-    pub(crate) fn set_new_childs(&mut self, idx: u32) {
-        assert!(self.huge_childs_idx == u32::MAX);
-        self.huge_childs_idx = idx
+    pub(crate) fn set_overflow_idx(&mut self, idx: u32) {
+        debug_assert!(self.overflow_idx == u32::MAX);
+        self.overflow_idx = idx;
     }
     pub(crate) fn get_single_child(&self) -> Option<(u8, u32)> {
         if let Some(ret) = self.childs.old_get_single_child()
-            && self.get_huge_childs_idx().is_none()
+            && self.get_overflow_idx().is_none()
         {
             return Some(ret);
         }
