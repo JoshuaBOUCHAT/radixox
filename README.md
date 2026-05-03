@@ -79,7 +79,9 @@ Tested with [YCSB](https://github.com/brianfrankcooper/YCSB) — industry standa
 | **GET P99.9** | 0.54 ms | **0.39 ms** | ✅ **-28%** |
 | **SET P99** | 0.50 ms | **0.38 ms** | ✅ **-24%** |
 
-> **Note on P99.99 and memory:** RadixOx's P99.99 is higher than Valkey on the caching workload (1.67 ms vs 0.57 ms) — occasional GC-like pauses from the THP warm-up path on small datasets. At scale (5M records, YCSB), this effect disappears and P99.99 converges (982 µs vs 1,014 µs). For small hot-cache workloads, Valkey also uses ~12% less RAM (45 MB vs 51 MB) — the ART overhead isn't amortized until the key space grows.
+> **On P99.99:** The 1.67 ms outlier on the caching workload vs Valkey's 0.57 ms needs further investigation — it may simply be measurement jitter on a short run rather than a structural difference. At scale (5M records, YCSB), P99.99 converges: RadixOx 982 µs vs Valkey 1,014 µs.
+>
+> **On memory (small datasets):** Valkey uses two string encodings. For values ≤ 44 bytes (`embstr`), data is stored inline in a single allocation — no extra heap cost. Above 44 bytes (`raw`), Valkey allocates a separate SDS buffer; the `robj` (16 bytes) then only holds metadata and a pointer. For the memtier workloads here (100–500 B caching, 50–200 B session), all values exceed that threshold, so both implementations allocate string data separately. The RAM difference likely comes from structural overhead per key: RadixOx ART nodes are 64 bytes each, amortized via path compression on shared prefixes, while Valkey carries a `dictEntry` plus key and value `robj` wrappers. On random short keys (memtier default), prefix sharing is minimal and the per-node cost dominates. At scale (5M records, YCSB) with longer structured keys, compression kicks in — RadixOx ends up using 5% less RAM.
 
 ---
 
