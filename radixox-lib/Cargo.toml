@@ -13,4 +13,3 @@ categories = ["network-programming", "parser-implementations"]
 redis-protocol = { workspace = true }
 bytes = { workspace = true }
 mimalloc = { workspace = true }
-smallvec = { workspace = true }

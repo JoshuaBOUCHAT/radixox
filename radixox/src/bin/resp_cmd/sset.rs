@@ -1,13 +1,11 @@
 use oxidart::OxidArt;
 use oxidart::error::TypeError;
+use oxidart::scommand::SPOPResult;
 use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::shared_frame::SharedFrame as Frame;
 
-pub fn cmd_sadd(args: &[SharedByte], art: &mut OxidArt) -> Frame {
-    if args.len() < 2 {
-        return Frame::Error("ERR wrong number of arguments for 'SADD' command".into());
-    }
-    match art.cmd_sadd(&args[0], &args[1..], None) {
+pub fn cmd_sadd(art: &mut OxidArt, key: SharedByte, members: &[SharedByte]) -> Frame {
+    match art.cmd_sadd(&key, members, None) {
         Ok(count) => Frame::Integer(count as i64),
         Err(TypeError::ValueNotSet) => {
             Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
@@ -16,77 +14,55 @@ pub fn cmd_sadd(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     }
 }
 
-pub fn cmd_srem(args: &[SharedByte], art: &mut OxidArt) -> Frame {
-    if args.len() < 2 {
-        return Frame::Error("ERR wrong number of arguments for 'SREM' command".into());
-    }
-    match art.cmd_srem(&args[0], &args[1..]) {
+pub fn cmd_srem(art: &mut OxidArt, key: SharedByte, members: &[SharedByte]) -> Frame {
+    match art.cmd_srem(&key, members) {
         Ok(count) => Frame::Integer(count as i64),
-        Err(redis_type) => Frame::Error(
-            format!(
-                "WRONGTYPE Operation against a key holding the wrong kind of value (expected set, got {})",
-                redis_type.as_str()
-            ),
-        ),
+        Err(redis_type) => Frame::Error(format!(
+            "WRONGTYPE Operation against a key holding the wrong kind of value (expected set, got {})",
+            redis_type.as_str()
+        )),
     }
 }
 
-pub fn cmd_sismember(args: &[SharedByte], art: &mut OxidArt) -> Frame {
-    if args.len() < 2 {
-        return Frame::Error("ERR wrong number of arguments for 'SISMEMBER' command".into());
-    }
-    match art.cmd_sismember(&args[0], args[1].clone()) {
+pub fn cmd_sismember(art: &mut OxidArt, key: SharedByte, member: SharedByte) -> Frame {
+    match art.cmd_sismember(&key, member) {
         Ok(exists) => Frame::Integer(if exists { 1 } else { 0 }),
-        Err(redis_type) => Frame::Error(
-            format!(
-                "WRONGTYPE Operation against a key holding the wrong kind of value (expected set, got {})",
-                redis_type.as_str()
-            ),
-        ),
+        Err(redis_type) => Frame::Error(format!(
+            "WRONGTYPE Operation against a key holding the wrong kind of value (expected set, got {})",
+            redis_type.as_str()
+        )),
     }
 }
 
-pub fn cmd_scard(args: &[SharedByte], art: &mut OxidArt) -> Frame {
-    if args.is_empty() {
-        return Frame::Error("ERR wrong number of arguments for 'SCARD' command".into());
-    }
-    match art.cmd_scard(&args[0]) {
+pub fn cmd_scard(art: &mut OxidArt, key: SharedByte) -> Frame {
+    match art.cmd_scard(&key) {
         Ok(count) => Frame::Integer(count as i64),
-        Err(redis_type) => Frame::Error(
-            format!(
-                "WRONGTYPE Operation against a key holding the wrong kind of value (expected set, got {})",
-                redis_type.as_str()
-            ),
-        ),
+        Err(redis_type) => Frame::Error(format!(
+            "WRONGTYPE Operation against a key holding the wrong kind of value (expected set, got {})",
+            redis_type.as_str()
+        )),
     }
 }
 
-pub fn cmd_smembers(args: &[SharedByte], art: &mut OxidArt) -> Frame {
-    if args.is_empty() {
-        return Frame::Error("ERR wrong number of arguments for 'SMEMBERS' command".into());
-    }
-    match art.cmd_smembers(&args[0]) {
+pub fn cmd_smembers(art: &mut OxidArt, key: SharedByte) -> Frame {
+    match art.cmd_smembers(&key) {
         Ok(members) => Frame::Array(members.into_iter().map(Frame::BulkString).collect()),
-        Err(redis_type) => Frame::Error(
-            format!(
-                "WRONGTYPE Operation against a key holding the wrong kind of value (expected set, got {})",
-                redis_type.as_str()
-            ),
-        ),
+        Err(redis_type) => Frame::Error(format!(
+            "WRONGTYPE Operation against a key holding the wrong kind of value (expected set, got {})",
+            redis_type.as_str()
+        )),
     }
 }
 
-pub fn cmd_spop(args: &[SharedByte], art: &mut OxidArt) -> Frame {
-    if args.is_empty() {
-        return Frame::Error("ERR wrong number of arguments for 'SPOP' command".into());
-    }
-    let count = args.get(1).map(|b| b.as_ref());
-    match art.cmd_spop(&args[0], count) {
-        Ok(oxidart::scommand::SPOPResult::Single(opt)) => match opt {
+pub fn cmd_spop(art: &mut OxidArt, key: SharedByte, count: Option<u64>) -> Frame {
+    let count_str = count.map(|n| n.to_string());
+    let count_bytes = count_str.as_deref().map(str::as_bytes);
+    match art.cmd_spop(&key, count_bytes) {
+        Ok(SPOPResult::Single(opt)) => match opt {
             Some(val) => Frame::BulkString(val),
             None => Frame::Null,
         },
-        Ok(oxidart::scommand::SPOPResult::Multiple(vec)) => {
+        Ok(SPOPResult::Multiple(vec)) => {
             Frame::Array(vec.into_iter().map(Frame::BulkString).collect())
         }
         Err(TypeError::ValueNotSet) => {

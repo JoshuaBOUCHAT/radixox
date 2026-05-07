@@ -627,7 +627,6 @@ dependencies = [
  "bytes",
  "mimalloc",
  "redis-protocol",
- "smallvec",
 ]
 
 [[package]]

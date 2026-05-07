@@ -193,6 +193,7 @@ impl Borrow<[u8]> for SharedByte {
 ///Represente l'invariant rc == 1 donc vue que un owner alors Send
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
 pub struct OwnedByte(SharedByte);
 impl Borrow<[u8]> for OwnedByte {
     fn borrow(&self) -> &[u8] {
@@ -216,3 +217,8 @@ impl Clone for OwnedByte {
     }
 }
 unsafe impl Send for OwnedByte {}
+impl Into<SharedByte> for OwnedByte {
+    fn into(self) -> SharedByte {
+        self.0
+    }
+}

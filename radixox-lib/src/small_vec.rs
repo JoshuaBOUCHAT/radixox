@@ -5,6 +5,8 @@ use std::{
     ptr::NonNull,
 };
 
+use crate::shared_byte::{OwnedByte, SharedByte};
+
 pub struct SmallVec<const S: usize, T> {
     size: u32, //This never shrink back so if size > S we are in HeapMode
     len: u32,
@@ -182,3 +184,23 @@ impl<const S: usize, T> SmallVecData<S, T> {
         }
     }
 }
+macro_rules! impl_into_shareds {
+    ($src:ty, $dst:ty) => {
+        impl<const S: usize> SmallVec<S, $src> {
+            pub fn into_shareds(self) -> SmallVec<S, $dst> {
+                const { assert!(size_of::<$src>() == size_of::<$dst>()) };
+                unsafe {
+                    let result = (&self as *const SmallVec<S, $src>)
+                        .cast::<SmallVec<S, $dst>>()
+                        .read();
+                    std::mem::forget(self);
+                    result
+                }
+            }
+        }
+    };
+}
+
+impl_into_shareds!(OwnedByte, SharedByte);
+impl_into_shareds!((OwnedByte, OwnedByte), (SharedByte, SharedByte));
+impl_into_shareds!((f64, OwnedByte), (f64, SharedByte));
