@@ -47,6 +47,9 @@ impl Default for SetOpts {
 
 pub enum Cmd {
     // --- Connection / admin -------------------------------------------
+    /// INFO [section] — retourne des infos serveur (réponse minimale)
+    Info,
+
     /// PING [message]
     Ping(Option<OwnedByte>),
     /// QUIT
@@ -122,8 +125,13 @@ pub enum Cmd {
 
     // --- Hash --------------------------------------------------------
     /// HSET key field value [field value ...]
-    /// Couvre aussi HMSET (alias déprécié).
     HSet {
+        key: OwnedByte,
+        fields: SmallVec<2, (OwnedByte, OwnedByte)>,
+    },
+
+    /// HMSET key field value [field value ...] — alias déprécié de HSET, doit répondre +OK
+    HMSet {
         key: OwnedByte,
         fields: SmallVec<2, (OwnedByte, OwnedByte)>,
     },
@@ -423,13 +431,13 @@ fn dispatch(raw: &[&[u8]]) -> Option<Cmd> {
                         let key = ob(args[0]);
                         Some(Cmd::HMGet { key, fields: multi_from!(1, |v| v) })
                     }
-                    b's' => { // HMSET → HSet
+                    b's' => { // HMSET — gardé distinct pour que le serveur réponde +OK
                         if args.len() < 3 || (args.len() - 1) % 2 != 0 { return None; }
                         let key = ob(args[0]);
                         let mut fields = SmallVec::new();
                         let mut i = 1;
                         while i < args.len() { fields.push((ob(args[i]), ob(args[i + 1]))); i += 2; }
-                        Some(Cmd::HSet { key, fields })
+                        Some(Cmd::HMSet { key, fields })
                     }
                     _ => None,
                 },
@@ -444,9 +452,13 @@ fn dispatch(raw: &[&[u8]]) -> Option<Cmd> {
             _ => None,
         },
 
-        // ── I : INCR INCRBY ───────────────────────────────────────────────
+        // ── I : INCR INCRBY INFO ──────────────────────────────────────────
         b'i' => match cmd.len() {
-            4 => { need!(1); Some(Cmd::Incr(ob(args[0]))) }
+            4 => match cmd[2] | 0x20 {
+                b'c' => { need!(1); Some(Cmd::Incr(ob(args[0]))) }  // INCR
+                b'f' => Some(Cmd::Info),                              // INFO
+                _ => None,
+            },
             6 => { need!(2); Some(Cmd::IncrBy { key: ob(args[0]), delta: arg_i64(args[1])? }) }
             _ => None,
         },
@@ -571,7 +583,16 @@ fn dispatch(raw: &[&[u8]]) -> Option<Cmd> {
 }
 
 impl Cmd {
-    pub fn from_slice(d: &[u8]) -> Option<Self> {
+    /// Parse a Cmd from already-decoded parts (cmd name + args as byte slices).
+    pub fn from_raw(parts: &[&[u8]]) -> Option<Self> {
+        if parts.is_empty() {
+            return None;
+        }
+        dispatch(parts)
+    }
+
+    /// Parse from raw RESP2 bytes, returns (Cmd, bytes_consumed) or None if incomplete/invalid.
+    pub fn parse(d: &[u8]) -> Option<(Self, usize)> {
         let mut pos = 0;
 
         if d.get(pos) != Some(&b'*') {
@@ -600,6 +621,10 @@ impl Cmd {
             expect_crlf(d, &mut pos)?;
         }
 
-        dispatch(&raw)
+        dispatch(&raw).map(|cmd| (cmd, pos))
+    }
+
+    pub fn from_slice(d: &[u8]) -> Option<Self> {
+        Self::parse(d).map(|(cmd, _)| cmd)
     }
 }

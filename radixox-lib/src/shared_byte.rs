@@ -204,6 +204,10 @@ impl OwnedByte {
     pub fn from_slice(data: impl AsRef<[u8]>) -> Self {
         Self(SharedByte::from_slice(data.as_ref()))
     }
+    #[inline]
+    pub fn into_shared(self) -> SharedByte {
+        self.0
+    }
 }
 impl std::ops::Deref for OwnedByte {
     type Target = [u8];

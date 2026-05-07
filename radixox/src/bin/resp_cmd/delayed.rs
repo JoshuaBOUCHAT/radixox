@@ -12,17 +12,17 @@ pub(crate) type AsyncFrame = Pin<Box<dyn Future<Output = Frame>>>;
 
 // ─── UNLINK ───────────────────────────────────────────────────────────────────
 
-pub(crate) fn cmd_unlink(args: &[SharedByte], art: SharedART) -> AsyncFrame {
-    Box::pin(handle_unlink(args.to_vec(), art))
+pub(crate) fn cmd_unlink(keys: Vec<SharedByte>, art: SharedART) -> AsyncFrame {
+    Box::pin(handle_unlink(keys, art))
 }
 
-async fn handle_unlink(args: Vec<SharedByte>, art: SharedART) -> Frame {
+async fn handle_unlink(keys: Vec<SharedByte>, art: SharedART) -> Frame {
     let mut count = 0i64;
-    for arg in args {
-        let prefix = if arg.ends_with(b"*") {
-            SharedByte::from_slice(&arg[..arg.len() - 1])
+    for key in keys {
+        let prefix = if key.ends_with(b"*") {
+            SharedByte::from_slice(&key[..key.len() - 1])
         } else {
-            arg
+            key
         };
         count += art.deln_async(prefix).await as i64;
     }
@@ -31,19 +31,16 @@ async fn handle_unlink(args: Vec<SharedByte>, art: SharedART) -> Frame {
 
 // ─── KEYS ─────────────────────────────────────────────────────────────────────
 
-pub(crate) fn cmd_keys(args: &[SharedByte], art: SharedART) -> AsyncFrame {
-    Box::pin(handle_keys(args.to_vec(), art))
+pub(crate) fn cmd_keys(pattern: SharedByte, art: SharedART) -> AsyncFrame {
+    Box::pin(handle_keys(pattern, art))
 }
 
-async fn handle_keys(args: Vec<SharedByte>, art: SharedART) -> Frame {
-    if args.is_empty() {
+async fn handle_keys(pattern: SharedByte, art: SharedART) -> Frame {
+    if pattern.is_empty() || pattern.as_ref() == b"*" {
         let keys = art.getn_async(SharedByte::from_slice(b"")).await;
         return Frame::Array(keys.into_iter().map(Frame::BulkString).collect());
     }
 
-    let pattern = args[0].clone();
-
-    // Fast path: simple prefix* or exact prefix → async getn
     if is_simple_prefix(&pattern) {
         let prefix = if pattern.ends_with(b"*") {
             SharedByte::from_slice(&pattern[..pattern.len() - 1])
@@ -54,7 +51,6 @@ async fn handle_keys(args: Vec<SharedByte>, art: SharedART) -> Frame {
         return Frame::Array(keys.into_iter().map(Frame::BulkString).collect());
     }
 
-    // Slow path: complex glob → DFA regex scan (sync, single borrow)
     let regex = glob_to_regex(&pattern);
     let borrowed = art.borrow();
     match borrowed.getn_regex(&regex) {

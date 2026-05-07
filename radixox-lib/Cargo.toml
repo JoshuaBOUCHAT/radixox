@@ -10,6 +10,4 @@ keywords = ["redis", "resp", "protocol", "bytes", "server"]
 categories = ["network-programming", "parser-implementations"]
 
 [dependencies]
-redis-protocol = { workspace = true }
-bytes = { workspace = true }
 mimalloc = { workspace = true }

@@ -362,7 +362,7 @@ fn cmd_hset() {
 #[test]
 fn cmd_hmset_alias() {
     let r = resp(&[b"HMSET", b"h", b"f", b"v"]);
-    assert!(matches!(Cmd::from_slice(&r), Some(Cmd::HSet { .. })));
+    assert!(matches!(Cmd::from_slice(&r), Some(Cmd::HMSet { .. })));
 }
 
 #[test]

@@ -13,20 +13,6 @@ pub fn cmd_hset(art: &mut OxidArt, key: SharedByte, fields: &[(SharedByte, Share
     }
 }
 
-pub fn cmd_hmset(
-    art: &mut OxidArt,
-    key: SharedByte,
-    fields: &[(SharedByte, SharedByte)],
-) -> Frame {
-    match art.cmd_hset(&key, fields, None) {
-        Ok(_) => Frame::SimpleString(SharedByte::from_slice(b"OK")),
-        Err(TypeError::ValueNotSet) => {
-            Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
-        }
-        Err(_) => Frame::Error("ERR internal error".into()),
-    }
-}
-
 pub fn cmd_hget(art: &mut OxidArt, key: SharedByte, field: SharedByte) -> Frame {
     match art.cmd_hget(&key, &field) {
         Ok(Some(val)) => Frame::BulkString(val),
