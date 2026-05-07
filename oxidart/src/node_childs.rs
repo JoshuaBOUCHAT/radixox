@@ -38,7 +38,11 @@ impl Default for Childs {
 
 impl ChildAble for Childs {
     fn find(&self, radix: u8) -> Option<u32> {
-        for (index, actual_radix) in (0..self.len()).map(|i| (i, self.radixs[i])) {
+        let len = self.len();
+        if len > CHILDS_SIZE {
+            unsafe { std::hint::unreachable_unchecked() }
+        }
+        for (index, actual_radix) in (0..len).map(|i| (i, self.radixs[i])) {
             if actual_radix == radix {
                 return Some(self.idxs[index]);
             }
@@ -117,7 +121,10 @@ impl HugeOverflow {
 
 impl ChildAble for HugeOverflow {
     fn find(&self, radix: u8) -> Option<u32> {
-        self.entries.iter().find(|e| e.radix == radix).map(|e| e.idx)
+        self.entries
+            .iter()
+            .find(|e| e.radix == radix)
+            .map(|e| e.idx)
     }
 
     fn push(&mut self, radix: u8, idx: u32) {

@@ -1,4 +1,6 @@
-use std::alloc::{Layout, alloc, dealloc};
+use mimalloc::MiMalloc;
+use std::alloc::GlobalAlloc;
+use std::alloc::Layout;
 use std::ops::Deref;
 
 // Inline : inner[0] = (len << 1) | 1    len ∈ 0..=7
@@ -36,9 +38,8 @@ impl CompactStr {
                 Self(Inner { inline: inner })
             } else {
                 unsafe {
-                    let layout =
-                        Layout::from_size_align(Self::HEAP_HEADER + new_len, 4).unwrap();
-                    let ptr = alloc(layout);
+                    let layout = Layout::from_size_align(Self::HEAP_HEADER + new_len, 4).unwrap();
+                    let ptr = MiMalloc.alloc(layout);
                     assert!(!ptr.is_null());
                     (ptr as *mut u32).write(new_len as u32);
                     let data = ptr.add(Self::HEAP_HEADER);
@@ -65,7 +66,7 @@ impl CompactStr {
         } else {
             unsafe {
                 let layout = Layout::from_size_align(Self::HEAP_HEADER + data.len(), 4).unwrap();
-                let ptr = alloc(layout);
+                let ptr = MiMalloc.alloc(layout);
                 assert!(!ptr.is_null());
                 (ptr as *mut u32).write(data.len() as u32);
                 std::ptr::copy_nonoverlapping(
@@ -85,9 +86,13 @@ impl Deref for CompactStr {
     #[inline]
     fn deref(&self) -> &[u8] {
         unsafe {
-            if self.0.inline[0] & 1 == 1 {
-                let len = (self.0.inline[0] >> 1) as usize;
-                &self.0.inline[1..1 + len]
+            let tag = self.0.inline[0];
+            if tag & 1 == 1 {
+                let len = (tag >> 1) as usize;
+                // Aide le compilo: len ne peut pas dépasser 7 par construction
+
+                std::hint::assert_unchecked(len <= 7);
+                self.0.inline.get_unchecked(1..1 + len)
             } else {
                 let ptr = self.0.heap;
                 let len = (ptr as *const u32).read() as usize;
@@ -110,7 +115,7 @@ impl Drop for CompactStr {
                 let ptr = self.0.heap;
                 let len = (ptr as *const u32).read() as usize;
                 let layout = Layout::from_size_align(Self::HEAP_HEADER + len, 4).unwrap();
-                dealloc(ptr, layout);
+                MiMalloc.dealloc(ptr, layout);
             }
         }
     }

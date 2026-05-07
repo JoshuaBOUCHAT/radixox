@@ -1,6 +1,7 @@
+use hashbrown::HashMap;
 use ordered_float::OrderedFloat;
 use radixox_lib::shared_byte::SharedByte;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
 /// ZSet internal representation with double indexing for optimal performance.
 ///
@@ -8,6 +9,7 @@ use std::collections::{BTreeSet, HashMap};
 /// - `scores`: HashMap provides O(1) member -> score lookup (ZSCORE, ZREM)
 ///
 /// Both structures are kept in sync on all mutations.
+#[repr(align(64))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ZSetInner {
     /// Sorted index: (score, member) tuples ordered by score, then lexicographically.

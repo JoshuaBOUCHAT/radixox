@@ -1,8 +1,10 @@
 use crate::zset_inner::ZSetInner;
 
+use hashbrown::HashMap;
 use ordered_float::OrderedFloat;
 use radixox_lib::shared_byte::SharedByte;
-use std::collections::{BTreeSet, HashMap};
+use smallvec::SmallVec;
+use std::collections::BTreeSet;
 
 use crate::{
     OxidArt, Value,
@@ -36,20 +38,21 @@ impl<'a> Iterator for ZIter<'a> {
         }
     }
 }
+const _: () = assert!(size_of::<InnerZCommand>() <= 64);
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum InnerZCommand {
     /// Small ZSet: sorted Vec<(score, member)> for sets below the threshold.
     /// Vec = 24 bytes — cache-friendly, no heap indirection.
-    Small(Vec<(OrderedFloat<f64>, SharedByte)>),
+    Small(SmallVec<[(OrderedFloat<f64>, SharedByte); 2]>),
     /// Large ZSet: boxed double-indexed structure for O(1) score lookup + O(log n) range.
     /// Box = 8 bytes — keeps InnerZCommand ≤32 bytes total.
-    Large(Box<ZSetInner>),
+    Large(ZSetInner),
 }
 
 impl InnerZCommand {
     pub fn new() -> Self {
-        InnerZCommand::Small(Vec::new())
+        InnerZCommand::Small(SmallVec::new())
     }
 
     /// Insert or update a member with a score.
@@ -81,7 +84,7 @@ impl InnerZCommand {
                     }
                     scores.insert(member.clone(), score);
                     sorted.insert((score, member));
-                    *self = InnerZCommand::Large(Box::new(ZSetInner { sorted, scores }));
+                    *self = InnerZCommand::Large(ZSetInner { sorted, scores });
                 } else {
                     let pos =
                         vec.partition_point(|(s, m)| (*s, m.as_ref()) < (score, member.as_ref()));

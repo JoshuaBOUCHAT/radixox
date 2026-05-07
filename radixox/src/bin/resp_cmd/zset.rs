@@ -30,12 +30,10 @@ pub fn cmd_zcard(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     }
     match art.cmd_zcard(&args[0]) {
         Ok(count) => Frame::Integer(count as i64),
-        Err(redis_type) => Frame::Error(
-            format!(
-                "WRONGTYPE Operation against a key holding the wrong kind of value (expected zset, got {})",
-                redis_type.as_str()
-            ),
-        ),
+        Err(redis_type) => Frame::Error(format!(
+            "WRONGTYPE Operation against a key holding the wrong kind of value (expected zset, got {})",
+            redis_type.as_str()
+        )),
     }
 }
 
@@ -57,12 +55,10 @@ pub fn cmd_zrange(args: &[SharedByte], art: &mut OxidArt) -> Frame {
 
     match art.cmd_zrange(&args[0], start, stop, with_scores) {
         Ok(result) => Frame::Array(result.into_iter().map(Frame::BulkString).collect()),
-        Err(redis_type) => Frame::Error(
-            format!(
-                "WRONGTYPE Operation against a key holding the wrong kind of value (expected zset, got {})",
-                redis_type.as_str()
-            ),
-        ),
+        Err(redis_type) => Frame::Error(format!(
+            "WRONGTYPE Operation against a key holding the wrong kind of value (expected zset, got {})",
+            redis_type.as_str()
+        )),
     }
 }
 
@@ -73,12 +69,10 @@ pub fn cmd_zscore(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     match art.cmd_zscore(&args[0], args[1].clone()) {
         Ok(Some(score)) => Frame::BulkString(SharedByte::from_slice(score.to_string().as_bytes())),
         Ok(None) => Frame::Null,
-        Err(redis_type) => Frame::Error(
-            format!(
-                "WRONGTYPE Operation against a key holding the wrong kind of value (expected zset, got {})",
-                redis_type.as_str()
-            ),
-        ),
+        Err(redis_type) => Frame::Error(format!(
+            "WRONGTYPE Operation against a key holding the wrong kind of value (expected zset, got {})",
+            redis_type.as_str()
+        )),
     }
 }
 
@@ -88,12 +82,10 @@ pub fn cmd_zrem(args: &[SharedByte], art: &mut OxidArt) -> Frame {
     }
     match art.cmd_zrem(&args[0], &args[1..]) {
         Ok(removed) => Frame::Integer(removed as i64),
-        Err(redis_type) => Frame::Error(
-            format!(
-                "WRONGTYPE Operation against a key holding the wrong kind of value (expected zset, got {})",
-                redis_type.as_str()
-            ),
-        ),
+        Err(redis_type) => Frame::Error(format!(
+            "WRONGTYPE Operation against a key holding the wrong kind of value (expected zset, got {})",
+            redis_type.as_str()
+        )),
     }
 }
 

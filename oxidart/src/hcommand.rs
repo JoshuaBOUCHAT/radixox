@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use radixox_lib::shared_byte::SharedByte;
 
@@ -13,7 +13,7 @@ const THRESHOLD: usize = 16;
 #[derive(Clone, Debug, PartialEq)]
 pub enum InnerHCommand {
     Small(Vec<(SharedByte, SharedByte)>),
-    Large(BTreeMap<SharedByte, SharedByte>),
+    Large(HashMap<SharedByte, SharedByte>),
 }
 
 impl InnerHCommand {
@@ -33,7 +33,7 @@ impl InnerHCommand {
                 }
                 if vec.len() >= THRESHOLD {
                     // Promote: build BTreeMap from existing entries + new one in one pass.
-                    let mut map = BTreeMap::new();
+                    let mut map = HashMap::new();
                     for (k, v) in vec.drain(..) {
                         map.insert(k, v);
                     }

@@ -157,7 +157,6 @@ impl std::fmt::Debug for SharedByte {
         write!(f, "SharedString({:?}, rc={})", self.as_str(), self.rc())
     }
 }
-impl SharedByte {}
 
 impl PartialEq for SharedByte {
     fn eq(&self, other: &Self) -> bool {
@@ -190,3 +189,30 @@ impl Borrow<[u8]> for SharedByte {
         self
     }
 }
+
+///Represente l'invariant rc == 1 donc vue que un owner alors Send
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OwnedByte(SharedByte);
+impl Borrow<[u8]> for OwnedByte {
+    fn borrow(&self) -> &[u8] {
+        &self.0
+    }
+}
+impl OwnedByte {
+    pub fn from_slice(data: impl AsRef<[u8]>) -> Self {
+        Self(SharedByte::from_slice(data.as_ref()))
+    }
+}
+impl std::ops::Deref for OwnedByte {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+impl Clone for OwnedByte {
+    fn clone(&self) -> Self {
+        Self(SharedByte::from_slice(self.0.as_slice()))
+    }
+}
+unsafe impl Send for OwnedByte {}

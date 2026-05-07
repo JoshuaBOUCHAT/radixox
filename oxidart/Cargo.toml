@@ -18,7 +18,7 @@ ordered-float = "5.1.0"
 monoio.workspace = true
 hislab = { version = "0.2.1", features = ["rand"] }
 radixox-lib = { workspace = true }
-
+mimalloc = { workspace = true }
 
 rand = "0.8"
 regex-automata = { version = "0.4", optional = true, default-features = false, features = [
@@ -27,6 +27,7 @@ regex-automata = { version = "0.4", optional = true, default-features = false, f
     "syntax",
 ] }
 thin-vec = "0.2.14"
+hashbrown = "0.17.0"
 
 [features]
 regex = ["dep:regex-automata"]
