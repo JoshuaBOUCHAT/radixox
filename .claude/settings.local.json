@@ -21,7 +21,17 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(cargo check:*)",
       "Bash(cargo clippy *)",
-      "Bash(memtier_benchmark --help)"
+      "Bash(memtier_benchmark --help)",
+      "Bash(printf '*2\\\\r\\\\n$3\\\\r\\\\nGET\\\\r\\\\n$3\\\\r\\\\nfoo\\\\r\\\\n')",
+      "Bash(timeout 3 nc -q1 127.0.0.1 6379)",
+      "Bash(xxd)",
+      "Bash(echo \"exit $?\")",
+      "Bash(pkill -9 -f \"radixox_old/target\\\\|/tmp/radixox_\")",
+      "Bash(RUSTFLAGS=\"-C target-cpu=native\" cargo build --release -p radixox)",
+      "Read(//sys/kernel/mm/transparent_hugepage/**)",
+      "Bash(ps aux *)",
+      "Read(//home/joshua/rust/hislab/src/**)",
+      "Bash(valkey-server --version)"
     ]
   }
 }

@@ -5,8 +5,8 @@ use oxidart::{OxidArt, TtlResult, counter::CounterError, value::Value};
 use radixox_lib::cmd::{SetCondition, SetOpts};
 use radixox_lib::shared_byte::SharedByte;
 
-pub(crate) fn cmd_get(art: &mut OxidArt, key: SharedByte) -> Frame {
-    match art.get(&key) {
+pub(crate) fn cmd_get(art: &mut OxidArt, key: &[u8]) -> Frame {
+    match art.get(key) {
         Some(val) => match val.as_bytes() {
             Some(b) => Frame::BulkString(b),
             None => Frame::Error(
@@ -17,21 +17,17 @@ pub(crate) fn cmd_get(art: &mut OxidArt, key: SharedByte) -> Frame {
     }
 }
 
-pub(crate) fn cmd_set(art: &mut OxidArt, key: SharedByte, val: SharedByte, opts: SetOpts) -> Frame {
+pub(crate) fn cmd_set(art: &mut OxidArt, key: &[u8], val: SharedByte, opts: SetOpts) -> Frame {
     let value = Value::String(val);
 
-    if !matches!(opts.condition, SetCondition::Always) {
-        let key_exists = art.get(&key).is_some();
-        match opts.condition {
-            SetCondition::IfNotExists if key_exists => return Frame::Null,
-            SetCondition::IfExists if !key_exists => return Frame::Null,
-            _ => {}
-        }
-    }
+    let if_exists = match opts.condition {
+        SetCondition::Always => None,
+        SetCondition::IfExists => Some(true),
+        SetCondition::IfNotExists => Some(false),
+    };
 
-    match opts.ttl {
-        Some(duration) => art.set_ttl(key, duration, value),
-        None => art.set(key, value),
+    if !art.set_cond(key, opts.ttl, value, if_exists) {
+        return Frame::Null;
     }
 
     Frame::SimpleString(SharedByte::from_slice(b"OK"))
@@ -46,35 +42,35 @@ fn counter_err(e: CounterError) -> Frame {
     }
 }
 
-pub(crate) fn cmd_incr(art: &mut OxidArt, key: SharedByte) -> Frame {
-    match art.incr(key) {
+pub(crate) fn cmd_incr(art: &mut OxidArt, key: &[u8]) -> Frame {
+    match art.incr(SharedByte::from_slice(key)) {
         Ok(val) => Frame::Integer(val),
         Err(e) => counter_err(e),
     }
 }
 
-pub(crate) fn cmd_decr(art: &mut OxidArt, key: SharedByte) -> Frame {
-    match art.decr(key) {
+pub(crate) fn cmd_decr(art: &mut OxidArt, key: &[u8]) -> Frame {
+    match art.decr(SharedByte::from_slice(key)) {
         Ok(val) => Frame::Integer(val),
         Err(e) => counter_err(e),
     }
 }
 
-pub(crate) fn cmd_incrby(art: &mut OxidArt, key: SharedByte, delta: i64) -> Frame {
-    match art.incrby(key, delta) {
+pub(crate) fn cmd_incrby(art: &mut OxidArt, key: &[u8], delta: i64) -> Frame {
+    match art.incrby(SharedByte::from_slice(key), delta) {
         Ok(val) => Frame::Integer(val),
         Err(e) => counter_err(e),
     }
 }
 
-pub(crate) fn cmd_decrby(art: &mut OxidArt, key: SharedByte, delta: i64) -> Frame {
-    match art.decrby(key, delta) {
+pub(crate) fn cmd_decrby(art: &mut OxidArt, key: &[u8], delta: i64) -> Frame {
+    match art.decrby(SharedByte::from_slice(key), delta) {
         Ok(val) => Frame::Integer(val),
         Err(e) => counter_err(e),
     }
 }
 
-pub(crate) fn cmd_del(art: &mut OxidArt, keys: &[SharedByte]) -> Frame {
+pub(crate) fn cmd_del(art: &mut OxidArt, keys: &[&[u8]]) -> Frame {
     let mut count = 0i64;
     for key in keys {
         if art.del(key).is_some() {
@@ -84,31 +80,31 @@ pub(crate) fn cmd_del(art: &mut OxidArt, keys: &[SharedByte]) -> Frame {
     Frame::Integer(count)
 }
 
-pub(crate) fn cmd_ttl(art: &mut OxidArt, key: SharedByte) -> Frame {
-    match art.get_ttl(key) {
+pub(crate) fn cmd_ttl(art: &mut OxidArt, key: &[u8]) -> Frame {
+    match art.get_ttl(SharedByte::from_slice(key)) {
         TtlResult::KeyNotExist => Frame::Integer(-2),
         TtlResult::KeyWithoutTtl => Frame::Integer(-1),
         TtlResult::KeyWithTtl(secs) => Frame::Integer(secs as i64),
     }
 }
 
-pub(crate) fn cmd_pttl(art: &mut OxidArt, key: SharedByte) -> Frame {
-    match art.get_ttl(key) {
+pub(crate) fn cmd_pttl(art: &mut OxidArt, key: &[u8]) -> Frame {
+    match art.get_ttl(SharedByte::from_slice(key)) {
         TtlResult::KeyNotExist => Frame::Integer(-2),
         TtlResult::KeyWithoutTtl => Frame::Integer(-1),
         TtlResult::KeyWithTtl(secs) => Frame::Integer((secs * 1000) as i64),
     }
 }
 
-pub(crate) fn cmd_expire(art: &mut OxidArt, key: SharedByte, dur: Duration) -> Frame {
-    if art.expire(key, dur) { Frame::Integer(1) } else { Frame::Integer(0) }
+pub(crate) fn cmd_expire(art: &mut OxidArt, key: &[u8], dur: Duration) -> Frame {
+    if art.expire(SharedByte::from_slice(key), dur) { Frame::Integer(1) } else { Frame::Integer(0) }
 }
 
-pub(crate) fn cmd_persist(art: &mut OxidArt, key: SharedByte) -> Frame {
-    if art.persist(key) { Frame::Integer(1) } else { Frame::Integer(0) }
+pub(crate) fn cmd_persist(art: &mut OxidArt, key: &[u8]) -> Frame {
+    if art.persist(SharedByte::from_slice(key)) { Frame::Integer(1) } else { Frame::Integer(0) }
 }
 
-pub(crate) fn cmd_exists(art: &mut OxidArt, keys: &[SharedByte]) -> Frame {
+pub(crate) fn cmd_exists(art: &mut OxidArt, keys: &[&[u8]]) -> Frame {
     let mut count = 0i64;
     for key in keys {
         if art.get(key).is_some() {
@@ -118,7 +114,7 @@ pub(crate) fn cmd_exists(art: &mut OxidArt, keys: &[SharedByte]) -> Frame {
     Frame::Integer(count)
 }
 
-pub(crate) fn cmd_mget(art: &mut OxidArt, keys: &[SharedByte]) -> Frame {
+pub(crate) fn cmd_mget(art: &mut OxidArt, keys: &[&[u8]]) -> Frame {
     let results: Vec<Frame> = keys
         .iter()
         .map(|key| match art.get(key) {
@@ -132,15 +128,15 @@ pub(crate) fn cmd_mget(art: &mut OxidArt, keys: &[SharedByte]) -> Frame {
     Frame::Array(results)
 }
 
-pub(crate) fn cmd_mset(art: &mut OxidArt, pairs: &[(SharedByte, SharedByte)]) -> Frame {
+pub(crate) fn cmd_mset(art: &mut OxidArt, pairs: &[(&[u8], SharedByte)]) -> Frame {
     for (k, v) in pairs {
-        art.set(k.clone(), Value::String(v.clone()));
+        art.set(SharedByte::from_slice(k), Value::String(v.clone()));
     }
     Frame::SimpleString(SharedByte::from_slice(b"OK"))
 }
 
-pub(crate) fn cmd_type(art: &mut OxidArt, key: SharedByte) -> Frame {
-    match art.get(&key) {
+pub(crate) fn cmd_type(art: &mut OxidArt, key: &[u8]) -> Frame {
+    match art.get(key) {
         Some(val) => {
             Frame::SimpleString(SharedByte::from_slice(val.redis_type().as_str().as_bytes()))
         }

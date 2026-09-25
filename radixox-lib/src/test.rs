@@ -439,15 +439,17 @@ fn cmd_subscribe_multi() {
 
 #[test]
 fn cmd_invalid_returns_none() {
+    // RESP incomplet/malformé : None (attend plus d'octets, ne peut pas avancer le curseur).
     assert!(Cmd::from_slice(b"").is_none());
     assert!(Cmd::from_slice(b"PING\r\n").is_none()); // pas un array RESP
-    // SET sans valeur
-    let r = resp(&[b"SET", b"k"]);
-    assert!(Cmd::from_slice(&r).is_none());
-    // HSET avec nombre de champs impair
-    let r = resp(&[b"HSET", b"h", b"f1"]);
-    assert!(Cmd::from_slice(&r).is_none());
-    // Commande inconnue
-    let r = resp(&[b"FOOBAR"]);
-    assert!(Cmd::from_slice(&r).is_none());
+
+    // RESP syntaxiquement complet mais commande non reconnue/arité invalide :
+    // Some(Cmd::Unknown) — le curseur doit avancer (répond ERR) sinon la
+    // connexion reste bloquée à vie sur une commande qui ne deviendra jamais valide.
+    let r = resp(&[b"SET", b"k"]); // SET sans valeur
+    assert!(matches!(Cmd::from_slice(&r), Some(Cmd::Unknown)));
+    let r = resp(&[b"HSET", b"h", b"f1"]); // nombre de champs impair
+    assert!(matches!(Cmd::from_slice(&r), Some(Cmd::Unknown)));
+    let r = resp(&[b"FOOBAR"]); // commande inconnue
+    assert!(matches!(Cmd::from_slice(&r), Some(Cmd::Unknown)));
 }

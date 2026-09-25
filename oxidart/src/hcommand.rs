@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use radixox_lib::shared_byte::SharedByte;
+use radixox_lib::{shared_byte::SharedByte, small_vec::SmallVec};
 
 use crate::{
     OxidArt,
@@ -12,13 +12,13 @@ const THRESHOLD: usize = 16;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum InnerHCommand {
-    Small(Vec<(SharedByte, SharedByte)>),
+    Small(SmallVec<2, (SharedByte, SharedByte)>),
     Large(HashMap<SharedByte, SharedByte>),
 }
 
 impl InnerHCommand {
     pub(crate) fn new() -> Self {
-        InnerHCommand::Small(Vec::new())
+        InnerHCommand::Small(SmallVec::new())
     }
 
     /// Insert or update a field. Returns true if newly inserted, false if updated.
@@ -31,20 +31,24 @@ impl InnerHCommand {
                         return false;
                     }
                 }
-                if vec.len() >= THRESHOLD {
+                let len = vec.len();
+
+                if len >= THRESHOLD {
                     // Promote: build BTreeMap from existing entries + new one in one pass.
-                    let mut map = HashMap::new();
-                    for (k, v) in vec.drain(..) {
+                    let map =
+                        InnerHCommand::Large(HashMap::with_capacity(THRESHOLD + THRESHOLD >> 1));
+                    let InnerHCommand::Small(old_vec) = std::mem::replace(self, map) else {
+                        unreachable!()
+                    };
+                    let InnerHCommand::Large(map) = self else {
+                        unreachable!()
+                    };
+
+                    for (k, v) in old_vec.into_iter() {
                         map.insert(k, v);
                     }
                     map.insert(field, value);
-                    *self = InnerHCommand::Large(map);
                 } else {
-                    // Avoid Vec's default MIN_NON_ZERO_CAP=4 growth: allocate exactly 1 slot.
-                    // For small hashes (YCSB: 1 field), this saves ~144 bytes per hash × 5M = ~720 MB.
-                    if vec.len() == vec.capacity() {
-                        vec.reserve_exact(1);
-                    }
                     vec.push((field, value));
                 }
                 true
@@ -102,7 +106,7 @@ impl InnerHCommand {
         match self {
             InnerHCommand::Small(v) => {
                 let pos = v.iter().position(|(k, _)| k == &field)?;
-                Some(v.swap_remove(pos).1)
+                Some(v.remove_swap(pos).1)
             }
             InnerHCommand::Large(m) => m.remove(&field),
         }
@@ -117,7 +121,7 @@ impl InnerHCommand {
         match self {
             InnerHCommand::Small(v) => {
                 let mut result = Vec::with_capacity(v.len() * 2);
-                for (k, val) in v {
+                for (k, val) in v.as_ref() {
                     result.push(k.clone());
                     result.push(val.clone());
                 }

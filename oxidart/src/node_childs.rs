@@ -1,13 +1,13 @@
 use std::cell::RefCell;
 
-use arrayvec::ArrayVec;
 use hislab::HiSlab;
+use radixox_lib::small_vec::SmallVec;
 
 pub(crate) const CHILDS_SIZE: usize = 6;
 const ASCII_MAX_CHAR: usize = 127;
 const EXA_DIGIT_COUNT: usize = 16;
 const LIGHT_OVERFLOW_SIZE: usize = EXA_DIGIT_COUNT - CHILDS_SIZE; // 10
-const HUGE_OVERFLOW_CAPACITY: usize = ASCII_MAX_CHAR - CHILDS_SIZE; // 121
+const HUGE_OVERFLOW_CAPACITY: usize = ASCII_MAX_CHAR - LIGHT_OVERFLOW_SIZE; // 111
 
 // ── Childs ───────────────────────────────────────────────────────────────────
 
@@ -106,14 +106,13 @@ struct HugeChildRegistry {
 }
 
 #[repr(align(64))]
-#[derive(Default)]
 pub(crate) struct HugeOverflow {
-    entries: ArrayVec<HugeChildRegistry, HUGE_OVERFLOW_CAPACITY>,
+    entries: SmallVec<HUGE_OVERFLOW_CAPACITY, HugeChildRegistry>,
 }
 
 impl HugeOverflow {
     fn new(radix: u8, idx: u32) -> Self {
-        let mut entries = ArrayVec::new_const();
+        let mut entries = SmallVec::new();
         entries.push(HugeChildRegistry { radix, idx });
         Self { entries }
     }
@@ -133,7 +132,7 @@ impl ChildAble for HugeOverflow {
 
     fn remove(&mut self, radix: u8) -> Option<u32> {
         let pos = self.entries.iter().position(|e| e.radix == radix)?;
-        Some(self.entries.swap_remove(pos).idx)
+        Some(self.entries.remove_swap(pos).idx)
     }
 
     fn is_empty(&self) -> bool {

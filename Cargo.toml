@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["radixox", "oxidart", "radixox-lib"]
+members = ["radixox", "oxidart", "radixox-lib", "valart"]
 
 [workspace.package]
 version = "0.5.0"

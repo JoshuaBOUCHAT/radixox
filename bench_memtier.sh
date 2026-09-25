@@ -15,13 +15,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PORT=6379
 
 # Keyspace et timing
-KEY_MAX="${KEY_MAX:-500000}"
-TEST_TIME="${TEST_TIME:-60}"       # secondes par phase benchmarkée
-LOAD_TIME="${LOAD_TIME:-20}"       # secondes pour la phase de load
+KEY_MAX="${KEY_MAX:-50000000}"
+TEST_TIME="${TEST_TIME:-30}"       # secondes par phase benchmarkée
+LOAD_TIME="${LOAD_TIME:-15}"       # secondes pour la phase de load
 
 # memtier : 4 threads × 20 clients = 80 connexions
 MT_THREADS="${MT_THREADS:-4}"
 MT_CLIENTS="${MT_CLIENTS:-20}"
+MT_PIPELINE="${MT_PIPELINE:-1}"
 
 RADIXOX_BIN="$SCRIPT_DIR/target/release/radixox"
 VALKEY_IO_THREADS="${VALKEY_IO_THREADS:-1}"
@@ -111,6 +112,7 @@ run_load() {
     --test-time="$LOAD_TIME" \
     --print-percentiles=50,99,99.9,99.99 \
     --hide-histogram \
+    --pipeline "$MT_PIPELINE"\
     > "$outfile" 2>&1
 }
 
@@ -130,6 +132,7 @@ run_caching() {
     --test-time="$TEST_TIME" \
     --print-percentiles=50,99,99.9,99.99 \
     --hide-histogram \
+     --pipeline "$MT_PIPELINE"\
     > "$outfile" 2>&1
 }
 
@@ -150,6 +153,7 @@ run_session() {
     --test-time="$TEST_TIME" \
     --print-percentiles=50,99,99.9,99.99 \
     --hide-histogram \
+    --pipeline "$MT_PIPELINE"\
     > "$outfile" 2>&1
 }
 

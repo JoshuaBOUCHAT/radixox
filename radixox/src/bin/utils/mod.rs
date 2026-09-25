@@ -5,7 +5,11 @@ use std::{
     task::{Poll, Waker},
 };
 
-use monoio::{io::AsyncWriteRentExt, net::tcp::TcpOwnedWriteHalf};
+use monoio::{
+    buf::SliceMut,
+    io::{AsyncReadRent, AsyncWriteRentExt},
+    net::tcp::{TcpOwnedReadHalf, TcpOwnedWriteHalf},
+};
 use radixox_lib::{
     gen_arena::{GenArena, Key},
     shared_byte::SharedByte,
@@ -345,6 +349,77 @@ impl ConnState {
         };
         *self = state;
         Ok(())
+    }
+    pub(crate) fn encode(&mut self, frame: Frame) {
+        let Self::Normal(_, buf) = self else {
+            unreachable!()
+        };
+        extend_encode(buf, &frame);
+    }
+    pub(crate) async fn flush(&mut self) -> IOResult<()> {
+        if let Self::Normal(_, buffer) = self
+            && !buffer.is_empty()
+        {
+            let state = self.take();
+            let Self::Normal(mut write, buf) = state else {
+                unreachable!()
+            };
+            let (res, mut buf) = write.write_all(buf).await;
+            buf.clear();
+            let _ = std::mem::replace(self, Self::Normal(write, buf));
+            res?;
+        }
+        Ok(())
+    }
+
+    /// Flush les réponses en attente et lit la prochaine requête en parallèle
+    /// (deux SQEs dans le même batch io_uring en mode Normal non-vide).
+    pub(crate) async fn read_and_flush(
+        &mut self,
+        io_buf: SliceMut<Vec<u8>>,
+        registry: &Rc<RefCell<SubRegistry>>,
+        read: &mut TcpOwnedReadHalf,
+    ) -> IOResult<(usize, SliceMut<Vec<u8>>)> {
+        match self {
+            Self::Normal(_, buf) if !buf.is_empty() => {
+                let Self::Normal(mut write, write_buf) = self.take() else {
+                    unreachable!()
+                };
+                let ((write_res, mut write_buf), read_res) =
+                    monoio::join!(write.write_all(write_buf), read.read(io_buf));
+                write_buf.clear();
+                *self = Self::Normal(write, write_buf);
+                write_res?;
+                let (n, returned) = read_res;
+                Ok((n?, returned))
+            }
+            Self::Normal(_, _) => {
+                let (res, returned) = read.read(io_buf).await;
+                Ok((res?, returned))
+            }
+            Self::PubSub(sub_id) => {
+                let cancelation = registry
+                    .borrow_mut()
+                    .get(*sub_id)
+                    .expect("can't get cancelation")
+                    .cancelation
+                    .clone();
+
+                let (res, returned) = monoio::select! {
+                    err_msg = cancelation => {
+                        let err = std::io::Error::new(
+                            std::io::ErrorKind::ConnectionAborted,
+                            String::from_utf8_lossy(&err_msg)
+                        );
+                        return Err(err);
+                    }
+                    res_tuple = read.read(io_buf) => res_tuple
+                };
+                Ok((res?, returned))
+            }
+            Self::Blocking => todo!(),
+            Self::None => panic!("read_and_flush called on None ConnState"),
+        }
     }
 
     async fn handle_pubsub_write(

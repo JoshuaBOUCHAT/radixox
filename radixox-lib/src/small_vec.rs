@@ -29,6 +29,24 @@ impl<const S: usize, T> SmallVec<S, T> {
             data: SmallVecData::new(),
         }
     }
+    pub fn with_capacity(cap: usize) -> Self {
+        if cap <= S {
+            return Self::new();
+        }
+        let layout = Layout::array::<T>(cap).unwrap();
+        let ptr = unsafe {
+            let ptr = alloc(layout);
+            if ptr.is_null() {
+                panic!("alloc failed");
+            }
+            NonNull::new_unchecked(ptr as *mut T)
+        };
+        Self {
+            size: cap as u32,
+            len: 0,
+            data: SmallVecData { ptr },
+        }
+    }
     pub fn push(&mut self, item: T) {
         if self.is_inline() {
             if self.size > self.len {
@@ -85,6 +103,25 @@ impl<const S: usize, T> SmallVec<S, T> {
         self.data.ptr = ptr;
         self.size = new_size;
     }
+    pub fn pop(&mut self) -> Option<T> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        Some(unsafe { self.get_ptr().add(self.len as usize).read() })
+    }
+    pub fn remove_swap(&mut self, index: usize) -> T {
+        assert!(index < self.len as usize);
+        self.len -= 1;
+        let ptr = unsafe { self.get_ptr() };
+        unsafe {
+            let removed = ptr.add(index).read();
+            if index < self.len as usize {
+                ptr.add(index).write(ptr.add(self.len as usize).read());
+            }
+            removed
+        }
+    }
     unsafe fn get_ptr(&mut self) -> NonNull<T> {
         unsafe {
             if self.is_heap() {
@@ -112,6 +149,17 @@ impl<const S: usize, T> Deref for SmallVec<S, T> {
                 std::slice::from_raw_parts(self.data.ptr.as_ptr(), self.len as usize)
             } else {
                 std::slice::from_raw_parts(self.data.inline.as_ptr(), self.len as usize)
+            }
+        }
+    }
+}
+impl<const S: usize, T> std::ops::DerefMut for SmallVec<S, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe {
+            if self.is_heap() {
+                std::slice::from_raw_parts_mut(self.data.ptr.as_ptr(), self.len as usize)
+            } else {
+                std::slice::from_raw_parts_mut((*self.data.inline).as_mut_ptr(), self.len as usize)
             }
         }
     }
@@ -200,7 +248,25 @@ macro_rules! impl_into_shareds {
         }
     };
 }
-
+impl<const S: usize, T: std::fmt::Debug> std::fmt::Debug for SmallVec<S, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+impl<const S: usize, T: PartialEq> PartialEq for SmallVec<S, T> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+impl<const S: usize, T: Clone> Clone for SmallVec<S, T> {
+    fn clone(&self) -> Self {
+        let mut new_vec = Self::with_capacity(self.len as usize);
+        for item in self.iter() {
+            new_vec.push(item.clone());
+        }
+        new_vec
+    }
+}
 impl_into_shareds!(OwnedByte, SharedByte);
 impl_into_shareds!((OwnedByte, OwnedByte), (SharedByte, SharedByte));
 impl_into_shareds!((f64, OwnedByte), (f64, SharedByte));

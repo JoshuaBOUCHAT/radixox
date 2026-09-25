@@ -3,8 +3,8 @@ use oxidart::error::TypeError;
 use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::shared_frame::SharedFrame as Frame;
 
-pub fn cmd_hset(art: &mut OxidArt, key: SharedByte, fields: &[(SharedByte, SharedByte)]) -> Frame {
-    match art.cmd_hset(&key, fields, None) {
+pub fn cmd_hset(art: &mut OxidArt, key: &[u8], fields: &[(SharedByte, SharedByte)]) -> Frame {
+    match art.cmd_hset(key, fields, None) {
         Ok(added) => Frame::Integer(added as i64),
         Err(TypeError::ValueNotSet) => {
             Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
@@ -13,8 +13,8 @@ pub fn cmd_hset(art: &mut OxidArt, key: SharedByte, fields: &[(SharedByte, Share
     }
 }
 
-pub fn cmd_hget(art: &mut OxidArt, key: SharedByte, field: SharedByte) -> Frame {
-    match art.cmd_hget(&key, &field) {
+pub fn cmd_hget(art: &mut OxidArt, key: &[u8], field: &[u8]) -> Frame {
+    match art.cmd_hget(key, field) {
         Ok(Some(val)) => Frame::BulkString(val),
         Ok(None) => Frame::Null,
         Err(_) => {
@@ -23,8 +23,8 @@ pub fn cmd_hget(art: &mut OxidArt, key: SharedByte, field: SharedByte) -> Frame 
     }
 }
 
-pub fn cmd_hgetall(art: &mut OxidArt, key: SharedByte) -> Frame {
-    match art.cmd_hgetall(&key) {
+pub fn cmd_hgetall(art: &mut OxidArt, key: &[u8]) -> Frame {
+    match art.cmd_hgetall(key) {
         Ok(fields) => Frame::Array(fields.into_iter().map(Frame::BulkString).collect()),
         Err(_) => {
             Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
@@ -32,8 +32,8 @@ pub fn cmd_hgetall(art: &mut OxidArt, key: SharedByte) -> Frame {
     }
 }
 
-pub fn cmd_hdel(art: &mut OxidArt, key: SharedByte, fields: &[SharedByte]) -> Frame {
-    match art.cmd_hdel(&key, fields) {
+pub fn cmd_hdel(art: &mut OxidArt, key: &[u8], fields: &[SharedByte]) -> Frame {
+    match art.cmd_hdel(key, fields) {
         Ok(count) => Frame::Integer(count as i64),
         Err(_) => {
             Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
@@ -41,8 +41,8 @@ pub fn cmd_hdel(art: &mut OxidArt, key: SharedByte, fields: &[SharedByte]) -> Fr
     }
 }
 
-pub fn cmd_hexists(art: &mut OxidArt, key: SharedByte, field: SharedByte) -> Frame {
-    match art.cmd_hexists(&key, &field) {
+pub fn cmd_hexists(art: &mut OxidArt, key: &[u8], field: &[u8]) -> Frame {
+    match art.cmd_hexists(key, field) {
         Ok(exists) => Frame::Integer(if exists { 1 } else { 0 }),
         Err(_) => {
             Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
@@ -50,8 +50,8 @@ pub fn cmd_hexists(art: &mut OxidArt, key: SharedByte, field: SharedByte) -> Fra
     }
 }
 
-pub fn cmd_hlen(art: &mut OxidArt, key: SharedByte) -> Frame {
-    match art.cmd_hlen(&key) {
+pub fn cmd_hlen(art: &mut OxidArt, key: &[u8]) -> Frame {
+    match art.cmd_hlen(key) {
         Ok(len) => Frame::Integer(len as i64),
         Err(_) => {
             Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
@@ -59,8 +59,8 @@ pub fn cmd_hlen(art: &mut OxidArt, key: SharedByte) -> Frame {
     }
 }
 
-pub fn cmd_hkeys(art: &mut OxidArt, key: SharedByte) -> Frame {
-    match art.cmd_hkeys(&key) {
+pub fn cmd_hkeys(art: &mut OxidArt, key: &[u8]) -> Frame {
+    match art.cmd_hkeys(key) {
         Ok(keys) => Frame::Array(keys.into_iter().map(Frame::BulkString).collect()),
         Err(_) => {
             Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
@@ -68,8 +68,8 @@ pub fn cmd_hkeys(art: &mut OxidArt, key: SharedByte) -> Frame {
     }
 }
 
-pub fn cmd_hvals(art: &mut OxidArt, key: SharedByte) -> Frame {
-    match art.cmd_hvals(&key) {
+pub fn cmd_hvals(art: &mut OxidArt, key: &[u8]) -> Frame {
+    match art.cmd_hvals(key) {
         Ok(vals) => Frame::Array(vals.into_iter().map(Frame::BulkString).collect()),
         Err(_) => {
             Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
@@ -77,8 +77,8 @@ pub fn cmd_hvals(art: &mut OxidArt, key: SharedByte) -> Frame {
     }
 }
 
-pub fn cmd_hmget(art: &mut OxidArt, key: SharedByte, fields: &[SharedByte]) -> Frame {
-    match art.cmd_hmget(&key, fields) {
+pub fn cmd_hmget(art: &mut OxidArt, key: &[u8], fields: &[SharedByte]) -> Frame {
+    match art.cmd_hmget(key, fields) {
         Ok(values) => Frame::Array(
             values
                 .into_iter()
@@ -94,8 +94,8 @@ pub fn cmd_hmget(art: &mut OxidArt, key: SharedByte, fields: &[SharedByte]) -> F
     }
 }
 
-pub fn cmd_hincrby(art: &mut OxidArt, key: SharedByte, field: SharedByte, delta: i64) -> Frame {
-    match art.cmd_hincrby(&key, field, delta) {
+pub fn cmd_hincrby(art: &mut OxidArt, key: &[u8], field: SharedByte, delta: i64) -> Frame {
+    match art.cmd_hincrby(key, field, delta) {
         Ok(new_val) => Frame::Integer(new_val),
         Err(_) => {
             Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())

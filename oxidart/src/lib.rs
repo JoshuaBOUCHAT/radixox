@@ -44,7 +44,7 @@
 //! Keys must be valid ASCII bytes. Non-ASCII keys will trigger a debug assertion.
 
 pub mod async_command;
-mod compact_str;
+pub mod compact_str;
 pub mod error;
 
 pub mod hcommand;
@@ -66,6 +66,8 @@ mod test;
 
 #[cfg(test)]
 mod test_structures;
+
+use std::mem::ManuallyDrop;
 
 use hislab::TaggedHiSlab;
 use radixox_lib::shared_byte::SharedByte;
@@ -730,6 +732,40 @@ impl OxidArt {
         self.set_internal(key, expires_at, val);
     }
 
+    /// Inserts or updates a key-value pair, conditioned on prior existence, in a
+    /// single tree traversal (no separate lookup + insert).
+    ///
+    /// * `if_exists = None` — always set (like [`OxidArt::set`] / [`OxidArt::set_ttl`]).
+    /// * `if_exists = Some(true)` — set only if the key already exists (XX semantics).
+    /// * `if_exists = Some(false)` — set only if the key does not already exist (NX semantics).
+    ///
+    /// Returns `true` if the value was written.
+    pub fn set_cond(
+        &mut self,
+        key: &[u8],
+        ttl: Option<std::time::Duration>,
+        val: Value,
+        if_exists: Option<bool>,
+    ) -> bool {
+        debug_assert!(key.is_ascii(), "key must be ASCII");
+        let idx = self.ensure_key(key);
+
+        if let Some(want_exists) = if_exists {
+            let node = self.get_node(idx);
+            let exists = node.has_val() && !node.is_expired(self.now);
+            if exists != want_exists {
+                return false;
+            }
+        }
+
+        let exp = match ttl {
+            Some(d) => self.now.saturating_add(d.as_secs()),
+            None => ExpAndRadix::NO_EXPIRACY,
+        };
+        self.get_node_mut(idx).set_val(val, exp);
+        true
+    }
+
     fn set_internal(&mut self, key: SharedByte, ttl: u64, val: Value) {
         debug_assert!(key.is_ascii(), "key must be ASCII");
         let key_len = key.len();
@@ -810,6 +846,12 @@ impl OxidArt {
         let old_radix = old_compression[common_len];
         // Check if old value had a TTL (needs to stay tagged)
         let old_had_ttl = old_exp.does_expire();
+        // old_child is reachable from idx via old_radix — use old_radix as parent_radix,
+        // not the original node's parent_radix (which was the radix to reach idx from its parent).
+        let old_exp_for_child = match old_exp.exp() {
+            Some(exp) => ExpAndRadix::new(exp, old_radix),
+            None => ExpAndRadix::no_expiracy(old_radix),
+        };
         let old_child = Node {
             overflow_idx: old_overflow_idx,
             compression: CompactStr::from_slice(&old_compression[common_len + 1..]),
@@ -817,7 +859,7 @@ impl OxidArt {
             val: old_val_bits,
             childs: old_childs,
             parent_idx: idx,
-            exp_and_radix: old_exp,
+            exp_and_radix: old_exp_for_child,
         };
         let old_child_idx = if old_had_ttl {
             self.insert_tagged(old_child)
@@ -826,6 +868,25 @@ impl OxidArt {
         };
 
         self.push_child_idx(idx, old_child_idx, old_radix);
+
+        // Fix parent pointers: children in old_childs still have parent_idx = idx (pre-split).
+        // They must now point to old_child_idx.
+        let child_indices: Vec<u32> = self
+            .get_node(old_child_idx)
+            .childs
+            .iter()
+            .map(|(_, i)| i)
+            .collect();
+        let ov_idx = self.get_node(old_child_idx).get_overflow_idx();
+        let overflow_children: Vec<u32> = ov_idx
+            .and_then(|ov| self.overflow_arena.get(ov))
+            .map(|ov| ov.iter().map(|(_, i)| i).collect())
+            .unwrap_or_default();
+        for child_idx in child_indices.into_iter().chain(overflow_children) {
+            if let Some(child) = self.map.get_mut(child_idx) {
+                child.parent_idx = old_child_idx;
+            }
+        }
 
         // If the value doesn't go on the intermediate node, create a new leaf
         if !val_on_intermediate {
@@ -876,7 +937,8 @@ impl OxidArt {
                 .push(radix, inserted_idx),
             (true, None) => {
                 let new_overflow_idx = self.alloc_overflow_with_first(radix, inserted_idx);
-                self.get_node_mut(parent_idx).set_overflow_idx(new_overflow_idx);
+                self.get_node_mut(parent_idx)
+                    .set_overflow_idx(new_overflow_idx);
             }
             (true, Some(oi)) => {
                 self.overflow_arena
@@ -1172,10 +1234,15 @@ impl OxidArt {
         // Merge: parent absorbs child's compression, val, exp, childs, overflow.
         // `child` is still in scope so &child.compression is valid.
         let child_overflow_idx = child.overflow_idx;
+        let child_exp = child.exp_and_radix.exp();
         let node = self.get_node_mut(node_idx);
         node.compression
             .append_and_replace(child_radix, &child.compression);
-        node.exp_and_radix = child.exp_and_radix;
+        // Transfer only the expiry from child, preserving node's parent_radix bits.
+        match child_exp {
+            Some(exp) => node.exp_and_radix.set_exp(exp),
+            None => node.exp_and_radix.set_no_expiracy(),
+        }
         std::mem::swap(&mut node.childs, &mut child.childs);
         node.overflow_idx = child_overflow_idx;
 
@@ -1245,27 +1312,41 @@ struct Node {
     parent_idx: u32,
 }
 
+struct ValNode {
+    compression: CompactStr,
+    parent_idx: u32,
+    childs: u32,
+    exp_and_radix: ExpAndRadix,
+    value: Option<SharedByte>,
+    data: NodeData,
+}
+union NodeData {
+    hash: ManuallyDrop<[(ExpAndRadix, SharedByte, SharedByte); 4]>,
+    set: ManuallyDrop<[(ExpAndRadix, SharedByte); 6]>,
+    childs: ([u32; 18], [u8; 18], u32),
+}
+
 impl Drop for Node {
     fn drop(&mut self) {
         unsafe { drop_raw(self.tag, &mut self.val) };
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 #[repr(transparent)]
-struct ExpAndRadix {
+pub struct ExpAndRadix {
     inner: u64,
 }
 impl ExpAndRadix {
     const NO_EXPIRACY: u64 = 0x00FFFFFFFFFFFFFF;
     const RADIX_MASK: u64 = !Self::NO_EXPIRACY;
     const EXP_LENGTH: u64 = 56;
-    const fn no_expiracy(parent_radix: u8) -> Self {
+    pub const fn no_expiracy(parent_radix: u8) -> Self {
         Self {
             inner: ((parent_radix as u64) << 56) | Self::NO_EXPIRACY,
         }
     }
-    fn exp(self) -> Option<u64> {
+    pub fn exp(self) -> Option<u64> {
         let exp = self.inner & Self::NO_EXPIRACY;
         if exp == Self::NO_EXPIRACY {
             None
@@ -1273,22 +1354,22 @@ impl ExpAndRadix {
             Some(exp)
         }
     }
-    fn parent_radix(self) -> u8 {
+    pub fn parent_radix(self) -> u8 {
         ((self.inner & Self::RADIX_MASK) >> Self::EXP_LENGTH) as u8
     }
-    fn does_expire(self) -> bool {
+    pub fn does_expire(self) -> bool {
         self.inner & Self::NO_EXPIRACY != Self::NO_EXPIRACY
     }
     ///this function panic if the 8 upper bit of the ttl provide is not at 0 because the niche is needed to store radix
-    fn set_exp(&mut self, exp: u64) {
+    pub fn set_exp(&mut self, exp: u64) {
         assert!(exp & Self::RADIX_MASK == 0);
         self.inner = self.inner & Self::RADIX_MASK | exp
     }
-    fn set_no_expiracy(&mut self) {
+    pub fn set_no_expiracy(&mut self) {
         self.inner |= Self::NO_EXPIRACY;
     }
     ///this function panic if the 8 upper bit of the ttl provide is not at 0 because the niche is needed to store radix
-    fn new(exp: u64, parent_radix: u8) -> Self {
+    pub fn new(exp: u64, parent_radix: u8) -> Self {
         assert!(exp & Self::RADIX_MASK == 0);
         Self {
             inner: ((parent_radix as u64) << Self::EXP_LENGTH) | exp,

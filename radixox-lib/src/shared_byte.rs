@@ -1,14 +1,15 @@
 use mimalloc::MiMalloc;
 use std::alloc::{GlobalAlloc, Layout};
 use std::borrow::Borrow;
-use std::marker::PhantomData;
+
 use std::ops::Deref;
 use std::ptr::NonNull;
+
+use crate::prefetch::{PreFetch, PreFetchPtr};
 
 #[repr(transparent)]
 pub struct SharedByte {
     ptr: NonNull<u8>,
-    _not_send: PhantomData<*mut u8>,
 }
 
 impl SharedByte {
@@ -35,7 +36,7 @@ impl SharedByte {
 
         unsafe {
             let total = Self::HEADER_SIZE + data.len();
-            let layout = Layout::from_size_align(total, 4).unwrap();
+            let layout = Layout::from_size_align(total, 8).unwrap();
             let ptr = MiMalloc.alloc(layout);
             assert!(!ptr.is_null());
 
@@ -48,7 +49,6 @@ impl SharedByte {
 
             Self {
                 ptr: NonNull::new_unchecked(ptr),
-                _not_send: PhantomData {},
             }
         }
     }
@@ -96,7 +96,7 @@ impl SharedByte {
                 }
             }
         } else {
-            let layout = Layout::from_size_align(Self::HEADER_SIZE + len, 4).unwrap();
+            let layout = Layout::from_size_align(Self::HEADER_SIZE + len, 8).unwrap();
             unsafe {
                 let new_ptr = MiMalloc.alloc(layout);
                 assert!(!new_ptr.is_null());
@@ -123,10 +123,7 @@ impl Clone for SharedByte {
             *rc += 1;
         }
 
-        Self {
-            ptr: self.ptr,
-            _not_send: PhantomData {},
-        }
+        Self { ptr: self.ptr }
     }
 }
 
@@ -138,7 +135,7 @@ impl Drop for SharedByte {
             *rc -= 1;
             if *rc == 0 {
                 let total = Self::HEADER_SIZE + self.len();
-                let layout = Layout::from_size_align(total, 4).unwrap();
+                let layout = Layout::from_size_align(total, 8).unwrap();
                 MiMalloc.dealloc(self.ptr.as_ptr(), layout);
             }
         }
@@ -187,6 +184,14 @@ impl Ord for SharedByte {
 impl Borrow<[u8]> for SharedByte {
     fn borrow(&self) -> &[u8] {
         self
+    }
+}
+impl PreFetch for SharedByte {
+    fn prefetch(&self)
+    where
+        Self: Sized,
+    {
+        self.ptr.ptr_prefetch();
     }
 }
 

@@ -1,6 +1,18 @@
 #!/bin/bash
 set -euo pipefail
 
+# Usage:
+#   ./bench_compare.sh                    # RadixOx vs Valkey (starts/stops both, as before)
+#   ./bench_compare.sh --running [label]  # bench whatever server is ALREADY running on $PORT
+#                                          # (any Redis-compatible service). Does not start or
+#                                          # kill anything. label defaults to "Service".
+MODE="compare"
+RUNNING_LABEL="Service"
+if [ "${1:-}" = "--running" ]; then
+  MODE="running"
+  RUNNING_LABEL="${2:-Service}"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 YCSB_DIR="$(cd "$SCRIPT_DIR/../ycsb-redis-binding-0.18.0-SNAPSHOT" && pwd)"
 WORKLOAD="workloads/workloada"
@@ -33,7 +45,7 @@ cleanup() {
       tail -30 "$CURRENT_LOG"
     fi
   fi
-  kill_port 2>/dev/null || true
+  [ "$MODE" = "running" ] || kill_port 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -113,6 +125,74 @@ parse_inline_pct() {
   grep -oP "\[$op:[^\]]*\]" "$file" 2>/dev/null | tail -1 |
     grep -oP "${pct}=\K[0-9]+" || true
 }
+
+# ============================================
+# Mode: bench whatever is already running on $PORT
+# ============================================
+if [ "$MODE" = "running" ]; then
+  echo "═══════════════════════════════════════════════════"
+  echo "  YCSB Benchmark: $RUNNING_LABEL (already running on :$PORT)"
+  echo "  Workload A: 50% read / 50% update"
+  echo "  Records: $RECORDS | Ops: $OPS | Threads: $THREADS"
+  echo "  Field length: $FIELDLENGTH bytes"
+  echo "═══════════════════════════════════════════════════"
+  echo ""
+
+  wait_for_server
+
+  SVC_PID=$(ss -tlnp "sport = :$PORT" 2>/dev/null | grep -oP '(?<=pid=)\d+' | head -1 || true)
+
+  echo "[1/2] Loading $RECORDS records..."
+  CURRENT_LOG=/tmp/service_load.txt
+  run_ycsb load /tmp/service_load.txt
+  SVC_LOAD_OPS=$(parse_stat /tmp/service_load.txt "Throughput(ops/sec)")
+  SVC_LOAD_P99=$(parse_stat /tmp/service_load.txt "[INSERT], 99thPercentileLatency")
+  echo "  Load: $SVC_LOAD_OPS ops/sec | P99: $SVC_LOAD_P99 µs"
+
+  echo "[2/2] Running $OPS operations..."
+  CURRENT_LOG=/tmp/service_run.txt
+  run_ycsb run /tmp/service_run.txt
+  SVC_RUN_OPS=$(parse_stat /tmp/service_run.txt "Throughput(ops/sec)")
+  SVC_READ_AVG=$(parse_stat /tmp/service_run.txt "[READ], AverageLatency")
+  SVC_READ_P95=$(parse_stat /tmp/service_run.txt "[READ], 95thPercentileLatency")
+  SVC_READ_P99=$(parse_stat /tmp/service_run.txt "[READ], 99thPercentileLatency")
+  SVC_READ_P999=$(parse_inline_pct /tmp/service_run.txt READ 99.9)
+  SVC_READ_P9999=$(parse_inline_pct /tmp/service_run.txt READ 99.99)
+  SVC_UPDATE_P99=$(parse_stat /tmp/service_run.txt "[UPDATE], 99thPercentileLatency")
+  echo "  Run: $SVC_RUN_OPS ops/sec"
+
+  if [ -n "$SVC_PID" ]; then
+    SVC_PEAK_MB=$(peak_rss_mb "$SVC_PID")
+    echo "  Peak RSS: ${SVC_PEAK_MB} MB"
+  else
+    SVC_PEAK_MB="N/A"
+  fi
+  echo ""
+
+  echo "═══════════════════════════════════════════════════"
+  echo "  RESULTS — $RUNNING_LABEL"
+  echo "═══════════════════════════════════════════════════"
+  printf "%-28s %12s\n" "Load throughput (ops/sec)" "$SVC_LOAD_OPS"
+  printf "%-28s %12s\n" "Load P99 (µs)" "$SVC_LOAD_P99"
+  echo ""
+  printf "%-28s %12s\n" "Run throughput (ops/sec)" "$SVC_RUN_OPS"
+  printf "%-28s %12s\n" "READ avg (µs)" "$SVC_READ_AVG"
+  printf "%-28s %12s\n" "READ P95 (µs)" "$SVC_READ_P95"
+  printf "%-28s %12s\n" "READ P99 (µs)" "$SVC_READ_P99"
+  printf "%-28s %12s\n" "READ P99.9 (µs)" "$SVC_READ_P999"
+  printf "%-28s %12s\n" "READ P99.99 (µs)" "$SVC_READ_P9999"
+  printf "%-28s %12s\n" "UPDATE P99 (µs)" "$SVC_UPDATE_P99"
+  echo ""
+  printf "%-28s %12s\n" "Peak RSS (MB)" "$SVC_PEAK_MB"
+  echo ""
+  echo "Full logs: /tmp/service_{load,run}.txt"
+  echo ""
+  echo "NOTE: server left running, not stopped (it wasn't started by this script)."
+
+  CURRENT_LOG=""
+  trap - EXIT
+  exit 0
+fi
 
 # ============================================
 # Build RadixOx

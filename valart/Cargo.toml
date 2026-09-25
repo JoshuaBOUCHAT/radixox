@@ -1,0 +1,12 @@
+[package]
+name = "valart"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+radixox-lib = { workspace = true }
+oxidart = { workspace = true }
+hislab = { version = "0.2.2", features = ["rand"] }

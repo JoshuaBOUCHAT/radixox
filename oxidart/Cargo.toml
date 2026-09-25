@@ -12,11 +12,10 @@ categories = ["data-structures"]
 
 [dependencies]
 bytes.workspace = true
-arrayvec = "0.7.6"
 smallvec.workspace = true
 ordered-float = "5.1.0"
 monoio.workspace = true
-hislab = { version = "0.2.1", features = ["rand"] }
+hislab = { version = "0.2.2", features = ["rand"] }
 radixox-lib = { workspace = true }
 mimalloc = { workspace = true }
 
