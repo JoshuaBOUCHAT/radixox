@@ -18,11 +18,8 @@ const CAPACITIES: [usize; 7] = [4, 8, 16, 32, 64, 128, 256];
 const TAG_MASK: usize = 0b111;
 
 /// Le radix space fait 256 valeurs (`u8`) et l'inline du node parent en
-/// occupe déjà au moins une : l'overflow ne peut donc structurellement
-/// jamais dépasser 255 entrées, même à la classe de capacité 256. `len`
-/// tient toujours dans un `u8`.
-const HEADER_LEN_SIZE: usize = size_of::<u8>();
-
+/// occupe toujours au moins une : l'overflow ne dépasse jamais 255 entrées,
+/// `len` et `nb_childs` tiennent dans un `u8`.
 #[inline]
 const fn bitmap_len(capacity: usize) -> usize {
     capacity.div_ceil(8)
@@ -31,14 +28,6 @@ const fn bitmap_len(capacity: usize) -> usize {
 #[inline]
 const fn align_up8(n: usize) -> usize {
     (n + 7) & !7
-}
-
-/// Offset du début de la zone de données packées (key/val/idx), depuis le
-/// début du bloc alloué. Header `len` (1B) + bitmap TTL + radix, arrondi à 8
-/// pour que le premier `SharedByte` de la zone data soit correctement aligné.
-#[inline]
-const fn data_start(capacity: usize) -> usize {
-    align_up8(HEADER_LEN_SIZE + bitmap_len(capacity) + capacity)
 }
 
 // --- SetOverflow : une clé par entrée, enfants packés -----------------------
@@ -476,18 +465,31 @@ impl Drop for SetOverflow {
     }
 }
 
-// --- HashOverflow : key + val par entrée -------------------------------------
+// --- HashOverflow : clé + valeur par entrée, enfants packés -----------------
 //
-// Même schéma de bloc que `SetOverflow`. Zone data, par paire d'entrées :
-// 40 bytes :
-// [key_2i(8) | val_2i(8) | idx_2i(4) | idx_2i+1(4) | key_2i+1(8) | val_2i+1(8)]
+// Même schéma que `SetOverflow`, avec une colonne de valeurs en plus :
+//
+// [len: u8][nb_childs: u8][child_cap: u16]
+// [radix: cap][ctrl: cap][has_child: cap/8 bits][pad → 8]
+// [keys: cap × 8][vals: cap × 8][childs: child_cap × 4]
 
-const HASH_STRIDE: usize = 40;
+const HASH_HEADER: usize = 4;
+
+#[inline]
+const fn hash_keys_start(cap: usize) -> usize {
+    align_up8(HASH_HEADER + 2 * cap + bitmap_len(cap))
+}
+
+#[inline]
+const fn hash_block_size(cap: usize, child_cap: usize) -> usize {
+    hash_keys_start(cap) + cap * 16 + child_cap * 4
+}
 
 #[repr(transparent)]
 pub struct HashOverflow {
     ptr: NonNull<u8>,
 }
+
 impl PreFetch for HashOverflow {
     fn prefetch(&self) {
         self.ptr.ptr_prefetch();
@@ -521,6 +523,22 @@ impl HashOverflow {
         unsafe { self.base_ptr().write(len as u8) }
     }
 
+    /// Nombre d'entrées qui ont un enfant.
+    #[inline]
+    pub fn childs_len(&self) -> usize {
+        unsafe { self.base_ptr().add(1).read() as usize }
+    }
+
+    #[inline]
+    fn set_childs_len(&mut self, n: usize) {
+        unsafe { self.base_ptr().add(1).write(n as u8) }
+    }
+
+    #[inline]
+    pub fn child_capacity(&self) -> usize {
+        unsafe { (self.base_ptr().add(2) as *const u16).read() as usize }
+    }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -532,32 +550,33 @@ impl HashOverflow {
     }
 
     #[inline]
-    fn bitmap_ptr(&self) -> *mut u8 {
-        unsafe { self.base_ptr().add(HEADER_LEN_SIZE) }
-    }
-
-    #[inline]
-    pub fn has_ttl(&self, i: usize) -> bool {
-        debug_assert!(i < self.len());
-        unsafe { (*self.bitmap_ptr().add(i / 8) & (1 << (i % 8))) != 0 }
-    }
-
-    #[inline]
-    pub fn set_ttl(&mut self, i: usize, val: bool) {
-        unsafe {
-            let byte = self.bitmap_ptr().add(i / 8);
-            let bit = 1u8 << (i % 8);
-            if val {
-                *byte |= bit;
-            } else {
-                *byte &= !bit;
-            }
-        }
-    }
-
-    #[inline]
     fn radix_ptr(&self) -> *mut u8 {
-        unsafe { self.bitmap_ptr().add(bitmap_len(self.capacity())) }
+        unsafe { self.base_ptr().add(HASH_HEADER) }
+    }
+
+    #[inline]
+    fn ctrl_ptr(&self) -> *mut u8 {
+        unsafe { self.radix_ptr().add(self.capacity()) }
+    }
+
+    #[inline]
+    fn bitmap_ptr(&self) -> *mut u8 {
+        unsafe { self.ctrl_ptr().add(self.capacity()) }
+    }
+
+    #[inline]
+    fn keys_ptr(&self) -> *mut SharedByte {
+        unsafe { self.base_ptr().add(hash_keys_start(self.capacity())) as *mut SharedByte }
+    }
+
+    #[inline]
+    fn vals_ptr(&self) -> *mut SharedByte {
+        unsafe { self.keys_ptr().add(self.capacity()) }
+    }
+
+    #[inline]
+    fn childs_ptr(&self) -> *mut u32 {
+        unsafe { self.vals_ptr().add(self.capacity()) as *mut u32 }
     }
 
     #[inline]
@@ -567,72 +586,155 @@ impl HashOverflow {
     }
 
     #[inline]
-    fn set_radix(&mut self, i: usize, r: u8) {
-        unsafe { *self.radix_ptr().add(i) = r }
+    pub fn ctrl(&self, i: usize) -> u8 {
+        debug_assert!(i < self.len());
+        unsafe { *self.ctrl_ptr().add(i) }
     }
 
     #[inline]
-    fn data_ptr(&self) -> *mut u8 {
-        unsafe { self.base_ptr().add(data_start(self.capacity())) }
-    }
-
-    fn key_ptr(&self, i: usize) -> *mut SharedByte {
-        let pair_base = unsafe { self.data_ptr().add((i / 2) * HASH_STRIDE) };
-        let off = if i % 2 == 0 { 0 } else { 24 };
-        unsafe { pair_base.add(off) as *mut SharedByte }
-    }
-
-    fn val_ptr(&self, i: usize) -> *mut SharedByte {
-        let pair_base = unsafe { self.data_ptr().add((i / 2) * HASH_STRIDE) };
-        let off = if i % 2 == 0 { 8 } else { 32 };
-        unsafe { pair_base.add(off) as *mut SharedByte }
-    }
-
-    fn idx_ptr(&self, i: usize) -> *mut u32 {
-        let pair_base = unsafe { self.data_ptr().add((i / 2) * HASH_STRIDE) };
-        let off = if i % 2 == 0 { 16 } else { 20 };
-        unsafe { pair_base.add(off) as *mut u32 }
-    }
-
     pub fn key(&self, i: usize) -> &SharedByte {
         debug_assert!(i < self.len());
-        unsafe { &*self.key_ptr(i) }
+        unsafe { &*self.keys_ptr().add(i) }
     }
 
+    #[inline]
     pub fn val(&self, i: usize) -> &SharedByte {
         debug_assert!(i < self.len());
-        unsafe { &*self.val_ptr(i) }
+        unsafe { &*self.vals_ptr().add(i) }
     }
 
+    #[inline]
     pub fn val_mut(&mut self, i: usize) -> &mut SharedByte {
         debug_assert!(i < self.len());
-        unsafe { &mut *self.val_ptr(i) }
+        unsafe { &mut *self.vals_ptr().add(i) }
     }
 
-    pub fn idx(&self, i: usize) -> u32 {
+    #[inline]
+    pub fn has_child(&self, i: usize) -> bool {
+        unsafe { (*self.bitmap_ptr().add(i / 8) >> (i % 8)) & 1 != 0 }
+    }
+
+    #[inline]
+    fn set_has_child(&mut self, i: usize, val: bool) {
+        unsafe {
+            let byte = self.bitmap_ptr().add(i / 8);
+            if val {
+                *byte |= 1 << (i % 8);
+            } else {
+                *byte &= !(1 << (i % 8));
+            }
+        }
+    }
+
+    /// Nombre d'entrées avec enfant parmi `0..i` (voir `SetOverflow::rank`).
+    #[inline]
+    fn rank(&self, i: usize) -> usize {
+        let bm = self.bitmap_ptr();
+        let mut rank = 0;
+        let mut w = 0;
+        while (w + 1) * 64 <= i {
+            rank += unsafe { (bm.add(w * 8) as *const u64).read_unaligned() }.count_ones();
+            w += 1;
+        }
+        let rem = i - w * 64;
+        if rem > 0 {
+            let word = unsafe { (bm.add(w * 8) as *const u64).read_unaligned() };
+            rank += (word & ((1u64 << rem) - 1)).count_ones();
+        }
+        rank as usize
+    }
+
+    #[inline]
+    pub fn child(&self, i: usize) -> u32 {
         debug_assert!(i < self.len());
-        unsafe { self.idx_ptr(i).read() }
+        if !self.has_child(i) {
+            return NO_CHILD;
+        }
+        unsafe { self.childs_ptr().add(self.rank(i)).read() }
     }
 
-    pub fn set_idx(&mut self, i: usize, idx: u32) {
+    /// Pose ou efface l'enfant de l'entrée `i`. Effacer peut réduire le
+    /// tableau d'enfants (voir [`Self::shrink_if_sparse`]).
+    pub fn set_child(&mut self, i: usize, child: u32) {
+        self.set_child_no_shrink(i, child);
+        if child == NO_CHILD {
+            self.shrink_if_sparse();
+        }
+    }
+
+    /// `set_child` sans réduction : pour les opérations composées, qui
+    /// réduisent une seule fois à la fin.
+    fn set_child_no_shrink(&mut self, i: usize, child: u32) {
         debug_assert!(i < self.len());
-        unsafe { self.idx_ptr(i).write(idx) }
+        match (self.has_child(i), child != NO_CHILD) {
+            (true, true) => unsafe { self.childs_ptr().add(self.rank(i)).write(child) },
+            (true, false) => {
+                self.child_remove(self.rank(i));
+                self.set_has_child(i, false);
+            }
+            (false, true) => {
+                self.child_insert(self.rank(i), child);
+                self.set_has_child(i, true);
+            }
+            (false, false) => {}
+        }
     }
 
-    fn total_size(&self) -> usize {
-        data_start(self.capacity()) + (self.capacity() / 2) * HASH_STRIDE
+    fn child_insert(&mut self, r: usize, child: u32) {
+        let n = self.childs_len();
+        if n == self.child_capacity() {
+            let new_child_cap = (n * 2).clamp(4, self.capacity());
+            self.realloc(self.class(), new_child_cap);
+        }
+        unsafe {
+            let childs = self.childs_ptr();
+            std::ptr::copy(childs.add(r), childs.add(r + 1), n - r);
+            childs.add(r).write(child);
+        }
+        self.set_childs_len(n + 1);
     }
 
-    fn alloc_block(class: u8) -> Self {
-        let capacity = CAPACITIES[class as usize];
-        let size = data_start(capacity) + (capacity / 2) * HASH_STRIDE;
+    fn child_remove(&mut self, r: usize) -> u32 {
+        let n = self.childs_len();
+        debug_assert!(r < n);
+        unsafe {
+            let childs = self.childs_ptr();
+            let child = childs.add(r).read();
+            std::ptr::copy(childs.add(r + 1), childs.add(r), n - r - 1);
+            self.set_childs_len(n - 1);
+            child
+        }
+    }
+
+    /// Remplace la clé, la valeur et le ctrl de l'entrée `i` (radix et enfant
+    /// inchangés), retourne l'ancien couple `(clé, valeur)`.
+    pub fn replace_entry(
+        &mut self,
+        i: usize,
+        key: SharedByte,
+        val: SharedByte,
+        ctrl: u8,
+    ) -> (SharedByte, SharedByte) {
+        debug_assert!(i < self.len());
+        unsafe {
+            *self.ctrl_ptr().add(i) = ctrl;
+            (
+                std::ptr::replace(self.keys_ptr().add(i), key),
+                std::ptr::replace(self.vals_ptr().add(i), val),
+            )
+        }
+    }
+
+    fn alloc_block(class: u8, child_cap: usize) -> Self {
+        let size = hash_block_size(CAPACITIES[class as usize], child_cap);
         let layout = Layout::from_size_align(size, 8).unwrap();
         unsafe {
-            let raw = BlockAlloc.alloc(layout);
+            // Zéro : voir `SetOverflow::alloc_block`.
+            let raw = BlockAlloc.alloc_zeroed(layout);
             if raw.is_null() {
                 handle_alloc_error(layout);
             }
-            raw.write(0); // len = 0
+            (raw.add(2) as *mut u16).write(child_cap as u16);
             let tagged = (raw as usize | class as usize) as *mut u8;
             Self {
                 ptr: NonNull::new_unchecked(tagged),
@@ -641,115 +743,138 @@ impl HashOverflow {
     }
 
     pub fn new() -> Self {
-        Self::alloc_block(0)
+        Self::alloc_block(0, 0)
     }
 
-    fn grow(&mut self) {
-        let class = self.class();
-        assert!(class < 6, "HashOverflow: max capacity (256) reached");
-        let old_cap = self.capacity();
-        let mut new = Self::alloc_block(class + 1);
+    fn block_layout(&self) -> Layout {
+        Layout::from_size_align(self.block_bytes(), 8).unwrap()
+    }
+
+    /// Taille du bloc alloué (octets demandés à MiMalloc).
+    pub fn block_bytes(&self) -> usize {
+        hash_block_size(self.capacity(), self.child_capacity())
+    }
+
+    /// Nouveau bloc (classe et capacité d'enfants données), contenu recopié.
+    fn realloc(&mut self, class: u8, child_cap: usize) {
+        let len = self.len();
+        let nb_childs = self.childs_len();
+        debug_assert!(len <= CAPACITIES[class as usize] && nb_childs <= child_cap);
+        let new = Self::alloc_block(class, child_cap);
         unsafe {
-            std::ptr::copy_nonoverlapping(self.bitmap_ptr(), new.bitmap_ptr(), bitmap_len(old_cap));
-            std::ptr::copy_nonoverlapping(self.radix_ptr(), new.radix_ptr(), old_cap);
-            std::ptr::copy_nonoverlapping(
-                self.data_ptr(),
-                new.data_ptr(),
-                (old_cap / 2) * HASH_STRIDE,
-            );
+            new.base_ptr().write(len as u8);
+            new.base_ptr().add(1).write(nb_childs as u8);
+            std::ptr::copy_nonoverlapping(self.radix_ptr(), new.radix_ptr(), len);
+            std::ptr::copy_nonoverlapping(self.ctrl_ptr(), new.ctrl_ptr(), len);
+            // Bits ≥ len toujours à 0 : `bitmap_len(len)` suffit.
+            std::ptr::copy_nonoverlapping(self.bitmap_ptr(), new.bitmap_ptr(), bitmap_len(len));
+            std::ptr::copy_nonoverlapping(self.keys_ptr(), new.keys_ptr(), len);
+            std::ptr::copy_nonoverlapping(self.vals_ptr(), new.vals_ptr(), len);
+            std::ptr::copy_nonoverlapping(self.childs_ptr(), new.childs_ptr(), nb_childs);
+            BlockAlloc.dealloc(self.base_ptr(), self.block_layout());
         }
-        new.set_len(self.len());
-        unsafe {
-            BlockAlloc.dealloc(
-                self.base_ptr(),
-                Layout::from_size_align(self.total_size(), 8).unwrap(),
-            )
-        };
-        // Pas `*self = new` : ça déclencherait le `Drop` de l'ancienne valeur
-        // (double free, déjà désallouée juste au-dessus). On ne remplace que
-        // le pointeur, puis on `forget` `new` pour ne pas désallouer deux fois
-        // le bloc qu'on vient d'adopter.
+        // Voir `SetOverflow::realloc` : on adopte le pointeur, sans Drop.
         self.ptr = new.ptr;
         std::mem::forget(new);
     }
 
-    /// Ajoute une entrée en fin de tableau, sans vérifier si `radix` est déjà
-    /// présent (pur append, pas de dédup — à l'appelant de garantir l'unicité
-    /// si besoin, ex: vérifier `get_value(radix).is_none()` avant).
-    pub fn add_value(
-        &mut self,
-        radix: u8,
-        key: SharedByte,
-        val: SharedByte,
-        idx: u32,
-        has_ttl: bool,
-    ) {
+    /// Ajoute une entrée en fin de tableau, sans dédup (à l'appelant de
+    /// garantir que `radix` est absent).
+    pub fn add_value(&mut self, radix: u8, ctrl: u8, key: SharedByte, val: SharedByte, child: u32) {
         if self.is_full() {
-            self.grow();
+            let class = self.class();
+            assert!(class < 6, "HashOverflow: max capacity (256) reached");
+            self.realloc(class + 1, self.child_capacity());
         }
         let i = self.len();
-        self.set_radix(i, radix);
-        unsafe { self.key_ptr(i).write(key) };
-        unsafe { self.val_ptr(i).write(val) };
-        unsafe { self.idx_ptr(i).write(idx) };
-        self.set_ttl(i, has_ttl);
+        unsafe {
+            *self.radix_ptr().add(i) = radix;
+            *self.ctrl_ptr().add(i) = ctrl;
+            self.keys_ptr().add(i).write(key);
+            self.vals_ptr().add(i).write(val);
+        }
         self.set_len(i + 1);
+        self.set_child(i, child);
     }
 
-    /// Scan linéaire sur `radix`. Version lecture seule : le TTL est un
-    /// simple `bool`, pas de ref vers le bitmap (impossible d'avoir
-    /// `&mut bool` sur un bit tassé).
-    pub fn get_values(&self, radix: u8) -> Option<(&SharedByte, &SharedByte, &u8, bool)> {
-        (0..self.len())
-            .find(|&i| self.radix(i) == radix)
-            .map(|i| unsafe {
-                (
-                    &*self.val_ptr(i),
-                    &*self.key_ptr(i),
-                    &*self.radix_ptr().add(i),
-                    self.has_ttl(i),
-                )
-            })
+    /// Position de l'entrée de radix `radix` (unique dans le node), SWAR.
+    #[inline]
+    pub fn find(&self, radix: u8) -> Option<usize> {
+        let len = self.len();
+        let base = self.radix_ptr();
+        let mut i = 0;
+        while i + 8 <= len {
+            let word = unsafe { (base.add(i) as *const u64).read_unaligned() };
+            if let Some(j) = swar_find(word, radix) {
+                return Some(i + j);
+            }
+            i += 8;
+        }
+        (i..len).find(|&j| unsafe { *base.add(j) } == radix)
     }
 
-    //pub fn get_value(&mut self,radix:u8,now:u64)->Option<SharedByte>
-
-    /// Version lecture/écriture : retourne l'index `i` au lieu du TTL — pas
-    /// de `&mut bool` possible sur le bitmap, l'appelant modifie le TTL via
-    /// `has_ttl(i)` / `set_ttl(i, ..)` avec cet index.
-    pub fn get_value_mut(
-        &mut self,
-        radix: u8,
-    ) -> Option<(&mut SharedByte, &SharedByte, &u8, usize)> {
-        let i = (0..self.len()).find(|&i| self.radix(i) == radix)?;
-        let val_ptr = self.val_ptr(i);
-        let key_ptr = self.key_ptr(i);
-        let radix_ptr = unsafe { self.radix_ptr().add(i) };
-        unsafe { Some((&mut *val_ptr, &*key_ptr, &*radix_ptr, i)) }
+    /// Une entrée sans enfant, s'il y en a.
+    pub fn find_childless(&self) -> Option<usize> {
+        (0..self.len()).rev().find(|&i| !self.has_child(i))
     }
 
-    /// Retire l'entrée `i` en la remplaçant par la dernière (ordre non préservé).
-    pub fn swap_remove(&mut self, i: usize) -> (SharedByte, SharedByte, u32) {
+    /// Retire l'entrée `i` en la remplaçant par la dernière (ordre non
+    /// préservé). Retourne `(radix, ctrl, key, val, child)`.
+    pub fn swap_remove(&mut self, i: usize) -> (u8, u8, SharedByte, SharedByte, u32) {
         debug_assert!(i < self.len());
         let last = self.len() - 1;
-        unsafe {
-            let removed_key = self.key_ptr(i).read();
-            let removed_val = self.val_ptr(i).read();
-            let removed_idx = self.idx_ptr(i).read();
-            if i != last {
-                let last_key = self.key_ptr(last).read();
-                let last_val = self.val_ptr(last).read();
-                let last_idx = self.idx_ptr(last).read();
-                let last_ttl = self.has_ttl(last);
-                self.key_ptr(i).write(last_key);
-                self.val_ptr(i).write(last_val);
-                self.idx_ptr(i).write(last_idx);
-                self.set_radix(i, self.radix(last));
-                self.set_ttl(i, last_ttl);
+        let child = self.child(i);
+        self.set_child_no_shrink(i, NO_CHILD);
+        let removed = unsafe {
+            (
+                *self.radix_ptr().add(i),
+                *self.ctrl_ptr().add(i),
+                self.keys_ptr().add(i).read(),
+                self.vals_ptr().add(i).read(),
+                child,
+            )
+        };
+        if i != last {
+            let last_child = self.child(last);
+            self.set_child_no_shrink(last, NO_CHILD);
+            unsafe {
+                *self.radix_ptr().add(i) = *self.radix_ptr().add(last);
+                *self.ctrl_ptr().add(i) = *self.ctrl_ptr().add(last);
+                self.keys_ptr().add(i).write(self.keys_ptr().add(last).read());
+                self.vals_ptr().add(i).write(self.vals_ptr().add(last).read());
             }
-            self.set_len(last);
-            (removed_key, removed_val, removed_idx)
+            self.set_child_no_shrink(i, last_child);
         }
+        self.set_len(last);
+        self.shrink_if_sparse();
+        removed
+    }
+
+    /// Voir `SetOverflow::shrink_if_sparse`.
+    fn shrink_if_sparse(&mut self) {
+        let len = self.len();
+        let mut class = self.class();
+        while class > 0 && len <= CAPACITIES[class as usize] / 4 {
+            class -= 1;
+        }
+        let nb_childs = self.childs_len();
+        let child_cap = self.child_capacity();
+        let new_child_cap = if nb_childs == 0 {
+            0
+        } else if nb_childs <= child_cap / 4 {
+            (nb_childs * 2).max(4)
+        } else {
+            child_cap
+        };
+        if class != self.class() || new_child_cap != child_cap {
+            self.realloc(class, new_child_cap);
+        }
+    }
+
+    /// Retire la dernière entrée. Retourne `(radix, ctrl, key, val, child)`.
+    pub fn pop(&mut self) -> Option<(u8, u8, SharedByte, SharedByte, u32)> {
+        let last = self.len().checked_sub(1)?;
+        Some(self.swap_remove(last))
     }
 }
 
@@ -763,16 +888,11 @@ impl Drop for HashOverflow {
     fn drop(&mut self) {
         for i in 0..self.len() {
             unsafe {
-                std::ptr::drop_in_place(self.key_ptr(i));
-                std::ptr::drop_in_place(self.val_ptr(i));
+                std::ptr::drop_in_place(self.keys_ptr().add(i));
+                std::ptr::drop_in_place(self.vals_ptr().add(i));
             }
         }
-        unsafe {
-            BlockAlloc.dealloc(
-                self.base_ptr(),
-                Layout::from_size_align(self.total_size(), 8).unwrap(),
-            )
-        };
+        unsafe { BlockAlloc.dealloc(self.base_ptr(), self.block_layout()) };
     }
 }
 
@@ -907,24 +1027,41 @@ mod tests {
     }
 
     #[test]
-    fn hash_push_get_grow_across_classes() {
+    fn hash_push_get_grow_shrink() {
         let mut o = HashOverflow::new();
-        for i in 0..20u32 {
+        for i in 0..200u32 {
+            let child = if i % 3 == 0 { i * 10 } else { NO_CHILD };
             o.add_value(
                 i as u8,
+                (i * 7) as u8,
                 SharedByte::from_slice(i.to_le_bytes()),
                 SharedByte::from_slice((i * 2).to_le_bytes()),
-                i * 10,
-                i % 2 == 0,
+                child,
             );
         }
-        assert_eq!(o.len(), 20);
-        for i in 0..20u32 {
+        assert_eq!((o.len(), o.childs_len()), (200, 67));
+        for i in 0..200u32 {
+            let child = if i % 3 == 0 { i * 10 } else { NO_CHILD };
+            assert_eq!(o.radix(i as usize), i as u8);
+            assert_eq!(o.ctrl(i as usize), (i * 7) as u8);
+            assert_eq!(o.child(i as usize), child);
             assert_eq!(o.key(i as usize).as_slice(), &i.to_le_bytes());
             assert_eq!(o.val(i as usize).as_slice(), &(i * 2).to_le_bytes());
-            assert_eq!(o.idx(i as usize), i * 10);
-            assert_eq!(o.has_ttl(i as usize), i % 2 == 0);
+            assert_eq!(o.find(i as u8), Some(i as usize));
         }
+        while o.len() > 2 {
+            let (radix, _, key, val, child) = o.swap_remove(0);
+            let r = radix as u32;
+            assert_eq!(key.as_slice(), &r.to_le_bytes());
+            assert_eq!(val.as_slice(), &(r * 2).to_le_bytes());
+            assert_eq!(child, if r % 3 == 0 { r * 10 } else { NO_CHILD });
+            for i in 0..o.len() {
+                let r = o.radix(i) as u32;
+                assert_eq!(o.val(i).as_slice(), &(r * 2).to_le_bytes());
+                assert_eq!(o.child(i), if r % 3 == 0 { r * 10 } else { NO_CHILD });
+            }
+        }
+        assert_eq!(o.capacity(), 4);
     }
 
     #[test]
@@ -933,9 +1070,12 @@ mod tests {
         let val = SharedByte::from_slice(b"v");
         {
             let mut o = HashOverflow::new();
-            o.add_value(0, key.clone(), val.clone(), 0, false);
+            o.add_value(0, 0, key.clone(), val.clone(), 3);
             assert_eq!(key.rc(), 2);
             assert_eq!(val.rc(), 2);
+            let (old_k, old_v) =
+                o.replace_entry(0, SharedByte::from_slice(b"k2"), val.clone(), 1);
+            assert_eq!((old_k.rc(), old_v.rc()), (2, 3));
         }
         assert_eq!(key.rc(), 1);
         assert_eq!(val.rc(), 1);

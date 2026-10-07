@@ -12,7 +12,7 @@
 //! - Lookup : au niveau `d`, slot de radix `h[d]` ; on ne déréférence la clé
 //!   que si `ctrl` correspond (1 faux positif sur 256), sinon on descend.
 //! - Niveau 7 (octets de dispatch épuisés) : l'enfant du slot n'est pas un
-//!   node mais un bucket de [`CollisionBuckets`], hors de l'union, scanné
+//!   node mais un bucket de [`crate::common::CollisionBuckets`], hors de l'union, scanné
 //!   linéairement. Pour y arriver il faut 8 clés empilées sur le même chemin
 //!   de 56 bits : jamais en pratique avec une seed aléatoire.
 //!
@@ -29,12 +29,12 @@
 //!    `parent_or_card` = idx du parent, `parent_radix` = radix du slot parent
 //!    (back-pointer pour la compaction).
 
-use std::hash::{BuildHasher, Hasher};
 use std::mem::{ManuallyDrop, MaybeUninit};
 
 use radixox_lib::prefetch::PreFetch;
 use radixox_lib::shared_byte::SharedByte;
 
+use crate::common::{DISPATCH_LEVELS, Slot, mix64};
 use crate::overflow::{NO_CHILD, swar_find};
 use crate::{NodeType, SetOverflow, ValNode, ValTrees};
 
@@ -42,31 +42,6 @@ use crate::{NodeType, SetOverflow, ValNode, ValTrees};
 pub(crate) const INLINE_SET_LEN: usize = 11;
 /// Zone partagée clés/enfants, en mots de 4 B : une clé = 2 mots, un enfant = 1.
 const POOL_WORDS: usize = 2 * INLINE_SET_LEN;
-/// Nombre de niveaux de dispatch (octets `h[0..7]`).
-pub(crate) const DISPATCH_LEVELS: usize = 7;
-
-#[derive(Clone, Copy)]
-struct MemberHash(u64);
-
-impl MemberHash {
-    #[inline(always)]
-    fn radix(self, depth: usize) -> u8 {
-        debug_assert!(depth < DISPATCH_LEVELS);
-        (self.0 >> (8 * depth)) as u8
-    }
-
-    #[inline(always)]
-    fn ctrl(self) -> u8 {
-        (self.0 >> 56) as u8
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Slot {
-    Inline(usize),
-    Overflow(usize),
-}
-
 /// Nœud de Set, 128 B.
 ///
 /// `pool` est partagé entre les clés et les enfants : les clés occupent les
@@ -232,7 +207,7 @@ impl SetNode {
         }
     }
 
-    #[inline]
+    #[cfg(test)]
     fn radix_of(&self, slot: Slot) -> u8 {
         match slot {
             Slot::Inline(i) => self.prefix[i],
@@ -430,54 +405,7 @@ impl Drop for SetNode {
     }
 }
 
-/// Buckets de collision : atteints quand les 7 octets de dispatch sont
-/// épuisés. Hors de l'union `ValNode` (cas quasi inexistant, aucune
-/// optimisation de layout).
-#[derive(Default)]
-pub(crate) struct CollisionBuckets {
-    buckets: Vec<Vec<SharedByte>>,
-    free: Vec<u32>,
-}
-
-impl CollisionBuckets {
-    fn alloc(&mut self, first: SharedByte) -> u32 {
-        match self.free.pop() {
-            Some(idx) => {
-                self.buckets[idx as usize].push(first);
-                idx
-            }
-            None => {
-                self.buckets.push(vec![first]);
-                (self.buckets.len() - 1) as u32
-            }
-        }
-    }
-
-    fn get(&self, idx: u32) -> &Vec<SharedByte> {
-        &self.buckets[idx as usize]
-    }
-
-    fn get_mut(&mut self, idx: u32) -> &mut Vec<SharedByte> {
-        &mut self.buckets[idx as usize]
-    }
-
-    fn release(&mut self, idx: u32) {
-        self.buckets[idx as usize] = Vec::new();
-        self.free.push(idx);
-    }
-}
-
 impl ValTrees {
-    #[inline(always)]
-    fn member_hash(&self, member: &[u8]) -> MemberHash {
-        let mut hasher = self.hasher.build_hasher();
-        hasher.write(member);
-        let h = hasher.finish();
-        #[cfg(test)]
-        let h = h & self.hash_mask;
-        MemberHash(h)
-    }
-
     #[inline(always)]
     fn set_node(&self, idx: u32) -> &SetNode {
         debug_assert!(self.nodes.is_occupied(idx));
@@ -845,14 +773,6 @@ impl ValTrees {
         assert_eq!(total, self.set_card(root) as usize, "cardinal incohérent");
         total
     }
-}
-
-#[inline(always)]
-fn mix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^ (x >> 31)
 }
 
 #[cfg(test)]
