@@ -793,6 +793,7 @@ dependencies = [
  "fastrand",
  "foldhash",
  "hislab",
+ "mimalloc",
  "oxidart",
  "radixox-lib",
 ]

@@ -35,13 +35,15 @@ use std::mem::{ManuallyDrop, MaybeUninit};
 use radixox_lib::prefetch::PreFetch;
 use radixox_lib::shared_byte::SharedByte;
 
-use crate::overflow::swar_find;
+use crate::overflow::{NO_CHILD, swar_find};
 use crate::{NodeType, SetOverflow, ValNode, ValTrees};
 
-pub(crate) const INLINE_SET_LEN: usize = 8;
+/// Entrées inline max (nœud sans enfant).
+pub(crate) const INLINE_SET_LEN: usize = 11;
+/// Zone partagée clés/enfants, en mots de 4 B : une clé = 2 mots, un enfant = 1.
+const POOL_WORDS: usize = 2 * INLINE_SET_LEN;
 /// Nombre de niveaux de dispatch (octets `h[0..7]`).
 pub(crate) const DISPATCH_LEVELS: usize = 7;
-const NO_CHILD: u32 = u32::MAX;
 
 #[derive(Clone, Copy)]
 struct MemberHash(u64);
@@ -65,13 +67,21 @@ enum Slot {
     Overflow(usize),
 }
 
+/// Nœud de Set, 128 B.
+///
+/// `pool` est partagé entre les clés et les enfants : les clés occupent les
+/// mots `[0, 2·count)` depuis le début, les idx d'enfants sont packés à la
+/// fin, `[POOL_WORDS - K, POOL_WORDS)`, dans l'ordre des slots (rang). Seuls
+/// les slots qui ont un enfant (bit dans `has_child`) paient ses 4 B.
+/// Contrainte : `2·count + K ≤ 22`, donc 11 entrées sans enfant, 10 avec 1-2
+/// enfants, 7 quand toutes ont un enfant (nœud interne plein).
 #[repr(C, align(128))]
 pub struct SetNode {
-    keys: [MaybeUninit<SharedByte>; INLINE_SET_LEN],
-    childs_idx: [u32; INLINE_SET_LEN],
-    overflow: Option<SetOverflow>,
+    pool: [MaybeUninit<u64>; INLINE_SET_LEN],
     prefix: [u8; INLINE_SET_LEN],
     ctrl: [u8; INLINE_SET_LEN],
+    has_child: u16,
+    overflow: Option<SetOverflow>,
     count: u8,
     parent_radix: u8,
     _pad: u8,
@@ -86,11 +96,11 @@ impl PreFetch for SetNode {}
 impl SetNode {
     fn new(parent_or_card: u32, parent_radix: u8) -> Self {
         Self {
-            keys: [const { MaybeUninit::uninit() }; INLINE_SET_LEN],
-            childs_idx: [NO_CHILD; INLINE_SET_LEN],
-            overflow: None,
+            pool: [MaybeUninit::uninit(); INLINE_SET_LEN],
             prefix: [0; INLINE_SET_LEN],
             ctrl: [0; INLINE_SET_LEN],
+            has_child: 0,
+            overflow: None,
             count: 0,
             parent_radix,
             _pad: 0,
@@ -120,14 +130,92 @@ impl SetNode {
         }
     }
 
+    // --- pool ---------------------------------------------------------------
+
+    #[inline]
+    fn inline_childs(&self) -> usize {
+        self.has_child.count_ones() as usize
+    }
+
+    /// Mots libres dans le pool.
+    #[inline]
+    fn room(&self) -> usize {
+        POOL_WORDS - 2 * self.count as usize - self.inline_childs()
+    }
+
+    #[inline]
+    fn key_ptr(&self, i: usize) -> *const SharedByte {
+        debug_assert!(i < INLINE_SET_LEN);
+        unsafe { self.pool.as_ptr().add(i) as *const SharedByte }
+    }
+
+    #[inline]
+    fn key_ptr_mut(&mut self, i: usize) -> *mut SharedByte {
+        debug_assert!(i < INLINE_SET_LEN);
+        unsafe { self.pool.as_mut_ptr().add(i) as *mut SharedByte }
+    }
+
+    #[inline]
+    fn words(&self) -> *const u32 {
+        self.pool.as_ptr() as *const u32
+    }
+
+    #[inline]
+    fn words_mut(&mut self) -> *mut u32 {
+        self.pool.as_mut_ptr() as *mut u32
+    }
+
+    #[inline]
+    fn inline_has_child(&self, i: usize) -> bool {
+        (self.has_child >> i) & 1 != 0
+    }
+
+    #[inline]
+    fn inline_rank(&self, i: usize) -> usize {
+        (self.has_child & ((1u16 << i) - 1)).count_ones() as usize
+    }
+
+    /// Insère un idx au rang `r` (le bit `has_child` est posé par l'appelant,
+    /// après). Le bloc d'enfants grandit vers le bas.
+    fn inline_child_insert(&mut self, r: usize, child: u32) {
+        let k = self.inline_childs();
+        debug_assert!(self.room() >= 1);
+        let base = POOL_WORDS - k;
+        unsafe {
+            let words = self.words_mut();
+            std::ptr::copy(words.add(base), words.add(base - 1), r);
+            words.add(base - 1 + r).write(child);
+        }
+    }
+
+    /// Retire l'idx au rang `r` (le bit est effacé par l'appelant, après).
+    fn inline_child_remove(&mut self, r: usize) -> u32 {
+        let k = self.inline_childs();
+        debug_assert!(r < k);
+        let base = POOL_WORDS - k;
+        unsafe {
+            let words = self.words_mut();
+            let child = words.add(base + r).read();
+            std::ptr::copy(words.add(base), words.add(base + 1), r);
+            child
+        }
+    }
+
+    // --- accès par slot -----------------------------------------------------
+
     #[inline]
     fn find(&self, radix: u8) -> Option<Slot> {
-        // Les octets au-delà de `count` sont périmés mais toujours à des
-        // positions plus hautes que les valides : le premier match SWAR est
-        // donc valide ssi il est < count.
-        if let Some(i) = swar_find(u64::from_le_bytes(self.prefix), radix) {
-            if i < self.count as usize {
-                return Some(Slot::Inline(i));
+        let count = self.count as usize;
+        // Octets au-delà de `count` périmés mais toujours à des positions plus
+        // hautes que les valides : le premier match SWAR est valide ssi < count.
+        let word = u64::from_le_bytes(self.prefix[..8].try_into().unwrap());
+        match swar_find(word, radix) {
+            Some(i) if i < count => return Some(Slot::Inline(i)),
+            Some(_) => {}
+            None => {
+                if let Some(i) = (8..count).find(|&i| self.prefix[i] == radix) {
+                    return Some(Slot::Inline(i));
+                }
             }
         }
         self.overflow.as_ref()?.find(radix).map(Slot::Overflow)
@@ -138,9 +226,17 @@ impl SetNode {
         match slot {
             Slot::Inline(i) => {
                 debug_assert!(i < self.count as usize);
-                unsafe { self.keys[i].assume_init_ref() }
+                unsafe { &*self.key_ptr(i) }
             }
             Slot::Overflow(i) => self.overflow_ref().key(i),
+        }
+    }
+
+    #[inline]
+    fn radix_of(&self, slot: Slot) -> u8 {
+        match slot {
+            Slot::Inline(i) => self.prefix[i],
+            Slot::Overflow(i) => self.overflow_ref().radix(i),
         }
     }
 
@@ -155,16 +251,58 @@ impl SetNode {
     #[inline]
     fn child(&self, slot: Slot) -> u32 {
         match slot {
-            Slot::Inline(i) => self.childs_idx[i],
-            Slot::Overflow(i) => self.overflow_ref().idx(i),
+            Slot::Inline(i) => {
+                if !self.inline_has_child(i) {
+                    return NO_CHILD;
+                }
+                let base = POOL_WORDS - self.inline_childs();
+                unsafe { self.words().add(base + self.inline_rank(i)).read() }
+            }
+            Slot::Overflow(i) => self.overflow_ref().child(i),
         }
     }
 
-    #[inline]
+    /// Pose ou efface l'enfant d'un slot.
+    ///
+    /// ⚠ Poser un enfant sur un slot inline alors que le pool est plein
+    /// déplace l'entrée dans l'overflow : `slot` n'est plus valide ensuite.
+    /// Effacer un enfant libère de la place et peut rapatrier des entrées
+    /// d'overflow : les `Slot::Overflow` ne sont plus valides ensuite.
     fn set_child(&mut self, slot: Slot, child: u32) {
-        match slot {
-            Slot::Inline(i) => self.childs_idx[i] = child,
-            Slot::Overflow(i) => self.overflow_mut().set_idx(i, child),
+        let i = match slot {
+            Slot::Overflow(i) => {
+                self.overflow_mut().set_child(i, child);
+                // L'entrée devient peut-être rapatriable (2 mots suffisent).
+                if child == NO_CHILD {
+                    self.refill();
+                }
+                return;
+            }
+            Slot::Inline(i) => i,
+        };
+        match (self.inline_has_child(i), child != NO_CHILD) {
+            (true, true) => {
+                let base = POOL_WORDS - self.inline_childs();
+                let r = self.inline_rank(i);
+                unsafe { self.words_mut().add(base + r).write(child) }
+            }
+            (true, false) => {
+                self.inline_child_remove(self.inline_rank(i));
+                self.has_child &= !(1 << i);
+                self.refill();
+            }
+            (false, true) if self.room() >= 1 => {
+                self.inline_child_insert(self.inline_rank(i), child);
+                self.has_child |= 1 << i;
+            }
+            (false, true) => {
+                let radix = self.prefix[i];
+                let (key, ctrl, _) = self.remove(slot);
+                self.overflow
+                    .get_or_insert_with(SetOverflow::new)
+                    .add_value(radix, ctrl, key, child);
+            }
+            (false, false) => {}
         }
     }
 
@@ -185,7 +323,7 @@ impl SetNode {
         match slot {
             Slot::Inline(i) => {
                 self.ctrl[i] = ctrl;
-                unsafe { std::mem::replace(self.keys[i].assume_init_mut(), key) }
+                unsafe { std::ptr::replace(self.key_ptr_mut(i), key) }
             }
             Slot::Overflow(i) => self.overflow_mut().replace_key(i, key, ctrl),
         }
@@ -193,10 +331,9 @@ impl SetNode {
 
     /// Ajoute un slot. L'appelant garantit que `radix` est absent du node.
     fn push(&mut self, radix: u8, ctrl: u8, key: SharedByte, child: u32) {
-        let i = self.count as usize;
-        if i < INLINE_SET_LEN {
-            self.write_inline(i, radix, ctrl, key, child);
-            self.count += 1;
+        let need = 2 + (child != NO_CHILD) as usize;
+        if self.room() >= need {
+            self.push_inline(radix, ctrl, key, child);
         } else {
             self.overflow
                 .get_or_insert_with(SetOverflow::new)
@@ -204,50 +341,81 @@ impl SetNode {
         }
     }
 
-    #[inline]
-    fn write_inline(&mut self, i: usize, radix: u8, ctrl: u8, key: SharedByte, child: u32) {
+    /// Ajoute en fin d'inline. L'appelant a vérifié la place.
+    fn push_inline(&mut self, radix: u8, ctrl: u8, key: SharedByte, child: u32) {
+        let i = self.count as usize;
         self.prefix[i] = radix;
         self.ctrl[i] = ctrl;
-        self.keys[i].write(key);
-        self.childs_idx[i] = child;
+        unsafe { self.key_ptr_mut(i).write(key) };
+        self.count += 1;
+        if child != NO_CHILD {
+            // Dernier slot ⇒ rang le plus haut.
+            self.inline_child_insert(self.inline_childs(), child);
+            self.has_child |= 1 << i;
+        }
     }
 
-    /// Retire un slot, retourne `(clé, ctrl, enfant)`. Maintient l'invariant 4
-    /// en rapatriant la dernière entrée d'overflow dans l'inline.
+    /// Peut-on rapatrier une entrée d'overflow dans l'inline ?
+    fn refill_candidate(&self) -> Option<usize> {
+        let overflow = self.overflow.as_ref()?;
+        match self.room() {
+            0 | 1 => None,
+            2 => overflow.find_childless(),
+            _ => Some(overflow.len() - 1),
+        }
+    }
+
+    /// Invariant 4 : rapatrie des entrées d'overflow tant qu'il y a la place.
+    fn refill(&mut self) {
+        while let Some(j) = self.refill_candidate() {
+            let overflow = self.overflow_mut();
+            let (radix, ctrl, key, child) = overflow.swap_remove(j);
+            if overflow.is_empty() {
+                self.overflow = None;
+            }
+            self.push_inline(radix, ctrl, key, child);
+        }
+    }
+
+    /// Retire un slot, retourne `(clé, ctrl, enfant)`. Maintient l'invariant
+    /// 4 en rapatriant des entrées d'overflow dans la place libérée.
     fn remove(&mut self, slot: Slot) -> (SharedByte, u8, u32) {
         match slot {
             Slot::Overflow(i) => {
                 let overflow = self.overflow_mut();
-                let removed = overflow.swap_remove(i);
+                let (_, ctrl, key, child) = overflow.swap_remove(i);
                 if overflow.is_empty() {
                     self.overflow = None;
                 }
-                removed
+                (key, ctrl, child)
             }
             Slot::Inline(i) => {
                 let last = self.count as usize - 1;
                 debug_assert!(i <= last);
-                let key = unsafe { self.keys[i].assume_init_read() };
-                let removed = (key, self.ctrl[i], self.childs_idx[i]);
+                let child = self.child(slot);
+                if child != NO_CHILD {
+                    self.inline_child_remove(self.inline_rank(i));
+                    self.has_child &= !(1 << i);
+                }
+                let key = unsafe { self.key_ptr(i).read() };
+                let removed = (key, self.ctrl[i], child);
                 if i != last {
                     self.prefix[i] = self.prefix[last];
                     self.ctrl[i] = self.ctrl[last];
-                    self.childs_idx[i] = self.childs_idx[last];
-                    let moved = unsafe { self.keys[last].assume_init_read() };
-                    self.keys[i].write(moved);
-                }
-                self.count -= 1;
-
-                if let Some(overflow) = self.overflow.as_mut() {
-                    let (radix, ctrl, key, child) =
-                        overflow.pop().expect("invariant: overflow présent ⇒ non vide");
-                    let emptied = overflow.is_empty();
-                    self.write_inline(last, radix, ctrl, key, child);
-                    self.count += 1;
-                    if emptied {
-                        self.overflow = None;
+                    unsafe {
+                        let moved = self.key_ptr(last).read();
+                        self.key_ptr_mut(i).write(moved);
+                    }
+                    // L'enfant du dernier slot change de rang.
+                    if self.inline_has_child(last) {
+                        let c = self.inline_child_remove(self.inline_rank(last));
+                        self.has_child &= !(1 << last);
+                        self.inline_child_insert(self.inline_rank(i), c);
+                        self.has_child |= 1 << i;
                     }
                 }
+                self.count -= 1;
+                self.refill();
                 removed
             }
         }
@@ -256,8 +424,8 @@ impl SetNode {
 
 impl Drop for SetNode {
     fn drop(&mut self) {
-        for key in &mut self.keys[..self.count as usize] {
-            unsafe { key.assume_init_drop() };
+        for i in 0..self.count as usize {
+            unsafe { std::ptr::drop_in_place(self.key_ptr_mut(i)) };
         }
     }
 }
@@ -530,6 +698,28 @@ impl ValTrees {
         }
     }
 
+    /// Octets des blocs overflow du Set. Ils sont alloués par MiMalloc en
+    /// direct : invisibles pour l'allocateur global, comme le slab
+    /// ([`Self::slab_bytes`]). Parcours complet, pour les benchs.
+    pub fn set_overflow_bytes(&self, root: u32) -> usize {
+        let mut total = 0;
+        let mut stack = vec![(root, 0usize)];
+        while let Some((idx, depth)) = stack.pop() {
+            if depth == DISPATCH_LEVELS {
+                continue;
+            }
+            let node = self.set_node(idx);
+            total += node.overflow.as_ref().map_or(0, SetOverflow::block_bytes);
+            for n in 0..node.len() {
+                let child = node.child(node.slot_at(n));
+                if child != NO_CHILD {
+                    stack.push((child, depth + 1));
+                }
+            }
+        }
+        total
+    }
+
     /// Libère tout le Set, racine comprise. `root` n'est plus valide après.
     pub fn set_drop(&mut self, root: u32) {
         let mut stack = vec![(root, 0usize)];
@@ -626,17 +816,20 @@ impl ValTrees {
                     assert_eq!(node.parent_radix, parent_radix, "back-pointer radix");
                 }
             }
+            assert!(2 * node.count as usize + node.inline_childs() <= POOL_WORDS);
+            assert_eq!(node.has_child >> node.count, 0, "bit has_child hors des slots");
             if let Some(overflow) = &node.overflow {
-                assert_eq!(node.count as usize, INLINE_SET_LEN, "overflow sans inline plein");
                 assert!(!overflow.is_empty(), "overflow vide alloué");
+                assert!(node.refill_candidate().is_none(), "place inline non utilisée");
+                assert_eq!(
+                    overflow.childs_len(),
+                    (0..overflow.len()).filter(|&i| overflow.has_child(i)).count()
+                );
             }
             let mut seen = [false; 256];
             for n in 0..node.len() {
                 let slot = node.slot_at(n);
-                let radix = match slot {
-                    Slot::Inline(i) => node.prefix[i],
-                    Slot::Overflow(i) => node.overflow_ref().radix(i),
-                };
+                let radix = node.radix_of(slot);
                 assert!(!seen[radix as usize], "radix dupliqué dans un node");
                 seen[radix as usize] = true;
                 let h = self.member_hash(node.key(slot));
@@ -679,6 +872,57 @@ mod tests {
     fn layout() {
         assert_eq!(size_of::<SetNode>(), 128);
         assert_eq!(std::mem::offset_of!(SetNode, node_type), crate::NODE_TYPE_OFFSET);
+    }
+
+    /// Nœud seul : modèle de référence `radix → (clé, enfant)`, enfants posés,
+    /// effacés et slots retirés dans le désordre. Exerce la relocation vers
+    /// l'overflow (pool plein) et le rapatriement (place libérée).
+    #[test]
+    fn node_child_packing() {
+        use std::collections::HashMap;
+        let mut node = SetNode::new(0, 0);
+        let mut model: HashMap<u8, (Vec<u8>, u32)> = HashMap::new();
+        for r in 0..40u8 {
+            node.push(r, r, sb([r]), NO_CHILD);
+            model.insert(r, (vec![r], NO_CHILD));
+        }
+        assert_eq!(node.count as usize, INLINE_SET_LEN);
+        let check = |node: &SetNode, model: &HashMap<u8, (Vec<u8>, u32)>| {
+            assert_eq!(node.len(), model.len());
+            assert!(2 * node.count as usize + node.inline_childs() <= POOL_WORDS);
+            if node.overflow.is_some() {
+                assert!(node.refill_candidate().is_none());
+            }
+            for (&r, (key, child)) in model {
+                let slot = node.find(r).expect("radix perdu");
+                assert_eq!(node.key(slot).as_slice(), key.as_slice());
+                assert_eq!(node.ctrl_of(slot), r);
+                assert_eq!(node.child(slot), *child, "radix {r}");
+            }
+        };
+        let mut rnd = 1u64;
+        for step in 0..5_000u32 {
+            rnd = mix64(rnd);
+            let r = (rnd % 40) as u8;
+            match (rnd >> 40) % 3 {
+                0 | 1 if model.contains_key(&r) => {
+                    let child = if (rnd >> 50) % 3 == 0 { NO_CHILD } else { step };
+                    node.set_child(node.find(r).unwrap(), child);
+                    model.get_mut(&r).unwrap().1 = child;
+                }
+                _ => match model.remove(&r) {
+                    Some((key, child)) => {
+                        let (k, ctrl, c) = node.remove(node.find(r).unwrap());
+                        assert_eq!((k.as_slice(), ctrl, c), (key.as_slice(), r, child));
+                    }
+                    None => {
+                        node.push(r, r, sb([r]), NO_CHILD);
+                        model.insert(r, (vec![r], NO_CHILD));
+                    }
+                },
+            }
+            check(&node, &model);
+        }
     }
 
     #[test]
