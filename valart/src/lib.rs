@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     mem::{ManuallyDrop, MaybeUninit, offset_of},
     ptr::drop_in_place,
 };
@@ -13,9 +12,9 @@ use radixox_lib::{
 };
 use std::collections::BTreeSet;
 mod overflow;
+mod set;
 pub use overflow::{HashOverflow, SetOverflow};
-
-use crate::FindResult::None;
+use set::{CollisionBuckets, SetNode};
 
 type NodeMap = [ValNode];
 
@@ -115,139 +114,6 @@ impl HashNode {
     }*/
 }
 
-const INLINE_SET_LEN: usize = 8;
-
-#[repr(C, align(128))]
-pub struct SetNode {
-    prefix: [u8; INLINE_SET_LEN],
-    childs_idx: [u32; INLINE_SET_LEN],
-    inline_keys: [MaybeUninit<SharedByte>; INLINE_SET_LEN],
-    ttls: Option<ThinVec<ExpAndRadix>>,
-
-    overflow: Option<SetOverflow>,
-    count: u8,
-    ttl_map: u8,
-    // Pousse `node_type` au même offset que dans `HashNode` (voir
-    // NODE_TYPE_OFFSET) : nécessaire pour lire le tag depuis l'union sans
-    // connaître la variante active.
-    _pad: u8,
-    node_type: NodeType,
-}
-impl PreFetch for SetNode {}
-
-enum FindResult {
-    None,
-    Inline { idx: usize },
-    Overflow { idx: usize },
-    Expired { child_idx: u32 },
-}
-
-impl SetNode {
-    fn find_from_prefix(&mut self, prefix: u8, now: u64) -> FindResult {
-        if let Some(idx) = self.prefix[0..(self.count as usize)]
-            .iter()
-            .position(|&c| c == prefix)
-        {
-            if !self.have_ttl(idx) || !self.expired_and_remove(prefix, now) {
-                return FindResult::Inline { idx };
-            }
-
-            let child_idx = self.remove_inline(idx);
-
-            if child_idx == u32::MAX {
-                return None;
-            }
-
-            return FindResult::Expired { child_idx };
-        }
-        let ttl_idx = {
-            let Some(overflow) = self.overflow.as_mut() else {
-                return FindResult::None;
-            };
-            let Some((idx, has_ttl)) = overflow.position_and_ttl(prefix) else {
-                return FindResult::None;
-            };
-            if !has_ttl {
-                return FindResult::Overflow { idx };
-            }
-
-            idx
-        };
-        if !self.expired_and_remove(prefix, now) {
-            return FindResult::Overflow { idx: ttl_idx };
-        }
-        //SAFETY: la valeur de overflow a déja était check plus haut
-        let (_, child_idx) =
-            unsafe { self.overflow.as_mut().unwrap_unchecked() }.swap_remove(ttl_idx);
-
-        if child_idx == u32::MAX {
-            return None;
-        }
-
-        FindResult::Expired { child_idx }
-    }
-    fn have_ttl(&self, index: usize) -> bool {
-        (self.ttl_map & (1 << index)) != 0
-    }
-    fn expired_and_remove(&mut self, prefix: u8, now: u64) -> bool {
-        let ttls = self
-            .ttls
-            .as_mut()
-            .expect("There is a value with a ttl but there is no ttls store associated");
-
-        let idx = ttls
-            .iter()
-            .position(|&exp| exp.parent_radix() == prefix)
-            .expect(
-                "prefix is associated to a tll but no coresponding tll entry found in ttls map",
-            );
-        if ttls[idx]
-            .exp()
-            .expect("value with a ttl, a ttl entry but the field ttl is empty")
-            > now
-        {
-            return false;
-        }
-        ttls.swap_remove(idx);
-        true
-    }
-    fn remove_inline(&mut self, idx: usize) -> u32 {
-        self.count -= 1;
-        let count = self.count as usize;
-        let bit = (self.ttl_map >> count) & 1;
-        self.ttl_map = (self.ttl_map & !(1 << idx)) | (bit << idx);
-        self.prefix[idx] = self.prefix[count];
-        let ret = self.childs_idx[idx];
-        self.childs_idx[idx] = self.childs_idx[count];
-        // Branchless : si idx == count (on retire justement le dernier
-        // élément), le write ci-dessous ne fait que réécrire les mêmes
-        // octets sur place. Seul `removed` est droppé — `idx`/`count` sont
-        // hors de la plage valide [0, count) après le décrément, donc ce
-        // slot n'est plus jamais relu ni redroppé.
-        let ptr = self.inline_keys.as_mut_ptr();
-        unsafe {
-            let removed = ptr.add(idx).read();
-            ptr.add(idx).write(ptr.add(count).read());
-            drop(removed);
-        }
-        ret
-    }
-    fn inline_get_child_idx(&self, idx: usize) -> u32 {
-        assert!(idx < self.count as usize);
-        unsafe {
-            std::hint::assert_unchecked(idx < INLINE_SET_LEN);
-        }
-        self.childs_idx[idx]
-    }
-    fn inline_get_key(&self, idx: usize) -> &SharedByte {
-        assert!(idx < self.count as usize);
-        unsafe {
-            std::hint::assert_unchecked(idx < INLINE_SET_LEN);
-            self.inline_keys[idx].assume_init_ref()
-        }
-    }
-}
-
 trait Lookup {
     type LookUpResult;
     fn lookup(&self, store: &[ValNode], key: &[u8]) -> Self::LookUpResult;
@@ -283,23 +149,65 @@ impl TtlNode {
 
 pub struct ValTrees {
     nodes: HiSlab<ValNode>,
+    /// Zones de collision des Set (hors de l'union `ValNode`), atteintes
+    /// quand les 7 octets de dispatch du hash sont épuisés.
+    set_collisions: CollisionBuckets,
+    /// Seed du hash des membres. Globale à tous les Set (merge-join entre
+    /// Set possible) et à persister dans le dump : la position de chaque
+    /// entrée en dépend.
+    seed: u64,
+    hasher: foldhash::quality::FixedState,
+    /// Tests : masque appliqué au hash pour forcer des collisions.
+    #[cfg(test)]
+    hash_mask: u64,
+}
+impl ValTrees {
+    /// Virtual capacity par défaut du slab : 2^26 nœuds × 128 B = 8 GiB
+    /// réservés en virtuel, committés à la demande.
+    pub const DEFAULT_VIRTUAL_CAPACITY: u32 = 1 << 26;
+
+    pub fn new() -> Self {
+        use std::hash::BuildHasher;
+        let seed = std::collections::hash_map::RandomState::new().hash_one(0u64);
+        Self::with_seed(seed, Self::DEFAULT_VIRTUAL_CAPACITY)
+    }
+
+    /// Seed explicite : rechargement d'un dump, tests reproductibles.
+    pub fn with_seed(seed: u64, virtual_capacity: u32) -> Self {
+        Self {
+            nodes: HiSlab::new(0, virtual_capacity).expect("valart: mmap du slab impossible"),
+            set_collisions: CollisionBuckets::default(),
+            seed,
+            hasher: foldhash::quality::FixedState::with_seed(seed),
+            #[cfg(test)]
+            hash_mask: u64::MAX,
+        }
+    }
+
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// Octets occupés dans le slab (nœuds vivants × 128 B). Le slab est un
+    /// mmap : invisible pour l'allocateur global, à ajouter à part. Les
+    /// overflows et buckets de collision passent, eux, par l'allocateur.
+    pub fn slab_bytes(&self) -> usize {
+        self.nodes.count_occupied() * size_of::<ValNode>()
+    }
+}
+impl Default for ValTrees {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl ValTrees {
     fn node_hash(&self, idx: u32) -> &HashNode {
         assert_eq!(self.nodes[idx].tag(), NodeType::HashSet);
         unsafe { &self.nodes[idx].hash }
     }
-    fn node_set(&self, idx: u32) -> &SetNode {
-        assert_eq!(self.nodes[idx].tag(), NodeType::Set);
-        unsafe { &self.nodes[idx].set }
-    }
     fn node_hash_mut(&mut self, idx: u32) -> &mut HashNode {
         assert_eq!(self.nodes[idx].tag(), NodeType::HashSet);
         unsafe { &mut self.nodes[idx].hash }
-    }
-    fn node_set_mut(&mut self, idx: u32) -> &mut SetNode {
-        assert_eq!(self.nodes[idx].tag(), NodeType::Set);
-        unsafe { &mut self.nodes[idx].set }
     }
 }
 
@@ -307,71 +215,6 @@ enum CmdHashSetResult {
     New,
     SameKey,
     SameKeyAndVal,
-}
-
-impl ValTrees {
-    fn set_is_set(&mut self, start_index: u32, key: &[u8], now: u64) -> bool {
-        let mut idx = start_index;
-        let mut prefix = key[0];
-        let mut i = 0;
-        let mut to_fill = VecDeque::new();
-        loop {
-            let node = self.node_set_mut(idx);
-            match node.find_from_prefix(prefix, now) {
-                FindResult::None => return false,
-                FindResult::Inline { idx: val_idx } => {
-                    let child_idx = node.childs_idx[val_idx];
-                    if child_idx != u32::MAX {
-                        self.node_set(child_idx).prefetch();
-                        if self.node_set(idx).inline_get_key(val_idx).as_ref() == key {
-                            return true;
-                        }
-                        idx = child_idx;
-                    } else {
-                        return self.node_set(idx).inline_get_key(val_idx).as_ref() == key;
-                    }
-                }
-                FindResult::Overflow { idx: val_idx } => {
-                    let child_idx = node.overflow.as_ref().unwrap().idx(val_idx);
-                    if child_idx != u32::MAX {
-                        self.node_set(child_idx).prefetch();
-                        if self.validate_value(idx, val_idx, key) {
-                            return true;
-                        }
-                    } else {
-                        return self.validate_value(idx, val_idx, key);
-                    }
-                }
-                FindResult::Expired { child_idx } => {
-                    //Expired occurs only and only if the value expired and have childs
-                    //if it expired and have no childs it simply return None
-                    self.node_set(child_idx).prefetch();
-                    to_fill.push_back(idx);
-                    idx = child_idx;
-                }
-            }
-            i += 1;
-            if i >= key.len() {
-                return false;
-            }
-            prefix = key[i];
-        }
-    }
-    fn hash_get(&self, start_index: u32, key: &[u8]) -> Option<SharedByte> {}
-    ///return true if the key was already presente
-    fn set_set(&mut self, start_index: u32, key: &[u8]) -> bool {}
-    fn hash_set(&mut self, start_index: u32, key: SharedByte, val: SharedByte) -> CmdHashSetResult {
-    }
-
-    fn validate_value(&self, idx: u32, val_idx: usize, key: &[u8]) -> bool {
-        self.node_set(idx)
-            .overflow
-            .as_ref()
-            .unwrap()
-            .key(val_idx)
-            .as_ref()
-            == key
-    }
 }
 
 // Sondes de taille : rust-analyzer se trompe souvent sur le niche-filling des

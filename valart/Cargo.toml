@@ -10,3 +10,7 @@ repository.workspace = true
 radixox-lib = { workspace = true }
 oxidart = { workspace = true }
 hislab = { version = "0.2.2", features = ["rand"] }
+foldhash = "0.2"
+
+[dev-dependencies]
+fastrand = "2"
