@@ -322,12 +322,13 @@ fn set_sismember() {
 }
 
 #[test]
-fn set_smembers_sorted() {
+fn set_smembers_all_members() {
     let mut art = OxidArt::new();
-    // Insert in reverse order — BTreeSet must return lexicographic order
+    // Redis ne garantit aucun ordre pour SMEMBERS : on compare triés.
     art.cmd_sadd(b"s", &bv(&["z", "m", "a", "b"]), None)
         .unwrap();
-    let members = art.cmd_smembers(b"s").unwrap();
+    let mut members = art.cmd_smembers(b"s").unwrap();
+    members.sort();
     assert_eq!(members, vec![b("a"), b("b"), b("m"), b("z")]);
 }
 

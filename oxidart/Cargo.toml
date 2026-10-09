@@ -15,9 +15,12 @@ bytes.workspace = true
 smallvec.workspace = true
 ordered-float = "5.1.0"
 monoio.workspace = true
-hislab = { version = "0.2.2", features = ["rand"] }
+# path le temps du chantier save (copy_occupancy), repasser en version publiée ensuite
+hislab = { path = "../../hislab", features = ["rand"] }
 radixox-lib = { workspace = true }
+valart = { path = "../valart" }
 mimalloc = { workspace = true }
+libmimalloc-sys = { workspace = true }
 
 rand = "0.8"
 regex-automata = { version = "0.4", optional = true, default-features = false, features = [

@@ -1,184 +1,44 @@
-use std::collections::HashMap;
-
-use radixox_lib::{shared_byte::SharedByte, small_vec::SmallVec};
+use radixox_lib::shared_byte::SharedByte;
 
 use crate::{
     OxidArt,
     error::TypeError,
-    value::{RedisType, Tag, value_into_raw},
+    value::{RedisType, Tag, drop_raw, valart},
 };
 
-const THRESHOLD: usize = 16;
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum InnerHCommand {
-    Small(SmallVec<2, (SharedByte, SharedByte)>),
-    Large(HashMap<SharedByte, SharedByte>),
-}
-
-impl InnerHCommand {
-    pub(crate) fn new() -> Self {
-        InnerHCommand::Small(SmallVec::new())
-    }
-
-    /// Insert or update a field. Returns true if newly inserted, false if updated.
-    pub(crate) fn insert(&mut self, field: SharedByte, value: SharedByte) -> bool {
-        match self {
-            InnerHCommand::Small(vec) => {
-                for (k, v) in vec.iter_mut() {
-                    if k == &field {
-                        *v = value;
-                        return false;
-                    }
-                }
-                let len = vec.len();
-
-                if len >= THRESHOLD {
-                    // Promote: build BTreeMap from existing entries + new one in one pass.
-                    let map =
-                        InnerHCommand::Large(HashMap::with_capacity(THRESHOLD + THRESHOLD >> 1));
-                    let InnerHCommand::Small(old_vec) = std::mem::replace(self, map) else {
-                        unreachable!()
-                    };
-                    let InnerHCommand::Large(map) = self else {
-                        unreachable!()
-                    };
-
-                    for (k, v) in old_vec.into_iter() {
-                        map.insert(k, v);
-                    }
-                    map.insert(field, value);
-                } else {
-                    vec.push((field, value));
-                }
-                true
-            }
-            InnerHCommand::Large(map) => map.insert(field, value).is_none(),
-        }
-    }
-
-    /// Remove and return the value of an arbitrary field (last for Small, first for Large).
-    #[allow(dead_code)]
-    pub(crate) fn pop(&mut self) -> Option<SharedByte> {
-        match self {
-            InnerHCommand::Small(vec) => vec.pop().map(|(_, v)| v),
-            InnerHCommand::Large(map) => {
-                let key = map.keys().next()?.clone();
-                map.remove(&key)
-            }
-        }
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        match self {
-            InnerHCommand::Small(v) => v.len(),
-            InnerHCommand::Large(m) => m.len(),
-        }
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub(crate) fn get(&self, field: &[u8]) -> Option<&SharedByte> {
-        match self {
-            InnerHCommand::Small(v) => v
-                .iter()
-                .find(|(k, _)| k.as_slice() == field)
-                .map(|(_, v)| v),
-            InnerHCommand::Large(m) => m.get(field),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn get_mut(&mut self, field: &[u8]) -> Option<&mut SharedByte> {
-        match self {
-            InnerHCommand::Small(v) => v
-                .iter_mut()
-                .find(|(k, _)| k.as_slice() == field)
-                .map(|(_, v)| v),
-            InnerHCommand::Large(m) => m.get_mut(field),
-        }
-    }
-
-    /// Remove a field and return its value.
-    pub(crate) fn del(&mut self, field: SharedByte) -> Option<SharedByte> {
-        match self {
-            InnerHCommand::Small(v) => {
-                let pos = v.iter().position(|(k, _)| k == &field)?;
-                Some(v.remove_swap(pos).1)
-            }
-            InnerHCommand::Large(m) => m.remove(&field),
-        }
-    }
-
-    pub(crate) fn contains_key(&self, field: &[u8]) -> bool {
-        self.get(field).is_some()
-    }
-
-    /// All field-value pairs as a flat vec [field1, val1, field2, val2, ...].
-    pub(crate) fn all(&self) -> Vec<SharedByte> {
-        match self {
-            InnerHCommand::Small(v) => {
-                let mut result = Vec::with_capacity(v.len() * 2);
-                for (k, val) in v.as_ref() {
-                    result.push(k.clone());
-                    result.push(val.clone());
-                }
-                result
-            }
-            InnerHCommand::Large(m) => {
-                let mut result = Vec::with_capacity(m.len() * 2);
-                for (k, val) in m {
-                    result.push(k.clone());
-                    result.push(val.clone());
-                }
-                result
-            }
-        }
-    }
-
-    pub(crate) fn keys(&self) -> Vec<SharedByte> {
-        match self {
-            InnerHCommand::Small(v) => v.iter().map(|(k, _)| k.clone()).collect(),
-            InnerHCommand::Large(m) => m.keys().cloned().collect(),
-        }
-    }
-
-    pub(crate) fn values(&self) -> Vec<SharedByte> {
-        match self {
-            InnerHCommand::Small(v) => v.iter().map(|(_, val)| val.clone()).collect(),
-            InnerHCommand::Large(m) => m.values().cloned().collect(),
-        }
-    }
-}
-
 impl OxidArt {
-    /// Get or create a hash at the given key, ensuring type correctness.
-    fn get_hash_mut<'a>(
-        &'a mut self,
-        ttl: Option<u64>,
-        key: &[u8],
-    ) -> Result<&'a mut InnerHCommand, TypeError> {
+    /// Racine valart du Hash à `key`, créé vide s'il n'existe pas (ou a expiré).
+    fn get_or_create_hash(&mut self, ttl: Option<u64>, key: &[u8]) -> Result<u32, TypeError> {
         let now = self.now;
         let node_key = self.ensure_key(key);
         let node = self.get_node_mut(node_key);
 
         match node.get_value_mut(now) {
-            Some(ref v) if *v.tag == Tag::Hash => {}
+            Some(v) if *v.tag == Tag::Hash => return Ok(unsafe { v.val.idx }),
             Some(_) => return Err(TypeError::ValueNotSet),
-            None => {
-                let (tag, val) = value_into_raw(crate::Value::Hash(InnerHCommand::new()));
-                node.tag = tag;
-                node.val = val;
-                if let Some(ttl) = ttl {
-                    node.exp_and_radix.set_exp(ttl);
-                }
-            }
-        };
-        let mut node_val = node.get_value_mut(now).unwrap();
+            None => {}
+        }
+        // Valeur expirée encore en place : la libérer, et ne pas hériter de
+        // son TTL.
+        if node.tag != Tag::None {
+            unsafe { drop_raw(node.tag, &mut node.val) };
+            node.exp_and_radix.set_no_expiracy();
+        }
+        let root = valart().hash_create();
+        node.tag = Tag::Hash;
+        node.val.idx = root;
+        if let Some(ttl) = ttl {
+            node.exp_and_radix.set_exp(ttl);
+        }
+        Ok(root)
+    }
 
-        node_val.as_hash_mut().map_err(|_| TypeError::ValueNotSet)
+    /// Racine valart du Hash à `key`, `None` si la clé n'existe pas.
+    fn hash_root(&mut self, key: &[u8]) -> Result<Option<u32>, RedisType> {
+        match self.get_mut(key) {
+            Some(val) => val.hash_root().map(Some),
+            None => Ok(None),
+        }
     }
 
     /// HSET - set one or more field-value pairs in a hash.
@@ -191,33 +51,38 @@ impl OxidArt {
     ) -> Result<u32, TypeError> {
         debug_assert!(!field_values.is_empty());
 
-        let inner = self.get_hash_mut(ttl, key)?;
+        let root = self.get_or_create_hash(ttl, key)?;
+        let trees = valart();
         let mut added = 0;
-
         for (field, value) in field_values {
-            if inner.insert(field.clone(), value.clone()) {
+            if trees.hash_set(root, field.clone(), value.clone()).is_none() {
                 added += 1;
             }
         }
-
         Ok(added)
     }
 
     /// HGET - get the value of a hash field.
     pub fn cmd_hget(&mut self, key: &[u8], field: &[u8]) -> Result<Option<SharedByte>, RedisType> {
-        let Some(val) = self.get_mut(key) else {
+        let Some(root) = self.hash_root(key)? else {
             return Ok(None);
         };
-        Ok(val.as_hash()?.get(field).cloned())
+        Ok(valart().hash_get(root, field).cloned())
     }
 
     /// HGETALL - get all field-value pairs in a hash.
     /// Returns a flat vector: [field1, value1, field2, value2, ...]
     pub fn cmd_hgetall(&mut self, key: &[u8]) -> Result<Vec<SharedByte>, RedisType> {
-        let Some(val) = self.get_mut(key) else {
+        let Some(root) = self.hash_root(key)? else {
             return Ok(Vec::new());
         };
-        Ok(val.as_hash()?.all())
+        let trees = valart();
+        let mut result = Vec::with_capacity(2 * trees.hash_len(root) as usize);
+        trees.hash_for_each(root, |k, v| {
+            result.push(k.clone());
+            result.push(v.clone());
+        });
+        Ok(result)
     }
 
     /// HDEL - delete one or more hash fields.
@@ -226,58 +91,56 @@ impl OxidArt {
     pub fn cmd_hdel(&mut self, key: &[u8], fields: &[SharedByte]) -> Result<u32, RedisType> {
         debug_assert!(!fields.is_empty());
 
-        let (deleted, need_cleanup) = {
-            let Some(mut val) = self.get_mut(key) else {
-                return Ok(0);
-            };
-            let inner = val.as_hash_mut()?;
-            let mut deleted = 0;
-
-            for field in fields {
-                if inner.del(field.clone()).is_some() {
-                    deleted += 1;
-                }
-            }
-            (deleted, inner.is_empty())
+        let Some(root) = self.hash_root(key)? else {
+            return Ok(0);
         };
-
-        if need_cleanup {
+        let trees = valart();
+        let deleted = fields
+            .iter()
+            .filter(|field| trees.hash_remove(root, field).is_some())
+            .count() as u32;
+        if trees.hash_len(root) == 0 {
             let _ = self.del(key);
         }
-
         Ok(deleted)
     }
 
     /// HEXISTS - check if a field exists in a hash.
     pub fn cmd_hexists(&mut self, key: &[u8], field: &[u8]) -> Result<bool, RedisType> {
-        let Some(val) = self.get_mut(key) else {
+        let Some(root) = self.hash_root(key)? else {
             return Ok(false);
         };
-        Ok(val.as_hash()?.contains_key(field))
+        Ok(valart().hash_contains(root, field))
     }
 
     /// HLEN - get the number of fields in a hash.
     pub fn cmd_hlen(&mut self, key: &[u8]) -> Result<u32, RedisType> {
-        let Some(val) = self.get_mut(key) else {
+        let Some(root) = self.hash_root(key)? else {
             return Ok(0);
         };
-        Ok(val.as_hash()?.len() as u32)
+        Ok(valart().hash_len(root))
     }
 
     /// HKEYS - get all field names in a hash.
     pub fn cmd_hkeys(&mut self, key: &[u8]) -> Result<Vec<SharedByte>, RedisType> {
-        let Some(val) = self.get_mut(key) else {
+        let Some(root) = self.hash_root(key)? else {
             return Ok(Vec::new());
         };
-        Ok(val.as_hash()?.keys())
+        let trees = valart();
+        let mut result = Vec::with_capacity(trees.hash_len(root) as usize);
+        trees.hash_for_each(root, |k, _| result.push(k.clone()));
+        Ok(result)
     }
 
     /// HVALS - get all values in a hash.
     pub fn cmd_hvals(&mut self, key: &[u8]) -> Result<Vec<SharedByte>, RedisType> {
-        let Some(val) = self.get_mut(key) else {
+        let Some(root) = self.hash_root(key)? else {
             return Ok(Vec::new());
         };
-        Ok(val.as_hash()?.values())
+        let trees = valart();
+        let mut result = Vec::with_capacity(trees.hash_len(root) as usize);
+        trees.hash_for_each(root, |_, v| result.push(v.clone()));
+        Ok(result)
     }
 
     /// HMGET - get the values of multiple hash fields.
@@ -287,11 +150,14 @@ impl OxidArt {
         key: &[u8],
         fields: &[SharedByte],
     ) -> Result<Vec<Option<SharedByte>>, RedisType> {
-        let Some(val) = self.get_mut(key) else {
+        let Some(root) = self.hash_root(key)? else {
             return Ok(vec![None; fields.len()]);
         };
-        let inner = val.as_hash()?;
-        Ok(fields.iter().map(|f| inner.get(f).cloned()).collect())
+        let trees = valart();
+        Ok(fields
+            .iter()
+            .map(|f| trees.hash_get(root, f).cloned())
+            .collect())
     }
 
     /// HINCRBY - increment a hash field by an integer value.
@@ -303,9 +169,10 @@ impl OxidArt {
         field: SharedByte,
         increment: i64,
     ) -> Result<i64, TypeError> {
-        let inner = self.get_hash_mut(None, key)?;
+        let root = self.get_or_create_hash(None, key)?;
+        let trees = valart();
 
-        let current = match inner.get(&field) {
+        let current = match trees.hash_get(root, &field) {
             Some(bytes) => {
                 let s = std::str::from_utf8(bytes).map_err(|_| TypeError::NotAInt)?;
                 s.parse::<i64>().map_err(|_| TypeError::NotAInt)?
@@ -314,7 +181,13 @@ impl OxidArt {
         };
 
         let new_val = current.checked_add(increment).ok_or(TypeError::NotAInt)?;
-        inner.insert(field, SharedByte::from_slice(new_val.to_string()));
+        let new_bytes = SharedByte::from_slice(new_val.to_string());
+        match trees.hash_get_mut(root, &field) {
+            Some(slot) => *slot = new_bytes,
+            None => {
+                trees.hash_set(root, field, new_bytes);
+            }
+        }
         Ok(new_val)
     }
 }

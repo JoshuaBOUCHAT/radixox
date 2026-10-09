@@ -11,3 +11,4 @@ categories = ["network-programming", "parser-implementations"]
 
 [dependencies]
 mimalloc = { workspace = true }
+libmimalloc-sys = { workspace = true }

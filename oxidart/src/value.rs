@@ -1,12 +1,13 @@
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::VecDeque,
     mem::{ManuallyDrop, MaybeUninit},
 };
 
 use hislab::HiSlab;
 use radixox_lib::shared_byte::SharedByte;
+use valart::ValTrees;
 
-use crate::{hcommand::InnerHCommand, zcommand::InnerZCommand};
+use crate::zcommand::InnerZCommand;
 
 // ─── Tag ─────────────────────────────────────────────────────────────────────
 
@@ -45,8 +46,9 @@ pub(crate) union ValUnion {
 
 // ─── Static slabs ─────────────────────────────────────────────────────────────
 
-static mut HASH_SLAB: MaybeUninit<HiSlab<InnerHCommand>> = MaybeUninit::uninit();
-static mut SET_SLAB: MaybeUninit<HiSlab<BTreeSet<SharedByte>>> = MaybeUninit::uninit();
+/// Hash et Set : arbres valart. Le nœud oxidart stocke l'idx de la racine
+/// dans `ValUnion::idx`.
+static mut VALART: MaybeUninit<ValTrees> = MaybeUninit::uninit();
 static mut ZSET_SLAB: MaybeUninit<HiSlab<InnerZCommand>> = MaybeUninit::uninit();
 static mut LIST_SLAB: MaybeUninit<HiSlab<VecDeque<SharedByte>>> = MaybeUninit::uninit();
 
@@ -56,9 +58,7 @@ static SLAB_INIT: std::sync::Once = std::sync::Once::new();
 pub(crate) fn init_slabs() {
     SLAB_INIT.call_once(|| unsafe {
         #[allow(static_mut_refs)]
-        HASH_SLAB.write(HiSlab::new(0, 100_000_000).expect("hash slab alloc"));
-        #[allow(static_mut_refs)]
-        SET_SLAB.write(HiSlab::new(0, 100_000_000).expect("set slab alloc"));
+        VALART.write(ValTrees::new());
         #[allow(static_mut_refs)]
         ZSET_SLAB.write(HiSlab::new(0, 100_000_000).expect("zset slab alloc"));
         #[allow(static_mut_refs)]
@@ -66,18 +66,13 @@ pub(crate) fn init_slabs() {
     });
 }
 
+/// Arbres valart (Hash, Set). Même contrat que les slabs : mono-thread, et
+/// l'appelant ne garde jamais deux références vivantes en même temps.
 #[inline]
-fn hash_slab() -> &'static mut HiSlab<InnerHCommand> {
+pub(crate) fn valart() -> &'static mut ValTrees {
     #[allow(static_mut_refs)]
     unsafe {
-        HASH_SLAB.assume_init_mut()
-    }
-}
-#[inline]
-fn set_slab() -> &'static mut HiSlab<BTreeSet<SharedByte>> {
-    #[allow(static_mut_refs)]
-    unsafe {
-        SET_SLAB.assume_init_mut()
+        VALART.assume_init_mut()
     }
 }
 #[inline]
@@ -95,30 +90,36 @@ fn list_slab() -> &'static mut HiSlab<VecDeque<SharedByte>> {
     }
 }
 
-pub(crate) fn alloc_hash(val: InnerHCommand) -> u32 {
-    hash_slab().insert(val)
-}
-pub(crate) fn free_hash(idx: u32) {
-    hash_slab().remove(idx);
-}
-pub(crate) fn hash_ref(idx: u32) -> &'static InnerHCommand {
-    hash_slab().get(idx).unwrap()
-}
-pub(crate) fn hash_mut(idx: u32) -> &'static mut InnerHCommand {
-    hash_slab().get_mut(idx).unwrap()
+fn hash_from_pairs(pairs: Vec<(SharedByte, SharedByte)>) -> u32 {
+    let trees = valart();
+    let root = trees.hash_create();
+    for (field, val) in pairs {
+        trees.hash_set(root, field, val);
+    }
+    root
 }
 
-pub(crate) fn alloc_set(val: BTreeSet<SharedByte>) -> u32 {
-    set_slab().insert(val)
+fn hash_to_pairs(root: u32) -> Vec<(SharedByte, SharedByte)> {
+    let trees = valart();
+    let mut pairs = Vec::with_capacity(trees.hash_len(root) as usize);
+    trees.hash_for_each(root, |k, v| pairs.push((k.clone(), v.clone())));
+    pairs
 }
-pub(crate) fn free_set(idx: u32) {
-    set_slab().remove(idx);
+
+fn set_from_members(members: Vec<SharedByte>) -> u32 {
+    let trees = valart();
+    let root = trees.set_create();
+    for member in members {
+        trees.set_add(root, member);
+    }
+    root
 }
-pub(crate) fn set_ref(idx: u32) -> &'static BTreeSet<SharedByte> {
-    set_slab().get(idx).unwrap()
-}
-pub(crate) fn set_mut(idx: u32) -> &'static mut BTreeSet<SharedByte> {
-    set_slab().get_mut(idx).unwrap()
+
+fn set_to_members(root: u32) -> Vec<SharedByte> {
+    let trees = valart();
+    let mut members = Vec::with_capacity(trees.set_card(root) as usize);
+    trees.set_for_each(root, |m| members.push(m.clone()));
+    members
 }
 
 pub(crate) fn alloc_zset(val: InnerZCommand) -> u32 {
@@ -160,8 +161,8 @@ pub(crate) fn value_into_raw(val: Value) -> (Tag, ValUnion) {
                 bytes: ManuallyDrop::new(b),
             },
         ),
-        Value::Hash(h) => (Tag::Hash, ValUnion { idx: alloc_hash(h) }),
-        Value::Set(s) => (Tag::Set, ValUnion { idx: alloc_set(s) }),
+        Value::Hash(h) => (Tag::Hash, ValUnion { idx: hash_from_pairs(h) }),
+        Value::Set(s) => (Tag::Set, ValUnion { idx: set_from_members(s) }),
         Value::ZSet(z) => (Tag::ZSet, ValUnion { idx: alloc_zset(z) }),
         Value::List(l) => (Tag::List, ValUnion { idx: alloc_list(l) }),
     }
@@ -177,8 +178,8 @@ pub(crate) unsafe fn value_from_raw_ref(tag: Tag, val: &ValUnion) -> Value {
             Tag::None => panic!("value_from_raw_ref: Tag::None"),
             Tag::Int => Value::Int(val.integer),
             Tag::Bytes => Value::String((*val.bytes).clone()),
-            Tag::Hash => Value::Hash(hash_ref(val.idx).clone()),
-            Tag::Set => Value::Set(set_ref(val.idx).clone()),
+            Tag::Hash => Value::Hash(hash_to_pairs(val.idx)),
+            Tag::Set => Value::Set(set_to_members(val.idx)),
             Tag::ZSet => Value::ZSet(zset_ref(val.idx).clone()),
             Tag::List => Value::List(list_ref(val.idx).clone()),
         }
@@ -195,8 +196,16 @@ pub(crate) unsafe fn value_take_raw(tag: Tag, val: ValUnion) -> Value {
             Tag::None => panic!("value_take_raw: Tag::None"),
             Tag::Int => Value::Int(val.integer),
             Tag::Bytes => Value::String(ManuallyDrop::into_inner(val.bytes)),
-            Tag::Hash => Value::Hash(hash_slab().remove(val.idx).expect("hash slot")),
-            Tag::Set => Value::Set(set_slab().remove(val.idx).expect("set slot")),
+            Tag::Hash => {
+                let pairs = hash_to_pairs(val.idx);
+                valart().hash_drop(val.idx);
+                Value::Hash(pairs)
+            }
+            Tag::Set => {
+                let members = set_to_members(val.idx);
+                valart().set_drop(val.idx);
+                Value::Set(members)
+            }
             Tag::ZSet => Value::ZSet(zset_slab().remove(val.idx).expect("zset slot")),
             Tag::List => Value::List(list_slab().remove(val.idx).expect("list slot")),
         }
@@ -211,8 +220,8 @@ pub(crate) unsafe fn drop_raw(tag: Tag, val: &mut ValUnion) {
     unsafe {
         match tag {
             Tag::Bytes => ManuallyDrop::drop(&mut val.bytes),
-            Tag::Hash => free_hash(val.idx),
-            Tag::Set => free_set(val.idx),
+            Tag::Hash => valart().hash_drop(val.idx),
+            Tag::Set => valart().set_drop(val.idx),
             Tag::ZSet => free_zset(val.idx),
             Tag::List => free_list(val.idx),
             Tag::Int | Tag::None => {}
@@ -251,30 +260,18 @@ impl<'a> NodeValMut<'a> {
         Ok(new_val)
     }
 
-    pub fn as_hash(&self) -> Result<&InnerHCommand, RedisType> {
+    /// Racine valart du Hash.
+    pub fn hash_root(&self) -> Result<u32, RedisType> {
         match *self.tag {
-            Tag::Hash => Ok(unsafe { hash_ref(self.val.idx) }),
+            Tag::Hash => Ok(unsafe { self.val.idx }),
             _ => Err(self.tag.redis_type()),
         }
     }
 
-    pub fn as_hash_mut(&mut self) -> Result<&'static mut InnerHCommand, RedisType> {
+    /// Racine valart du Set.
+    pub fn set_root(&self) -> Result<u32, RedisType> {
         match *self.tag {
-            Tag::Hash => Ok(unsafe { hash_mut(self.val.idx) }),
-            _ => Err(self.tag.redis_type()),
-        }
-    }
-
-    pub fn as_set(&self) -> Result<&BTreeSet<SharedByte>, RedisType> {
-        match *self.tag {
-            Tag::Set => Ok(unsafe { set_ref(self.val.idx) }),
-            _ => Err(self.tag.redis_type()),
-        }
-    }
-
-    pub fn as_set_mut(&mut self) -> Result<&'static mut BTreeSet<SharedByte>, RedisType> {
-        match *self.tag {
-            Tag::Set => Ok(unsafe { set_mut(self.val.idx) }),
+            Tag::Set => Ok(unsafe { self.val.idx }),
             _ => Err(self.tag.redis_type()),
         }
     }
@@ -310,13 +307,16 @@ impl<'a> NodeValMut<'a> {
 
 // ─── Public Value enum ────────────────────────────────────────────────────────
 
+/// Valeur détachée de l'arbre. Pour Hash et Set, c'est une copie des entrées
+/// (ordre sans signification) : les commandes travaillent directement sur les
+/// arbres valart, ces variantes ne servent qu'à l'API générique `get`/`set`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     String(SharedByte),
     Int(i64),
-    Hash(InnerHCommand),
+    Hash(Vec<(SharedByte, SharedByte)>),
     List(VecDeque<SharedByte>),
-    Set(BTreeSet<SharedByte>),
+    Set(Vec<SharedByte>),
     ZSet(InnerZCommand),
 }
 
@@ -350,28 +350,14 @@ impl Value {
         }
     }
 
-    pub fn as_hash(&self) -> Result<&InnerHCommand, RedisType> {
+    pub fn as_hash(&self) -> Result<&[(SharedByte, SharedByte)], RedisType> {
         match self {
             Value::Hash(h) => Ok(h),
             other => Err(other.redis_type()),
         }
     }
 
-    pub fn as_hash_mut(&mut self) -> Result<&mut InnerHCommand, RedisType> {
-        match self {
-            Value::Hash(h) => Ok(h),
-            other => Err(other.redis_type()),
-        }
-    }
-
-    pub fn as_set(&self) -> Result<&BTreeSet<SharedByte>, RedisType> {
-        match self {
-            Value::Set(s) => Ok(s),
-            other => Err(other.redis_type()),
-        }
-    }
-
-    pub fn as_set_mut(&mut self) -> Result<&mut BTreeSet<SharedByte>, RedisType> {
+    pub fn as_set(&self) -> Result<&[SharedByte], RedisType> {
         match self {
             Value::Set(s) => Ok(s),
             other => Err(other.redis_type()),

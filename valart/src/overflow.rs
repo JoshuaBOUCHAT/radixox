@@ -1,11 +1,27 @@
-use std::alloc::{GlobalAlloc, Layout, handle_alloc_error};
+use std::alloc::{Layout, handle_alloc_error};
 
-// Blocs overflow : MiMalloc en direct (pools par taille, comme `SharedByte`).
+// Blocs overflow : mimalloc en direct (pools par taille, comme `SharedByte`).
+// `mi_zalloc` et pas `MiMalloc.alloc_zeroed` : ce dernier passe par
+// `mi_zalloc_aligned`, qui sur page vide sur-alloue size+align-1 et peut
+// tomber dans la classe de taille suivante. mimalloc aligne déjà sur 8, ce
+// qui suffit au tag de 3 bits.
 // En test, allocateur système pour qu'AddressSanitizer voie les blocs.
-#[cfg(test)]
-use std::alloc::System as BlockAlloc;
 #[cfg(not(test))]
-use mimalloc::MiMalloc as BlockAlloc;
+unsafe fn block_zalloc(layout: Layout) -> *mut u8 {
+    unsafe { libmimalloc_sys::mi_zalloc(layout.size()) as *mut u8 }
+}
+#[cfg(not(test))]
+unsafe fn block_free(ptr: *mut u8, _layout: Layout) {
+    unsafe { libmimalloc_sys::mi_free(ptr as *mut _) }
+}
+#[cfg(test)]
+unsafe fn block_zalloc(layout: Layout) -> *mut u8 {
+    unsafe { std::alloc::alloc_zeroed(layout) }
+}
+#[cfg(test)]
+unsafe fn block_free(ptr: *mut u8, layout: Layout) {
+    unsafe { std::alloc::dealloc(ptr, layout) }
+}
 use std::ptr::NonNull;
 
 use radixox_lib::prefetch::PreFetch;
@@ -279,10 +295,11 @@ impl SetOverflow {
         unsafe {
             // Zéro : len = nb_childs = 0, bitmap vide, et `rank` peut lire
             // des mots entiers sans toucher d'octet non initialisé.
-            let raw = BlockAlloc.alloc_zeroed(layout);
+            let raw = block_zalloc(layout);
             if raw.is_null() {
                 handle_alloc_error(layout);
             }
+            debug_assert!(raw as usize & TAG_MASK == 0);
             (raw.add(2) as *mut u16).write(child_cap as u16);
             let tagged = (raw as usize | class as usize) as *mut u8;
             Self {
@@ -320,7 +337,7 @@ impl SetOverflow {
             std::ptr::copy_nonoverlapping(self.bitmap_ptr(), new.bitmap_ptr(), bitmap_len(len));
             std::ptr::copy_nonoverlapping(self.keys_ptr(), new.keys_ptr(), len);
             std::ptr::copy_nonoverlapping(self.childs_ptr(), new.childs_ptr(), nb_childs);
-            BlockAlloc.dealloc(self.base_ptr(), self.block_layout());
+            block_free(self.base_ptr(), self.block_layout());
         }
         // Pas `*self = new` : ça déclencherait le `Drop` de l'ancienne valeur
         // (déjà désallouée, clés déplacées). On adopte le pointeur et on
@@ -461,7 +478,7 @@ impl Drop for SetOverflow {
         for i in 0..self.len() {
             unsafe { std::ptr::drop_in_place(self.keys_ptr().add(i)) };
         }
-        unsafe { BlockAlloc.dealloc(self.base_ptr(), self.block_layout()) };
+        unsafe { block_free(self.base_ptr(), self.block_layout()) };
     }
 }
 
@@ -730,10 +747,11 @@ impl HashOverflow {
         let layout = Layout::from_size_align(size, 8).unwrap();
         unsafe {
             // Zéro : voir `SetOverflow::alloc_block`.
-            let raw = BlockAlloc.alloc_zeroed(layout);
+            let raw = block_zalloc(layout);
             if raw.is_null() {
                 handle_alloc_error(layout);
             }
+            debug_assert!(raw as usize & TAG_MASK == 0);
             (raw.add(2) as *mut u16).write(child_cap as u16);
             let tagged = (raw as usize | class as usize) as *mut u8;
             Self {
@@ -771,7 +789,7 @@ impl HashOverflow {
             std::ptr::copy_nonoverlapping(self.keys_ptr(), new.keys_ptr(), len);
             std::ptr::copy_nonoverlapping(self.vals_ptr(), new.vals_ptr(), len);
             std::ptr::copy_nonoverlapping(self.childs_ptr(), new.childs_ptr(), nb_childs);
-            BlockAlloc.dealloc(self.base_ptr(), self.block_layout());
+            block_free(self.base_ptr(), self.block_layout());
         }
         // Voir `SetOverflow::realloc` : on adopte le pointeur, sans Drop.
         self.ptr = new.ptr;
@@ -892,7 +910,7 @@ impl Drop for HashOverflow {
                 std::ptr::drop_in_place(self.vals_ptr().add(i));
             }
         }
-        unsafe { BlockAlloc.dealloc(self.base_ptr(), self.block_layout()) };
+        unsafe { block_free(self.base_ptr(), self.block_layout()) };
     }
 }
 

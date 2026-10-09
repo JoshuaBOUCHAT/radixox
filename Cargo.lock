@@ -195,8 +195,6 @@ dependencies = [
 [[package]]
 name = "hislab"
 version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "287413d542f49d0f492a6f8df7475ba1a3896f8dbd90d2a3f290531495fb85c3"
 dependencies = [
  "libc",
  "memmap2",
@@ -502,6 +500,7 @@ dependencies = [
  "bytes",
  "hashbrown",
  "hislab",
+ "libmimalloc-sys",
  "mimalloc",
  "monoio",
  "ordered-float",
@@ -510,6 +509,7 @@ dependencies = [
  "regex-automata",
  "smallvec",
  "thin-vec",
+ "valart",
 ]
 
 [[package]]
@@ -583,6 +583,7 @@ dependencies = [
 name = "radixox-lib"
 version = "0.5.0"
 dependencies = [
+ "libmimalloc-sys",
  "mimalloc",
 ]
 
@@ -793,8 +794,8 @@ dependencies = [
  "fastrand",
  "foldhash",
  "hislab",
+ "libmimalloc-sys",
  "mimalloc",
- "oxidart",
  "radixox-lib",
 ]
 

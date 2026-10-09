@@ -1,5 +1,4 @@
-use mimalloc::MiMalloc;
-use std::alloc::{GlobalAlloc, Layout};
+use libmimalloc_sys::{mi_free, mi_malloc};
 use std::borrow::Borrow;
 
 use std::ops::Deref;
@@ -35,9 +34,12 @@ impl SharedByte {
         assert!(data.len() <= u32::MAX as usize);
 
         unsafe {
+            // mi_malloc plutôt que MiMalloc.alloc : ce dernier passe par
+            // mi_malloc_aligned qui, sur page vide, sur-alloue size+align-1
+            // (106 B → bloc 128 au lieu de 112). mi_malloc garantit déjà
+            // un alignement ≥ 8.
             let total = Self::HEADER_SIZE + data.len();
-            let layout = Layout::from_size_align(total, 8).unwrap();
-            let ptr = MiMalloc.alloc(layout);
+            let ptr = mi_malloc(total) as *mut u8;
             assert!(!ptr.is_null());
 
             // écrire len
@@ -96,9 +98,8 @@ impl SharedByte {
                 }
             }
         } else {
-            let layout = Layout::from_size_align(Self::HEADER_SIZE + len, 8).unwrap();
             unsafe {
-                let new_ptr = MiMalloc.alloc(layout);
+                let new_ptr = mi_malloc(Self::HEADER_SIZE + len) as *mut u8;
                 assert!(!new_ptr.is_null());
                 (new_ptr as *mut u32).write(len as u32);
                 (new_ptr.add(4) as *mut u16).write(1);
@@ -108,7 +109,12 @@ impl SharedByte {
                     *dst.add(i) = (*src.add(i)).to_ascii_uppercase();
                 }
 
-                self.ptr = NonNull::new_unchecked(new_ptr);
+                // Pas `self.ptr = new_ptr` : réécrire le champ (NonNull est Copy)
+                // ne drop rien, l'ancien buffer garderait son rc et fuirait.
+                // Assigner `*self` drop l'ancienne valeur → décrémente son rc.
+                *self = Self {
+                    ptr: NonNull::new_unchecked(new_ptr),
+                };
             }
         }
     }
@@ -134,9 +140,7 @@ impl Drop for SharedByte {
             let rc = self.rc_ptr();
             *rc -= 1;
             if *rc == 0 {
-                let total = Self::HEADER_SIZE + self.len();
-                let layout = Layout::from_size_align(total, 8).unwrap();
-                MiMalloc.dealloc(self.ptr.as_ptr(), layout);
+                mi_free(self.ptr.as_ptr() as *mut _);
             }
         }
     }
@@ -229,5 +233,30 @@ unsafe impl Send for OwnedByte {}
 impl Into<SharedByte> for OwnedByte {
     fn into(self) -> SharedByte {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_uppercase_shared_releases_old_rc() {
+        let a = SharedByte::from_slice(b"hello");
+        let mut b = a.clone();
+        assert_eq!(a.rc(), 2);
+        b.to_uppercase();
+        assert_eq!(b.as_slice(), b"HELLO");
+        assert_eq!(b.rc(), 1);
+        assert_eq!(a.as_slice(), b"hello");
+        assert_eq!(a.rc(), 1);
+    }
+
+    #[test]
+    fn to_uppercase_unique_in_place() {
+        let mut a = SharedByte::from_slice(b"MiXeD");
+        a.to_uppercase();
+        assert_eq!(a.as_slice(), b"MIXED");
+        assert_eq!(a.rc(), 1);
     }
 }

@@ -72,6 +72,8 @@ Principe directeur : **le hot path n'est jamais dévié ; c'est le save qui est 
 
 ### 3.2bis Format de sérialisation : node-level, pas memcpy brut, pas réinsertion logique
 
+> **Remplacé (2026-10-09) par `SAVE_DESIGN.md`** : parcours DFS de l'arbre (pas du slab), enregistrements `lcp` + suffixe par fichier de voie, reload en masse. Le texte ci-dessous est conservé pour l'historique.
+
 Ni dump brut du slab (memcpy), ni réinsertion via `ensure_key`/`split_node` (trop lent, refait la logique métier). Format retenu :
 
 - **Itération linéaire du slab** (nœuds initialisés, filtrée par le bitmap HiSlab) → écriture séquentielle sur disque. Cache-friendly, et minimise la durée du save donc la fenêtre CoW (cf. §3.5 — plus le save dure, plus de nœuds risquent d'être déviés).

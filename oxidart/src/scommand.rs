@@ -1,11 +1,9 @@
-use std::collections::BTreeSet;
-
 use radixox_lib::shared_byte::SharedByte;
 
 use crate::{
-    OxidArt, Value,
+    OxidArt,
     error::TypeError,
-    value::{RedisType, Tag, value_into_raw},
+    value::{RedisType, Tag, drop_raw, valart},
 };
 
 pub enum SPOPResult {
@@ -13,32 +11,38 @@ pub enum SPOPResult {
     Multiple(Vec<SharedByte>),
 }
 impl OxidArt {
-    fn get_btree_set_mut<'a>(
-        &'a mut self,
-        ttl: Option<u64>,
-        key: &[u8],
-    ) -> Result<&'a mut BTreeSet<SharedByte>, TypeError> {
+    /// Racine valart du Set à `key`, créé vide s'il n'existe pas (ou a expiré).
+    fn get_or_create_set(&mut self, ttl: Option<u64>, key: &[u8]) -> Result<u32, TypeError> {
         let now = self.now;
         let node_key = self.ensure_key(key);
         let node = self.get_node_mut(node_key);
 
         match node.get_value_mut(now) {
-            Some(ref v) if *v.tag == Tag::Set => {}
+            Some(v) if *v.tag == Tag::Set => return Ok(unsafe { v.val.idx }),
             Some(_) => return Err(TypeError::ValueNotSet),
-            None => {
-                let (tag, val) = value_into_raw(Value::Set(BTreeSet::new()));
-                node.tag = tag;
-                node.val = val;
-                if let Some(ttl) = ttl {
-                    node.exp_and_radix.set_exp(ttl);
-                }
-            }
-        };
+            None => {}
+        }
+        // Valeur expirée encore en place : la libérer, et ne pas hériter de
+        // son TTL.
+        if node.tag != Tag::None {
+            unsafe { drop_raw(node.tag, &mut node.val) };
+            node.exp_and_radix.set_no_expiracy();
+        }
+        let root = valart().set_create();
+        node.tag = Tag::Set;
+        node.val.idx = root;
+        if let Some(ttl) = ttl {
+            node.exp_and_radix.set_exp(ttl);
+        }
+        Ok(root)
+    }
 
-        node.get_value_mut(now)
-            .unwrap()
-            .as_set_mut()
-            .map_err(|_| TypeError::ValueNotSet)
+    /// Racine valart du Set à `key`, `None` si la clé n'existe pas.
+    fn set_root(&mut self, key: &[u8]) -> Result<Option<u32>, RedisType> {
+        match self.get_mut(key) {
+            Some(val) => val.set_root().map(Some),
+            None => Ok(None),
+        }
     }
 
     /// SPOP - remove and return one or more random members from a set.
@@ -57,22 +61,25 @@ impl OxidArt {
             None => 1,
         };
 
-        let set = self.get_btree_set_mut(None, key)?;
+        let Some(root) = self.set_root(key).map_err(|_| TypeError::ValueNotSet)? else {
+            return Ok(if count == 1 {
+                SPOPResult::Single(None)
+            } else {
+                SPOPResult::Multiple(Vec::new())
+            });
+        };
+        let trees = valart();
+        let popped: Vec<SharedByte> = (0..count)
+            .map_while(|_| trees.set_pop(root, rand::random()))
+            .collect();
+        if trees.set_card(root) == 0 {
+            let _ = self.del(key);
+        }
 
         if count == 1 {
-            return Ok(SPOPResult::Single(set.pop_last()));
+            return Ok(SPOPResult::Single(popped.into_iter().next()));
         }
-
-        let mut res = Vec::with_capacity(count.min(set.len() as u32) as usize);
-        for _ in 0..count {
-            if let Some(val) = set.pop_last() {
-                res.push(val);
-            } else {
-                break;
-            }
-        }
-
-        Ok(SPOPResult::Multiple(res))
+        Ok(SPOPResult::Multiple(popped))
     }
     pub fn cmd_sadd(
         &mut self,
@@ -82,70 +89,49 @@ impl OxidArt {
     ) -> Result<u32, TypeError> {
         debug_assert!(!members.is_empty());
 
-        let set = self.get_btree_set_mut(ttl, key)?;
-        let mut count = 0;
-
-        for member in members {
-            if set.insert(member.clone()) {
-                count += 1;
-            }
-        }
-
-        Ok(count)
+        let root = self.get_or_create_set(ttl, key)?;
+        let trees = valart();
+        Ok(members
+            .iter()
+            .filter(|member| trees.set_add(root, (*member).clone()))
+            .count() as u32)
     }
     pub fn cmd_srem(&mut self, key: &[u8], members: &[SharedByte]) -> Result<u32, RedisType> {
         debug_assert!(!members.is_empty());
 
-        let (count, need_clean_up) = {
-            let Some(mut val) = self.get_mut(key) else {
-                return Ok(0);
-            };
-            let set = val.as_set_mut()?;
-            let mut count = 0;
-
-            for member in members {
-                if set.remove(member) {
-                    count += 1;
-                }
-            }
-            (count, set.is_empty())
+        let Some(root) = self.set_root(key)? else {
+            return Ok(0);
         };
-        if need_clean_up {
+        let trees = valart();
+        let count = members
+            .iter()
+            .filter(|member| trees.set_remove(root, member))
+            .count() as u32;
+        if trees.set_card(root) == 0 {
             let _ = self.del(key);
         }
-
         Ok(count)
     }
     pub fn cmd_smembers(&mut self, key: &[u8]) -> Result<Vec<SharedByte>, RedisType> {
-        let res: Vec<_> = {
-            let Some(val) = self.get_mut(key) else {
-                return Ok(Vec::new());
-            };
-            val.as_set()?.iter().cloned().collect()
+        let Some(root) = self.set_root(key)? else {
+            return Ok(Vec::new());
         };
-        if res.is_empty() {
-            let _ = self.del(key);
-        }
+        let trees = valart();
+        let mut res = Vec::with_capacity(trees.set_card(root) as usize);
+        trees.set_for_each(root, |m| res.push(m.clone()));
         Ok(res)
     }
     pub fn cmd_sismember(&mut self, key: &[u8], member: SharedByte) -> Result<bool, RedisType> {
-        let Some(val) = self.get_mut(key) else {
+        let Some(root) = self.set_root(key)? else {
             return Ok(false);
         };
-        Ok(val.as_set()?.contains(&member))
+        Ok(valart().set_contains(root, &member))
     }
     pub fn cmd_scard(&mut self, key: &[u8]) -> Result<u32, RedisType> {
-        let len = {
-            let Some(val) = self.get_mut(key) else {
-                return Ok(0);
-            };
-            val.as_set()?.len()
+        let Some(root) = self.set_root(key)? else {
+            return Ok(0);
         };
-
-        if len == 0 {
-            let _ = self.del(key);
-        }
-        Ok(len as u32)
+        Ok(valart().set_card(root))
     }
 }
 

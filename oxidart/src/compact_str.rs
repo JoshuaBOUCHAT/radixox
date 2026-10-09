@@ -1,6 +1,6 @@
-use mimalloc::MiMalloc;
-use std::alloc::GlobalAlloc;
-use std::alloc::Layout;
+// mi_malloc direct (pas MiMalloc.alloc → mi_malloc_aligned, qui sur-alloue
+// size+align-1 sur page vide). Alignement ≥ 8 garanti par mimalloc.
+use libmimalloc_sys::{mi_free, mi_malloc};
 use std::ops::Deref;
 
 // Inline : inner[0] = (len << 1) | 1    len ∈ 0..=7
@@ -38,8 +38,7 @@ impl CompactStr {
                 Self(Inner { inline: inner })
             } else {
                 unsafe {
-                    let layout = Layout::from_size_align(Self::HEAP_HEADER + new_len, 4).unwrap();
-                    let ptr = MiMalloc.alloc(layout);
+                    let ptr = mi_malloc(Self::HEAP_HEADER + new_len) as *mut u8;
                     assert!(!ptr.is_null());
                     (ptr as *mut u32).write(new_len as u32);
                     let data = ptr.add(Self::HEAP_HEADER);
@@ -65,8 +64,7 @@ impl CompactStr {
             Self(Inner { inline: inner })
         } else {
             unsafe {
-                let layout = Layout::from_size_align(Self::HEAP_HEADER + data.len(), 4).unwrap();
-                let ptr = MiMalloc.alloc(layout);
+                let ptr = mi_malloc(Self::HEAP_HEADER + data.len()) as *mut u8;
                 assert!(!ptr.is_null());
                 (ptr as *mut u32).write(data.len() as u32);
                 std::ptr::copy_nonoverlapping(
@@ -112,10 +110,7 @@ impl Drop for CompactStr {
     fn drop(&mut self) {
         unsafe {
             if self.0.inline[0] & 1 == 0 {
-                let ptr = self.0.heap;
-                let len = (ptr as *const u32).read() as usize;
-                let layout = Layout::from_size_align(Self::HEAP_HEADER + len, 4).unwrap();
-                MiMalloc.dealloc(ptr, layout);
+                mi_free(self.0.heap as *mut _);
             }
         }
     }

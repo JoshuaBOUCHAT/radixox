@@ -172,6 +172,11 @@ fn spawn_acceptor(
                     _ => panic!("accept fatal: {e}"),
                 },
             };
+            // Sans ça, Nagle retient une écriture tant que la précédente n'est
+            // pas acquittée (jusqu'à ~40 ms avec le delayed ACK du client).
+            if let Err(e) = stream.set_nodelay(true) {
+                eprintln!("set_nodelay: {e}");
+            }
             monoio::spawn(handle_connection(
                 stream,
                 shared_art.clone(),

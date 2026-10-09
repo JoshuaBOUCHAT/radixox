@@ -615,3 +615,120 @@ inventer.
   rentable seulement si le workload réel est dominé par des inserts plutôt que
   des re-scores de membres existants ; à trancher selon l'usage visé, pas un
   défaut universel.
+
+## 13. ZSet — design retenu après investigation (2026-10-07, pas implémenté)
+
+Remplace la « direction pressentie » du §12.4. Le ZSet actuel (`InnerZCommand` :
+`SmallVec` trié ≤ 16, puis `BTreeSet<(score, membre)>` + `HashMap`) reste
+branché tel quel ; Hash et Set sont passés sur valart.
+
+### 13.1 Le point bloquant du §12.4 : les rangs
+
+Un trie (oxidart) ou un `BTreeMap` std ne connaît pas la taille de ses
+sous-arbres. Toutes les commandes par **position** restent alors en O(n) :
+ZRANGE par index (la forme par défaut), ZRANK/ZREVRANK, ZCOUNT, ZLEXCOUNT,
+ZREMRANGEBYRANK, ZRANDMEMBER. Constat sur l'existant : `cmd_zrange` fait
+`iter().skip(start)` (`oxidart/src/zcommand.rs`), donc `ZRANGE k -10 -1` sur 1M
+membres parcourt les 1M. Redis fait O(log n) grâce aux `span` de sa skiplist.
+Ajouter des compteurs à oxidart les ferait payer à tous les nœuds du keyspace.
+
+### 13.2 Trois représentations selon la taille
+
+1. **≤ 7 membres** : un seul nœud 128 B du slab valart, 7 × (score u64 + ptr
+   membre) triés + 1 octet de contrôle par entrée. Zéro allocation, rang =
+   index, lookup membre = SWAR sur les ctrl.
+2. **8 à ~128 membres** : un bloc trié unique en colonnes
+   `[scores u64][membres][ctrl]`, façon listpack. ~17 B/membre, aucun index
+   séparé ; insert/remove = memmove ≤ ~2 Ko.
+3. **> 128 membres** : deux structures.
+   - **B+tree à compteurs** (order-statistic), clé = `(score u64 ordonné, ptr
+     membre)`, **aucune valeur**. Nœuds ~512 B ; feuilles en colonnes
+     (`scores [u64; 31]`, `membres [ptr; 31]`), chaînées prev/next ; nœuds
+     internes : séparateurs + enfants u32 + **compteur par sous-arbre**. Hauteur
+     ~5 pour 1M. Comparaison : `u64` d'abord, octets du membre seulement en cas
+     d'égalité de score (ordre lexicographique exigé par ZRANGE/ZRANGEBYLEX).
+   - **Index membre → score** : variante de `HashNode` valart, score `u64`
+     inline à la place de la valeur `SharedByte` (même 16 B/entrée). Le membre
+     est le même `SharedByte` que dans le B+tree (rc = 2, pas de copie).
+   - Estimation ~40 B/membre hors octets des membres (actuel ~70 B, Redis
+     skiplist + dict ~90-100 B). À vérifier au bench.
+
+### 13.3 Mécanique
+
+- **Rang** : en descendant, somme des compteurs des sous-arbres à gauche du
+  chemin. **Sélection par rang** : on descend en soustrayant. **ZCOUNT** =
+  rang(max) − rang(min). Insert/remove : ±1 sur les compteurs du chemin (déjà
+  en cache).
+- **Équilibrage** : B+tree équilibré par construction (feuilles à la même
+  profondeur, split qui remonte, emprunt/fusion sous la moitié), aucune
+  rotation, quel que soit l'ordre d'insertion.
+- **Min/max** : `first_leaf` / `last_leaf` dans l'en-tête → O(1). Après un pop,
+  le suivant est l'entrée voisine ou la feuille `next`. Compteurs du chemin du
+  min = enfant 0 à chaque niveau, redescente sans comparaison : **pas besoin de
+  pointeur parent pour ZPOPMIN/MAX**.
+- **ZINCRBY / ZADD update sur place** : si le nouveau score reste entre les
+  voisins dans la feuille, on déplace l'entrée dans la feuille ; aucun compteur
+  ne change (même optimisation que `zslUpdateScore` de Redis).
+- **Pas de référencement croisé par index** (`membre → score_idx`,
+  `score → membre_idx`) : les entrées d'un B+tree bougent à chaque insert
+  (décalage), split, fusion → il faudrait corriger jusqu'à ~30 pointeurs dans
+  l'index par insertion, en accès aléatoires. Le sens score → membre est
+  inutile (l'entrée contient déjà le ptr du membre). Redis lui-même relit le
+  score dans le dict puis **redescend** la skiplist (`zslDelete(score, ele)`),
+  il n'utilise pas son pointeur pour aller au nœud. Nous copions le score dans
+  l'index (8 B, comme leur pointeur) au lieu de pointer dessus.
+- **Score en f64 obligatoire** : f32 = entiers exacts seulement ≤ 2^24 → casse
+  les timestamps ms (files à délai, rate limiting, le cas d'usage n°1), les
+  classements > 16M points, les IDs. Gain f32 seulement ~18 % (~40 → ~33 B).
+  Si besoin un jour : encodage étroit par ZSet façon `intset` (4 B tant que
+  tous les scores y tiennent exactement, réécriture unique en 8 B sinon).
+  Normaliser −0.0 en 0.0 à l'insertion (Redis les considère égaux).
+
+### 13.4 Égalités de score massives (ex. file à priorité, tout à 0)
+
+Retrouver `(15, TRUC)` parmi des milliers d'ex-aequo = O(log n) comparaisons
+qui déréférencent chacune un membre (~25 cache misses, ~2 µs). Redis paie la
+même chose (`sdscmp`). Atténuations, à n'activer qu'après mesure :
+- **Indice de feuille** dans l'index (u32, entrée 16 → 20 B) : on cherche dans
+  la feuille indiquée le **pointeur membre identique** (même `SharedByte`,
+  comparaison SIMD de 31 u64, zéro déréférencement). Indice périmé (split /
+  fusion, ~1 insert sur 15) → redescente puis correction. Un indice faux ne
+  corrompt jamais rien. Demande des **pointeurs parents** dans le B+tree
+  (remonter pour les compteurs et pour ZRANK depuis une feuille), maintenus aux
+  splits — classique et contrôlable par le vérificateur.
+- **Préfixe de 8 octets du membre** à côté du score (+8 B/entrée) pour trancher
+  les comparaisons d'insertion sans déréférencement (inutile si les membres
+  partagent un long préfixe, ex. `job:000…`).
+
+### 13.5 Descente entrelacée (AMAC) pour ZADD d'un nouveau membre
+
+Les descentes index (hash du membre) et B+tree (score, membre) sont
+indépendantes : on les avance niveau par niveau en prefetchant le prochain nœud
+de chacune → coût ≈ max des deux au lieu de la somme. Si l'index révèle un
+membre existant avec un autre score, il faut en plus retrouver l'ancienne
+entrée (indice de feuille ou redescente).
+
+### 13.6 Options écartées
+
+- **Trie radix sur `score_be ++ membre` (oxidart)** : ex-aequo gratuits (octets
+  du membre dans le chemin, pas de déréférencement) mais rangs O(n) et ~64 B
+  par nœud.
+- **`BTreeMap<f64, membre | valart de membres>`** (deux niveaux) : pas de
+  compteurs (rangs O(n)), et un valart trierait les ex-aequo par hash au lieu de
+  l'ordre lexicographique exigé par Redis.
+
+### 13.7 Contraintes et plan
+
+- **Tous les nœuds en HiSlab** (B+tree compris, dans son propre slab), pour le
+  mécanisme de COW de la sauvegarde. Les blocs « moyen » (représentation 2) et
+  les overflows valart sont aujourd'hui hors slab : même point ouvert que pour
+  Hash/Set.
+- **v1** : B+tree à compteurs + feuilles chaînées + first/last, index membre →
+  score, redescente systématique (ni parents ni indice), représentations 1 et 2.
+  Couvre toutes les commandes avec les bonnes complexités ; seul point faible
+  les updates/suppressions sur de grands groupes d'ex-aequo.
+- **v2 si le bench des ex-aequo le justifie** : indice de feuille + parents,
+  descente entrelacée, préfixe de membre.
+- Développement comme Set/Hash : vérificateur d'invariants (compteurs, ordre,
+  remplissage, chaînage), tests contre un modèle de référence, bench 1M contre
+  `BTreeSet` + `HashMap`.
