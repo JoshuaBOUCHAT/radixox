@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > **Persistance / save** : lire `SAVE_DESIGN.md` avant de toucher à la
 > persistance, aux mutations d'`oxidart/src/lib.rs`, à `valart/` ou à
 > `radixox-lib/src/save_barrier.rs`. Il contient le design validé (COW
-> applicatif, parcours DFS à K voies, format), l'état du code, les options
+> applicatif, parcours DFS simple + prefetch, format), l'état du code, les options
 > écartées et l'ordre de réalisation (§6).
 
 ## Project Overview

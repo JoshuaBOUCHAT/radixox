@@ -152,13 +152,11 @@ impl OxidArt {
 
         if prefix_len == 0 {
             let now = self.now;
-            let had_val = self
-                .get_node_mut(self.root_idx)
-                .get_value_mut(now)
-                .take()
-                .is_some();
             let childs = self.collect_child_indices(self.root_idx);
-            self.get_node_mut(self.root_idx).childs = Default::default();
+            let root = self.node_mut(self.root_idx);
+            let had_val = root.has_val() && !root.is_expired(now);
+            root.clear_val();
+            root.childs = Default::default();
             return (childs, self.root_idx, usize::from(had_val));
         }
 
@@ -226,10 +224,11 @@ impl OxidArt {
             if has_val {
                 count += 1;
             }
+            // Nœud d'abord, overflow ensuite (la capture copie l'overflow).
+            self.remove_node(node_idx);
             if let Some(oi) = overflow_idx {
                 self.overflow_arena.free(oi);
             }
-            self.map.remove(node_idx);
             processed += 1;
         }
         count
@@ -415,6 +414,15 @@ mod tests {
         let art = make_art();
         assert_eq!(art.deln_async(SharedByte::from_str("")).await, 8);
         assert!(art.getn_async(SharedByte::from_str("")).await.is_empty());
+    }
+
+    #[monoio::test]
+    async fn deln_async_empty_prefix_clears_root_value() {
+        let art = make_art();
+        art.borrow_mut()
+            .set(SharedByte::from_str(""), Value::from_str("root"));
+        assert_eq!(art.deln_async(SharedByte::from_str("")).await, 9);
+        assert_eq!(art.borrow_mut().get(b""), None);
     }
 
     #[monoio::test]

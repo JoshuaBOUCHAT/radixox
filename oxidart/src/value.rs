@@ -144,9 +144,6 @@ pub(crate) fn free_list(idx: u32) {
 pub(crate) fn list_ref(idx: u32) -> &'static VecDeque<SharedByte> {
     list_slab().get(idx).unwrap()
 }
-pub(crate) fn list_mut(idx: u32) -> &'static mut VecDeque<SharedByte> {
-    list_slab().get_mut(idx).unwrap()
-}
 
 // ─── Tag+ValUnion ↔ Value conversions ────────────────────────────────────────
 
@@ -259,49 +256,47 @@ impl<'a> NodeValMut<'a> {
         self.val.integer = new_val;
         Ok(new_val)
     }
+}
 
+// ─── NodeValRef ───────────────────────────────────────────────────────────────
+
+/// Accès en lecture à la valeur d'un nœud. Les commandes qui ne modifient pas
+/// le nœud oxidart (lectures, et écritures qui ne touchent que le conteneur :
+/// valart, ZSet, List) passent par ici, pour ne pas déclencher de capture de
+/// save (SAVE_DESIGN.md §2.C).
+#[derive(Clone, Copy)]
+pub(crate) struct NodeValRef<'a> {
+    pub(crate) tag: Tag,
+    pub(crate) val: &'a ValUnion,
+}
+
+impl<'a> NodeValRef<'a> {
     /// Racine valart du Hash.
-    pub fn hash_root(&self) -> Result<u32, RedisType> {
-        match *self.tag {
+    pub fn hash_root(self) -> Result<u32, RedisType> {
+        match self.tag {
             Tag::Hash => Ok(unsafe { self.val.idx }),
             _ => Err(self.tag.redis_type()),
         }
     }
 
     /// Racine valart du Set.
-    pub fn set_root(&self) -> Result<u32, RedisType> {
-        match *self.tag {
+    pub fn set_root(self) -> Result<u32, RedisType> {
+        match self.tag {
             Tag::Set => Ok(unsafe { self.val.idx }),
             _ => Err(self.tag.redis_type()),
         }
     }
 
-    pub fn as_zset(&self) -> Result<&InnerZCommand, RedisType> {
-        match *self.tag {
-            Tag::ZSet => Ok(unsafe { zset_ref(self.val.idx) }),
+    /// Idx du ZSet dans son slab.
+    pub fn zset_idx(self) -> Result<u32, RedisType> {
+        match self.tag {
+            Tag::ZSet => Ok(unsafe { self.val.idx }),
             _ => Err(self.tag.redis_type()),
         }
     }
 
-    pub fn as_zset_mut(&mut self) -> Result<&'static mut InnerZCommand, RedisType> {
-        match *self.tag {
-            Tag::ZSet => Ok(unsafe { zset_mut(self.val.idx) }),
-            _ => Err(self.tag.redis_type()),
-        }
-    }
-
-    pub fn as_list(&self) -> Result<&VecDeque<SharedByte>, RedisType> {
-        match *self.tag {
-            Tag::List => Ok(unsafe { list_ref(self.val.idx) }),
-            _ => Err(self.tag.redis_type()),
-        }
-    }
-
-    pub fn as_list_mut(&mut self) -> Result<&mut VecDeque<SharedByte>, RedisType> {
-        match *self.tag {
-            Tag::List => Ok(unsafe { list_mut(self.val.idx) }),
-            _ => Err(self.tag.redis_type()),
-        }
+    pub fn as_zset(self) -> Result<&'static InnerZCommand, RedisType> {
+        self.zset_idx().map(zset_ref)
     }
 }
 

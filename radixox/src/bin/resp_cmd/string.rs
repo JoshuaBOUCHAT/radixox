@@ -73,7 +73,7 @@ pub(crate) fn cmd_decrby(art: &mut OxidArt, key: &[u8], delta: i64) -> Frame {
 pub(crate) fn cmd_del(art: &mut OxidArt, keys: &[&[u8]]) -> Frame {
     let mut count = 0i64;
     for key in keys {
-        if art.del(key).is_some() {
+        if art.del(key) {
             count += 1;
         }
     }

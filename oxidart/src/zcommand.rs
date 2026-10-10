@@ -7,9 +7,9 @@ use smallvec::SmallVec;
 use std::collections::BTreeSet;
 
 use crate::{
-    OxidArt, Value,
+    OxidArt,
     error::TypeError,
-    value::{RedisType, Tag, value_into_raw},
+    value::{RedisType, Tag, ValUnion, alloc_zset, zset_mut},
 };
 
 const THRESHOLD: usize = 16;
@@ -161,39 +161,22 @@ impl Default for InnerZCommand {
 
 impl OxidArt {
     /// Get or create a zset at the given key, ensuring type correctness.
-    fn get_zset_mut<'a>(
-        &'a mut self,
+    fn get_zset_mut(
+        &mut self,
         ttl: Option<u64>,
         key: SharedByte,
-    ) -> Result<&'a mut InnerZCommand, TypeError> {
-        let now = self.now;
+    ) -> Result<&'static mut InnerZCommand, TypeError> {
         let node_key = self.ensure_key(&key);
-        let node: &mut crate::Node = self.get_node_mut(node_key);
-
-        let need_tag = match node.get_value_mut(now) {
-            Some(ref v) if *v.tag == Tag::ZSet => false,
-            Some(_) => return Err(TypeError::ValueNotSet),
+        // Lecture d'abord : un ZSet existant ne modifie pas le nœud oxidart.
+        let idx = match self.get_node(node_key).get_value_ref(self.now) {
+            Some(v) => v.zset_idx().map_err(|_| TypeError::ValueNotSet)?,
             None => {
-                let (tag, val) = value_into_raw(Value::ZSet(InnerZCommand::default()));
-                node.tag = tag;
-                node.val = val;
-                if let Some(ttl) = ttl {
-                    node.exp_and_radix.set_exp(ttl);
-                    true
-                } else {
-                    false
-                }
+                let idx = alloc_zset(InnerZCommand::default());
+                self.install_value_raw(node_key, Tag::ZSet, ValUnion { idx }, ttl);
+                idx
             }
         };
-        if need_tag {
-            self.map.tag(node_key);
-        }
-
-        self.get_node_mut(node_key)
-            .get_value_mut(now)
-            .unwrap()
-            .as_zset_mut()
-            .map_err(|_| TypeError::ValueNotSet)
+        Ok(zset_mut(idx))
     }
 
     /// ZADD - add one or more members with scores to a sorted set.
@@ -220,7 +203,7 @@ impl OxidArt {
 
     /// ZCARD - get the number of members in a sorted set.
     pub fn cmd_zcard(&mut self, key: &[u8]) -> Result<u32, RedisType> {
-        let Some(val) = self.get_mut(key) else {
+        let Some(val) = self.get_ref(key) else {
             return Ok(0);
         };
         Ok(val.as_zset()?.len() as u32)
@@ -235,7 +218,7 @@ impl OxidArt {
         stop: i64,
         with_scores: bool,
     ) -> Result<Vec<SharedByte>, RedisType> {
-        let Some(val) = self.get_mut(key) else {
+        let Some(val) = self.get_ref(key) else {
             return Ok(Vec::new());
         };
         let zset = val.as_zset()?;
@@ -273,7 +256,7 @@ impl OxidArt {
 
     /// ZSCORE - get the score of a member in a sorted set.
     pub fn cmd_zscore(&mut self, key: &[u8], member: SharedByte) -> Result<Option<f64>, RedisType> {
-        let Some(val) = self.get_mut(key) else {
+        let Some(val) = self.get_ref(key) else {
             return Ok(None);
         };
         Ok(val.as_zset()?.score(member))
@@ -285,10 +268,10 @@ impl OxidArt {
         debug_assert!(!members.is_empty());
 
         let (removed, need_cleanup) = {
-            let Some(mut val) = self.get_mut(key) else {
+            let Some(val) = self.get_ref(key) else {
                 return Ok(0);
             };
-            let zset = val.as_zset_mut()?;
+            let zset = zset_mut(val.zset_idx()?);
             let mut removed = 0;
 
             for member in members {
@@ -300,7 +283,7 @@ impl OxidArt {
         };
 
         if need_cleanup {
-            let _ = self.del(key);
+            self.del(key);
         }
 
         Ok(removed)

@@ -33,7 +33,7 @@
 //! let entries = tree.getn(SharedByte::from_str("hello"));
 //!
 //! // Delete a key
-//! let deleted = tree.del(SharedByte::from_str("hello"));
+//! let deleted = tree.del(b"hello");
 //!
 //! // Delete all keys with a prefix
 //! let count = tree.deln(SharedByte::from_str("hello"));
@@ -81,7 +81,7 @@ use crate::node_childs::OverflowArena;
 
 pub use crate::value::Value;
 use crate::value::{
-    NodeValMut, Tag, ValUnion, drop_raw, init_slabs, value_from_raw_ref, value_into_raw,
+    NodeValMut, NodeValRef, Tag, ValUnion, drop_raw, init_slabs, value_from_raw_ref, value_into_raw,
     value_take_raw,
 };
 
@@ -121,6 +121,9 @@ pub struct OxidArt {
     /// The server is responsible for updating this via `set_now()`.
     pub now: u64,
     root_idx: u32,
+    /// Save en cours : les lectures ne modifient rien et l'évicteur est en
+    /// pause (SAVE_DESIGN.md §2.C). Remplacé par la `SaveBarrier` à l'étape 3.
+    saving: bool,
 }
 impl Default for OxidArt {
     fn default() -> Self {
@@ -150,6 +153,7 @@ impl OxidArt {
             root_idx,
             overflow_arena: OverflowArena::new(),
             now: 0,
+            saving: false,
         }
     }
 
@@ -157,6 +161,17 @@ impl OxidArt {
     #[inline]
     pub fn set_now(&mut self, now: u64) {
         self.now = now;
+    }
+
+    /// Indique si une save est en cours.
+    #[inline]
+    pub fn is_saving(&self) -> bool {
+        self.saving
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_saving(&mut self, saving: bool) {
+        self.saving = saving;
     }
 
     /// Returns the number of Overflow slots currently allocated.
@@ -187,6 +202,9 @@ impl OxidArt {
     ///
     /// Returns the total number of evicted entries.
     pub fn evict_expired(&mut self) -> usize {
+        if self.saving {
+            return 0;
+        }
         let mut rng = rand::thread_rng();
         let mut total_evicted = 0;
 
@@ -240,13 +258,13 @@ impl OxidArt {
 
         if has_children {
             // Node has children: just clear the value, keep the node
-            self.get_node_mut(target_idx).clear_val();
+            self.node_mut(target_idx).clear_val();
             // Untag since it no longer has a TTL value
             self.map.untag(target_idx);
             self.try_recompress(target_idx);
         } else {
             // Leaf node: remove completely
-            self.map.remove(target_idx);
+            self.remove_node(target_idx);
             self.remove_child(parent_idx, parent_radix);
             if parent_idx != self.root_idx {
                 self.try_recompress(parent_idx);
@@ -269,16 +287,36 @@ impl OxidArt {
         self.try_get_node(idx)
             .expect("Call to unfailable get_node failed")
     }
-    fn get_node_mut(&mut self, idx: u32) -> &mut Node {
-        self.try_get_node_mut(idx)
-            .expect("Call to unfailable get_node failed")
-    }
-
     fn try_get_node(&self, idx: u32) -> Option<&Node> {
         self.map.get(idx)
     }
-    fn try_get_node_mut(&mut self, idx: u32) -> Option<&mut Node> {
+
+    // ─── Points de passage (SAVE_DESIGN.md §3) ──────────────────────────────
+    //
+    // Seules fonctions qui donnent un `&mut Node` ou libèrent un nœud : la
+    // barrière de save y sera branchée. Modifier les enfants d'un nœud (inline
+    // ou dans l'`OverflowArena`), c'est modifier le nœud : appeler `node_mut`
+    // sur le parent *avant* de toucher à son overflow. Exceptions sans
+    // barrière (champs non écrits dans le dump) : `set_parent_idx` et le tag
+    // TTL du slab (`map.tag` / `map.untag`).
+
+    fn node_mut(&mut self, idx: u32) -> &mut Node {
+        self.try_node_mut(idx)
+            .expect("Call to unfailable node_mut failed")
+    }
+    fn try_node_mut(&mut self, idx: u32) -> Option<&mut Node> {
         self.map.get_mut(idx)
+    }
+    /// Retire un nœud du slab. L'appelant libère son overflow *après* cet
+    /// appel (la capture le copie).
+    fn remove_node(&mut self, idx: u32) -> Option<Node> {
+        self.map.remove(idx)
+    }
+    /// `parent_idx` n'est pas sérialisé : pas de barrière.
+    fn set_parent_idx(&mut self, idx: u32, parent_idx: u32) {
+        if let Some(node) = self.map.get_mut(idx) {
+            node.parent_idx = parent_idx;
+        }
     }
     fn find(&self, idx: u32, radix: u8) -> Option<u32> {
         let node = self.try_get_node(idx)?;
@@ -315,18 +353,20 @@ impl OxidArt {
         let now = self.now;
         self.get_node(idx).get_value(now)
     }
-    pub(crate) fn get_mut(&mut self, key: &[u8]) -> Option<NodeValMut<'_>> {
+    /// Valeur vivante à `key`, par référence (aucune capture de save).
+    pub(crate) fn get_ref(&mut self, key: &[u8]) -> Option<NodeValRef<'_>> {
         let idx = self.get_idx(key)?;
-        debug_assert!(key.is_ascii(), "key must be ASCII");
-        let now = self.now;
-        self.get_node_mut(idx).get_value_mut(now)
+        self.get_node(idx).get_value_ref(self.now)
     }
     fn get_idx(&mut self, key: &[u8]) -> Option<u32> {
         debug_assert!(key.is_ascii(), "key must be ASCII");
         let key_len = key.len();
         if key_len == 0 {
             if self.get_node(self.root_idx).is_expired(self.now) {
-                self.get_node_mut(self.root_idx).clear_val();
+                if self.saving {
+                    return None;
+                }
+                self.node_mut(self.root_idx).clear_val();
                 self.try_recompress(self.root_idx);
                 return None;
             }
@@ -343,7 +383,9 @@ impl OxidArt {
             match node.compare_compression_key(&key[cursor..]) {
                 CompResult::Final => {
                     if node.is_expired(self.now) {
-                        self.delete_node_inline(idx, parent_idx, parent_radix);
+                        if !self.saving {
+                            self.delete_node_inline(idx, parent_idx, parent_radix);
+                        }
                         return None;
                     }
                     return Some(idx);
@@ -371,16 +413,13 @@ impl OxidArt {
     /// - `TtlResult::KeyWithoutTtl` - The key exists but has no TTL (permanent)
     pub fn get_ttl(&self, key: SharedByte) -> TtlResult {
         debug_assert!(key.is_ascii(), "key must be ASCII");
-        eprintln!("si test s'affiche pas la clé existe just pas");
         let idx = match self.traverse_to_key(&key) {
             Some(idx) => idx,
             None => return TtlResult::KeyNotExist,
         };
 
         let node = self.get_node(idx);
-        eprintln!("test truc truc");
         if node.is_expired(self.now) {
-            eprintln!("key not existe at all ");
             return TtlResult::KeyNotExist;
         }
         match node.exp_and_radix.exp() {
@@ -399,12 +438,12 @@ impl OxidArt {
             return false;
         };
 
-        let node = self.get_node_mut(idx);
-        if node.is_expired(now) {
+        if self.get_node(idx).is_expired(now) {
             return false;
         }
 
         let new_expiry = now.saturating_add(ttl.as_secs());
+        let node = self.node_mut(idx);
         let was_permanent = !node.does_expire();
         node.exp_and_radix.set_exp(new_expiry);
 
@@ -425,10 +464,10 @@ impl OxidArt {
             return false;
         };
 
-        let node = self.get_node_mut(idx);
-        if !node.exp_and_radix.does_expire() {
+        if !self.get_node(idx).does_expire() {
             return false;
         }
+        let node = self.node_mut(idx);
         node.exp_and_radix.set_no_expiracy();
         if !node.has_val() {
             return false;
@@ -474,7 +513,7 @@ impl OxidArt {
 
         loop {
             let node = self
-                .try_get_node_mut(idx)
+                .try_get_node(idx)
                 .expect("idx exist so node should exist");
             match node.compare_compression_key(&key[cursor..]) {
                 CompResult::Final => return idx,
@@ -505,7 +544,26 @@ impl OxidArt {
     /// Returns `None` if the node has no value or the value is expired.
     pub(crate) fn node_value_mut(&mut self, idx: u32) -> Option<NodeValMut<'_>> {
         let now = self.now;
-        self.get_node_mut(idx).get_value_mut(now)
+        self.node_mut(idx).get_value_mut(now)
+    }
+
+    /// Pose une valeur neuve (conteneur créé par une commande) sur un nœud
+    /// sans valeur vivante. Une valeur expirée encore en place est libérée et
+    /// son TTL n'est pas hérité.
+    pub(crate) fn install_value_raw(&mut self, idx: u32, tag: Tag, val: ValUnion, ttl: Option<u64>) {
+        let node = self.node_mut(idx);
+        node.clear_val();
+        match ttl {
+            Some(exp) => node.exp_and_radix.set_exp(exp),
+            None => node.exp_and_radix.set_no_expiracy(),
+        }
+        node.tag = tag;
+        node.val = val;
+        if ttl.is_some() {
+            self.map.tag(idx);
+        } else {
+            self.map.untag(idx);
+        }
     }
 
     /// Deletes a node inline (used for TTL expiration cleanup)
@@ -516,10 +574,10 @@ impl OxidArt {
         };
 
         if has_children {
-            self.get_node_mut(target_idx).clear_val();
+            self.node_mut(target_idx).clear_val();
             self.try_recompress(target_idx);
         } else {
-            self.map.remove(target_idx);
+            self.remove_node(target_idx);
             self.remove_child(parent_idx, parent_radix);
             if parent_idx != self.root_idx {
                 self.try_recompress(parent_idx);
@@ -762,7 +820,7 @@ impl OxidArt {
             Some(d) => self.now.saturating_add(d.as_secs()),
             None => ExpAndRadix::NO_EXPIRACY,
         };
-        self.get_node_mut(idx).set_val(val, exp);
+        self.node_mut(idx).set_val(val, exp);
         true
     }
 
@@ -770,7 +828,7 @@ impl OxidArt {
         debug_assert!(key.is_ascii(), "key must be ASCII");
         let key_len = key.len();
         if key_len == 0 {
-            self.get_node_mut(self.root_idx).set_val(val, ttl);
+            self.node_mut(self.root_idx).set_val(val, ttl);
             return;
         }
         let mut idx = self.root_idx;
@@ -786,7 +844,7 @@ impl OxidArt {
             let node_comparaison = self.get_node(idx).compare_compression_key(&key[cursor..]);
             let common_len = match node_comparaison {
                 CompResult::Final => {
-                    self.get_node_mut(idx).set_val(val, ttl);
+                    self.node_mut(idx).set_val(val, ttl);
                     return;
                 }
                 CompResult::Path => {
@@ -813,7 +871,7 @@ impl OxidArt {
     ) -> u32 {
         let val_on_intermediate = common_len == key_rest.len();
         let (old_compression, old_tag, old_val_bits, old_childs, old_overflow_idx, old_exp) = {
-            let node = self.get_node_mut(idx);
+            let node = self.node_mut(idx);
             let old_compression = std::mem::take(&mut node.compression);
             // Take tag+val without dropping (ownership moves to old_child below)
             let (old_tag, old_val_bits) = node.take_tag_val_raw();
@@ -883,9 +941,7 @@ impl OxidArt {
             .map(|ov| ov.iter().map(|(_, i)| i).collect())
             .unwrap_or_default();
         for child_idx in child_indices.into_iter().chain(overflow_children) {
-            if let Some(child) = self.map.get_mut(child_idx) {
-                child.parent_idx = old_child_idx;
-            }
+            self.set_parent_idx(child_idx, old_child_idx);
         }
 
         // If the value doesn't go on the intermediate node, create a new leaf
@@ -919,10 +975,6 @@ impl OxidArt {
         compression: &[u8],
         ttl: u64,
     ) -> u32 {
-        let (is_full, overflow_idx) = {
-            let father_node = self.get_node(parent_idx);
-            (father_node.childs.is_full(), father_node.get_overflow_idx())
-        };
         let new_leaf = Node::new_leaf(compression, val, ttl, parent_idx, radix);
         // Tag the node if it has a real TTL (not NO_EXPIRY)
         let inserted_idx = if ttl != ExpAndRadix::NO_EXPIRACY {
@@ -930,57 +982,61 @@ impl OxidArt {
         } else {
             self.insert(new_leaf)
         };
-        match (is_full, overflow_idx) {
-            (false, _) => self
-                .get_node_mut(parent_idx)
-                .childs
-                .push(radix, inserted_idx),
-            (true, None) => {
-                let new_overflow_idx = self.alloc_overflow_with_first(radix, inserted_idx);
-                self.get_node_mut(parent_idx)
-                    .set_overflow_idx(new_overflow_idx);
-            }
-            (true, Some(oi)) => {
-                self.overflow_arena
-                    .get_mut(oi)
-                    .expect("overflow_idx must be valid")
-                    .push(radix, inserted_idx);
-            }
-        }
+        self.push_child_idx(parent_idx, inserted_idx, radix);
         inserted_idx
     }
 
-    /// Deletes a key from the tree and returns its value.
+    /// Deletes a key from the tree. Returns `true` if a live (non-expired)
+    /// value was removed.
     ///
-    /// Returns `Some(value)` if the key existed, or `None` if it didn't.
-    /// The tree automatically recompresses paths after deletion.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The key to delete. Must be valid ASCII.
+    /// Ne ramène pas la valeur (pas de copie d'un Hash/Set pour rien) ; voir
+    /// [`OxidArt::take`] pour GETDEL. The tree automatically recompresses
+    /// paths after deletion.
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// use oxidart::OxidArt;
-    /// use bytes::Bytes;
-    ///
     /// let mut tree = OxidArt::new();
-    /// tree.set(SharedByte::from_str("key"), SharedByte::from_str("value"));
-    ///
-    /// let deleted = tree.del(SharedByte::from_str("key"));
-    /// assert_eq!(deleted, Some(SharedByte::from_str("value")));
-    ///
-    /// // Key no longer exists
-    /// assert_eq!(tree.get(SharedByte::from_str("key")), None);
+    /// tree.set(SharedByte::from_str("key"), Value::from_str("value"));
+    /// assert!(tree.del(b"key"));
+    /// assert!(!tree.del(b"key"));
     /// ```
-    pub fn del(&mut self, key: &[u8]) -> Option<Value> {
+    pub fn del(&mut self, key: &[u8]) -> bool {
+        let now = self.now;
+        self.remove_key(key, |node| {
+            let live = node.has_val() && !node.is_expired(now);
+            node.clear_val();
+            live
+        })
+        .unwrap_or(false)
+    }
+
+    /// Deletes a key and returns its live value (`None` if absent or expired).
+    pub fn take(&mut self, key: &[u8]) -> Option<Value> {
+        let now = self.now;
+        self.remove_key(key, |node| {
+            if node.is_expired(now) {
+                node.clear_val();
+                None
+            } else {
+                node.take_val()
+            }
+        })
+        .flatten()
+    }
+
+    /// Retire la valeur de `key` via `f` (appelé sur le nœud encore en place
+    /// s'il a des enfants, sinon sur le nœud sorti du slab), puis supprime /
+    /// recompresse. `None` si la clé n'a pas de nœud.
+    fn remove_key<R>(&mut self, key: &[u8], f: impl FnOnce(&mut Node) -> R) -> Option<R> {
         debug_assert!(key.is_ascii(), "key must be ASCII");
-        let key_len = key.len();
-        if key_len == 0 {
-            let old_val = self.get_node_mut(self.root_idx).take_val();
+        if key.is_empty() {
+            if !self.get_node(self.root_idx).has_val() {
+                return None;
+            }
+            let res = f(self.node_mut(self.root_idx));
             self.try_recompress(self.root_idx);
-            return old_val;
+            return Some(res);
         }
 
         // Traverse like get, keeping track of the immediate parent
@@ -1006,26 +1062,31 @@ impl OxidArt {
             cursor += 1;
         };
 
-        // Check if the node has children
-        let has_children = {
+        let (has_children, has_val) = {
             let node = self.get_node(target_idx);
-            !node.childs.is_empty() || node.get_overflow_idx().is_some()
+            (
+                !node.childs.is_empty() || node.get_overflow_idx().is_some(),
+                node.has_val(),
+            )
         };
 
         if has_children {
             // Node with children: keep the node, just remove the value
-            let old_val = self.get_node_mut(target_idx).take_val()?;
+            if !has_val {
+                return None;
+            }
+            let res = f(self.node_mut(target_idx));
             self.try_recompress(target_idx);
-            Some(old_val)
+            Some(res)
         } else {
             // Node without children (leaf): completely remove from the slab
-            let mut node = self.map.remove(target_idx)?;
-            let old_val = node.take_val();
+            let mut node = self.remove_node(target_idx)?;
+            let res = f(&mut node);
             self.remove_child(parent_idx, parent_radix);
             if parent_idx != self.root_idx {
                 self.try_recompress(parent_idx);
             }
-            old_val
+            Some(res)
         }
     }
 
@@ -1062,12 +1123,14 @@ impl OxidArt {
 
         if prefix_len == 0 {
             // Delete everything from root (keep root node, clear its content)
-            let root = self.get_node_mut(self.root_idx);
-            let had_val = root.take_val().is_some();
+            let now = self.now;
             let childs_to_free: Vec<u32> = self.collect_child_indices(self.root_idx);
+            let root = self.node_mut(self.root_idx);
+            let had_val = root.has_val() && !root.is_expired(now);
+            root.clear_val();
 
             // Clear children of root (note: root's huge_childs not freed, negligible)
-            self.get_node_mut(self.root_idx).childs = Childs::default();
+            root.childs = Childs::default();
 
             let freed = self.free_subtree_iterative(childs_to_free);
             return freed + if had_val { 1 } else { 0 };
@@ -1180,13 +1243,12 @@ impl OxidArt {
                 count += 1;
             }
 
-            // Free overflow slot (also drops HugeOverflow if present)
+            // Remove the node from the slab, then its overflow slot (also
+            // drops HugeOverflow if present)
+            self.remove_node(node_idx);
             if let Some(oi) = overflow_idx {
                 self.overflow_arena.free(oi);
             }
-
-            // Remove the node from the slab
-            self.map.remove(node_idx);
         }
 
         count
@@ -1206,7 +1268,7 @@ impl OxidArt {
         };
 
         // Remove child from slab — we own it.
-        let mut child = match self.map.remove(child_idx) {
+        let mut child = match self.remove_node(child_idx) {
             Some(c) => c,
             None => return,
         };
@@ -1216,18 +1278,14 @@ impl OxidArt {
 
         // Update grandchildren parent pointers.
         for (_, grandchild_idx) in child.childs.iter() {
-            if let Some(grandchild) = self.map.get_mut(grandchild_idx) {
-                grandchild.parent_idx = node_idx;
-            }
+            self.set_parent_idx(grandchild_idx, node_idx);
         }
         if let Some(overflow_idx) = child.get_overflow_idx()
             && let Some(overflow) = self.overflow_arena.get(overflow_idx)
         {
             let indices: Vec<u32> = overflow.iter().map(|(_, idx)| idx).collect();
             for grandchild_idx in indices {
-                if let Some(grandchild) = self.map.get_mut(grandchild_idx) {
-                    grandchild.parent_idx = node_idx;
-                }
+                self.set_parent_idx(grandchild_idx, node_idx);
             }
         }
 
@@ -1235,7 +1293,7 @@ impl OxidArt {
         // `child` is still in scope so &child.compression is valid.
         let child_overflow_idx = child.overflow_idx;
         let child_exp = child.exp_and_radix.exp();
-        let node = self.get_node_mut(node_idx);
+        let node = self.node_mut(node_idx);
         node.compression
             .append_and_replace(child_radix, &child.compression);
         // Transfer only the expiry from child, preserving node's parent_radix bits.
@@ -1252,9 +1310,10 @@ impl OxidArt {
         // child drops here: compression freed, tag=None so val is not freed.
     }
 
-    /// If the node has exactly 1 child and no value, absorb the child
+    /// Removes the child at `radix` from `parent_idx` (inline or overflow).
     fn remove_child(&mut self, parent_idx: u32, radix: u8) {
-        let Some(parent) = self.try_get_node_mut(parent_idx) else {
+        // node_mut avant toute modification de l'overflow (point de passage).
+        let Some(parent) = self.try_node_mut(parent_idx) else {
             return;
         };
         if parent.childs.remove(radix).is_some() {
@@ -1273,13 +1332,14 @@ impl OxidArt {
             .unwrap_or(false);
         if is_now_empty {
             self.overflow_arena.free(overflow_idx);
-            self.get_node_mut(parent_idx).overflow_idx = u32::MAX;
+            self.node_mut(parent_idx).overflow_idx = u32::MAX;
         }
     }
 
     fn push_child_idx(&mut self, parent_idx: u32, idx: u32, radix: u8) {
+        // node_mut avant toute modification de l'overflow (point de passage).
         let overflow_idx = {
-            let node = self.get_node_mut(parent_idx);
+            let node = self.node_mut(parent_idx);
             if !node.childs.is_full() {
                 node.childs.push(radix, idx);
                 return;
@@ -1289,7 +1349,7 @@ impl OxidArt {
 
         let Some(overflow_idx) = overflow_idx else {
             let new_overflow_idx = self.alloc_overflow_with_first(radix, idx);
-            self.get_node_mut(parent_idx).overflow_idx = new_overflow_idx;
+            self.node_mut(parent_idx).set_overflow_idx(new_overflow_idx);
             return;
         };
 
@@ -1471,6 +1531,16 @@ impl Node {
             return None;
         }
         Some(unsafe { value_from_raw_ref(self.tag, &self.val) })
+    }
+
+    fn get_value_ref(&self, now: u64) -> Option<NodeValRef<'_>> {
+        if self.tag == Tag::None || self.is_expired(now) {
+            return None;
+        }
+        Some(NodeValRef {
+            tag: self.tag,
+            val: &self.val,
+        })
     }
 
     fn get_value_mut<'a>(&'a mut self, now: u64) -> Option<NodeValMut<'a>> {

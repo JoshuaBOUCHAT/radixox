@@ -3,42 +3,25 @@ use radixox_lib::shared_byte::SharedByte;
 use crate::{
     OxidArt,
     error::TypeError,
-    value::{RedisType, Tag, drop_raw, valart},
+    value::{RedisType, Tag, ValUnion, valart},
 };
 
 impl OxidArt {
     /// Racine valart du Hash à `key`, créé vide s'il n'existe pas (ou a expiré).
     fn get_or_create_hash(&mut self, ttl: Option<u64>, key: &[u8]) -> Result<u32, TypeError> {
-        let now = self.now;
         let node_key = self.ensure_key(key);
-        let node = self.get_node_mut(node_key);
-
-        match node.get_value_mut(now) {
-            Some(v) if *v.tag == Tag::Hash => return Ok(unsafe { v.val.idx }),
-            Some(_) => return Err(TypeError::ValueNotSet),
-            None => {}
-        }
-        // Valeur expirée encore en place : la libérer, et ne pas hériter de
-        // son TTL.
-        if node.tag != Tag::None {
-            unsafe { drop_raw(node.tag, &mut node.val) };
-            node.exp_and_radix.set_no_expiracy();
+        // Lecture d'abord : un Hash existant ne modifie pas le nœud oxidart.
+        if let Some(v) = self.get_node(node_key).get_value_ref(self.now) {
+            return v.hash_root().map_err(|_| TypeError::ValueNotSet);
         }
         let root = valart().hash_create();
-        node.tag = Tag::Hash;
-        node.val.idx = root;
-        if let Some(ttl) = ttl {
-            node.exp_and_radix.set_exp(ttl);
-        }
+        self.install_value_raw(node_key, Tag::Hash, ValUnion { idx: root }, ttl);
         Ok(root)
     }
 
     /// Racine valart du Hash à `key`, `None` si la clé n'existe pas.
     fn hash_root(&mut self, key: &[u8]) -> Result<Option<u32>, RedisType> {
-        match self.get_mut(key) {
-            Some(val) => val.hash_root().map(Some),
-            None => Ok(None),
-        }
+        self.get_ref(key).map(|v| v.hash_root()).transpose()
     }
 
     /// HSET - set one or more field-value pairs in a hash.
@@ -100,7 +83,7 @@ impl OxidArt {
             .filter(|field| trees.hash_remove(root, field).is_some())
             .count() as u32;
         if trees.hash_len(root) == 0 {
-            let _ = self.del(key);
+            self.del(key);
         }
         Ok(deleted)
     }

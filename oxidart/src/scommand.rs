@@ -3,7 +3,7 @@ use radixox_lib::shared_byte::SharedByte;
 use crate::{
     OxidArt,
     error::TypeError,
-    value::{RedisType, Tag, drop_raw, valart},
+    value::{RedisType, Tag, ValUnion, valart},
 };
 
 pub enum SPOPResult {
@@ -13,36 +13,19 @@ pub enum SPOPResult {
 impl OxidArt {
     /// Racine valart du Set à `key`, créé vide s'il n'existe pas (ou a expiré).
     fn get_or_create_set(&mut self, ttl: Option<u64>, key: &[u8]) -> Result<u32, TypeError> {
-        let now = self.now;
         let node_key = self.ensure_key(key);
-        let node = self.get_node_mut(node_key);
-
-        match node.get_value_mut(now) {
-            Some(v) if *v.tag == Tag::Set => return Ok(unsafe { v.val.idx }),
-            Some(_) => return Err(TypeError::ValueNotSet),
-            None => {}
-        }
-        // Valeur expirée encore en place : la libérer, et ne pas hériter de
-        // son TTL.
-        if node.tag != Tag::None {
-            unsafe { drop_raw(node.tag, &mut node.val) };
-            node.exp_and_radix.set_no_expiracy();
+        // Lecture d'abord : un Set existant ne modifie pas le nœud oxidart.
+        if let Some(v) = self.get_node(node_key).get_value_ref(self.now) {
+            return v.set_root().map_err(|_| TypeError::ValueNotSet);
         }
         let root = valart().set_create();
-        node.tag = Tag::Set;
-        node.val.idx = root;
-        if let Some(ttl) = ttl {
-            node.exp_and_radix.set_exp(ttl);
-        }
+        self.install_value_raw(node_key, Tag::Set, ValUnion { idx: root }, ttl);
         Ok(root)
     }
 
     /// Racine valart du Set à `key`, `None` si la clé n'existe pas.
     fn set_root(&mut self, key: &[u8]) -> Result<Option<u32>, RedisType> {
-        match self.get_mut(key) {
-            Some(val) => val.set_root().map(Some),
-            None => Ok(None),
-        }
+        self.get_ref(key).map(|v| v.set_root()).transpose()
     }
 
     /// SPOP - remove and return one or more random members from a set.
@@ -73,7 +56,7 @@ impl OxidArt {
             .map_while(|_| trees.set_pop(root, rand::random()))
             .collect();
         if trees.set_card(root) == 0 {
-            let _ = self.del(key);
+            self.del(key);
         }
 
         if count == 1 {
@@ -108,7 +91,7 @@ impl OxidArt {
             .filter(|member| trees.set_remove(root, member))
             .count() as u32;
         if trees.set_card(root) == 0 {
-            let _ = self.del(key);
+            self.del(key);
         }
         Ok(count)
     }

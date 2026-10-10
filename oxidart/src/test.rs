@@ -127,7 +127,7 @@ fn test_del_basic() {
     art.set(key.clone(), val.clone());
     assert_eq!(art.get(&key), Some(val.clone()));
 
-    let deleted = art.del(&key);
+    let deleted = art.take(&key);
     assert_eq!(deleted, Some(val));
     assert_eq!(art.get(&key), None);
 }
@@ -135,7 +135,7 @@ fn test_del_basic() {
 #[test]
 fn test_del_nonexistent() {
     let mut art = OxidArt::new();
-    assert_eq!(art.del(b"missing"), None);
+    assert_eq!(art.take(b"missing"), None);
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn test_del_empty_key() {
     let val = Value::from_str("root");
 
     art.set(SharedByte::from_str(""), val.clone());
-    assert_eq!(art.del(b""), Some(val));
+    assert_eq!(art.take(b""), Some(val));
     assert_eq!(art.get(&SharedByte::from_str("")), None);
 }
 
@@ -157,7 +157,7 @@ fn test_del_with_recompression() {
     art.set(SharedByte::from_str("uso"), Value::from_str("val_uso"));
 
     // Supprimer "uso"
-    let deleted = art.del(b"uso");
+    let deleted = art.take(b"uso");
     assert_eq!(deleted, Some(Value::from_str("val_uso")));
 
     // "user" doit toujours exister
@@ -179,7 +179,7 @@ fn test_del_intermediate_node_with_children() {
     art.set(SharedByte::from_str("abc"), Value::from_str("val_abc"));
 
     // Supprimer "ab" qui est intermédiaire
-    let deleted = art.del(b"ab");
+    let deleted = art.take(b"ab");
     assert_eq!(deleted, Some(Value::from_str("val_ab")));
 
     // "a" et "abc" doivent toujours exister
@@ -236,7 +236,7 @@ fn test_del_then_reinsert() {
     let val2 = Value::from_str("val2");
 
     art.set(key.clone(), val1.clone());
-    art.del(&key);
+    art.take(&key);
     art.set(key.clone(), val2.clone());
 
     assert_eq!(art.get(&key), Some(val2));
@@ -250,9 +250,9 @@ fn test_del_all_keys() {
     art.set(SharedByte::from_str("b"), Value::from_str("2"));
     art.set(SharedByte::from_str("c"), Value::from_str("3"));
 
-    art.del(b"a");
-    art.del(b"b");
-    art.del(b"c");
+    art.take(b"a");
+    art.take(b"b");
+    art.take(b"c");
 
     assert_eq!(art.get(&SharedByte::from_str("a")), None);
     assert_eq!(art.get(&SharedByte::from_str("b")), None);
@@ -867,7 +867,7 @@ fn test_recompress_transfers_overflow() {
     art.set(SharedByte::from_str("x"), Value::from_str("xval"));
 
     // Deleting "x" triggers try_recompress which must transfer overflow_idx
-    let deleted = art.del(b"x");
+    let deleted = art.take(b"x");
     assert!(deleted.is_some(), "del(x) should return the value");
 
     // All 7 children must remain accessible after recompress
@@ -898,3 +898,88 @@ fn test_ensure() {
     assert_eq!(art.get(KEY), Some(val));
 }
 */
+
+// ─── Mode save : lectures sans modification (SAVE_DESIGN.md §2.C) ────────────
+
+#[test]
+fn save_mode_expired_get_keeps_node() {
+    let mut art = OxidArt::new();
+    art.set_now(100);
+    art.set_ttl(
+        SharedByte::from_str("sess:a"),
+        std::time::Duration::from_secs(10),
+        Value::from_str("x"),
+    );
+    art.set(SharedByte::from_str("sess:b"), Value::from_str("y"));
+    let nodes = art.node_count();
+
+    art.set_now(200);
+    art.set_saving(true);
+    assert_eq!(art.get(b"sess:a"), None);
+    assert_eq!(art.node_count(), nodes, "une lecture ne libère rien pendant une save");
+    assert_eq!(art.evict_expired(), 0, "évicteur en pause pendant une save");
+    assert_eq!(art.node_count(), nodes);
+
+    art.set_saving(false);
+    assert_eq!(art.get(b"sess:a"), None);
+    assert!(art.node_count() < nodes, "hors save, la clé expirée est nettoyée");
+    assert_eq!(art.get(b"sess:b"), Some(Value::from_str("y")));
+}
+
+#[test]
+fn save_mode_expired_root_kept() {
+    let mut art = OxidArt::new();
+    art.set_now(100);
+    art.set_ttl(
+        SharedByte::from_str(""),
+        std::time::Duration::from_secs(10),
+        Value::from_str("root"),
+    );
+    art.set_now(200);
+    art.set_saving(true);
+    assert_eq!(art.get(b""), None);
+    assert!(art.get_node(art.root_idx).has_val());
+    art.set_saving(false);
+    assert_eq!(art.get(b""), None);
+    assert!(!art.get_node(art.root_idx).has_val());
+}
+
+#[test]
+fn del_returns_bool_and_ignores_expired() {
+    let mut art = OxidArt::new();
+    art.set_now(100);
+    art.set(SharedByte::from_str("k"), Value::from_str("v"));
+    art.set_ttl(
+        SharedByte::from_str("t"),
+        std::time::Duration::from_secs(10),
+        Value::from_str("v"),
+    );
+    assert!(art.del(b"k"));
+    assert!(!art.del(b"k"));
+    art.set_now(200);
+    assert!(!art.del(b"t"), "une clé expirée ne compte pas pour DEL");
+    assert_eq!(art.get(b"t"), None);
+}
+
+#[test]
+fn take_expired_returns_none() {
+    let mut art = OxidArt::new();
+    art.set_now(100);
+    art.set_ttl(
+        SharedByte::from_str("t"),
+        std::time::Duration::from_secs(10),
+        Value::from_str("v"),
+    );
+    art.set_now(200);
+    assert_eq!(art.take(b"t"), None);
+}
+
+#[test]
+fn deln_root_clears_root_value() {
+    let mut art = OxidArt::new();
+    art.set(SharedByte::from_str(""), Value::from_str("root"));
+    art.set(SharedByte::from_str("a"), Value::from_str("1"));
+    assert_eq!(art.deln(b""), 2);
+    assert_eq!(art.get(b""), None);
+    assert_eq!(art.get(b"a"), None);
+}

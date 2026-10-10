@@ -17,8 +17,6 @@
 | **Bitset `intact`** | Copie du bitmap de présence HiSlab au T0 (`copy_occupancy`). Bit à 1 = présent à T0, ni modifié ni sérialisé. Sert aussi de dirty flag. |
 | **Point de passage** | Seule fonction autorisée à donner un `&mut` sur un nœud, ou à le libérer. La barrière y est placée. |
 | **Liste différée** | Pendant une save, ce qui sort d'un nœud **valart capturé** (nœud retiré, clé/valeur sortie) et les **conteneurs Hash/Set supprimés** y sont déplacés bit à bit au lieu d'être droppés. Vidée par tranches à la fin de la save. |
-| **Voie, étage, vol** | Parcours à K voies DFS, prefetch en deux étages, vol de travail entre voies. |
-| **Époque** | Numéro de la save, noté par UNLINK au moment de sa coupe. |
 
 ## 1. Ce qui peut changer pendant une save
 
@@ -93,8 +91,8 @@ enum Deferred {
 }
 ```
 - **Seuls les nœuds valart capturés diffèrent** (leur image pointe sur les ressources T0). Bitset `captured` sur le slab valart (1 bit/slot) : mis à 1 à la capture, remis à 0 quand la save consomme l'image, et à `finish` pour les images restantes (via les clés de la map). Règle au point de passage pendant une save : `captured[idx]` → liste différée, sinon drop normal. On diffère tout ce qui sort d'un nœud capturé, même ce qui est né après T0.
-- **Un `take` consomme le nœud en entier** : la voie copie la liste de tous ses enfants (idx), le pointeur de valeur et la compression. Ensuite le nœud ne concerne plus la save.
-- **Aucun pointeur brut ne survit à une pause** : avant de rendre la main, chaque voie termine son tour (sérialise les valeurs prefetchées en attente). Seuls des idx restent dans les piles, valides grâce au COW.
+- **Un `take` consomme le nœud en entier** : le parcours copie la liste de tous ses enfants (idx), le pointeur de valeur et la compression. Ensuite le nœud ne concerne plus la save.
+- **Aucun pointeur brut ne survit à une pause** : avant de rendre la main, le parcours termine le nœud en cours (sérialise sa valeur). Seuls des idx restent dans la pile, valides grâce au COW.
 - La liste différée est vidée **par tranches** en fin de save (même budget que le parcours). Un nouveau `begin` attend qu'elle soit vide.
 - Hors save : comportement normal, aucun coût.
 - Un conteneur supprimé pendant la save n'est pas détruit, donc ses nœuds valart restent intacts : pas de capture en masse.
@@ -117,43 +115,51 @@ Sérialisés **intégralement au `begin`**, de façon bloquante, dans une sectio
 Copiés intégralement au T0 (rarissimes).
 
 ### F. UNLINK
-- `deln_async` note l'époque à la coupe.
-- Coupe faite avant le T0 de la save en cours : la libération continue via `forget` (sans capture), le sous-arbre est inaccessible depuis T0.
-- Coupe pendant la save : on compte les clés en lecture, on répond, et la libération physique attend la fin de la save.
+- Avant chaque `free_chunk`, `deln_async` regarde si une save est active ; si oui, il **attend un waker** enregistré dans la barrière. `finish` réveille tous les wakers et les libérations reprennent.
+- La coupe (`remove_child` sur le parent) passe par la barrière comme toute mutation : une seule capture. Coupe pendant la save → le sous-arbre reste visible via l'image du parent et il est dumpé (il existait à T0). Coupe avant T0 → inaccessible depuis la racine T0, jamais parcouru.
+- Les nœuds du sous-arbre ne sont pas touchés tant que la save tourne : pas de capture en masse, pas d'époque, pas de `forget`.
+- Coût accepté : un UNLINK lancé pendant une save répond à la fin de la save (le compte se fait pendant la libération).
 
 ## 3. Barrières
 
 | Slab | Barrière | Points de passage |
 |---|---|---|
-| Oxidart `Node` | `SaveBarrier<NodeImage>` | `node_mut(idx)`, `remove_node(idx)`, `children_mut(idx)` |
+| Oxidart `Node` | `SaveBarrier<NodeImage>` | `node_mut(idx)` / `try_node_mut(idx)`, `remove_node(idx)` (modifier l'overflow d'un nœud = appeler `node_mut` sur lui avant ; `remove_node` avant de libérer son overflow) |
 | Valart `ValNode` | `SaveBarrier<ValNodeImage>` (une seule pour Hash et Set) | `hash_node_mut`, `set_node_mut`, `free_hash_node`, `free_set_node` |
 | Collisions valart | aucune | copie au T0 |
 | ZSet, List | aucune | sérialisés au `begin` |
 
-Audit : plus aucun `map.get_mut`, `map.remove` ou `nodes.get_unchecked_mut` hors des points de passage (sauf correction de `parent_idx`).
+Audit : plus aucun `map.get_mut`, `map.remove` ou `nodes.get_unchecked_mut` hors des points de passage (sauf `set_parent_idx` et `map.tag`/`untag`, non sérialisés). Fait côté oxidart (étape 1).
 
 ## 4. Parcours
 
 - **DFS** (jamais BFS : la frontière d'un BFS peut contenir des millions de feuilles).
-- **K voies** entrelacées. Chaque voie a sa pile, son buffer de chemin (préfixe de la clé courante) et son bloc de sortie.
-- **Deux étages par pas** : terminer le nœud précédent (valeur et compression en cache) → écrire l'enregistrement, empiler les enfants ; puis lire le nœud suivant (prefetché quand son parent a été lu) → `barrier.take(idx)`, copier ce qu'il faut, prefetch de la valeur, de la compression heap, du bloc overflow et des enfants.
-- **Vol** : une voie inoccupée prend la frame **du fond** (le plus gros sous-arbre) de la voie dont la frame du fond est **la moins profonde** (plus petit `depth` en `buf[start]` ; la longueur de pile n'est pas le bon critère), et recopie le préfixe `victime.path[..depth]`.
-- **`StealStack`** au lieu d'une `VecDeque` : `buf: Vec<Frame>` + `start` (frames `[0, start)` déjà volées). Le propriétaire fait `push`/`pop` à la fin, le voleur prend `buf[start]` et incrémente `start`. Pile vidée → `clear()` et `start = 0`. Capacité réservée une fois ; si le haut est plein et `start > 0`, on récupère la place du début (`copy_within`) au lieu de grossir. Un seul thread : pas d'atomiques.
-- **Frames typées** `Ox{idx,depth,radix}` / `Val{idx,level}` / `Coll{bucket}`. Un conteneur est toujours traité par une seule voie (le vol ne prend que des frames `Ox`). Un conteneur plus grand qu'un bloc est découpé en morceaux : le premier morceau du bloc suivant répète la clé (`lcp = 0`, clé complète) avec le **bit 6 du tag** (« suite de conteneur ») ; au reload, ses entrées s'ajoutent au conteneur existant.
+- **Un seul DFS classique** : une pile, un buffer de chemin (préfixe de la clé courante), un buffer de sortie. Pas de voies multiples ni de vol de travail (décision 2026-10-10, voir §5ter).
+- **Un pas** : pop d'un idx → `barrier.take(idx)` → lire le nœud (image ou vivant) → **prefetch** de la valeur heap (`SharedByte`), de la compression heap et du bloc overflow s'il y en a → empiler les enfants → **prefetch du nouveau haut de pile** (dernier enfant empilé, ou frère déjà présent si le nœud est une feuille) → revenir sur la valeur et sérialiser l'enregistrement.
+- Recouvrement : le nœud suivant est en vol pendant la sérialisation du courant. Les premiers nœuds d'une branche restent séquentiels, c'est accepté. Le bloc overflow peut quand même fauter (lu juste après son prefetch pour empiler les enfants) : accepté en v1.
+- **La pile DFS ne contient que des nœuds oxidart** : frame `Ox{idx, depth, radix}`. Pas de pile polymorphique.
+- **Conteneurs : deux sérialiseurs monomorphes, `HashSer` et `SetSer`** (un arbre valart ne contient qu'un type), chacun avec sa pile d'idx valart et ses buckets de collision, et une boucle interne sans test de type :
+  ```rust
+  struct HashSer { stack: Vec<u32>, .. }   // idem SetSer
+  fn step(&mut self, budget: &mut u32, out: &mut Out) -> Poll<()>;  // Ready = conteneur fini
+  ```
+  Le DFS garde au plus un sérialiseur en cours (`Option` d'un enum à deux variantes, ou deux champs `Option`) : le choix Hash/Set se fait **une fois par démarrage ou reprise**, jamais par nœud ni par entrée. Si `HashSer` et `SetSer` restent copiés l'un de l'autre comme `hash.rs`/`set.rs`, un `ValSer<K>` générique monomorphisé est équivalent.
+  Quand le DFS tombe sur une clé Hash/Set, il écrit l'en-tête de l'enregistrement (tag, lcp, suffixe, TTL, cardinalité T0) puis démarre le sérialiseur. Au début de chaque tranche, s'il y en a un en cours, on le reprend avant de dépiler un nouveau nœud oxidart. Un gros conteneur s'étale donc sur plusieurs tranches dans le même flux, sans découpage.
+- **Un nœud (oxidart ou valart) est traité en entier dans une tranche** : le budget peut déborder d'un nœud. Après une pause, seuls des idx restent dans les deux piles.
 - Ordre des frères indifférent : seule la contiguïté des sous-arbres compte (voir §5).
-- **Tranches** : la save rend la main quand un budget de travail est épuisé, pas après N nœuds. Coûts : 1 par nœud lu (oxidart ou valart), 1 par bloc annexe lu (overflow, compression heap, bucket de collision), 1 par valeur/champ/membre écrit, +1 par 4 KB copiés pour une grosse valeur. Budget commun aux voies : constante `SAVE_TRANCHE_BUDGET = 1024`, à ajuster sur le p99.99 de memtier pendant une save.
+- **Tranches** : la save est une task monoio ; elle fait une tranche puis `yield_now().await` (comme `deln_async`). Elle rend la main quand un budget de travail est épuisé, pas après N nœuds. Budget partagé entre le DFS et le sérialiseur de conteneur. Coûts : 1 par nœud lu (oxidart ou valart), 1 par bloc annexe lu (overflow, compression heap, bucket de collision), 1 par valeur/champ/membre écrit, +1 par 4 KB copiés pour une grosse valeur. Constante `SAVE_TRANCHE_BUDGET = 1024`, à ajuster sur le p99.99 de memtier pendant une save.
 - Clés expirées au T0 : non écrites.
 
-Mesures (10M nœuds, idx mélangés) : linéaire 3,9 ns/nœud ; DFS strict + prefetch des enfants 13,4 ; 16 voies 11,1 ; 32 voies 10,6 ; plancher matériel aléatoire ~7 ns/ligne.
+Mesures (10M nœuds, idx mélangés, parcours seul sans sérialisation) : linéaire 3,9 ns/nœud ; DFS strict + prefetch des enfants 13,4 ; 16 voies 11,1 ; 32 voies 10,6 ; plancher matériel aléatoire ~7 ns/ligne. L'écart DFS/voies (~3 ns/nœud, ~30 ms pour 10M) devient marginal une fois la sérialisation ajoutée, et la save tourne par tranches : sa durée totale compte peu.
 
 ## 5. Format et fichiers
 
 Varints à préfixe façon UTF-8 (la longueur se lit dans le premier octet).
 
 ```
-enregistrement (fichiers de voie) :
-  u8     tag        bits 0-3 : type (String, Int, Hash, Set, ZSet, List) ; bit 6 : suite de conteneur ; bit 7 : TTL présent
-  varint lcp        préfixe commun avec la clé précédente (0 en début de segment et de bloc)
+enregistrement :
+  u8     tag        bits 0-3 : type (String, Int, Hash, Set, ZSet, List) ; bit 7 : TTL présent
+  varint lcp        préfixe commun avec la clé précédente (0 pour la première clé)
   varint len_suffixe
   [varint ttl_restant = expiration − T0 (secondes)]   si bit 7
   suffixe
@@ -166,29 +172,27 @@ enregistrement (fichiers de voie) :
 ```
 - TTL : écart par rapport au `T0` de l'en-tête (1 à 3 octets en général). Les clés expirées au T0 ne sont pas écrites, donc l'écart est toujours ≥ 0. Un drapeau d'unité dans l'en-tête permettra de passer aux ms.
 
-### Un fichier par voie
+### Fichiers
 ```
-dump.tmp-<époque>/
-  voie-00.rxd … voie-NN.rxd   ajout à la fin uniquement : blocs [longueur][nb_clés][données][checksum]
-  zl.rxd                      section ZSet/List (sérialisée au begin)
-  MANIFEST                    écrit en dernier : T0, unité TTL, seed valart, fichiers, nb de clés, checksums
+dump.tmp/
+  data.rxd     flux unique : en-tête (magic, version, T0, unité TTL) | enregistrements | marqueur de fin
+  zl.rxd       section ZSet/List (sérialisée au begin)
+  MANIFEST     écrit en dernier : T0, unité TTL, seed valart, fichiers, nb de clés, crc32c de chaque fichier
 ```
-- Pas d'écriture concurrente dans un même fichier ; les écritures partielles io_uring restent locales à une voie.
+- Pas de blocs : un seul parcours écrit un seul flux. Checksum : un crc32c par fichier, calculé au fil de l'écriture, vérifié au reload (détecte corruption/troncature ; l'atomicité vient du rename).
 - Fin de save : fsync de chaque fichier, puis MANIFEST, son fsync, et `rename` du dossier. **Le dump est valide à partir de là** (reload par insertions, ordre quelconque).
 
 ### Contiguïté des préfixes et reload en masse
 - **Pas de tri entre frères.** Le DFS garantit qu'un sous-arbre est écrit d'un bloc : toutes les clés sous un préfixe sont contiguës (`user:1…` juste après `user:`), quel que soit l'ordre `user:b, user:c, user:a`. C'est tout ce qu'il faut : dans oxidart, l'ordre entre frères n'a pas d'importance.
-- Chaque voie produit une série de **segments** : un nouveau segment commence à chaque sous-arbre volé (début marqué dans le bloc). La voie volée continue son propre segment après le « trou ».
-- **Reload en masse** : clés codées par rapport à la précédente (`lcp` + suffixe) ; le constructeur garde la pile des nœuds ouverts, remonte à la profondeur `lcp` et ajoute la suite comme nouvel enfant. Pas de recherche ni de split par clé, nœuds alloués dans l'ordre DFS. **Une seule recherche par segment** pour le raccrocher.
-- **Fusion optionnelle** (plus tard) : regrouper les fichiers de voie en un seul, compresser. Elle ne compare pas de clés ; elle ne touche que des fichiers (thread ou processus séparé, sans verrou), et un plantage pendant la fusion ne perd rien.
-- Le T0 (et l'unité du TTL) est dans le `MANIFEST` **et** dans l'en-tête de chaque fichier de voie, pour qu'un fichier se lise seul.
-- Compression par bloc (lz4/zstd) plus tard. Écriture des voies : buffers de 256 KB–1 MB soumis à io_uring dès qu'ils sont pleins ; ordre temp → fsync → rename.
+- **Reload en masse** : clés codées par rapport à la précédente (`lcp` + suffixe) ; le constructeur garde la pile des nœuds ouverts, remonte à la profondeur `lcp` et ajoute la suite comme nouvel enfant. Pas de recherche ni de split par clé, nœuds alloués dans l'ordre DFS. Le fichier est un seul flux depuis la racine.
+- Le T0 (et l'unité du TTL) est dans le `MANIFEST` **et** dans l'en-tête de `data.rxd`, pour qu'un fichier se lise seul.
+- Compression (lz4/zstd en flux) plus tard. Écriture : buffers de 256 KB–1 MB soumis à io_uring dès qu'ils sont pleins ; ordre temp → fsync → rename.
 
 ## 5bis. Comportement côté serveur (valeurs par défaut)
 
 - **`SAVE`** répond quand la save est terminée (seule la connexion qui l'a lancée attend) ; **`BGSAVE`** répond tout de suite. Une seconde demande pendant une save → erreur `Background save already in progress`. Saves automatiques : plus tard, avec l'AOF.
 - **Fichier** : chemin réglable (équivalent `dir` + `dbfilename`), `dump.rxdb` par défaut. Au démarrage, on recharge le dump existant **avant** d'accepter des connexions.
-- **FLUSHDB et `deln` synchrones pendant une save** : même règle qu'UNLINK (couper, compter, libérer après la save).
+- **FLUSHDB et `deln` synchrones pendant une save** : correct sans règle spéciale (chaque libération passe par la barrière), mais capture tout le sous-arbre. Pour éviter cette dérive mémoire, les faire passer par le chemin async (waker).
 - **Mémoire** : images + liste différée exposées dans `INFO`, sans limite en v1.
 - **Erreur disque** (ENOSPC, fsync) : abandon de la save, suppression du dossier temporaire, le dump précédent reste intact ; la liste différée est vidée normalement.
 - **TTL** : oxidart stocke des secondes ; unité « secondes » dans l'en-tête.
@@ -203,6 +207,8 @@ dump.tmp-<époque>/
 | BFS | La frontière peut contenir des millions de feuilles. |
 | Format par nœud avec ids | Lié au layout interne ; inutile avec un DFS. |
 | Clé complète par enregistrement | Remplacée par `lcp` + suffixe (DFS = sous-arbres contigus). |
+| Blocs `[longueur][nb_clés][données][checksum]` et bit « suite de conteneur » | Venaient des fichiers par voie ; avec un seul flux séquentiel, un conteneur s'étale sur plusieurs tranches sans découpage. |
+| Pile DFS polymorphique (frames Ox/Val/Coll), puis `ContainerSer` unique | Test de type dans la boucle ; remplacés par la pile DFS oxidart seule + `HashSer`/`SetSer` monomorphes. |
 | Tri des frères / fusion triée | La contiguïté des préfixes suffit au reload en masse. |
 | TTL en date absolue u64 | Écart à T0 en varint : 1 à 3 octets. |
 | Astuce « premier octet ≠ 0 = pas de TTL » | Une clé peut commencer par `0x00` (Redis accepte tous les octets) ; le bit 7 du tag est sans ambiguïté. |
@@ -211,8 +217,9 @@ dump.tmp-<époque>/
 | Bump allocator pour l'undo-log | Inutile en v1 ; on mesure d'abord avec la `BTreeMap` std. |
 | Free différé dans l'allocateur (hook dans `SharedByte::drop`) | Coûte hors save ; remplacé par rc+1 (oxidart) et la liste différée ciblée (valart). |
 | rc+1 sur les entrées valart à la capture | Jusqu'à des centaines de sauts mémoire par capture. |
-| Bloquer UNLINK pendant la save (verrou lecteurs/écrivain) | Remplacé par l'époque de coupe + libération différée. |
-| `VecDeque` pour les piles des voies | `StealStack` (Vec + `start`), pas de croissance par l'avant. |
+| Bloquer UNLINK pendant la save (verrou lecteurs/écrivain) | Remplacé par un waker dans la barrière, attendu avant chaque `free_chunk`. |
+| Époque de coupe + `forget` pour les UNLINK commencés avant T0 | Inutile : toute libération en cours attend le waker, le sous-arbre coupé n'est pas parcouru. |
+| Parcours à K voies + vol de travail (`StealStack`, segments, un fichier par voie) | Gain mesuré ~20 % sur le parcours seul, marginal avec la sérialisation et le découpage en tranches ; complexité (vol, segments, reload par segment, K fichiers) non justifiée. DFS simple + prefetch du haut de pile. À ne reconsidérer que si un bench de bout en bout le justifie. |
 | Stores non-temporels pour la copie du bitmap | ×1,5 seulement ; si la pause du `begin` gêne, passer à la copie paresseuse par bloc de 512 slots. |
 | Clones de `SharedByte` gardés par le parcours | Salit les lignes de cache et impose une 2e passe aléatoire ; on sérialise directement. |
 
@@ -221,6 +228,13 @@ dump.tmp-<époque>/
 - `radixox-lib/src/save_barrier.rs` : `BitSet` (`get`/`set`/`clear`/`next_set`/`words_mut`) et `SaveBarrier<T>` (`begin_with(snapshot)`, `before_write(idx, &T)` qui fait un `ptr::read`, `forget`, `is_intact`, `unsafe take(idx) -> T0::{Slab, Image(&T)}`, `epoch`, `finish`). 6 tests sur un arbre jouet, propres sous ASan. **À faire à l'étape 3** : capture par closure (`before_write(idx, || image)`), images possédées et droppables (oxidart) vs bit à bit (valart), bitset `captured` pour valart.
 - `~/rust/hislab` : `copy_occupancy(&self, out: &mut Vec<u64>) -> u32` sur `HiSlab` et `TaggedHiSlab` (+ test). Oxidart et valart en dépendance `path = "../../hislab"` le temps du chantier (repasser sur une version publiée ensuite). Commité dans hislab (ed38da3, non publié), avec la croissance eager de lvl2/lvl3 dans `bitmap_tree.rs`.
 - Fix mimalloc : `SharedByte`, `CompactStr` et les blocs overflow valart appellent `mi_malloc`/`mi_zalloc`/`mi_free` (crate `libmimalloc-sys`) au lieu de `MiMalloc.alloc`, qui passe par `mi_malloc_aligned` et sur-alloue (−8 % de RSS à 100 B).
+
+### Étape 1 faite (2026-10-10)
+- `oxidart/src/lib.rs` : points de passage `node_mut` / `try_node_mut` / `remove_node` / `set_parent_idx` (exception sans barrière) ; `get_node_mut` supprimé. `create_node_with_val` passe par `push_child_idx`. `free_subtree_iterative` et `free_chunk` (UNLINK) retirent le nœud **avant** de libérer son overflow.
+- Champ `saving: bool` (remplacé par la `SaveBarrier` à l'étape 3) : `get_idx` ne supprime plus une clé expirée pendant une save, `evict_expired` renvoie 0. `set_saving` en `cfg(test)`.
+- Lectures sans capture : `get_ref(key) -> NodeValRef` (tag + `&ValUnion`) remplace `get_mut` ; `hash_root`, `set_root`, `cmd_zcard/zrange/zscore/zrem` passent par là. `get_or_create_hash/set` et `get_zset_mut` lisent d'abord et n'appellent `node_mut` (via `install_value_raw`) que pour créer. `NodeValMut` ne sert plus qu'à `incr`.
+- `del(key) -> bool` (ne ramène pas la valeur, ne compte pas une clé expirée) ; `take(key) -> Option<Value>` pour GETDEL.
+- Corrections au passage : `get_zset_mut` ne libérait pas une valeur expirée et héritait de son TTL ; un Hash/Set/ZSet créé avec TTL est maintenant tagué pour l'évicteur (le Hash/Set ne l'était pas) ; `deln("")` / `deln_async("")` vident vraiment la valeur de la racine (`deln_async` ne la supprimait pas) ; DEL d'une clé expirée renvoie 0.
 
 ## 5quinquies. Méthode de travail
 
@@ -231,12 +245,12 @@ dump.tmp-<époque>/
 
 ## 6. Ordre de réalisation
 
-1. Points de passage oxidart, lectures sans `NodeValMut` dans les commandes de lecture, signatures sans valeur de retour, lectures sans modification pendant une save. Refactor pur : tous les tests existants passent.
+1. ✅ Points de passage oxidart, lectures sans `NodeValMut` dans les commandes de lecture, signatures sans valeur de retour, lectures sans modification pendant une save. Refactor pur : tous les tests existants passent.
 2. Points de passage valart, même principe.
 3. `SaveBarrier` avec closure de capture, `NodeImage` / `ValNodeImage`, barrières branchées.
-4. Liste différée, drop différé des conteneurs, règles UNLINK, pause de l'évicteur.
-5. DFS de référence (une voie, synchrone) et test aléatoire sur un vrai `OxidArt` (SET, DEL, HSET, SADD, UNLINK, expirations mélangés aux pas de la save) comparé à l'état T0, sous ASan.
-6. K voies + prefetch à deux étages + vol, testées contre le DFS de référence ; bench ns/clé.
-7. Format, fichiers de voie, blocs, checksum, section ZSet/List, MANIFEST, I/O.
-8. Reload en masse par segment depuis les fichiers de voie, et test aller-retour.
-9. (Optionnel, plus tard) Fusion des fichiers de voie, compression.
+4. Liste différée, drop différé des conteneurs, waker UNLINK dans la barrière, pause de l'évicteur.
+5. DFS (synchrone d'abord) et test aléatoire sur un vrai `OxidArt` (SET, DEL, HSET, SADD, UNLINK, expirations mélangés aux pas de la save) comparé à l'état T0, sous ASan.
+6. DFS par tranches + prefetch (valeur, compression, overflow, haut de pile), testé contre le DFS synchrone ; bench ns/clé.
+7. Format, fichier de données, crc32c, section ZSet/List, MANIFEST, I/O.
+8. Reload en masse depuis le fichier, et test aller-retour.
+9. (Optionnel, plus tard) Compression.
