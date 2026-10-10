@@ -1,6 +1,6 @@
 // mi_malloc direct (pas MiMalloc.alloc → mi_malloc_aligned, qui sur-alloue
 // size+align-1 sur page vide). Alignement ≥ 8 garanti par mimalloc.
-use libmimalloc_sys::{mi_free, mi_malloc};
+use radixox_lib::raw_alloc::{free as mi_free, malloc as mi_malloc};
 use std::ops::Deref;
 
 // Inline : inner[0] = (len << 1) | 1    len ∈ 0..=7
@@ -110,7 +110,7 @@ impl Drop for CompactStr {
     fn drop(&mut self) {
         unsafe {
             if self.0.inline[0] & 1 == 0 {
-                mi_free(self.0.heap as *mut _);
+                mi_free(self.0.heap);
             }
         }
     }

@@ -49,6 +49,7 @@ pub mod error;
 
 pub mod hcommand;
 mod node_childs;
+mod save;
 pub mod scommand;
 pub mod value;
 pub mod zcommand;
@@ -67,6 +68,9 @@ mod test;
 #[cfg(test)]
 mod test_structures;
 
+#[cfg(test)]
+mod test_save;
+
 use std::mem::ManuallyDrop;
 
 use hislab::TaggedHiSlab;
@@ -78,10 +82,12 @@ use crate::compact_str::CompactStr;
 use crate::node_childs::ChildAble;
 use crate::node_childs::Childs;
 use crate::node_childs::OverflowArena;
+use crate::save::{NodeImage, OxidSave};
 
 pub use crate::value::Value;
 use crate::value::{
-    NodeValMut, NodeValRef, Tag, ValUnion, drop_raw, init_slabs, value_from_raw_ref, value_into_raw,
+    NodeValMut, NodeValRef, Tag, ValUnion, drop_raw, init_slabs, valart, value_from_raw_ref,
+    value_into_raw,
     value_take_raw,
 };
 
@@ -121,9 +127,8 @@ pub struct OxidArt {
     /// The server is responsible for updating this via `set_now()`.
     pub now: u64,
     root_idx: u32,
-    /// Save en cours : les lectures ne modifient rien et l'évicteur est en
-    /// pause (SAVE_DESIGN.md §2.C). Remplacé par la `SaveBarrier` à l'étape 3.
-    saving: bool,
+    /// Save progressive : barrière COW sur `map` (SAVE_DESIGN.md).
+    save: OxidSave,
 }
 impl Default for OxidArt {
     fn default() -> Self {
@@ -153,7 +158,7 @@ impl OxidArt {
             root_idx,
             overflow_arena: OverflowArena::new(),
             now: 0,
-            saving: false,
+            save: OxidSave::default(),
         }
     }
 
@@ -163,15 +168,29 @@ impl OxidArt {
         self.now = now;
     }
 
-    /// Indique si une save est en cours.
+    /// Indique si une save est en cours. Pendant une save, les lectures ne
+    /// modifient rien et l'évicteur est en pause (SAVE_DESIGN.md §2.C).
     #[inline]
     pub fn is_saving(&self) -> bool {
-        self.saving
+        self.save.barrier.is_active()
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_saving(&mut self, saving: bool) {
-        self.saving = saving;
+    /// Démarre une save : fige la vue T0 (bitmap de présence d'oxidart et
+    /// de valart).
+    pub fn begin_save(&mut self) {
+        let map = &self.map;
+        self.save.barrier.begin_with(|buf| {
+            map.copy_occupancy(buf);
+        });
+        self.save.t0 = self.now;
+        valart().begin_save();
+    }
+
+    /// Termine la save (fin normale ou abandon) : images libérées.
+    pub fn finish_save(&mut self) {
+        self.save.barrier.finish();
+        self.save.childs.clear();
+        valart().finish_save();
     }
 
     /// Returns the number of Overflow slots currently allocated.
@@ -202,7 +221,7 @@ impl OxidArt {
     ///
     /// Returns the total number of evicted entries.
     pub fn evict_expired(&mut self) -> usize {
-        if self.saving {
+        if self.is_saving() {
             return 0;
         }
         let mut rng = rand::thread_rng();
@@ -305,12 +324,24 @@ impl OxidArt {
             .expect("Call to unfailable node_mut failed")
     }
     fn try_node_mut(&mut self, idx: u32) -> Option<&mut Node> {
+        self.before_write(idx);
         self.map.get_mut(idx)
     }
     /// Retire un nœud du slab. L'appelant libère son overflow *après* cet
     /// appel (la capture le copie).
     fn remove_node(&mut self, idx: u32) -> Option<Node> {
+        self.before_write(idx);
         self.map.remove(idx)
+    }
+    /// Barrière : capture l'image T0 du nœud s'il est encore intact.
+    #[inline]
+    fn before_write(&mut self, idx: u32) {
+        let Self { map, overflow_arena, save, .. } = self;
+        let OxidSave { barrier, childs, .. } = save;
+        barrier.before_write(idx, || {
+            let node = map.get(idx).expect("intact à T0 ⇒ encore occupé");
+            NodeImage::capture(node, overflow_arena, childs)
+        });
     }
     /// `parent_idx` n'est pas sérialisé : pas de barrière.
     fn set_parent_idx(&mut self, idx: u32, parent_idx: u32) {
@@ -363,7 +394,7 @@ impl OxidArt {
         let key_len = key.len();
         if key_len == 0 {
             if self.get_node(self.root_idx).is_expired(self.now) {
-                if self.saving {
+                if self.is_saving() {
                     return None;
                 }
                 self.node_mut(self.root_idx).clear_val();
@@ -383,7 +414,7 @@ impl OxidArt {
             match node.compare_compression_key(&key[cursor..]) {
                 CompResult::Final => {
                     if node.is_expired(self.now) {
-                        if !self.saving {
+                        if !self.is_saving() {
                             self.delete_node_inline(idx, parent_idx, parent_radix);
                         }
                         return None;

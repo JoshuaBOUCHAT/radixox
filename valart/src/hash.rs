@@ -15,7 +15,8 @@ use radixox_lib::shared_byte::SharedByte;
 
 use crate::common::{DISPATCH_LEVELS, Slot, mix64};
 use crate::overflow::{NO_CHILD, swar_find};
-use crate::{HashOverflow, NodeType, ValNode, ValTrees};
+use crate::{HashOverflow, NodeType, ValNode, ValNodeImage, ValTrees};
+use radixox_lib::save_barrier::T0;
 
 /// Entrées inline max (nœud sans enfant).
 pub(crate) const INLINE_HASH_LEN: usize = 6;
@@ -46,6 +47,29 @@ pub struct HashNode {
 }
 
 impl PreFetch for HashNode {}
+
+impl HashNode {
+    /// Image T0 pour la save (SAVE_DESIGN.md §2.A) : copie bit à bit, bloc
+    /// overflow copié. Les entrées ne sont pas clonées : valart diffère
+    /// toutes ses libérations pendant une save. Libérer avec `free_image`.
+    pub(crate) fn image_copy(&self) -> ManuallyDrop<Self> {
+        // SAFETY: copie bit à bit jamais droppée ; son overflow est remplacé
+        // par une copie à elle avant toute utilisation.
+        let mut copy = ManuallyDrop::new(unsafe { std::ptr::read(self) });
+        if let Some(ov) = &self.overflow {
+            let ov = ManuallyDrop::into_inner(ov.shallow_copy());
+            unsafe { std::ptr::write(&mut copy.overflow, Some(ov)) };
+        }
+        copy
+    }
+
+    /// Libère le bloc overflow d'une image, sans toucher aux entrées.
+    pub(crate) fn free_image(img: &mut ManuallyDrop<Self>) {
+        if let Some(ov) = img.overflow.take() {
+            HashOverflow::free_shallow(ManuallyDrop::new(ov));
+        }
+    }
+}
 
 impl HashNode {
     fn new(parent_or_card: u32, parent_radix: u8) -> Self {
@@ -446,6 +470,7 @@ impl ValTrees {
     #[inline(always)]
     fn hash_node_mut(&mut self, idx: u32) -> &mut HashNode {
         debug_assert!(self.nodes.is_occupied(idx));
+        self.before_write(idx);
         let node = unsafe { self.nodes.get_unchecked_mut(idx) };
         debug_assert_eq!(node.tag(), NodeType::Hash);
         unsafe { &mut node.hash }
@@ -457,7 +482,10 @@ impl ValTrees {
         })
     }
 
+    /// Hors `hash_drop`, un nœud libéré est toujours vide (ni entrée ni
+    /// overflow) : rien à différer.
     fn free_hash_node(&mut self, idx: u32) {
+        self.before_write(idx);
         drop(self.nodes.remove(idx));
     }
 
@@ -641,6 +669,37 @@ impl ValTrees {
         Some((k, v))
     }
 
+    /// Parcours de la vue T0 pendant une save (nœuds modifiés lus dans leur
+    /// image). Consomme les nœuds dans la barrière : un conteneur n'est
+    /// parcouru qu'une fois par save. Référence synchrone ; le sérialiseur
+    /// par tranches viendra à l'étape 6.
+    /// TODO : buckets de collision lus vivants (copie au T0 pas faite).
+    pub fn hash_for_each_t0(&mut self, root: u32, mut f: impl FnMut(&SharedByte, &SharedByte)) {
+        let mut stack = vec![(root, 0usize)];
+        let Self { nodes, save, hash_collisions: collisions, .. } = self;
+        while let Some((idx, depth)) = stack.pop() {
+            if depth == DISPATCH_LEVELS {
+                for (k, v) in collisions.get(idx) {
+                    f(k, v);
+                }
+                continue;
+            }
+            let node: &HashNode = match save.take(idx) {
+                Some(T0::Slab) => unsafe { &nodes.get_unchecked(idx).hash },
+                Some(T0::Image(ValNodeImage::Hash(n))) => n,
+                _ => panic!("nœud valart {idx} absent de la vue T0"),
+            };
+            for n in 0..node.len() {
+                let slot = node.slot_at(n);
+                f(node.key(slot), node.val(slot));
+                let child = node.child(slot);
+                if child != NO_CHILD {
+                    stack.push((child, depth + 1));
+                }
+            }
+        }
+    }
+
     /// HGETALL / HKEYS / HVALS : parcours complet, ordre sans signification.
     pub fn hash_for_each(&self, root: u32, mut f: impl FnMut(&SharedByte, &SharedByte)) {
         let mut stack = vec![(root, 0usize)];
@@ -685,7 +744,18 @@ impl ValTrees {
     }
 
     /// Libère tout le Hash, racine comprise. `root` n'est plus valide après.
+    ///
+    /// Pendant une save, la destruction est différée à `finish_save` (le
+    /// parcours peut encore lire ce conteneur dans la vue T0).
     pub fn hash_drop(&mut self, root: u32) {
+        if self.save.is_active() {
+            self.deferred_drops.push((NodeType::Hash, root));
+            return;
+        }
+        self.hash_drop_now(root);
+    }
+
+    pub(crate) fn hash_drop_now(&mut self, root: u32) {
         let mut stack = vec![(root, 0usize)];
         while let Some((idx, depth)) = stack.pop() {
             if depth == DISPATCH_LEVELS {
@@ -815,6 +885,9 @@ impl ValTrees {
 
 #[cfg(test)]
 mod tests {
+    use radixox_lib::save_barrier::T0;
+
+    use crate::ValNodeImage;
     use super::*;
     use std::collections::HashMap;
 
@@ -843,6 +916,57 @@ mod tests {
         let old = get(t, root, field);
         assert_eq!(t.hash_remove(root, field.as_bytes()), old.is_some(), "{field}");
         old
+    }
+
+    /// Une étape du parcours T0 : lit le nœud `idx` (slab ou image),
+    /// collecte ses entrées et empile ses enfants.
+    fn visit_t0(t: &mut ValTrees, idx: u32, got: &mut Vec<(Vec<u8>, Vec<u8>)>, stack: &mut Vec<u32>) {
+        let ValTrees { nodes, save, .. } = t;
+        let node: &HashNode = match save.take(idx) {
+            Some(T0::Slab) => unsafe { &nodes.get_unchecked(idx).hash },
+            Some(T0::Image(ValNodeImage::Hash(n))) => n,
+            _ => panic!("nœud {idx} absent de la vue T0"),
+        };
+        for n in 0..node.len() {
+            let slot = node.slot_at(n);
+            got.push((node.key(slot).to_vec(), node.val(slot).to_vec()));
+            if node.child(slot) != NO_CHILD {
+                stack.push(node.child(slot));
+            }
+        }
+    }
+
+    /// Un conteneur sérialisé sur plusieurs tranches : la racine est déjà
+    /// écrite quand HDEL fait remonter des entrées des feuilles vers elle,
+    /// puis les supprime depuis la racine (non capturée). Les images des
+    /// feuilles référencent encore ces entrées : elles doivent survivre
+    /// jusqu'à `finish_save` (sous ASan, l'ancienne règle « on ne diffère
+    /// que ce qui sort d'un nœud capturé » fait un use-after-free ici).
+    #[test]
+    fn save_entries_moved_up_then_removed() {
+        let mut t = trees();
+        t.hash_mask = 0; // chaîne : une entrée par niveau
+        let root = t.hash_create();
+        for i in 0..6 {
+            t.hash_set(root, sb(format!("f{i}")), sb(format!("valeur-longue-{i}")));
+        }
+        let mut expect = Vec::new();
+        t.hash_for_each(root, |k, v| expect.push((k.to_vec(), v.to_vec())));
+        expect.sort();
+
+        t.begin_save();
+        let (mut got, mut stack) = (Vec::new(), Vec::new());
+        visit_t0(&mut t, root, &mut got, &mut stack); // tranche 1 : la racine
+        for i in 0..6 {
+            assert!(t.hash_remove(root, format!("f{i}").as_bytes()));
+        }
+        while let Some(idx) = stack.pop() {
+            visit_t0(&mut t, idx, &mut got, &mut stack); // tranches suivantes
+        }
+        t.finish_save();
+        got.sort();
+        assert_eq!(got, expect);
+        assert_eq!(t.hash_len(root), 0);
     }
 
     #[test]

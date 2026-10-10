@@ -914,13 +914,13 @@ fn save_mode_expired_get_keeps_node() {
     let nodes = art.node_count();
 
     art.set_now(200);
-    art.set_saving(true);
+    art.begin_save();
     assert_eq!(art.get(b"sess:a"), None);
     assert_eq!(art.node_count(), nodes, "une lecture ne libère rien pendant une save");
     assert_eq!(art.evict_expired(), 0, "évicteur en pause pendant une save");
     assert_eq!(art.node_count(), nodes);
 
-    art.set_saving(false);
+    art.finish_save();
     assert_eq!(art.get(b"sess:a"), None);
     assert!(art.node_count() < nodes, "hors save, la clé expirée est nettoyée");
     assert_eq!(art.get(b"sess:b"), Some(Value::from_str("y")));
@@ -936,10 +936,10 @@ fn save_mode_expired_root_kept() {
         Value::from_str("root"),
     );
     art.set_now(200);
-    art.set_saving(true);
+    art.begin_save();
     assert_eq!(art.get(b""), None);
     assert!(art.get_node(art.root_idx).has_val());
-    art.set_saving(false);
+    art.finish_save();
     assert_eq!(art.get(b""), None);
     assert!(!art.get_node(art.root_idx).has_val());
 }

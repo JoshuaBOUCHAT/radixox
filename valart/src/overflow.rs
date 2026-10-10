@@ -8,11 +8,11 @@ use std::alloc::{Layout, handle_alloc_error};
 // En test, allocateur système pour qu'AddressSanitizer voie les blocs.
 #[cfg(not(test))]
 unsafe fn block_zalloc(layout: Layout) -> *mut u8 {
-    unsafe { libmimalloc_sys::mi_zalloc(layout.size()) as *mut u8 }
+    unsafe { radixox_lib::raw_alloc::zalloc(layout.size()) }
 }
 #[cfg(not(test))]
 unsafe fn block_free(ptr: *mut u8, _layout: Layout) {
-    unsafe { libmimalloc_sys::mi_free(ptr as *mut _) }
+    unsafe { radixox_lib::raw_alloc::free(ptr) }
 }
 #[cfg(test)]
 unsafe fn block_zalloc(layout: Layout) -> *mut u8 {
@@ -467,6 +467,31 @@ pub(crate) fn swar_find(word: u64, byte: u8) -> Option<usize> {
     }
 }
 
+impl SetOverflow {
+    /// Copie bit à bit du bloc pour une image de save : les entrées ne sont
+    /// pas clonées (pas de refcount). Libérer avec [`Self::free_shallow`],
+    /// jamais dropper.
+    pub(crate) fn shallow_copy(&self) -> std::mem::ManuallyDrop<Self> {
+        let layout = self.block_layout();
+        unsafe {
+            let raw = block_zalloc(layout);
+            if raw.is_null() {
+                handle_alloc_error(layout);
+            }
+            std::ptr::copy_nonoverlapping(self.base_ptr(), raw, layout.size());
+            let tagged = (raw as usize | self.class() as usize) as *mut u8;
+            std::mem::ManuallyDrop::new(Self {
+                ptr: NonNull::new_unchecked(tagged),
+            })
+        }
+    }
+
+    /// Libère le bloc d'une copie superficielle sans dropper ses entrées.
+    pub(crate) fn free_shallow(copy: std::mem::ManuallyDrop<Self>) {
+        unsafe { block_free(copy.base_ptr(), copy.block_layout()) };
+    }
+}
+
 impl Default for SetOverflow {
     fn default() -> Self {
         Self::new()
@@ -893,6 +918,31 @@ impl HashOverflow {
     pub fn pop(&mut self) -> Option<(u8, u8, SharedByte, SharedByte, u32)> {
         let last = self.len().checked_sub(1)?;
         Some(self.swap_remove(last))
+    }
+}
+
+impl HashOverflow {
+    /// Copie bit à bit du bloc pour une image de save : les entrées ne sont
+    /// pas clonées (pas de refcount). Libérer avec [`Self::free_shallow`],
+    /// jamais dropper.
+    pub(crate) fn shallow_copy(&self) -> std::mem::ManuallyDrop<Self> {
+        let layout = self.block_layout();
+        unsafe {
+            let raw = block_zalloc(layout);
+            if raw.is_null() {
+                handle_alloc_error(layout);
+            }
+            std::ptr::copy_nonoverlapping(self.base_ptr(), raw, layout.size());
+            let tagged = (raw as usize | self.class() as usize) as *mut u8;
+            std::mem::ManuallyDrop::new(Self {
+                ptr: NonNull::new_unchecked(tagged),
+            })
+        }
+    }
+
+    /// Libère le bloc d'une copie superficielle sans dropper ses entrées.
+    pub(crate) fn free_shallow(copy: std::mem::ManuallyDrop<Self>) {
+        unsafe { block_free(copy.base_ptr(), copy.block_layout()) };
     }
 }
 

@@ -36,7 +36,8 @@ use radixox_lib::shared_byte::SharedByte;
 
 use crate::common::{DISPATCH_LEVELS, Slot, mix64};
 use crate::overflow::{NO_CHILD, swar_find};
-use crate::{NodeType, SetOverflow, ValNode, ValTrees};
+use crate::{NodeType, SetOverflow, ValNode, ValNodeImage, ValTrees};
+use radixox_lib::save_barrier::T0;
 
 /// Entrées inline max (nœud sans enfant).
 pub(crate) const INLINE_SET_LEN: usize = 11;
@@ -67,6 +68,29 @@ pub struct SetNode {
 }
 
 impl PreFetch for SetNode {}
+
+impl SetNode {
+    /// Image T0 pour la save (SAVE_DESIGN.md §2.A) : copie bit à bit, bloc
+    /// overflow copié. Les entrées ne sont pas clonées : valart diffère
+    /// toutes ses libérations pendant une save. Libérer avec `free_image`.
+    pub(crate) fn image_copy(&self) -> ManuallyDrop<Self> {
+        // SAFETY: copie bit à bit jamais droppée ; son overflow est remplacé
+        // par une copie à elle avant toute utilisation.
+        let mut copy = ManuallyDrop::new(unsafe { std::ptr::read(self) });
+        if let Some(ov) = &self.overflow {
+            let ov = ManuallyDrop::into_inner(ov.shallow_copy());
+            unsafe { std::ptr::write(&mut copy.overflow, Some(ov)) };
+        }
+        copy
+    }
+
+    /// Libère le bloc overflow d'une image, sans toucher aux entrées.
+    pub(crate) fn free_image(img: &mut ManuallyDrop<Self>) {
+        if let Some(ov) = img.overflow.take() {
+            SetOverflow::free_shallow(ManuallyDrop::new(ov));
+        }
+    }
+}
 
 impl SetNode {
     fn new(parent_or_card: u32, parent_radix: u8) -> Self {
@@ -417,6 +441,7 @@ impl ValTrees {
     #[inline(always)]
     fn set_node_mut(&mut self, idx: u32) -> &mut SetNode {
         debug_assert!(self.nodes.is_occupied(idx));
+        self.before_write(idx);
         let node = unsafe { self.nodes.get_unchecked_mut(idx) };
         debug_assert_eq!(node.tag(), NodeType::Set);
         unsafe { &mut node.set }
@@ -428,7 +453,10 @@ impl ValTrees {
         })
     }
 
+    /// Hors `set_drop`, un nœud libéré est toujours vide (ni entrée ni
+    /// overflow) : rien à différer.
     fn free_set_node(&mut self, idx: u32) {
+        self.before_write(idx);
         drop(self.nodes.remove(idx));
     }
 
@@ -613,6 +641,35 @@ impl ValTrees {
         Some(key)
     }
 
+    /// Parcours de la vue T0 pendant une save (nœuds modifiés lus dans leur
+    /// image). Consomme les nœuds dans la barrière : un conteneur n'est
+    /// parcouru qu'une fois par save. Référence synchrone ; le sérialiseur
+    /// par tranches viendra à l'étape 6.
+    /// TODO : buckets de collision lus vivants (copie au T0 pas faite).
+    pub fn set_for_each_t0(&mut self, root: u32, mut f: impl FnMut(&SharedByte)) {
+        let mut stack = vec![(root, 0usize)];
+        let Self { nodes, save, set_collisions: collisions, .. } = self;
+        while let Some((idx, depth)) = stack.pop() {
+            if depth == DISPATCH_LEVELS {
+                collisions.get(idx).iter().for_each(&mut f);
+                continue;
+            }
+            let node: &SetNode = match save.take(idx) {
+                Some(T0::Slab) => unsafe { &nodes.get_unchecked(idx).set },
+                Some(T0::Image(ValNodeImage::Set(n))) => n,
+                _ => panic!("nœud valart {idx} absent de la vue T0"),
+            };
+            for n in 0..node.len() {
+                let slot = node.slot_at(n);
+                f(node.key(slot));
+                let child = node.child(slot);
+                if child != NO_CHILD {
+                    stack.push((child, depth + 1));
+                }
+            }
+        }
+    }
+
     /// SMEMBERS : parcours complet. Ordre = ordre du trie, sans signification.
     pub fn set_for_each(&self, root: u32, mut f: impl FnMut(&SharedByte)) {
         let mut stack = vec![(root, 0usize)];
@@ -656,7 +713,18 @@ impl ValTrees {
     }
 
     /// Libère tout le Set, racine comprise. `root` n'est plus valide après.
+    ///
+    /// Pendant une save, la destruction est différée à `finish_save` (le
+    /// parcours peut encore lire ce conteneur dans la vue T0).
     pub fn set_drop(&mut self, root: u32) {
+        if self.save.is_active() {
+            self.deferred_drops.push((NodeType::Set, root));
+            return;
+        }
+        self.set_drop_now(root);
+    }
+
+    pub(crate) fn set_drop_now(&mut self, root: u32) {
         let mut stack = vec![(root, 0usize)];
         while let Some((idx, depth)) = stack.pop() {
             if depth == DISPATCH_LEVELS {

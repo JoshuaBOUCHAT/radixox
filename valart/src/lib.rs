@@ -7,6 +7,7 @@
 use std::mem::{ManuallyDrop, offset_of};
 
 use hislab::HiSlab;
+use radixox_lib::save_barrier::SaveBarrier;
 use radixox_lib::shared_byte::SharedByte;
 
 mod common;
@@ -54,6 +55,33 @@ impl Drop for ValNode {
     }
 }
 
+/// Image T0 d'un nœud valart (SAVE_DESIGN.md §2.A) : copie bit à bit, bloc
+/// overflow copié, entrées non clonées. Sûr parce que valart ne détruit
+/// aucune entrée pendant une save (liste différée, §2.B).
+enum ValNodeImage {
+    Hash(ManuallyDrop<HashNode>),
+    Set(ManuallyDrop<SetNode>),
+}
+
+impl ValNodeImage {
+    fn capture(node: &ValNode) -> Self {
+        match node.tag() {
+            NodeType::Hash => Self::Hash(unsafe { &node.hash }.image_copy()),
+            NodeType::Set => Self::Set(unsafe { &node.set }.image_copy()),
+            NodeType::ZSet => unreachable!("ZSet node not implemented yet"),
+        }
+    }
+}
+
+impl Drop for ValNodeImage {
+    fn drop(&mut self) {
+        match self {
+            Self::Hash(h) => HashNode::free_image(h),
+            Self::Set(s) => SetNode::free_image(s),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 enum NodeType {
@@ -72,6 +100,12 @@ pub struct ValTrees {
     /// persister dans le dump : la position de chaque entrée en dépend.
     seed: u64,
     hasher: foldhash::quality::FixedState,
+    /// Save progressive : barrière COW sur `nodes`.
+    save: SaveBarrier<ValNodeImage>,
+    /// Pendant une save : clés/valeurs sorties d'un nœud, et conteneurs
+    /// supprimés. Détruits à `finish_save`.
+    deferred_bytes: Vec<SharedByte>,
+    deferred_drops: Vec<(NodeType, u32)>,
     /// Tests : masque appliqué au hash pour forcer des collisions.
     #[cfg(test)]
     hash_mask: u64,
@@ -96,6 +130,9 @@ impl ValTrees {
             hash_collisions: CollisionBuckets::default(),
             seed,
             hasher: foldhash::quality::FixedState::with_seed(seed),
+            save: SaveBarrier::new(),
+            deferred_bytes: Vec::new(),
+            deferred_drops: Vec::new(),
             #[cfg(test)]
             hash_mask: u64::MAX,
         }
@@ -105,16 +142,57 @@ impl ValTrees {
     //
     // `hash_node_mut` / `set_node_mut` sont les seuls accès `&mut` à un nœud,
     // `free_hash_node` / `free_set_node` les seules libérations : la barrière
-    // de save y sera branchée. Une clé ou valeur qui *sort* d'un nœud
-    // (suppression, remplacement) passe par `dispose`. Les buckets de
-    // collision n'ont pas de barrière (copiés au T0).
+    // de save y est branchée (`before_write`). Une clé ou valeur qui *sort*
+    // d'un nœud (suppression, remplacement) passe par `dispose`. Les buckets
+    // de collision n'ont pas de barrière (copiés au T0).
+    //
+    // Pendant une save, *tout* ce qui sort d'un nœud est différé, pas
+    // seulement ce qui sort d'un nœud capturé : HDEL/SREM font remonter des
+    // entrées d'une feuille (capturée) vers un ancêtre (peut-être déjà
+    // sérialisé, donc non capturé) ; les détruire depuis l'ancêtre laisserait
+    // l'image de la feuille pointer dans le vide.
+
+    #[inline]
+    fn before_write(&mut self, idx: u32) {
+        let Self { nodes, save, .. } = self;
+        save.before_write(idx, || {
+            ValNodeImage::capture(unsafe { nodes.get_unchecked(idx) })
+        });
+    }
 
     /// Seul point où une clé/valeur sortie du nœud `node` est détruite.
-    /// Étape 4 : liste différée si le nœud a été capturé par la save en cours.
     #[inline]
     fn dispose(&mut self, node: u32, bytes: SharedByte) {
         let _ = node;
-        drop(bytes);
+        if self.save.is_active() {
+            self.deferred_bytes.push(bytes);
+        }
+    }
+
+    /// Démarre une save : fige la vue T0 du slab.
+    pub fn begin_save(&mut self) {
+        let nodes = &self.nodes;
+        self.save.begin_with(|buf| {
+            nodes.copy_occupancy(buf);
+        });
+    }
+
+    /// Termine la save : images libérées, libérations différées exécutées.
+    /// TODO : vider par tranches (SAVE_DESIGN.md §2.B).
+    pub fn finish_save(&mut self) {
+        self.save.finish();
+        self.deferred_bytes.clear();
+        for (kind, root) in std::mem::take(&mut self.deferred_drops) {
+            match kind {
+                NodeType::Hash => self.hash_drop_now(root),
+                NodeType::Set => self.set_drop_now(root),
+                NodeType::ZSet => unreachable!(),
+            }
+        }
+    }
+
+    pub fn is_saving(&self) -> bool {
+        self.save.is_active()
     }
 
     pub fn seed(&self) -> u64 {

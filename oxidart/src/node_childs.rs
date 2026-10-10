@@ -251,6 +251,23 @@ impl ChildAble for Overflow {
 }
 
 impl Overflow {
+    /// Parcourt tous les enfants (léger puis huge) sans allouer.
+    pub(crate) fn for_each_child(&self, mut f: impl FnMut(u8, u32)) {
+        for i in 0..self.len as usize {
+            f(self.radixs[i], self.idxs[i]);
+        }
+        if let Some(huge_idx) = self.big_overflow_idx {
+            with_huge_ovf(|s| {
+                if let Some(h) = s.get(huge_idx) {
+                    for e in h.entries.iter() {
+                        let (radix, idx) = (e.radix, e.idx);
+                        f(radix, idx);
+                    }
+                }
+            });
+        }
+    }
+
     fn drop_huge(&mut self) {
         if let Some(huge_idx) = self.big_overflow_idx.take() {
             with_huge_ovf(|s| s.remove(huge_idx));

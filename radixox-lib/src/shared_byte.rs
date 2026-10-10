@@ -1,4 +1,4 @@
-use libmimalloc_sys::{mi_free, mi_malloc};
+use crate::raw_alloc::{free as mi_free, malloc as mi_malloc};
 use std::borrow::Borrow;
 
 use std::ops::Deref;
@@ -140,7 +140,7 @@ impl Drop for SharedByte {
             let rc = self.rc_ptr();
             *rc -= 1;
             if *rc == 0 {
-                mi_free(self.ptr.as_ptr() as *mut _);
+                mi_free(self.ptr.as_ptr() as *mut u8);
             }
         }
     }

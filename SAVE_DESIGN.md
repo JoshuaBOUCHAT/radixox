@@ -16,7 +16,7 @@
 | **Capture** | Création d'une image. Au plus une par nœud et par save. |
 | **Bitset `intact`** | Copie du bitmap de présence HiSlab au T0 (`copy_occupancy`). Bit à 1 = présent à T0, ni modifié ni sérialisé. Sert aussi de dirty flag. |
 | **Point de passage** | Seule fonction autorisée à donner un `&mut` sur un nœud, ou à le libérer. La barrière y est placée. |
-| **Liste différée** | Pendant une save, ce qui sort d'un nœud **valart capturé** (nœud retiré, clé/valeur sortie) et les **conteneurs Hash/Set supprimés** y sont déplacés bit à bit au lieu d'être droppés. Vidée par tranches à la fin de la save. |
+| **Liste différée** | Pendant une save, **toute** clé/valeur qui sort d'un nœud valart et les **conteneurs Hash/Set supprimés** y sont mis de côté au lieu d'être détruits. Vidée à la fin de la save. |
 
 ## 1. Ce qui peut changer pendant une save
 
@@ -41,59 +41,37 @@
 
 ### A. Images
 
-**Oxidart** — même structure que le vivant, pour lire les enfants avec le même code :
+**Oxidart** — `NodeImage` autonome (`oxidart/src/save.rs`) :
 ```rust
-struct OxidCow {
-    images:    BTreeMap<u32, ManuallyDrop<Node>>, // overflow_idx réécrit → index dans `overflows`
-    overflows: Vec<Overflow>,                      // big_overflow_idx réécrit → index dans `huges`
-    huges:     Vec<HugeOverflow>,                  // copiées élément par élément (SmallVec peut être sur le heap en release)
+struct NodeImage {
+    compression: CompactStr,   // copie profonde
+    tag: Tag,
+    val: ValUnion,             // Bytes : clone (rc+1), droppé avec l'image ; Int : copie ; conteneurs : idx
+    exp_and_radix: ExpAndRadix,
+    childs_start: u32,         // enfants (inline + overflow + huge) aplatis
+    childs_len: u32,           //   dans OxidSave::childs: Vec<(u8, u32)>
 }
-trait ChildArenas { fn overflow(&self, i: u32) -> &Overflow; fn huge(&self, i: u32) -> &HugeOverflow; }
-fn for_each_child(node: &Node, arenas: &impl ChildArenas, f: impl FnMut(u8, u32));
-// deux impl : vivant (OverflowArena + HUGE_OVF) et COW (overflows + huges)
+struct OxidSave { barrier: SaveBarrier<NodeImage>, childs: Vec<(u8, u32)>, t0: u64 }
 ```
-- Règle : *modifier les enfants de X, c'est modifier X* (`push_child_idx` / `remove_child` appellent la barrière de X avant de toucher l'overflow). L'`OverflowArena` et la `HugeOverflow` n'ont ni bitset ni COW à elles : pour un nœud intact, la save les lit dans l'arena vivante (inchangée depuis T0).
-- Capture : **valeur `SharedByte` clonée (rc+1)** — l'image en détient une vraie référence, donc pas de liste différée ni de bitset `captured` côté oxidart ; le saut mémoire est de toute façon payé juste après par le drop quand c'est un SET qui écrase. **Compression heap copiée en profondeur.** Idx de conteneur : protégé par le drop différé des conteneurs (B).
-- `overflows` et `huges` sont vidés par `clear()` à la fin de la save (capacité conservée).
-- **Drop d'une image oxidart** (quand la save la consomme, ou à `finish`) : **jamais `drop(Node)`**, qui appellerait `drop_raw` et donc `hash_drop`/`set_drop`/`free_zset` sur l'idx de conteneur. `NodeImage` a son propre `Drop` : si `tag == Bytes` → drop du clone de `SharedByte` ; drop de la copie de compression ; tout autre tag (Int, Hash, Set, ZSet, List, None) → rien.
+- Règle : *modifier les enfants de X, c'est modifier X* (`push_child_idx` / `remove_child` passent par `node_mut(X)` avant de toucher l'overflow ; `remove_node` avant de libérer l'overflow). L'`OverflowArena` et la `HugeOverflow` n'ont ni bitset ni COW à elles : pour un nœud intact, la save les lit dans l'arena vivante (inchangée depuis T0).
+- Enfants aplatis plutôt que copies d'`Overflow`/`HugeOverflow` avec index réécrits (décision 2026-10-10) : plus simple, pas d'allocation par capture (un seul `Vec` réutilisé, vidé à `finish`), lecture triviale côté parcours.
+- **Drop d'une image oxidart** : jamais converti en `Node` (son `Drop` détruirait le conteneur). `NodeImage::drop` : si `tag == Bytes` → drop du clone ; la compression se droppe seule ; tout autre tag → rien.
 
-Capture oxidart, appelée **avant** toute modification du nœud ou de ses enfants :
-```rust
-if save.active && intact[idx] {
-    intact[idx] = false;
-    let mut img = capture_copy(&nodes[idx]);   // bit à bit + clone de la valeur (rc+1)
-                                               // + copie profonde de la compression si heap
-    if img.overflow_idx != u32::MAX {
-        let mut ov = copy_of(&overflow_arena[img.overflow_idx]);
-        if let Some(h) = ov.big_overflow_idx {              // à partir de 17 enfants
-            ov.big_overflow_idx = Some(cow.huges.len() as u32);
-            cow.huges.push(copy_elementwise(&huge_ovf[h]));
-        }
-        img.overflow_idx = cow.overflows.len() as u32;
-        cow.overflows.push(ov);
-    }
-    cow.images.insert(idx, img);
-}
-```
-Exemple : nœud 4 avec 9 enfants = 6 inline + 3 dans l'`Overflow` léger, pas de `HugeOverflow`. La save lit ensuite l'image via `for_each_child(&img, &cow, …)` et voit les 9 enfants T0, même si l'overflow vivant a été modifié, libéré ou réutilisé.
-
-**Valart** — `ManuallyDrop<ValNode>` bit à bit, **sans toucher aux refcounts** (jusqu'à 6 entrées inline + un bloc overflow de 255, trop de sauts mémoire). Le bloc overflow est copié (`mi_malloc` + memcpy, allocation propre car c'est un pointeur et sa taille varie) et l'image pointe sur la copie ; la copie est libérée avec l'image. La save utilise les mêmes accesseurs (`key`, `val`, `child`) sur l'image que sur un nœud vivant.
+**Valart** — `ManuallyDrop<ValNode>` bit à bit, **sans toucher aux refcounts** (jusqu'à 6 entrées inline + un bloc overflow de 255, trop de sauts mémoire). Le bloc overflow est copié (`mi_malloc` + memcpy, allocation propre car c'est un pointeur et sa taille varie) et l'image pointe sur la copie ; la copie est libérée avec l'image. La save utilise les mêmes accesseurs (`key`, `val`, `child`) sur l'image que sur un nœud vivant. Implémenté : `enum ValNodeImage { Hash(ManuallyDrop<HashNode>), Set(ManuallyDrop<SetNode>) }`, `HashNode::image_copy` / `free_image`, `HashOverflow::shallow_copy` / `free_shallow` (idem Set).
 
 `SaveBarrier::before_write(idx, || image)` reçoit une closure de construction.
 
 ### B. Liste différée (valart) et drop différé des conteneurs
-Côté valart (images sans refcount), pendant une save, ce qui sort d'un nœud **capturé** n'est pas détruit : on le déplace bit à bit dans la liste.
+Côté valart (images sans refcount), pendant une save, **rien de ce qui sort d'un nœud n'est détruit** :
 ```rust
-enum Deferred {
-    ValNode(ManuallyDrop<ValNode>),  // nœud valart retiré
-    Bytes(ManuallyDrop<SharedByte>), // clé/valeur sortie d'un nœud valart capturé
-    Container(Tag, u32),             // Hash/Set supprimé en entier
-}
+deferred_bytes: Vec<SharedByte>,        // via ValTrees::dispose (HDEL, SREM, SPOP, HSET qui écrase)
+deferred_drops: Vec<(NodeType, u32)>,   // hash_drop / set_drop pendant une save
 ```
-- **Seuls les nœuds valart capturés diffèrent** (leur image pointe sur les ressources T0). Bitset `captured` sur le slab valart (1 bit/slot) : mis à 1 à la capture, remis à 0 quand la save consomme l'image, et à `finish` pour les images restantes (via les clés de la map). Règle au point de passage pendant une save : `captured[idx]` → liste différée, sinon drop normal. On diffère tout ce qui sort d'un nœud capturé, même ce qui est né après T0.
+- **Pas de bitset `captured`** (décision 2026-10-10, prouvée sous ASan) : la règle « on ne diffère que ce qui sort d'un nœud capturé » est fausse. HDEL/SREM font remonter une entrée d'une feuille (capturée, image qui la référence) vers un ancêtre déjà sérialisé (donc non capturé) ; une suppression depuis l'ancêtre la détruirait alors que l'image de la feuille n'est pas encore lue. Test `valart::hash::tests::save_entries_moved_up_then_removed` (use-after-free sous ASan avec l'ancienne règle). Coût : 8 octets par entrée supprimée pendant la save.
+- Les nœuds libérés hors `hash_drop`/`set_drop` sont toujours vides (ni entrée, ni overflow) : la barrière les capture, rien d'autre à différer.
 - **Un `take` consomme le nœud en entier** : le parcours copie la liste de tous ses enfants (idx), le pointeur de valeur et la compression. Ensuite le nœud ne concerne plus la save.
 - **Aucun pointeur brut ne survit à une pause** : avant de rendre la main, le parcours termine le nœud en cours (sérialise sa valeur). Seuls des idx restent dans la pile, valides grâce au COW.
-- La liste différée est vidée **par tranches** en fin de save (même budget que le parcours). Un nouveau `begin` attend qu'elle soit vide.
+- La liste différée est vidée à `finish_save` (v1 : d'un coup ; TODO : par tranches, même budget que le parcours, un nouveau `begin` attendant qu'elle soit vide).
 - Hors save : comportement normal, aucun coût.
 - Un conteneur supprimé pendant la save n'est pas détruit, donc ses nœuds valart restent intacts : pas de capture en masse.
 - Valart est un `static` global : sa `SaveBarrier<ValNodeImage>` est un champ de `ValTrees`. Deux saves ne se chevauchent jamais (assertion).
@@ -112,7 +90,7 @@ enum Deferred {
 Sérialisés **intégralement au `begin`**, de façon bloquante, dans une section du fichier indexée par idx de slab. L'enregistrement d'une clé ZSet/List référence cet idx T0. Pas de barrière sur leurs slabs.
 
 ### E. Buckets de collision valart
-Copiés intégralement au T0 (rarissimes).
+Copiés intégralement au T0 (rarissimes), **en profondeur** (clones rc+1) : ils sont modifiés et droppés sans barrière ni liste différée. Pas encore fait : les parcours T0 lisent les buckets vivants.
 
 ### F. UNLINK
 - Avant chaque `free_chunk`, `deln_async` regarde si une save est active ; si oui, il **attend un waker** enregistré dans la barrière. `finish` réveille tous les wakers et les libérations reprennent.
@@ -225,7 +203,7 @@ dump.tmp/
 
 ## 5quater. État du code (2026-10-09, branche `custom_parser`, commit « valart branché dans oxidart, fix mimalloc, SaveBarrier + SAVE_DESIGN.md »)
 
-- `radixox-lib/src/save_barrier.rs` : `BitSet` (`get`/`set`/`clear`/`next_set`/`words_mut`) et `SaveBarrier<T>` (`begin_with(snapshot)`, `before_write(idx, &T)` qui fait un `ptr::read`, `forget`, `is_intact`, `unsafe take(idx) -> T0::{Slab, Image(&T)}`, `epoch`, `finish`). 6 tests sur un arbre jouet, propres sous ASan. **À faire à l'étape 3** : capture par closure (`before_write(idx, || image)`), images possédées et droppables (oxidart) vs bit à bit (valart), bitset `captured` pour valart.
+- `radixox-lib/src/save_barrier.rs` : `BitSet` (`get`/`set`/`clear`/`next_set`/`words_mut`) et `SaveBarrier<T>` (`begin_with(snapshot)`, `before_write(idx, &T)` qui fait un `ptr::read`, `forget`, `is_intact`, `unsafe take(idx) -> T0::{Slab, Image(&T)}`, `epoch`, `finish`). 6 tests sur un arbre jouet, propres sous ASan. *(Historique : remplacé à l'étape 3, voir plus bas.)*
 - `~/rust/hislab` : `copy_occupancy(&self, out: &mut Vec<u64>) -> u32` sur `HiSlab` et `TaggedHiSlab` (+ test). Oxidart et valart en dépendance `path = "../../hislab"` le temps du chantier (repasser sur une version publiée ensuite). Commité dans hislab (ed38da3, non publié), avec la croissance eager de lvl2/lvl3 dans `bitmap_tree.rs`.
 - Fix mimalloc : `SharedByte`, `CompactStr` et les blocs overflow valart appellent `mi_malloc`/`mi_zalloc`/`mi_free` (crate `libmimalloc-sys`) au lieu de `MiMalloc.alloc`, qui passe par `mi_malloc_aligned` et sur-alloue (−8 % de RSS à 100 B).
 
@@ -238,14 +216,23 @@ dump.tmp/
 
 ### Étape 2 faite (2026-10-10)
 - valart : seuls accès mutables au slab = `hash_node_mut` / `set_node_mut`, seules libérations = `free_hash_node` / `free_set_node` (maintenant `&mut self`, pour la barrière).
-- `ValTrees::dispose(node, bytes)` : seul point où une clé/valeur sortie d'un nœud est détruite (HDEL, SREM, SPOP, valeur écrasée par HSET). Étape 4 : liste différée si `captured[node]`. Les entrées *déplacées* entre nœuds (remontée de feuille, relocation overflow, refill) ne passent pas par là : rien n'est détruit.
+- `ValTrees::dispose(node, bytes)` : seul point où une clé/valeur sortie d'un nœud est détruite (HDEL, SREM, SPOP, valeur écrasée par HSET). Pendant une save : liste différée pour tout (étape 3, voir §2.B). Les entrées *déplacées* entre nœuds (remontée de feuille, relocation overflow, refill) ne passent pas par là : rien n'est détruit.
 - `hash_set -> bool` (champ nouveau), `hash_remove -> bool` ; `hash_get_mut` supprimé (HINCRBY passe par `hash_set`). `set_pop` renvoie un clone, l'original passe par `dispose`.
 - Buckets de collision : modifiés et droppés sans barrière ; la copie au T0 (§2.E) devra donc être **profonde** (clone rc+1 des `SharedByte`), pas bit à bit.
+
+### Étape 3 faite (+ liste différée valart de l'étape 4), 2026-10-10
+- `SaveBarrier<I>` : `before_write(idx, || image)`, images possédées droppées au `take` suivant ou à `finish`, `take` sûr ; plus d'`epoch` ni de `forget`.
+- Oxidart : `NodeImage` + `OxidSave` (`save.rs`), barrière dans `try_node_mut` / `remove_node` ; `begin_save` / `finish_save` (démarrent aussi valart) ; `is_saving()` remplace le booléen de l'étape 1.
+- Valart : `ValNodeImage`, barrière dans `hash_node_mut` / `set_node_mut` / `free_*_node`, `dispose` différé pendant une save, `hash_drop` / `set_drop` différés (`*_drop_now` à `finish_save`).
+- Tests : DFS T0 synchrone de référence (`save.rs::reference`, `hash_for_each_t0` / `set_for_each_t0`) ; `test_save.rs` (mutations aléatoires SET/DEL/TTL/INCR/HSET/HDEL/SADD/SREM/SPOP/deln entrelacées, FLUSHDB pendant une save) ; contrôles négatifs (barrière oxidart coupée → échec ; `dispose` sans différé → use-after-free ASan).
+- `radixox_lib::raw_alloc` + `--cfg radixox_sysalloc` pour ASan.
+- Bug préexistant vu sous ASan, hors save : `SmallVecIterator` (`radixox-lib/src/small_vec.rs:190`) lit la pile après déplacement sur `into_iter` d'un SmallVec inline (test `smallvec_into_iter_yields_reverse_order`).
+- Reste de l'étape 4 : waker UNLINK dans la barrière, vidage par tranches, copie profonde des buckets au T0.
 
 ## 5quinquies. Méthode de travail
 
 - **Tests** : mono-thread obligatoire (`RUST_TEST_THREADS=1` dans `.cargo/config.toml`, statics globaux). `cargo test -p radixox-lib -p oxidart -p valart`.
-- **ASan** (nightly installé) : `RUSTFLAGS="-Zsanitizer=address -C target-cpu=native" cargo +nightly test -p <crate> --target x86_64-unknown-linux-gnu --target-dir <scratch>`. Pour chaque test de COW, faire un **contrôle négatif** (désactiver la protection, vérifier qu'ASan signale un use-after-free).
+- **ASan** (nightly installé) : `ASAN_OPTIONS=detect_leaks=0 RUSTFLAGS="-Zsanitizer=address -C target-cpu=native --cfg radixox_sysalloc" cargo +nightly test -p <crate> --target x86_64-unknown-linux-gnu --target-dir <scratch>`. `--cfg radixox_sysalloc` bascule `radixox_lib::raw_alloc` (SharedByte, CompactStr, overflows valart) sur malloc/free : sans lui ASan ne voit pas les blocs mimalloc. `detect_leaks=0` : les tests monoio d'oxidart fuient leur runtime (préexistant). Pour chaque test de COW, faire un **contrôle négatif** (désactiver la protection, vérifier qu'ASan signale un use-after-free).
 - **Test de référence de l'étape 5** : mutations aléatoires sur un vrai `OxidArt` (SET, DEL, HSET, HDEL, SADD, SREM, UNLINK, EXPIRE, expirations) entrelacées avec les pas de la save ; le dump doit être identique à un `getn("")` + contenu des conteneurs pris à T0.
 - **Benchs** : profil `powerprofilesctl set performance` avant toute mesure ; runs courts (`TEST_TIME=10 LOAD_TIME=5 ./bench_memtier.sh`, `MT_PIPELINE=1` puis `256`), ordres de grandeur suffisants. Memtier avant/après l'étape 1 (le refactor touche le hot path), puis pendant une save (p99.99) pour régler `SAVE_TRANCHE_BUDGET`.
 
@@ -253,8 +240,8 @@ dump.tmp/
 
 1. ✅ Points de passage oxidart, lectures sans `NodeValMut` dans les commandes de lecture, signatures sans valeur de retour, lectures sans modification pendant une save. Refactor pur : tous les tests existants passent.
 2. ✅ Points de passage valart, même principe.
-3. `SaveBarrier` avec closure de capture, `NodeImage` / `ValNodeImage`, barrières branchées.
-4. Liste différée, drop différé des conteneurs, waker UNLINK dans la barrière, pause de l'évicteur.
+3. ✅ `SaveBarrier` avec closure de capture, `NodeImage` / `ValNodeImage`, barrières branchées.
+4. Liste différée ✅, drop différé des conteneurs ✅, pause de l'évicteur ✅, waker UNLINK dans la barrière, copie profonde des buckets au T0.
 5. DFS (synchrone d'abord) et test aléatoire sur un vrai `OxidArt` (SET, DEL, HSET, SADD, UNLINK, expirations mélangés aux pas de la save) comparé à l'état T0, sous ASan.
 6. DFS par tranches + prefetch (valeur, compression, overflow, haut de pile), testé contre le DFS synchrone ; bench ns/clé.
 7. Format, fichier de données, crc32c, section ZSet/List, MANIFEST, I/O.

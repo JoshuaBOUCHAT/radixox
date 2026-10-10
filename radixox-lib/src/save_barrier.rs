@@ -1,4 +1,5 @@
-//! Barrière d'écriture pour une save progressive (undo-log applicatif).
+//! Barrière d'écriture pour une save progressive (COW applicatif).
+//! Design complet : `SAVE_DESIGN.md` à la racine du dépôt.
 //!
 //! Le slab est muté en place pendant toute la save, qui parcourt l'arbre
 //! (pas le slab) par tranches. Au début, on copie le bitmap de présence du
@@ -8,22 +9,22 @@
 //!   save le lit dans le slab (et baisse le bit).
 //! - `intact[i] == 0` et `i` dans `images` : présent à T0, modifié ensuite
 //!   → la save lit l'image T0.
-//! - sinon : libre à T0, déjà sérialisé, ou rendu inaccessible avant T0.
+//! - sinon : libre à T0, déjà sérialisé, ou inaccessible depuis T0.
 //!   Les allocations n'ont donc pas de barrière.
 //!
 //! Avant de muter ou de libérer un slot, on capture son image si
 //! `intact[idx]`, puis on baisse le bit : au plus une capture par slot.
 //!
 //! Les idx restent valides d'une tranche à l'autre (la vue T0 ne bouge
-//! pas) : on peut les mettre en file et les prefetcher à l'avance.
+//! pas) : on peut les garder dans la pile du parcours et les prefetcher.
 //!
-//! Les images sont des copies **superficielles** (memcpy de `T`, jamais
-//! droppées). Tout ce qu'elles référencent (heap de `CompactStr`,
-//! `SharedByte`…) doit rester vivant jusqu'à la fin de la save : les free
-//! sont différés par l'appelant pendant qu'une save est active.
+//! L'image est construite par l'appelant (closure) et appartient à la
+//! barrière : elle est droppée quand la save la consomme (au `take`
+//! suivant) ou à `finish`. Ce qu'elle référence sans le posséder doit
+//! rester vivant jusqu'à `finish` (valart diffère toutes ses libérations
+//! pendant une save, SAVE_DESIGN.md §2.B).
 
 use std::collections::BTreeMap;
-use std::mem::ManuallyDrop;
 
 /// Bitset 1 bit par slot sur `Vec<u64>` (`Vec<bool>` coûterait 1 octet/slot).
 /// Même layout que le bitmap de niveau 1 de HiSlab : slot `i` = bit `i % 64`
@@ -83,39 +84,35 @@ impl BitSet {
 }
 
 /// Version T0 d'un nœud, pour la save.
-pub enum T0<'a, T> {
+pub enum T0<'a, I> {
     /// Intact : lire `slab[idx]` maintenant (garanti occupé). Le slot est
     /// désormais considéré comme sérialisé : une écriture ultérieure ne le
     /// capturera plus, donc tout ce qu'il faut en lire doit l'être avant de
-    /// rendre la main (les pointeurs restent valides via les free différés).
+    /// rendre la main.
     Slab,
-    /// Modifié depuis T0 : contenu T0.
-    Image(&'a T),
+    /// Modifié depuis T0 : contenu T0. Valide jusqu'au prochain `take`.
+    Image(&'a I),
 }
 
-pub struct SaveBarrier<T> {
+pub struct SaveBarrier<I> {
     active: bool,
-    /// Incrémentée à chaque `begin_with` : permet de dater une coupe
-    /// (UNLINK) par rapport au début de la save.
-    epoch: u64,
     /// Présent à T0, ni capturé ni sérialisé. Écrasé à chaque `begin_with`.
     intact: BitSet,
-    images: BTreeMap<u32, ManuallyDrop<T>>,
+    images: BTreeMap<u32, I>,
     /// Image rendue par le dernier `take` (`images` ne la contient plus).
-    last: Option<ManuallyDrop<T>>,
+    last: Option<I>,
 }
 
-impl<T> Default for SaveBarrier<T> {
+impl<I> Default for SaveBarrier<I> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T> SaveBarrier<T> {
+impl<I> SaveBarrier<I> {
     pub fn new() -> Self {
         Self {
             active: false,
-            epoch: 0,
             intact: BitSet::default(),
             images: BTreeMap::new(),
             last: None,
@@ -125,12 +122,6 @@ impl<T> SaveBarrier<T> {
     #[inline]
     pub fn is_active(&self) -> bool {
         self.active
-    }
-
-    /// Époque de la save en cours (ou de la dernière).
-    #[inline]
-    pub fn epoch(&self) -> u64 {
-        self.epoch
     }
 
     /// Nombre d'images T0 pas encore consommées par la save.
@@ -143,38 +134,28 @@ impl<T> SaveBarrier<T> {
     /// `|buf| slab.copy_occupancy(buf)`.
     pub fn begin_with(&mut self, snapshot: impl FnOnce(&mut Vec<u64>)) {
         assert!(!self.active, "save déjà en cours");
-        debug_assert!(self.images.is_empty());
+        debug_assert!(self.images.is_empty() && self.last.is_none());
         snapshot(self.intact.words_mut());
-        self.epoch += 1;
         self.active = true;
     }
 
     /// À appeler **avant** de muter ou de libérer le slot occupé `idx`.
     /// Inutile avant une allocation : un slot libre à T0 n'est jamais lu.
+    /// `capture` construit l'image T0 à partir de l'état courant (encore
+    /// intact) du slot ; elle n'est appelée qu'une fois par slot et par save.
     #[inline]
-    pub fn before_write(&mut self, idx: u32, current: &T) {
+    pub fn before_write(&mut self, idx: u32, capture: impl FnOnce() -> I) {
         if self.active && self.intact.get(idx as usize) {
-            self.capture(idx, current);
+            self.capture(idx, capture);
         }
     }
 
     #[cold]
-    fn capture(&mut self, idx: u32, current: &T) {
-        // SAFETY: copie bit à bit jamais droppée (ManuallyDrop) : aucune
-        // double libération. La validité des ressources pointées est le
-        // contrat de `take` (free différés pendant la save).
-        let copy = unsafe { std::ptr::read(current) };
-        self.images.insert(idx, ManuallyDrop::new(copy));
+    #[inline(never)]
+    fn capture(&mut self, idx: u32, capture: impl FnOnce() -> I) {
+        let img = capture();
+        self.images.insert(idx, img);
         self.intact.clear(idx as usize);
-    }
-
-    /// Slot inaccessible depuis l'état T0 (sous-arbre coupé avant T0) : on
-    /// peut le muter ou le libérer sans capture, la save ne le lira jamais.
-    #[inline]
-    pub fn forget(&mut self, idx: u32) {
-        if self.active && self.intact.get(idx as usize) {
-            self.intact.clear(idx as usize);
-        }
     }
 
     /// Indice pour prefetcher : le nœud sera-t-il lu dans le slab ?
@@ -185,14 +166,12 @@ impl<T> SaveBarrier<T> {
 
     /// Consomme la version T0 du nœud `idx`, atteint par le parcours.
     /// `None` si le slot n'existait pas à T0 ou a déjà été sérialisé.
-    ///
-    /// # Safety
-    /// Tout ce que référence une image T0 (heap, refcounts…) doit être
-    /// encore vivant : l'appelant diffère ses free pendant la save.
-    pub unsafe fn take(&mut self, idx: u32) -> Option<T0<'_, T>> {
+    /// L'image rendue par le `take` précédent est droppée ici.
+    pub fn take(&mut self, idx: u32) -> Option<T0<'_, I>> {
         if !self.active {
             return None;
         }
+        self.last = None;
         if self.intact.get(idx as usize) {
             self.intact.clear(idx as usize);
             return Some(T0::Slab);
@@ -202,7 +181,7 @@ impl<T> SaveBarrier<T> {
     }
 
     /// Termine la save (fin normale ou abandon). Les images restantes sont
-    /// jetées sans drop. `intact` sera écrasé par la prochaine copie.
+    /// droppées. `intact` sera écrasé par la prochaine copie.
     pub fn finish(&mut self) {
         self.images.clear();
         self.last = None;
@@ -214,36 +193,28 @@ impl<T> SaveBarrier<T> {
 mod tests {
     use super::*;
 
-    /// Nœud jouet : `String` et `Vec` pour avoir du vrai heap derrière les
-    /// images (une copie superficielle les partage avec le slab).
+    /// Nœud jouet : `String` et `Vec` pour avoir du vrai heap. Les images
+    /// sont des clones (possédées), comme les `NodeImage` d'oxidart.
     #[derive(Clone, Debug, PartialEq)]
     struct N {
         val: String,
         childs: Vec<u32>,
     }
 
-    /// Libération par tranches d'un sous-arbre coupé (UNLINK).
-    struct FreeJob {
-        stack: Vec<u32>,
-        /// Époque de save au moment de la coupe, et save active ou non.
-        cut_epoch: u64,
-        cut_during_save: bool,
-    }
-
-    /// Arbre jouet dans un slab, racine = slot 0. Pendant une save, tout ce
-    /// qui est écrasé ou libéré part au cimetière (free différé).
+    /// Arbre jouet dans un slab, racine = slot 0. Les UNLINK coupent tout de
+    /// suite et libèrent par tranches, mais jamais pendant une save (ils
+    /// attendent la fin, comme le waker de la barrière).
     struct Toy {
         slots: Vec<Option<N>>,
         barrier: SaveBarrier<N>,
-        graveyard: Vec<N>,
-        jobs: Vec<FreeJob>,
+        jobs: Vec<Vec<u32>>,
     }
 
     impl Toy {
         fn new(cap: usize) -> Self {
             let mut slots: Vec<Option<N>> = (0..cap).map(|_| None).collect();
             slots[0] = Some(N { val: "root".into(), childs: vec![] });
-            Self { slots, barrier: SaveBarrier::new(), graveyard: vec![], jobs: vec![] }
+            Self { slots, barrier: SaveBarrier::new(), jobs: vec![] }
         }
 
         fn begin(&mut self) {
@@ -259,20 +230,20 @@ mod tests {
             });
         }
 
-        fn bury(&mut self, old: N) {
-            if self.barrier.is_active() {
-                self.graveyard.push(old);
-            }
-        }
-
         /// Point de passage unique pour muter un nœud.
         fn mutate(&mut self, idx: u32, f: impl FnOnce(&mut N)) {
-            let cur = self.slots[idx as usize].as_ref().unwrap();
-            self.barrier.before_write(idx, cur);
-            let mut new = cur.clone();
-            f(&mut new);
-            let old = self.slots[idx as usize].replace(new).unwrap();
-            self.bury(old);
+            let Self { slots, barrier, .. } = self;
+            let cur = slots[idx as usize].as_mut().unwrap();
+            barrier.before_write(idx, || cur.clone());
+            f(cur);
+        }
+
+        /// Point de passage unique pour libérer un nœud.
+        fn remove(&mut self, idx: u32) -> N {
+            let Self { slots, barrier, .. } = self;
+            let cur = slots[idx as usize].as_ref().unwrap();
+            barrier.before_write(idx, || cur.clone());
+            slots[idx as usize].take().unwrap()
         }
 
         /// Nœuds accessibles depuis la racine (état courant).
@@ -294,66 +265,52 @@ mod tests {
             Some(idx)
         }
 
+        /// DEL d'une feuille : libération immédiate (capturée si besoin).
+        fn del_leaf(&mut self, parent: u32, pos: usize) {
+            let child = self.slots[parent as usize].as_ref().unwrap().childs[pos];
+            if !self.slots[child as usize].as_ref().unwrap().childs.is_empty() {
+                return;
+            }
+            self.mutate(parent, |n| {
+                n.childs.remove(pos);
+            });
+            self.remove(child);
+        }
+
         /// UNLINK : coupe immédiate, libération par tranches via `jobs`.
         fn cut(&mut self, parent: u32, pos: usize) {
             let child = self.slots[parent as usize].as_ref().unwrap().childs[pos];
             self.mutate(parent, |n| {
                 n.childs.remove(pos);
             });
-            self.jobs.push(FreeJob {
-                stack: vec![child],
-                cut_epoch: self.barrier.epoch(),
-                cut_during_save: self.barrier.is_active(),
-            });
+            self.jobs.push(vec![child]);
         }
 
-        /// Une tranche de libération (au plus `budget` nœuds).
+        /// Une tranche de libération (au plus `budget` nœuds). En attente
+        /// pendant une save.
         fn free_step(&mut self, budget: usize) {
-            let save_epoch = self.barrier.epoch();
-            let active = self.barrier.is_active();
-            let mut i = 0;
-            while i < self.jobs.len() {
-                let job = &self.jobs[i];
-                // Coupé pendant la save en cours : ses nœuds sont
-                // accessibles depuis T0, on attend la fin de la save.
-                if active && job.cut_during_save && job.cut_epoch == save_epoch {
-                    i += 1;
-                    continue;
-                }
-                // Sinon (coupé avant T0, ou pas de save) : sans capture.
-                let mut job = self.jobs.swap_remove(i);
-                for _ in 0..budget {
-                    let Some(idx) = job.stack.pop() else { break };
-                    self.barrier.forget(idx);
-                    let n = self.slots[idx as usize].take().unwrap();
-                    job.stack.extend(n.childs.iter().copied());
-                    self.bury(n);
-                }
-                if !job.stack.is_empty() {
-                    self.jobs.push(job);
-                }
+            if self.barrier.is_active() {
                 return;
             }
-        }
-
-        fn finish(&mut self) {
-            self.barrier.finish();
-            self.graveyard.clear();
-            // Les coupes faites pendant la save sont désormais libérables.
-            for job in &mut self.jobs {
-                job.cut_during_save = false;
+            let Some(mut stack) = self.jobs.pop() else { return };
+            for _ in 0..budget {
+                let Some(idx) = stack.pop() else { break };
+                let n = self.remove(idx);
+                stack.extend(n.childs.iter().copied());
+            }
+            if !stack.is_empty() {
+                self.jobs.push(stack);
             }
         }
     }
 
-    /// Parcours DFS de la vue T0 par tranches : renvoie les valeurs dans
-    /// l'ordre. `between` est appelé entre deux nœuds (mutations).
+    /// Parcours DFS de la vue T0 : renvoie les valeurs dans l'ordre.
+    /// `between` est appelé entre deux nœuds (mutations).
     fn save_dfs(t: &mut Toy, mut between: impl FnMut(&mut Toy)) -> Vec<String> {
         let mut out = vec![];
         let mut stack = vec![0u32];
         while let Some(idx) = stack.pop() {
-            // SAFETY: les free sont différés via `graveyard`.
-            let node = match unsafe { t.barrier.take(idx) } {
+            let node = match t.barrier.take(idx) {
                 Some(T0::Slab) => t.slots[idx as usize].clone().expect("intact vide"),
                 Some(T0::Image(n)) => n.clone(),
                 None => panic!("nœud T0 {idx} introuvable"),
@@ -389,7 +346,8 @@ mod tests {
     fn random_op(t: &mut Toy, rng: &mut Rng) {
         let r = t.reachable();
         let idx = r[rng.below(r.len())];
-        match rng.below(10) {
+        let k = t.slots[idx as usize].as_ref().unwrap().childs.len();
+        match rng.below(12) {
             0..=3 => {
                 let v = format!("v{}", rng.next());
                 t.mutate(idx, |n| n.val = v);
@@ -397,12 +355,8 @@ mod tests {
             4..=7 => {
                 t.add_child(idx, format!("c{}", rng.next()));
             }
-            8 => {
-                let k = t.slots[idx as usize].as_ref().unwrap().childs.len();
-                if k > 0 {
-                    t.cut(idx, rng.below(k));
-                }
-            }
+            8 if k > 0 => t.cut(idx, rng.below(k)),
+            9 | 10 if k > 0 => t.del_leaf(idx, rng.below(k)),
             _ => t.free_step(1 + rng.below(4)),
         }
     }
@@ -434,11 +388,11 @@ mod tests {
         let mut t = Toy::new(8);
         let a = t.add_child(0, "a".into()).unwrap();
         t.begin();
-        assert!(matches!(unsafe { t.barrier.take(a) }, Some(T0::Slab)));
+        assert!(matches!(t.barrier.take(a), Some(T0::Slab)));
         t.mutate(a, |n| n.val = "a2".into());
         assert_eq!(t.barrier.pending_images(), 0);
-        assert!(unsafe { t.barrier.take(a) }.is_none());
-        t.finish();
+        assert!(t.barrier.take(a).is_none());
+        t.barrier.finish();
     }
 
     #[test]
@@ -447,23 +401,25 @@ mod tests {
         let a = t.add_child(0, "a".into()).unwrap();
         let b = t.add_child(0, "b".into()).unwrap();
         let c = t.add_child(a, "c".into()).unwrap();
+        t.add_child(b, "d".into()).unwrap();
         let expect = dfs_vals(&t);
         t.begin();
         t.mutate(a, |n| n.val = "a-modifié".into()); // image T0
         t.mutate(a, |n| n.val = "a-modifié2".into()); // déjà capturé
         t.add_child(b, "né après T0".into()); // b capturé, nouveau ignoré
+        t.del_leaf(b, 0); // d libéré : lu dans son image
         t.cut(a, 0); // coupe pendant la save : c reste lisible
-        t.free_step(10); // différé : rien n'est libéré
+        t.free_step(10); // en attente : rien n'est libéré
         assert!(t.slots[c as usize].is_some());
         let got = save_dfs(&mut t, |_| {});
         assert_eq!(got, expect);
-        t.finish();
+        t.barrier.finish();
         t.free_step(10);
         assert!(t.slots[c as usize].is_none());
     }
 
     #[test]
-    fn cut_before_t0_frees_without_capture() {
+    fn cut_before_t0_waits_and_is_not_dumped() {
         let mut t = Toy::new(64);
         let a = t.add_child(0, "a".into()).unwrap();
         for i in 0..20 {
@@ -473,15 +429,18 @@ mod tests {
         t.cut(0, 0); // UNLINK de `a` avant la save, rien n'est libéré
         let expect = dfs_vals(&t);
         t.begin();
-        while !t.jobs.is_empty() {
-            t.free_step(3); // libère pendant la save, sans capture
-        }
+        t.free_step(100); // en attente pendant la save
+        assert!(t.slots[a as usize].is_some());
         assert_eq!(t.barrier.pending_images(), 0);
         assert_eq!(save_dfs(&mut t, |_| {}), expect);
-        t.finish();
+        t.barrier.finish();
+        while !t.jobs.is_empty() {
+            t.free_step(3);
+        }
+        assert!(t.slots[a as usize].is_none());
     }
 
-    /// Mutations aléatoires (dont UNLINK et libérations par tranches)
+    /// Mutations aléatoires (dont DEL, UNLINK et libérations par tranches)
     /// entrelacées avec les pas de la save, comparées à l'état T0.
     #[test]
     fn random_interleaving_matches_snapshot() {
@@ -500,7 +459,7 @@ mod tests {
                 }
             });
             assert_eq!(got, expect, "round {round}");
-            t.finish();
+            t.barrier.finish();
             assert_eq!(t.barrier.pending_images(), 0);
         }
     }
@@ -518,10 +477,10 @@ mod tests {
         for _ in 0..50 {
             random_op(&mut t, &mut rng);
         }
-        t.finish(); // abandon
+        t.barrier.finish(); // abandon
         let expect = dfs_vals(&t);
         t.begin();
         assert_eq!(save_dfs(&mut t, |_| {}), expect);
-        t.finish();
+        t.barrier.finish();
     }
 }
