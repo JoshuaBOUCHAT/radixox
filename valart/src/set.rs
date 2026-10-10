@@ -85,6 +85,14 @@ impl SetNode {
         copy
     }
 
+    /// Prefetch des blocs des 8 premières entrées (save).
+    pub(crate) fn prefetch_entries(&self) {
+        for n in 0..self.len().min(8) {
+            let slot = self.slot_at(n);
+            self.key(slot).prefetch();
+        }
+    }
+
     /// Libère le bloc overflow d'une image, sans toucher aux entrées.
     pub(crate) fn free_image(img: &mut ManuallyDrop<Self>) {
         if let Some(ov) = img.overflow.take() {

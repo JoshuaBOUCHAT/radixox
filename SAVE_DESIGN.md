@@ -244,6 +244,11 @@ dump.tmp/
 - Mesure (`oxidart/examples/save_bench.rs`, 1M insertions ≈ 880k clés, valeurs 100 B, sans I/O) : String 149 ms / 93 MB, Hash 1 champ 276 ms / 100 MB.
 - Reste : fichier + I/O io_uring + crc32c + MANIFEST + rename (étape 7), BGSAVE/SAVE côté serveur, reload (étape 8), vidage par tranches de la liste différée.
 
+### Pipeline d'écriture (branche `save-pipeline`, 2026-10-10)
+- Un enregistrement est écrit `PIPE_DEPTH = 2` enregistrements après sa visite : visite k = prefetch de la valeur (bloc `SharedByte` ou racine valart) ; visite k+1 = conteneur → racine en cache, prefetch de ses entrées (`ValTrees::prefetch_root_entries`) ; visite k+2 = écriture. En-tête (tag, lcp, suffixe, TTL) encodé à la visite, ordre DFS inchangé.
+- Valeurs en attente : copie bit à bit de la `SharedByte` du slab (sans refcount, valide pendant la tranche), clone possédé si elle vient d'une image (droppée au `take` suivant), et `own_pending()` clone tout avant de rendre la main. Contrôle négatif sans `own_pending` : use-after-free sous ASan.
+- Mesure (1M insertions) : String 149–162 → 118–122 ms, Hash 1 champ 256 → 147 ms.
+
 ## 5quinquies. Méthode de travail
 
 - **Tests** : mono-thread obligatoire (`RUST_TEST_THREADS=1` dans `.cargo/config.toml`, statics globaux). `cargo test -p radixox-lib -p oxidart -p valart`.

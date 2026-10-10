@@ -198,7 +198,10 @@ pub mod format {
     pub const TTL_BIT: u8 = 0x80;
 }
 
+use std::collections::VecDeque;
+
 use radixox_lib::prefetch::prefetch_l1;
+use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::save_barrier::T0;
 use radixox_lib::varint::{put_bytes, put_varint, zigzag};
 use valart::ValSer;
@@ -239,12 +242,81 @@ pub struct SaveCursor {
     min_trunc: usize,
     container: Container,
     ser: ValSer,
+    /// Enregistrements visités pas encore écrits (au plus `PIPE_DEPTH + 1`),
+    /// dans l'ordre du DFS. Voir `PIPE_DEPTH`.
+    pending: VecDeque<Pending>,
+    /// Buffers d'en-tête recyclés.
+    spare: Vec<Vec<u8>>,
     done: bool,
 }
 
 impl SaveCursor {
     pub fn is_done(&self) -> bool {
         self.done
+    }
+
+    /// Avant de rendre la main : plus aucun pointeur emprunté au slab dans
+    /// les enregistrements en attente.
+    fn own_pending(&mut self) {
+        for p in self.pending.iter_mut() {
+            p.val.own();
+        }
+    }
+}
+
+/// Profondeur du pipeline d'écriture : un enregistrement est écrit
+/// `PIPE_DEPTH` enregistrements après sa visite.
+/// - visite k : prefetch de la valeur (bloc `SharedByte`, ou racine valart) ;
+/// - visite k+1 : conteneur → racine en cache, prefetch de ses entrées ;
+/// - visite k+2 : écriture (tout est en cache).
+///
+/// L'en-tête (tag, lcp, suffixe, TTL) est encodé à la visite : l'ordre des
+/// enregistrements reste celui du DFS.
+const PIPE_DEPTH: usize = 2;
+
+/// Valeur d'un enregistrement en attente.
+enum PVal {
+    /// `owned == false` : copie bit à bit d'une `SharedByte` du slab, sans
+    /// refcount, valide tant que la tranche n'est pas finie (aucune mutation
+    /// pendant une tranche). Rendue possédée (clone) avant une pause.
+    Bytes { sb: ManuallyDrop<SharedByte>, owned: bool },
+    Int(i64),
+    Hash(u32),
+    Set(u32),
+    /// ZSet/List : idx dans la section.
+    Idx(u32),
+}
+
+impl PVal {
+    fn own(&mut self) {
+        if let PVal::Bytes { sb, owned } = self
+            && !*owned
+        {
+            *sb = ManuallyDrop::new((**sb).clone());
+            *owned = true;
+        }
+    }
+}
+
+impl Drop for PVal {
+    fn drop(&mut self) {
+        if let PVal::Bytes { sb, owned: true } = self {
+            unsafe { ManuallyDrop::drop(sb) };
+        }
+    }
+}
+
+struct Pending {
+    head: Vec<u8>,
+    val: PVal,
+}
+
+/// Visite k+1 d'un conteneur : sa racine est en cache, prefetch des entrées.
+#[inline(always)]
+fn warm(p: &Pending) {
+    match p.val {
+        PVal::Hash(root) | PVal::Set(root) => valart().prefetch_root_entries(root),
+        _ => {}
     }
 }
 
@@ -312,6 +384,8 @@ impl OxidArt {
             min_trunc: usize::MAX,
             container: Container::None,
             ser: ValSer::default(),
+            pending: VecDeque::with_capacity(PIPE_DEPTH + 1),
+            spare: Vec::new(),
             done: false,
         }
     }
@@ -331,24 +405,45 @@ impl OxidArt {
                 Container::Set => valart().set_ser_step(&mut cur.ser, out, &mut budget),
             };
             if !finished {
+                cur.own_pending();
                 return false;
             }
             cur.container = Container::None;
             if budget == 0 {
+                cur.own_pending();
                 return false;
             }
-            let Some(frame) = cur.stack.pop() else {
-                out.push(format::T_END);
-                cur.done = true;
-                return true;
-            };
-            self.save_node(cur, frame, out, &mut budget);
+            match cur.stack.pop() {
+                Some(frame) => {
+                    if self.save_node(cur, frame, &mut budget) {
+                        let n = cur.pending.len();
+                        if n >= 2 {
+                            warm(&cur.pending[n - 2]);
+                        }
+                        if n > PIPE_DEPTH {
+                            emit_oldest(cur, out, &mut budget);
+                        }
+                    }
+                }
+                None => {
+                    if cur.pending.is_empty() {
+                        out.push(format::T_END);
+                        cur.done = true;
+                        return true;
+                    }
+                    if let Some(next) = cur.pending.get(1) {
+                        warm(next);
+                    }
+                    emit_oldest(cur, out, &mut budget);
+                }
+            }
         }
     }
 
-    /// Un nœud : `take` T0, prefetch de la valeur, chemin, enfants empilés,
-    /// prefetch du nouveau haut de pile, puis écriture de l'enregistrement.
-    fn save_node(&mut self, cur: &mut SaveCursor, f: Frame, out: &mut Vec<u8>, budget: &mut u32) {
+    /// Visite d'un nœud : `take` T0, prefetch de la valeur, chemin, enfants
+    /// empilés, prefetch du nouveau haut de pile, en-tête encodé. Retourne
+    /// `true` si un enregistrement a été mis en attente.
+    fn save_node(&mut self, cur: &mut SaveCursor, f: Frame, budget: &mut u32) -> bool {
         let depth = f.depth as usize;
         cur.path.truncate(depth);
         cur.min_trunc = cur.min_trunc.min(depth);
@@ -360,7 +455,7 @@ impl OxidArt {
         let t0 = self.save.t0;
         let OxidArt { map, overflow_arena, save, .. } = self;
         let OxidSave { barrier, childs: img_childs, .. } = save;
-        let (tag, val, exp) = match barrier.take(f.idx) {
+        let (tag, val, exp, from_image) = match barrier.take(f.idx) {
             Some(T0::Slab) => {
                 let n = map.get(f.idx).expect("intact à T0 ⇒ occupé");
                 prefetch_value(n.tag, &n.val);
@@ -377,7 +472,7 @@ impl OxidArt {
                         cur.stack.push(Frame { idx, depth, radix: radix as u16 })
                     });
                 }
-                (n.tag, &n.val, n.exp_and_radix.exp())
+                (n.tag, &n.val, n.exp_and_radix.exp(), false)
             }
             Some(T0::Image(img)) => {
                 prefetch_value(img.tag, &img.val);
@@ -387,7 +482,7 @@ impl OxidArt {
                 for &(radix, idx) in &img_childs[s..s + img.childs_len as usize] {
                     cur.stack.push(Frame { idx, depth, radix: radix as u16 });
                 }
-                (img.tag, &img.val, img.exp_and_radix.exp())
+                (img.tag, &img.val, img.exp_and_radix.exp(), true)
             }
             None => panic!("nœud {} absent de la vue T0", f.idx),
         };
@@ -398,7 +493,7 @@ impl OxidArt {
         }
 
         if tag == Tag::None || exp.is_some_and(|e| e < t0) {
-            return;
+            return false;
         }
         let ty = match tag {
             Tag::Bytes => format::T_STRING,
@@ -411,36 +506,62 @@ impl OxidArt {
         };
         let lcp = cur.min_trunc.min(cur.prev_len);
         let ttl = exp.map(|e| e - t0);
-        out.push(ty | if ttl.is_some() { format::TTL_BIT } else { 0 });
-        put_varint(out, lcp as u64);
-        put_varint(out, (cur.path.len() - lcp) as u64);
+        let mut head = cur.spare.pop().unwrap_or_default();
+        head.clear();
+        head.push(ty | if ttl.is_some() { format::TTL_BIT } else { 0 });
+        put_varint(&mut head, lcp as u64);
+        put_varint(&mut head, (cur.path.len() - lcp) as u64);
         if let Some(ttl) = ttl {
-            put_varint(out, ttl);
+            put_varint(&mut head, ttl);
         }
-        out.extend_from_slice(&cur.path[lcp..]);
-        unsafe {
+        head.extend_from_slice(&cur.path[lcp..]);
+        let val = unsafe {
             match tag {
-                Tag::Bytes => {
-                    let b: &[u8] = &val.bytes;
-                    put_bytes(out, b);
-                    sub(budget, 1 + (b.len() >> 12) as u32);
-                }
-                Tag::Int => put_varint(out, zigzag(val.integer)),
-                Tag::Hash => {
-                    valart().hash_ser_begin(val.idx, &mut cur.ser, out);
-                    cur.container = Container::Hash;
-                }
-                Tag::Set => {
-                    valart().set_ser_begin(val.idx, &mut cur.ser, out);
-                    cur.container = Container::Set;
-                }
-                Tag::ZSet | Tag::List => put_varint(out, val.idx as u64),
+                // L'image est droppée au prochain `take` : clone possédé.
+                Tag::Bytes if from_image => PVal::Bytes {
+                    sb: ManuallyDrop::new((*val.bytes).clone()),
+                    owned: true,
+                },
+                Tag::Bytes => PVal::Bytes {
+                    sb: ManuallyDrop::new(std::ptr::read(&*val.bytes)),
+                    owned: false,
+                },
+                Tag::Int => PVal::Int(val.integer),
+                Tag::Hash => PVal::Hash(val.idx),
+                Tag::Set => PVal::Set(val.idx),
+                Tag::ZSet | Tag::List => PVal::Idx(val.idx),
                 Tag::None => unreachable!(),
             }
-        }
+        };
+        cur.pending.push_back(Pending { head, val });
         cur.prev_len = cur.path.len();
         cur.min_trunc = usize::MAX;
+        true
     }
+}
+
+/// Écrit l'enregistrement en attente le plus ancien. Un conteneur démarre son
+/// sérialiseur ; `save_step` le termine avant toute autre écriture.
+fn emit_oldest(cur: &mut SaveCursor, out: &mut Vec<u8>, budget: &mut u32) {
+    let mut p = cur.pending.pop_front().expect("enregistrement en attente");
+    out.extend_from_slice(&p.head);
+    match &p.val {
+        PVal::Bytes { sb, .. } => {
+            put_bytes(out, sb);
+            sub(budget, 1 + (sb.len() >> 12) as u32);
+        }
+        PVal::Int(n) => put_varint(out, zigzag(*n)),
+        PVal::Hash(root) => {
+            valart().hash_ser_begin(*root, &mut cur.ser, out);
+            cur.container = Container::Hash;
+        }
+        PVal::Set(root) => {
+            valart().set_ser_begin(*root, &mut cur.ser, out);
+            cur.container = Container::Set;
+        }
+        PVal::Idx(idx) => put_varint(out, *idx as u64),
+    }
+    cur.spare.push(std::mem::take(&mut p.head));
 }
 
 // ─── Lecture d'un dump ───────────────────────────────────────────────────────

@@ -7,7 +7,7 @@
 use std::mem::{ManuallyDrop, offset_of};
 
 use hislab::HiSlab;
-use radixox_lib::save_barrier::SaveBarrier;
+use radixox_lib::save_barrier::{SaveBarrier, T0};
 use radixox_lib::shared_byte::SharedByte;
 
 mod common;
@@ -215,6 +215,25 @@ impl ValTrees {
     #[inline]
     pub fn prefetch_root(&self, root: u32) {
         prefetch_slot(&self.nodes, root);
+    }
+
+    /// Prefetch des entrées de la racine d'un conteneur, lue dans sa version
+    /// T0 (à appeler quand la racine est en cache : `prefetch_root` une
+    /// visite plus tôt). Au plus 8 entrées.
+    pub fn prefetch_root_entries(&self, root: u32) {
+        match self.save.peek(root) {
+            Some(T0::Slab) => {
+                let node = unsafe { self.nodes.get_unchecked(root) };
+                match node.tag() {
+                    NodeType::Hash => unsafe { &node.hash }.prefetch_entries(),
+                    NodeType::Set => unsafe { &node.set }.prefetch_entries(),
+                    NodeType::ZSet => {}
+                }
+            }
+            Some(T0::Image(ValNodeImage::Hash(h))) => h.prefetch_entries(),
+            Some(T0::Image(ValNodeImage::Set(s))) => s.prefetch_entries(),
+            None => {}
+        }
     }
 
     pub fn is_saving(&self) -> bool {
