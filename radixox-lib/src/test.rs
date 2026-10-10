@@ -295,11 +295,11 @@ fn cmd_set_xx() {
 fn cmd_setnx() {
     let r = resp(&[b"SETNX", b"k", b"v"]);
     match Cmd::from_slice(&r) {
-        Some(Cmd::Set { opts, .. }) => {
-            assert!(matches!(opts.condition, SetCondition::IfNotExists));
-            assert!(opts.ttl.is_none());
+        Some(Cmd::SetNx { key, val }) => {
+            assert_eq!(key, b"k");
+            assert_eq!(val.as_ref(), b"v");
         }
-        _ => panic!("expected Set (SETNX)"),
+        _ => panic!("expected SetNx"),
     }
 }
 

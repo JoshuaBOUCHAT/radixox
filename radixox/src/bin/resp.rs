@@ -26,7 +26,8 @@ use resp_cmd::delayed::{cmd_keys, cmd_unlink};
 use resp_cmd::pub_sub::{cmd_publish, cmd_subscribe, cmd_unsubscribe};
 use resp_cmd::string::{
     cmd_dbsize, cmd_decr, cmd_decrby, cmd_del, cmd_exists, cmd_expire, cmd_flushdb, cmd_get,
-    cmd_incr, cmd_incrby, cmd_mget, cmd_mset, cmd_persist, cmd_pttl, cmd_set, cmd_ttl, cmd_type,
+    cmd_incr, cmd_incrby, cmd_mget, cmd_mset, cmd_persist, cmd_pttl, cmd_set, cmd_setnx, cmd_ttl,
+    cmd_type,
 };
 use resp_cmd::{
     cmd_hdel, cmd_hexists, cmd_hget, cmd_hgetall, cmd_hincrby, cmd_hkeys, cmd_hlen, cmd_hmget,
@@ -354,6 +355,7 @@ fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         // ── String / Keys ────────────────────────────────────────────────────
         Cmd::Get(key) => cmd_get(art, key),
         Cmd::Set { key, val, opts } => cmd_set(art, key, val, opts),
+        Cmd::SetNx { key, val } => cmd_setnx(art, key, val),
         Cmd::MGet(keys) => cmd_mget(art, &keys),
         Cmd::MSet(pairs) => cmd_mset(art, &pairs),
         Cmd::Del(keys) => cmd_del(art, &keys),

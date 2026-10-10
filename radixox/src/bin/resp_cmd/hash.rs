@@ -97,7 +97,8 @@ pub fn cmd_hmget(art: &mut OxidArt, key: &[u8], fields: &[SharedByte]) -> Frame 
 pub fn cmd_hincrby(art: &mut OxidArt, key: &[u8], field: SharedByte, delta: i64) -> Frame {
     match art.cmd_hincrby(key, field, delta) {
         Ok(new_val) => Frame::Integer(new_val),
-        Err(_) => {
+        Err(TypeError::NotAInt) => Frame::Error("ERR hash value is not an integer".into()),
+        Err(TypeError::ValueNotSet) => {
             Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
         }
     }

@@ -45,7 +45,7 @@ impl Default for SetOpts {
 //     persistante — Pub/Sub, UNLINK/KEYS) devient un `SharedByte` possédé.
 //
 // Règles de normalisation (au parsing) :
-//   - SETNX key val  → Set { opts: SetOpts { condition: IfNotExists, .. } }
+//   - SETNX key val  → SetNx (pas normalisé en SET NX : SETNX répond 1/0, SET NX OK/nil)
 //   - SETEX key s v  → Set { opts: SetOpts { ttl: Some(Duration::from_secs(s)), .. } }
 //   - HMSET          → HSet (alias déprécié, même sémantique)
 //   - EXPIRE key s   → Expire { dur: Duration::from_secs(s) }
@@ -79,12 +79,15 @@ pub enum Cmd<'a> {
     Get(&'a [u8]),
 
     /// SET key value [EX secs | PX ms] [NX | XX]
-    /// Couvre aussi SETNX et SETEX (normalisés au parsing).
+    /// Couvre aussi SETEX (normalisé au parsing).
     Set {
         key: &'a [u8],
         val: SharedByte,
         opts: SetOpts,
     },
+
+    /// SETNX key value — répond 1/0 (SET NX répond OK/nil).
+    SetNx { key: &'a [u8], val: SharedByte },
 
     /// MGET key [key ...]
     MGet(SmallVec<5, &'a [u8]>),
@@ -540,7 +543,7 @@ fn dispatch<'a>(raw: &[&'a [u8]]) -> Option<Cmd<'a>> {
                 b'c' => { need!(1); Some(Cmd::SCard(args[0])) } // SCARD
                 b'e' => match cmd[3] | 0x20 { // SET-x : s-e-t-?
                     b'e' => { need!(3); Some(Cmd::Set { key: args[0], val: sb(args[2]), opts: SetOpts { ttl: Some(Duration::from_secs(arg_u64(args[1])?)), condition: SetCondition::Always } }) } // SETEX
-                    b'n' => { need!(2); Some(Cmd::Set { key: args[0], val: sb(args[1]), opts: SetOpts { ttl: None, condition: SetCondition::IfNotExists } }) } // SETNX
+                    b'n' => { need!(2); Some(Cmd::SetNx { key: args[0], val: sb(args[1]) }) } // SETNX
                     _ => None,
                 },
                 _ => None,

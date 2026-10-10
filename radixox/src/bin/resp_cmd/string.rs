@@ -33,6 +33,10 @@ pub(crate) fn cmd_set(art: &mut OxidArt, key: &[u8], val: SharedByte, opts: SetO
     Frame::SimpleString(SharedByte::from_slice(b"OK"))
 }
 
+pub(crate) fn cmd_setnx(art: &mut OxidArt, key: &[u8], val: SharedByte) -> Frame {
+    Frame::Integer(art.set_cond(key, None, Value::String(val), Some(false)) as i64)
+}
+
 fn counter_err(e: CounterError) -> Frame {
     match e {
         CounterError::NotAnInteger => {
