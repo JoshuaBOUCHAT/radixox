@@ -802,19 +802,34 @@ impl ValTrees {
 
     pub(crate) fn hash_drop_now(&mut self, root: u32) {
         let mut stack = vec![(root, 0usize)];
-        while let Some((idx, depth)) = stack.pop() {
+        let mut budget = u32::MAX;
+        while !stack.is_empty() {
+            self.hash_drop_step(&mut stack, &mut budget);
+            budget = u32::MAX;
+        }
+    }
+
+    /// Destruction reprenable : traite des nœuds entiers de `stack` jusqu'à
+    /// épuiser `budget` (1 par nœud + 1 par entrée libérée). Pile vide = fini.
+    pub(crate) fn hash_drop_step(&mut self, stack: &mut Vec<(u32, usize)>, budget: &mut u32) {
+        while *budget > 0
+            && let Some((idx, depth)) = stack.pop()
+        {
             if depth == DISPATCH_LEVELS {
                 self.hash_collisions.release(idx);
+                *budget = budget.saturating_sub(1);
                 continue;
             }
             let node = self.hash_node(idx);
-            for n in 0..node.len() {
+            let len = node.len();
+            for n in 0..len {
                 let child = node.child(node.slot_at(n));
                 if child != NO_CHILD {
                     stack.push((child, depth + 1));
                 }
             }
             self.free_hash_node(idx);
+            *budget = budget.saturating_sub(1 + len as u32);
         }
     }
 
@@ -1023,6 +1038,57 @@ mod tests {
         t.finish_save();
         assert_eq!(got, expect);
         assert_eq!(t.hash_len(root), 0);
+    }
+
+    /// Liste différée vidée par tranches après la save : un gros Hash
+    /// supprimé (DEL) et des champs supprimés (HDEL) pendant la save sont
+    /// détruits petit à petit, sans dépasser le budget d'un nœud.
+    #[test]
+    fn deferred_list_drained_by_tranches() {
+        let mut t = trees();
+        let nodes = |t: &ValTrees| {
+            let mut n = 0;
+            t.nodes.for_each_occupied(|_, _| n += 1);
+            n
+        };
+        let big = t.hash_create();
+        for i in 0..20_000 {
+            t.hash_set(big, sb(format!("f{i}")), sb(format!("valeur-longue-{i}")));
+        }
+        let big_nodes = nodes(&t);
+        let small = t.hash_create();
+        for i in 0..100 {
+            t.hash_set(small, sb(format!("f{i}")), sb("v"));
+        }
+        let before = nodes(&t);
+
+        t.begin_save();
+        t.hash_drop(big);
+        for i in 0..50 {
+            assert!(t.hash_remove(small, format!("f{i}").as_bytes()));
+        }
+        // Le Hash supprimé reste intact ; HDEL ne libère que des nœuds
+        // devenus vides (capturés), les entrées sont différées.
+        assert!(nodes(&t) >= big_nodes, "Hash supprimé détruit pendant la save");
+        t.end_save();
+        assert_eq!(t.deferred_len(), (100, 1));
+
+        let mut tranches = 0;
+        let mut last = nodes(&t);
+        while !t.drain_deferred(64) {
+            tranches += 1;
+            let now = nodes(&t);
+            // Un nœud (≤ 1 + 255 entrées) au plus au-delà du budget.
+            assert!(now <= last, "tranche {tranches}");
+            last = now;
+        }
+        assert!(tranches > 100, "{tranches} tranches");
+        assert_eq!(t.deferred_len(), (0, 0));
+        assert!(nodes(&t) < before / 10);
+        assert_eq!(t.hash_len(small), 50);
+        t.hash_check(small);
+        // Hors save, une suppression est immédiate.
+        assert!(t.drain_deferred(1));
     }
 
     /// Buckets de collision modifiés pendant la save : le parcours T0 lit

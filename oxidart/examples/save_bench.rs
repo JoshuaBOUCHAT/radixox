@@ -67,9 +67,48 @@ fn main() {
         out.len() as f64 / 1e6 / dt.as_secs_f64()
     );
     eprintln!("RSS après save {} MB", rss_mb());
+
+    // Reload en masse dans un arbre neuf (valart et slabs ZSet/List sont
+    // globaux : le premier arbre est jeté avant).
+    let now = art.now;
+    let (nodes_before, n_keys) = (art.node_count(), art.getn(SharedByte::from_str("")).len());
+    drop(art);
+    let rss_before = rss_mb();
+    let mut back = OxidArt::new();
+    back.set_now(now);
+    let t = Instant::now();
+    let stats = back.load_dump(&out).expect("reload");
+    let dt = t.elapsed();
+    println!(
+        "reload : {} clés en {dt:.2?} → {:.1} ns/clé, {} nœuds (avant {nodes_before}), RSS +{} MB",
+        stats.keys,
+        dt.as_nanos() as f64 / stats.keys as f64,
+        back.node_count(),
+        rss_mb().saturating_sub(rss_before)
+    );
+    assert_eq!(stats.keys as usize, n_keys);
+    drop(back);
+
+    // Même chose depuis un fichier (pied compris), lu par fragments.
+    let path = std::env::temp_dir().join(format!("save_bench-{}.rxd", std::process::id()));
+    let mut file = out.clone();
+    file.extend_from_slice(&oxidart::save::format::footer(crc32fast::hash(&out)));
+    std::fs::write(&path, &file).unwrap();
+    drop(file);
+    let mut back = OxidArt::new();
+    back.set_now(now);
+    let t = Instant::now();
+    let stats = back.load_file(std::fs::File::open(&path).unwrap()).expect("reload fichier");
+    let dt = t.elapsed();
+    let _ = std::fs::remove_file(&path);
+    println!(
+        "reload fichier : {} clés en {dt:.2?} → {:.1} ns/clé (crc compris)",
+        stats.keys,
+        dt.as_nanos() as f64 / stats.keys as f64
+    );
     // Vérification complète seulement sur les petits dumps.
     if n <= 200_000 {
         let dump = parse_dump(&out).expect("dump illisible");
-        assert_eq!(dump.entries.len(), art.getn(SharedByte::from_str("")).len());
+        assert_eq!(dump.entries.len(), n_keys);
     }
 }

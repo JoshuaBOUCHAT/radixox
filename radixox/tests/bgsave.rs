@@ -20,11 +20,16 @@ impl Drop for Server {
     }
 }
 
+/// Dump brut (le test relit le format avec `check_footer` + `parse_dump`).
 fn start(dir: &PathBuf) -> Server {
-    start_on(PORT, dir)
+    start_with(PORT, dir, &[("RADIXOX_SAVE_ZSTD", "0")])
 }
 
 fn start_on(port: u16, dir: &PathBuf) -> Server {
+    start_with(port, dir, &[])
+}
+
+fn start_with(port: u16, dir: &PathBuf, env: &[(&str, &str)]) -> Server {
     let _ = Command::new("fuser")
         .args(["-k", &format!("{port}/tcp")])
         .stderr(Stdio::null())
@@ -33,6 +38,7 @@ fn start_on(port: u16, dir: &PathBuf) -> Server {
     let child = Command::new(env!("CARGO_BIN_EXE_radixox"))
         .env("RADIXOX_PORT", port.to_string())
         .env("RADIXOX_DIR", dir)
+        .envs(env.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -130,4 +136,199 @@ fn bgsave_failure_releases_the_save_slot() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(!dir.exists());
+}
+
+const PORT_RELOAD: u16 = 6414;
+
+/// Étape 8 : BGSAVE, arrêt, redémarrage sur le même `RADIXOX_DIR` ; tout est
+/// relu (String, Int, Hash, Set, TTL).
+#[test]
+fn restart_reloads_the_dump() {
+    let dir = std::env::temp_dir().join(format!("radixox-reload-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let url = format!("redis://127.0.0.1:{PORT_RELOAD}");
+    const N: usize = 20_000;
+    {
+        let _server = start_on(PORT_RELOAD, &dir);
+        let mut c = redis::Client::open(url.as_str()).unwrap().get_connection().unwrap();
+        let mut pipe = redis::pipe();
+        for i in 0..N {
+            pipe.cmd("SET").arg(format!("user:{i}")).arg(format!("valeur-{i}")).ignore();
+        }
+        pipe.cmd("INCRBY").arg("n").arg(-7).ignore();
+        pipe.cmd("HSET").arg("h").arg("f1").arg("a").arg("f2").arg("b").ignore();
+        pipe.cmd("SADD").arg("s").arg("m1").arg("m2").ignore();
+        pipe.cmd("SET").arg("t").arg("ttl").arg("EX").arg(1000).ignore();
+        pipe.query::<()>(&mut c).unwrap();
+        let _: String = redis::cmd("BGSAVE").query(&mut c).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !dir.join("dump.rxd").exists() {
+            assert!(Instant::now() < deadline, "dump.rxd absent après 10 s");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    let _server = start_on(PORT_RELOAD, &dir);
+    let mut c = redis::Client::open(url.as_str()).unwrap().get_connection().unwrap();
+    let size: usize = redis::cmd("DBSIZE").query(&mut c).unwrap();
+    assert_eq!(size, N + 4);
+    for i in [0, 1, 10, 123, N - 1] {
+        let v: String = redis::cmd("GET").arg(format!("user:{i}")).query(&mut c).unwrap();
+        assert_eq!(v, format!("valeur-{i}"));
+    }
+    let n: i64 = redis::cmd("INCR").arg("n").query(&mut c).unwrap();
+    assert_eq!(n, -6);
+    let h: Vec<String> = redis::cmd("HMGET").arg("h").arg("f1").arg("f2").query(&mut c).unwrap();
+    assert_eq!(h, ["a", "b"]);
+    let s: usize = redis::cmd("SCARD").arg("s").query(&mut c).unwrap();
+    assert_eq!(s, 2);
+    let ttl: i64 = redis::cmd("TTL").arg("t").query(&mut c).unwrap();
+    assert!(ttl > 990 && ttl <= 1000, "ttl {ttl}");
+    // L'arbre rechargé accepte les écritures (splits sur des nœuds rechargés).
+    redis::cmd("SET").arg("user:1x").arg("y").query::<()>(&mut c).unwrap();
+    let v: String = redis::cmd("GET").arg("user:1").query(&mut c).unwrap();
+    assert_eq!(v, "valeur-1");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Dump corrompu : le serveur refuse de démarrer (et ne l'écrase pas).
+#[test]
+fn corrupted_dump_prevents_startup() {
+    let dir = std::env::temp_dir().join(format!("radixox-corrupt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("dump.rxd"), b"RXDB pas un dump").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_radixox"))
+        .env("RADIXOX_PORT", "6415")
+        .env("RADIXOX_DIR", &dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn radixox");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("le serveur a démarré malgré un dump corrompu");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!status.success());
+    assert_eq!(std::fs::read(dir.join("dump.rxd")).unwrap(), b"RXDB pas un dump");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const PORT_ZSTD: u16 = 6416;
+
+/// BGSAVE compressé (zstd 3, petit tampon : le DFS attend le compresseur),
+/// puis redémarrage en mode brut : le format est reconnu au magic.
+#[test]
+fn compressed_bgsave_reloads() {
+    let dir = std::env::temp_dir().join(format!("radixox-zstd-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let url = format!("redis://127.0.0.1:{PORT_ZSTD}");
+    const N: usize = 50_000;
+    {
+        let env = [("RADIXOX_SAVE_ZSTD", "3"), ("RADIXOX_SAVE_BACKLOG_MB", "1")];
+        let _server = start_with(PORT_ZSTD, &dir, &env);
+        let mut c = redis::Client::open(url.as_str()).unwrap().get_connection().unwrap();
+        let mut pipe = redis::pipe();
+        for i in 0..N {
+            pipe.cmd("SET").arg(format!("user:{i}")).arg(format!("{{\"id\":{i},\"nom\":\"user{i}\"}}")).ignore();
+        }
+        pipe.cmd("HSET").arg("h").arg("f1").arg("a").ignore();
+        pipe.query::<()>(&mut c).unwrap();
+        let _: String = redis::cmd("BGSAVE").query(&mut c).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !dir.join("dump.rxd").exists() {
+            assert!(Instant::now() < deadline, "dump.rxd absent après 10 s");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let file = std::fs::read(dir.join("dump.rxd")).unwrap();
+    assert_eq!(&file[..4], &[0x28, 0xB5, 0x2F, 0xFD], "pas une frame zstd");
+
+    let _server = start_with(PORT_ZSTD, &dir, &[("RADIXOX_SAVE_ZSTD", "0")]);
+    let mut c = redis::Client::open(url.as_str()).unwrap().get_connection().unwrap();
+    let size: usize = redis::cmd("DBSIZE").query(&mut c).unwrap();
+    assert_eq!(size, N + 1);
+    let v: String = redis::cmd("GET").arg("user:4242").query(&mut c).unwrap();
+    assert_eq!(v, "{\"id\":4242,\"nom\":\"user4242\"}");
+    let h: String = redis::cmd("HGET").arg("h").arg("f1").query(&mut c).unwrap();
+    assert_eq!(h, "a");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const PORT_SAVE: u16 = 6417;
+
+/// SAVE bloquante : le fichier est en place quand la réponse arrive.
+#[test]
+fn save_is_synchronous_and_reloads() {
+    let dir = std::env::temp_dir().join(format!("radixox-save-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let url = format!("redis://127.0.0.1:{PORT_SAVE}");
+    {
+        let _server = start_on(PORT_SAVE, &dir);
+        let mut c = redis::Client::open(url.as_str()).unwrap().get_connection().unwrap();
+        let mut pipe = redis::pipe();
+        for i in 0..20_000 {
+            pipe.cmd("SET").arg(format!("k:{i}")).arg(i).ignore();
+        }
+        pipe.query::<()>(&mut c).unwrap();
+        let reply: String = redis::cmd("SAVE").query(&mut c).unwrap();
+        assert_eq!(reply, "OK");
+        assert!(dir.join("dump.rxd").exists(), "dump absent après SAVE");
+        assert!(!dir.join("dump.rxd.tmp").exists());
+    }
+    let _server = start_on(PORT_SAVE, &dir);
+    let mut c = redis::Client::open(url.as_str()).unwrap().get_connection().unwrap();
+    let size: usize = redis::cmd("DBSIZE").query(&mut c).unwrap();
+    assert_eq!(size, 20_000);
+    let v: String = redis::cmd("GET").arg("k:777").query(&mut c).unwrap();
+    assert_eq!(v, "777");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const PORT_SIG: u16 = 6418;
+
+/// SIGTERM avec `RADIXOX_SAVE_ON_EXIT=1` : save, sortie propre, reload.
+#[test]
+fn sigterm_saves_before_exit() {
+    let dir = std::env::temp_dir().join(format!("radixox-sigterm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let url = format!("redis://127.0.0.1:{PORT_SIG}");
+    let mut server = start_with(PORT_SIG, &dir, &[("RADIXOX_SAVE_ON_EXIT", "1")]);
+    {
+        let mut c = redis::Client::open(url.as_str()).unwrap().get_connection().unwrap();
+        redis::cmd("SET").arg("a").arg("1").query::<()>(&mut c).unwrap();
+        redis::cmd("HSET").arg("h").arg("f").arg("v").query::<()>(&mut c).unwrap();
+    }
+    let pid = server.0.id().to_string();
+    assert!(Command::new("kill").args(["-TERM", &pid]).status().unwrap().success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(st) = server.0.try_wait().unwrap() {
+            break st;
+        }
+        assert!(Instant::now() < deadline, "le serveur ne s'est pas arrêté");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success(), "{status:?}");
+    assert!(dir.join("dump.rxd").exists());
+
+    let _server = start_on(PORT_SIG, &dir);
+    let mut c = redis::Client::open(url.as_str()).unwrap().get_connection().unwrap();
+    let v: String = redis::cmd("GET").arg("a").query(&mut c).unwrap();
+    assert_eq!(v, "1");
+    let f: String = redis::cmd("HGET").arg("h").arg("f").query(&mut c).unwrap();
+    assert_eq!(f, "v");
+    let _ = std::fs::remove_dir_all(&dir);
 }

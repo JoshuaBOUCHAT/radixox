@@ -769,19 +769,34 @@ impl ValTrees {
 
     pub(crate) fn set_drop_now(&mut self, root: u32) {
         let mut stack = vec![(root, 0usize)];
-        while let Some((idx, depth)) = stack.pop() {
+        let mut budget = u32::MAX;
+        while !stack.is_empty() {
+            self.set_drop_step(&mut stack, &mut budget);
+            budget = u32::MAX;
+        }
+    }
+
+    /// Destruction reprenable : traite des nœuds entiers de `stack` jusqu'à
+    /// épuiser `budget` (1 par nœud + 1 par entrée libérée). Pile vide = fini.
+    pub(crate) fn set_drop_step(&mut self, stack: &mut Vec<(u32, usize)>, budget: &mut u32) {
+        while *budget > 0
+            && let Some((idx, depth)) = stack.pop()
+        {
             if depth == DISPATCH_LEVELS {
                 self.set_collisions.release(idx);
+                *budget = budget.saturating_sub(1);
                 continue;
             }
             let node = self.set_node(idx);
-            for n in 0..node.len() {
+            let len = node.len();
+            for n in 0..len {
                 let child = node.child(node.slot_at(n));
                 if child != NO_CHILD {
                     stack.push((child, depth + 1));
                 }
             }
             self.free_set_node(idx);
+            *budget = budget.saturating_sub(1 + len as u32);
         }
     }
 

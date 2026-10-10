@@ -45,10 +45,12 @@
 
 pub mod async_command;
 pub mod compact_str;
+pub mod compress;
 pub mod error;
 
 pub mod hcommand;
 mod node_childs;
+mod load;
 pub mod save;
 pub mod scommand;
 pub mod value;
@@ -84,6 +86,7 @@ use crate::node_childs::Childs;
 use crate::node_childs::OverflowArena;
 use crate::save::{NodeImage, OxidSave};
 
+pub use crate::load::{LoadError, LoadStats};
 pub use crate::save::{Dump, DumpEntry, DumpError, SaveCursor, check_footer, parse_dump};
 pub use crate::value::Value;
 use crate::value::{
@@ -187,14 +190,31 @@ impl OxidArt {
         valart().begin_save();
     }
 
-    /// Termine la save (fin normale ou abandon) : images libérées.
+    /// Termine la save (fin normale ou abandon) : images libérées, liste
+    /// différée valart vidée d'un coup. Côté serveur, préférer
+    /// [`end_save`](Self::end_save) puis [`drain_deferred`](Self::drain_deferred)
+    /// par tranches.
     pub fn finish_save(&mut self) {
+        self.end_save();
+        while !self.drain_deferred(u32::MAX) {}
+    }
+
+    /// Ferme la barrière (images libérées, UNLINK en attente réveillés) sans
+    /// vider la liste différée valart.
+    pub fn end_save(&mut self) {
         self.save.barrier.finish();
         self.save.childs.clear();
-        valart().finish_save();
+        valart().end_save();
         for waker in self.save.waiters.drain(..) {
             waker.wake();
         }
+    }
+
+    /// Une tranche du vidage de la liste différée valart (suppressions faites
+    /// pendant la save). `true` quand elle est vide. Voir
+    /// `ValTrees::drain_deferred`.
+    pub fn drain_deferred(&mut self, budget: u32) -> bool {
+        valart().drain_deferred(budget)
     }
 
     /// Returns the number of Overflow slots currently allocated.
@@ -499,7 +519,9 @@ impl OxidArt {
             return false;
         };
 
-        if !self.get_node(idx).does_expire() {
+        let node = self.get_node(idx);
+        // Expirée mais pas encore nettoyée : absente, ne pas la ressusciter.
+        if !node.does_expire() || node.is_expired(self.now) {
             return false;
         }
         let node = self.node_mut(idx);

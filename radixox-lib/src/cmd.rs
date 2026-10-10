@@ -73,6 +73,8 @@ pub enum Cmd<'a> {
     FlushDb,
     /// BGSAVE
     BgSave,
+    /// SAVE (bloquante)
+    Save,
 
     // --- String / clés -----------------------------------------------
     /// GET key
@@ -526,7 +528,7 @@ fn dispatch<'a>(raw: &[&'a [u8]]) -> Option<Cmd<'a>> {
         // ── Q : QUIT ──────────────────────────────────────────────────────
         b'q' => if cmd.len() == 4 { Some(Cmd::Quit) } else { None },
 
-        // ── S : SET SETNX SETEX SELECT SADD SREM SPOP SCARD SMEMBERS SISMEMBER SUBSCRIBE ──
+        // ── S : SET SETNX SETEX SELECT SAVE SADD SREM SPOP SCARD SMEMBERS SISMEMBER SUBSCRIBE ──
         b's' => match cmd.len() {
             3 => { // SET
                 need!(2);
@@ -534,6 +536,7 @@ fn dispatch<'a>(raw: &[&'a [u8]]) -> Option<Cmd<'a>> {
                 Some(Cmd::Set { key: args[0], val: sb(args[1]), opts })
             }
             4 => match cmd[1] | 0x20 {
+                b'a' if cmd.eq_ignore_ascii_case(b"save") => Some(Cmd::Save),
                 b'a' => { need!(2); let key = args[0]; Some(Cmd::SAdd { key, members: multi_owned_from!(1, |v| v) }) }
                 b'r' => { need!(2); let key = args[0]; Some(Cmd::SRem { key, members: multi_owned_from!(1, |v| v) }) }
                 b'p' => { need!(1); Some(Cmd::SPop { key: args[0], count: args.get(1).and_then(|s| arg_u64(s)) }) }
@@ -617,6 +620,12 @@ impl<'a> Cmd<'a> {
     /// Parse from raw RESP2 bytes, returns (Cmd, bytes_consumed) or None if incomplete/invalid.
     pub fn parse(d: &'a [u8]) -> Option<(Self, usize)> {
         let mut pos = 0;
+        // Lignes vides ignorées, comme Redis (commande inline vide) :
+        // `redis-cli --pipe` envoie `\r\n` avant son `ECHO` final ; sans ça,
+        // la connexion attendait indéfiniment la suite.
+        while d[pos..].starts_with(b"\r\n") {
+            pos += 2;
+        }
 
         if d.get(pos) != Some(&b'*') {
             return None;
@@ -650,5 +659,22 @@ impl<'a> Cmd<'a> {
 
     pub fn from_slice(d: &'a [u8]) -> Option<Self> {
         Self::parse(d).map(|(cmd, _)| cmd)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cmd;
+
+    #[test]
+    fn blank_lines_before_a_command_are_skipped() {
+        let d = b"\r\n\r\n*2\r\n$4\r\nECHO\r\n$2\r\nhi\r\n";
+        assert!(matches!(Cmd::from_slice(b"*1\r\n$4\r\nsave\r\n"), Some(Cmd::Save)));
+        assert!(matches!(Cmd::from_slice(b"*3\r\n$4\r\nSADD\r\n$1\r\ns\r\n$1\r\nm\r\n"), Some(Cmd::SAdd { .. })));
+        let (cmd, n) = Cmd::parse(d).expect("commande après des lignes vides");
+        assert!(matches!(cmd, Cmd::Echo(b"hi")));
+        assert_eq!(n, d.len());
+        // Lignes vides seules : rien à exécuter, on attend la suite.
+        assert!(Cmd::parse(b"\r\n").is_none());
     }
 }

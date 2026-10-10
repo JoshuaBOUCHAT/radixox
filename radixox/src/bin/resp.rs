@@ -56,12 +56,14 @@ fn main() -> std::io::Result<()> {
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(6379);
+        let shared_art =
+            OxidArt::shared_with_evictor(Duration::from_millis(100), Duration::from_secs(1));
+        resp_cmd::bgsave::load_at_startup(&shared_art)?;
+        resp_cmd::shutdown::install(shared_art.clone());
+
         let addr = format!("0.0.0.0:{port}");
         let listener = Rc::new(TcpListener::bind(&addr)?);
         println!("RadixOx RESP Server listening on {addr}");
-
-        let shared_art =
-            OxidArt::shared_with_evictor(Duration::from_millis(100), Duration::from_secs(1));
 
         let registry: SharedRegistry = Rc::new(RefCell::new(SubRegistry::default()));
 
@@ -323,6 +325,22 @@ async fn dispatch(
                 };
                 conn_state.encode(frame);
             }
+            Cmd::Save => {
+                let frame = match resp_cmd::bgsave::save_sync(&art, resp_cmd::bgsave::sync_level()) {
+                    Ok(st) => {
+                        eprintln!(
+                            "[save] {:.1} MB ({:.1} MB bruts) en {:.2?} (DFS {:.2?})",
+                            st.written as f64 / 1e6,
+                            st.raw as f64 / 1e6,
+                            st.total,
+                            st.walk
+                        );
+                        resp_ok()
+                    }
+                    Err(e) => Frame::Error(format!("ERR {e}").into()),
+                };
+                conn_state.encode(frame);
+            }
             Cmd::FlushDb if art.borrow().is_saving() => {
                 // Pendant une save : libération par tranches après la save
                 // (sinon tout l'arbre serait capturé).
@@ -415,6 +433,7 @@ fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         | Cmd::Keys(_)
         | Cmd::Unlink(_)
         | Cmd::BgSave
+        | Cmd::Save
         | Cmd::Info
         | Cmd::HMSet { .. }
         | Cmd::Unknown => unreachable!(),

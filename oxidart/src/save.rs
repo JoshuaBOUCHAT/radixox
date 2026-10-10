@@ -642,98 +642,23 @@ pub fn check_footer(file: &[u8]) -> Result<&[u8], DumpError> {
 }
 
 /// Décode un dump complet (en-tête, section ZSet/List, enregistrements).
+///
+/// Sert aux tests et aux outils ; le reload du serveur passe par
+/// [`OxidArt::load_dump`](crate::OxidArt::load_dump), qui construit l'arbre
+/// sans passer par des `DumpEntry`.
 pub fn parse_dump(buf: &[u8]) -> Result<Dump, DumpError> {
-    use std::collections::{HashMap, VecDeque};
-
-    use radixox_lib::shared_byte::SharedByte;
-    use radixox_lib::varint::{get_bytes, get_varint, unzigzag};
-
-    use crate::Value;
-    use crate::zcommand::InnerZCommand;
-
-    const TRUNC: DumpError = DumpError("dump tronqué");
-    let mut pos = 0usize;
-    let fixed = |pos: &mut usize, n: usize| -> Result<&[u8], DumpError> {
-        let b = buf.get(*pos..*pos + n).ok_or(TRUNC)?;
-        *pos += n;
-        Ok(b)
+    use crate::load::{DumpReader, Footer, LoadError};
+    let parse = || -> Result<Dump, LoadError> {
+        let mut rd = DumpReader::new(buf, Footer::None)?;
+        let mut entries = Vec::new();
+        while let Some(head) = rd.next_head()? {
+            let value = rd.value(head.ty)?;
+            entries.push(DumpEntry { key: rd.key().to_vec(), ttl: head.ttl, value });
+        }
+        Ok(Dump { t0: rd.t0, seed: rd.seed, entries })
     };
-    let varint = |pos: &mut usize| get_varint(buf, pos).ok_or(TRUNC);
-    let bytes = |pos: &mut usize| get_bytes(buf, pos).map(SharedByte::from_slice).ok_or(TRUNC);
-
-    if fixed(&mut pos, 4)? != format::MAGIC {
-        return Err(DumpError("magic invalide"));
-    }
-    if fixed(&mut pos, 1)?[0] != format::VERSION {
-        return Err(DumpError("version inconnue"));
-    }
-    if fixed(&mut pos, 1)?[0] != format::TTL_UNIT_SECONDS {
-        return Err(DumpError("unité de TTL inconnue"));
-    }
-    let t0 = u64::from_le_bytes(fixed(&mut pos, 8)?.try_into().unwrap());
-    let seed = u64::from_le_bytes(fixed(&mut pos, 8)?.try_into().unwrap());
-
-    let mut zsets: HashMap<u32, InnerZCommand> = HashMap::new();
-    for _ in 0..varint(&mut pos)? {
-        let idx = varint(&mut pos)? as u32;
-        let mut z = InnerZCommand::new();
-        for _ in 0..varint(&mut pos)? {
-            let score = f64::from_le_bytes(fixed(&mut pos, 8)?.try_into().unwrap());
-            z.insert(score, bytes(&mut pos)?);
-        }
-        zsets.insert(idx, z);
-    }
-    let mut lists: HashMap<u32, VecDeque<SharedByte>> = HashMap::new();
-    for _ in 0..varint(&mut pos)? {
-        let idx = varint(&mut pos)? as u32;
-        let n = varint(&mut pos)?;
-        let l = (0..n).map(|_| bytes(&mut pos)).collect::<Result<_, _>>()?;
-        lists.insert(idx, l);
-    }
-
-    let mut entries = Vec::new();
-    let mut key: Vec<u8> = Vec::new();
-    loop {
-        let tag = fixed(&mut pos, 1)?[0];
-        if tag == format::T_END {
-            break;
-        }
-        let lcp = varint(&mut pos)? as usize;
-        let suffix_len = varint(&mut pos)? as usize;
-        let ttl = if tag & format::TTL_BIT != 0 { Some(varint(&mut pos)?) } else { None };
-        if lcp > key.len() {
-            return Err(DumpError("lcp plus long que la clé précédente"));
-        }
-        key.truncate(lcp);
-        key.extend_from_slice(fixed(&mut pos, suffix_len)?);
-        let value = match tag & format::TYPE_MASK {
-            format::T_STRING => Value::String(bytes(&mut pos)?),
-            format::T_INT => Value::Int(unzigzag(varint(&mut pos)?)),
-            format::T_HASH => {
-                let n = varint(&mut pos)?;
-                let pairs = (0..n)
-                    .map(|_| Ok((bytes(&mut pos)?, bytes(&mut pos)?)))
-                    .collect::<Result<_, DumpError>>()?;
-                Value::Hash(pairs)
-            }
-            format::T_SET => {
-                let n = varint(&mut pos)?;
-                Value::Set((0..n).map(|_| bytes(&mut pos)).collect::<Result<_, _>>()?)
-            }
-            format::T_ZSET => {
-                let idx = varint(&mut pos)? as u32;
-                Value::ZSet(zsets.remove(&idx).ok_or(DumpError("ZSet absent de la section"))?)
-            }
-            format::T_LIST => {
-                let idx = varint(&mut pos)? as u32;
-                Value::List(lists.remove(&idx).ok_or(DumpError("List absente de la section"))?)
-            }
-            _ => return Err(DumpError("type inconnu")),
-        };
-        entries.push(DumpEntry { key: key.clone(), ttl, value });
-    }
-    if pos != buf.len() {
-        return Err(DumpError("octets après le marqueur de fin"));
-    }
-    Ok(Dump { t0, seed, entries })
+    parse().map_err(|e| match e {
+        LoadError::Dump(e) => e,
+        LoadError::Io(_) => unreachable!("lecture d'une tranche en mémoire"),
+    })
 }

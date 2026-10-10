@@ -31,6 +31,7 @@ regex-automata = { version = "0.4", optional = true, default-features = false, f
 ] }
 thin-vec = "0.2.14"
 hashbrown = "0.17.0"
+zstd-safe = { version = "8.1", default-features = false, features = ["experimental", "std"] }
 
 [features]
 regex = ["dep:regex-automata"]

@@ -119,9 +119,11 @@ pub struct ValTrees {
     /// Save progressive : barrière COW sur `nodes`.
     save: SaveBarrier<ValNodeImage>,
     /// Pendant une save : clés/valeurs sorties d'un nœud, et conteneurs
-    /// supprimés. Détruits à `finish_save`.
+    /// supprimés. Détruits après la save, par tranches (`drain_deferred`).
     deferred_bytes: Vec<SharedByte>,
     deferred_drops: Vec<(NodeType, u32)>,
+    /// Conteneur différé en cours de destruction (pile d'idx valart).
+    draining: Option<(NodeType, Vec<(u32, usize)>)>,
     /// Tests : masque appliqué au hash pour forcer des collisions.
     #[cfg(test)]
     hash_mask: u64,
@@ -149,6 +151,7 @@ impl ValTrees {
             save: SaveBarrier::new(),
             deferred_bytes: Vec::new(),
             deferred_drops: Vec::new(),
+            draining: None,
             #[cfg(test)]
             hash_mask: u64::MAX,
         }
@@ -187,6 +190,9 @@ impl ValTrees {
 
     /// Démarre une save : fige la vue T0 du slab.
     pub fn begin_save(&mut self) {
+        // Normalement déjà vide (le serveur attend la fin du vidage avant
+        // d'accepter une nouvelle save) : filet de sécurité, d'un coup.
+        while !self.drain_deferred(u32::MAX) {}
         let nodes = &self.nodes;
         self.save.begin_with(|buf| {
             nodes.copy_occupancy(buf);
@@ -195,20 +201,59 @@ impl ValTrees {
         self.hash_collisions.snapshot_t0();
     }
 
-    /// Termine la save : images libérées, libérations différées exécutées.
-    /// TODO : vider par tranches (SAVE_DESIGN.md §2.B).
+    /// Termine la save (fin normale ou abandon) et vide d'un coup la liste
+    /// différée. Le serveur utilise plutôt `end_save` + `drain_deferred`.
     pub fn finish_save(&mut self) {
+        self.end_save();
+        while !self.drain_deferred(u32::MAX) {}
+    }
+
+    /// Ferme la barrière (images libérées). La liste différée reste à vider
+    /// par [`drain_deferred`](Self::drain_deferred) : plus rien ne la
+    /// référence (images détruites, conteneurs inaccessibles depuis oxidart)
+    /// et elle ne grossit plus (hors save, tout est détruit tout de suite).
+    pub fn end_save(&mut self) {
         self.save.finish();
         self.set_collisions.clear_t0();
         self.hash_collisions.clear_t0();
-        self.deferred_bytes.clear();
-        for (kind, root) in std::mem::take(&mut self.deferred_drops) {
+    }
+
+    /// Une tranche du vidage de la liste différée (SAVE_DESIGN.md §2.B) :
+    /// coût 1 par valeur, 1 par nœud et 1 par entrée d'un conteneur détruit ;
+    /// un nœud est toujours détruit en entier. `true` quand tout est vidé.
+    pub fn drain_deferred(&mut self, mut budget: u32) -> bool {
+        debug_assert!(!self.save.is_active(), "vidage pendant une save");
+        let n = (budget as usize).min(self.deferred_bytes.len());
+        self.deferred_bytes.truncate(self.deferred_bytes.len() - n);
+        budget -= n as u32;
+        while budget > 0 {
+            let (kind, mut stack) = match self.draining.take() {
+                Some(d) => d,
+                None => match self.deferred_drops.pop() {
+                    Some((kind, root)) => (kind, vec![(root, 0)]),
+                    None => break,
+                },
+            };
             match kind {
-                NodeType::Hash => self.hash_drop_now(root),
-                NodeType::Set => self.set_drop_now(root),
+                NodeType::Hash => self.hash_drop_step(&mut stack, &mut budget),
+                NodeType::Set => self.set_drop_step(&mut stack, &mut budget),
                 NodeType::ZSet => unreachable!(),
             }
+            if !stack.is_empty() {
+                self.draining = Some((kind, stack));
+            }
         }
+        if self.deferred_bytes.capacity() > 0 && self.deferred_bytes.is_empty() && self.deferred_drops.is_empty() {
+            // Une grosse liste ne garde pas sa mémoire jusqu'à la save suivante.
+            self.deferred_bytes = Vec::new();
+            self.deferred_drops = Vec::new();
+        }
+        self.deferred_bytes.is_empty() && self.deferred_drops.is_empty() && self.draining.is_none()
+    }
+
+    /// Taille de la liste différée : (valeurs, conteneurs dont un en cours).
+    pub fn deferred_len(&self) -> (usize, usize) {
+        (self.deferred_bytes.len(), self.deferred_drops.len() + self.draining.is_some() as usize)
     }
 
     /// Prefetch de la racine d'un conteneur (128 B), avant de le sérialiser.
