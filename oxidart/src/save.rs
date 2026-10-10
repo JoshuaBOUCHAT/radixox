@@ -206,6 +206,7 @@ pub(crate) mod reference {
 ///            Hash → varint nb | (bytes champ | bytes valeur)* ;
 ///            Set → varint nb | bytes membre* ; ZSet/List → varint idx (section)
 /// fin      : u8 T_END
+/// pied     : u32 LE crc32 (IEEE) de tout ce qui précède | "RXDE"   (fichier seulement)
 /// ```
 /// `bytes` = varint len | octets. `lcp` = préfixe commun avec la clé
 /// précédente (le DFS écrit chaque sous-arbre d'un bloc).
@@ -222,6 +223,17 @@ pub mod format {
     pub const T_END: u8 = 0x0F;
     pub const TYPE_MASK: u8 = 0x0F;
     pub const TTL_BIT: u8 = 0x80;
+    /// Pied du fichier, ajouté par l'écrivain après `T_END` : détecte un
+    /// fichier tronqué ou corrompu (`check_footer`).
+    pub const FOOTER_MAGIC: [u8; 4] = *b"RXDE";
+    pub const FOOTER_LEN: usize = 8;
+
+    pub fn footer(crc: u32) -> [u8; FOOTER_LEN] {
+        let mut f = [0u8; FOOTER_LEN];
+        f[..4].copy_from_slice(&crc.to_le_bytes());
+        f[4..].copy_from_slice(&FOOTER_MAGIC);
+        f
+    }
 }
 
 use std::collections::VecDeque;
@@ -612,6 +624,22 @@ pub struct Dump {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct DumpError(pub &'static str);
+
+/// Vérifie le pied d'un fichier de dump et renvoie le flux qui le précède,
+/// à passer à `parse_dump`.
+pub fn check_footer(file: &[u8]) -> Result<&[u8], DumpError> {
+    let Some(body_len) = file.len().checked_sub(format::FOOTER_LEN) else {
+        return Err(DumpError("fichier tronqué (pas de pied)"));
+    };
+    let (body, foot) = file.split_at(body_len);
+    if foot[4..] != format::FOOTER_MAGIC {
+        return Err(DumpError("fichier tronqué (pied absent)"));
+    }
+    if crc32fast::hash(body) != u32::from_le_bytes(foot[..4].try_into().unwrap()) {
+        return Err(DumpError("crc invalide"));
+    }
+    Ok(body)
+}
 
 /// Décode un dump complet (en-tête, section ZSet/List, enregistrements).
 pub fn parse_dump(buf: &[u8]) -> Result<Dump, DumpError> {

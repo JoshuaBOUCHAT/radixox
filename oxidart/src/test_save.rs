@@ -237,3 +237,34 @@ fn dump_rejects_corruption() {
     extra.push(0);
     assert!(parse_dump(&extra).is_err());
 }
+
+#[test]
+fn file_footer_detects_truncation_and_corruption() {
+    use crate::save::format;
+    use crate::check_footer;
+
+    let mut art = OxidArt::new();
+    art.set_now(1_000);
+    for i in 0..500 {
+        art.set(sb(&format!("k{i}")), Value::String(sb("v")));
+    }
+    let mut body = Vec::new();
+    let mut cur = art.save_start(&mut body);
+    while !art.save_step(&mut cur, &mut body, 64) {}
+    drop(cur);
+    art.finish_save();
+
+    let mut file = body.clone();
+    file.extend_from_slice(&format::footer(crc32fast::hash(&body)));
+    assert_eq!(check_footer(&file).unwrap(), &body[..]);
+    assert_eq!(parse_dump(check_footer(&file).unwrap()).unwrap().entries.len(), 500);
+
+    // Tronqué : plus de pied valide.
+    for cut in [0, 3, file.len() / 2, file.len() - 1] {
+        assert!(check_footer(&file[..cut]).is_err(), "cut {cut}");
+    }
+    // Un octet modifié dans le corps.
+    let mut bad = file.clone();
+    bad[body.len() / 2] ^= 0x40;
+    assert_eq!(check_footer(&bad), Err(crate::DumpError("crc invalide")));
+}

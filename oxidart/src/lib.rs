@@ -84,7 +84,7 @@ use crate::node_childs::Childs;
 use crate::node_childs::OverflowArena;
 use crate::save::{NodeImage, OxidSave};
 
-pub use crate::save::{Dump, DumpEntry, DumpError, SaveCursor, parse_dump};
+pub use crate::save::{Dump, DumpEntry, DumpError, SaveCursor, check_footer, parse_dump};
 pub use crate::value::Value;
 use crate::value::{
     NodeValMut, NodeValRef, Tag, ValUnion, drop_raw, init_slabs, valart, value_from_raw_ref,

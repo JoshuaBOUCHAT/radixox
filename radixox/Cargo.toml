@@ -22,6 +22,7 @@ smallvec.workspace = true
 
 local-sync = "0.1.1"
 io-uring = "0.6.4"
+crc32fast = "1.4"
 
 [dev-dependencies]
 redis = "0.27"

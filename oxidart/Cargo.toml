@@ -23,6 +23,7 @@ mimalloc = { workspace = true }
 libmimalloc-sys = { workspace = true }
 
 rand = "0.8"
+crc32fast = "1.4"
 regex-automata = { version = "0.4", optional = true, default-features = false, features = [
     "dfa-build",
     "dfa-search",

@@ -190,15 +190,14 @@ enregistrement :
 ```
 - TTL : écart par rapport au `T0` de l'en-tête (1 à 3 octets en général). Les clés expirées au T0 ne sont pas écrites, donc l'écart est toujours ≥ 0. Un drapeau d'unité dans l'en-tête permettra de passer aux ms.
 
-### Fichiers
+### Fichier (implémenté 2026-10-10, remplace dossier + MANIFEST)
 ```
-dump.tmp/
-  data.rxd     flux unique : en-tête (magic, version, T0, unité TTL) | enregistrements | marqueur de fin
-  zl.rxd       section ZSet/List (sérialisée au begin)
-  MANIFEST     écrit en dernier : T0, unité TTL, seed valart, fichiers, nb de clés, crc32c de chaque fichier
+dump.rxd      en-tête | section ZSet/List | enregistrements | T_END | pied
+pied          u32 LE crc32 (IEEE, crc32fast) de tout ce qui précède | "RXDE"
 ```
-- Pas de blocs : un seul parcours écrit un seul flux. Checksum : un crc32c par fichier, calculé au fil de l'écriture, vérifié au reload (détecte corruption/troncature ; l'atomicité vient du rename).
-- Fin de save : fsync de chaque fichier, puis MANIFEST, son fsync, et `rename` du dossier. **Le dump est valide à partir de là** (reload par insertions, ordre quelconque).
+- Un seul fichier, puisque depuis l'étape 5 tout est dans un seul flux : plus de `zl.rxd` ni de `MANIFEST`. Le pied remplace le MANIFEST : `check_footer` détecte la troncature (pied absent) et la corruption (crc). `parse_dump` s'arrête à `T_END` et ignore le pied.
+- Écrit dans `dump.rxd.tmp`, puis fsync du fichier, `rename` sur `dump.rxd` (atomique, remplace l'ancien), fsync du dossier. **Le dump est valide à partir du rename.** Dossier : `RADIXOX_DIR` (défaut `.`).
+- crc32 IEEE (crc32fast, accéléré matériellement) au lieu de crc32c : crc32c n'était pas disponible hors ligne, même rôle.
 
 ### Contiguïté des préfixes et reload en masse
 - **Pas de tri entre frères.** Le DFS garantit qu'un sous-arbre est écrit d'un bloc : toutes les clés sous un préfixe sont contiguës (`user:1…` juste après `user:`), quel que soit l'ordre `user:b, user:c, user:a`. C'est tout ce qu'il faut : dans oxidart, l'ordre entre frères n'a pas d'importance.
@@ -206,23 +205,23 @@ dump.tmp/
 - **Zéro split (décidé 2026-10-10)** : le constructeur lit un enregistrement d'avance. Pour chaque clé il connaît alors `lcp` avec la précédente et avec la suivante ; le nœud de la clé commence à `max(lcp_préc, lcp_suiv)`, donc chaque nœud est créé directement avec sa compression finale (construction de trie par tableau LCP). Aucun nœud n'est repris après création.
 - **Clés expirées au reload** : on les saute sans casser le chaînage, car en ordre DFS `lcp(A, C) = min(lcp(A, B), lcp(B, C))` (profondeur de l'ancêtre commun) ; le constructeur garde ce minimum à travers les clés sautées.
 - Comparaison Redis : chargement par `dictAdd` (taille pré-annoncée par `RESIZEDB`, mais un accès aléatoire au tableau de buckets par clé, donc un défaut de cache par clé dès qu'il dépasse le cache). Ici : parent en haut de pile, nœuds alloués à la suite dans le HiSlab, sous-arbres contigus en mémoire après le reload. Coût dominant attendu : l'allocation des valeurs (`mi_malloc`, ~20–50 ns par valeur). À mesurer à l'étape 8.
-- Le T0 (et l'unité du TTL) est dans le `MANIFEST` **et** dans l'en-tête de `data.rxd`, pour qu'un fichier se lise seul.
+- Le T0 (et l'unité du TTL) est dans l'en-tête de `dump.rxd`.
 - Écriture : buffers de 256 KB–1 MB soumis à io_uring dès qu'ils sont pleins ; ordre temp → fsync → rename.
 
 ### Compression (décidé 2026-10-10)
 - **v1 : dump brut**, sans compression. La barrière se ferme dès la fin de la save brute (~135 ms pour 1M clés sous charge, ~48 ms à vide).
-- **Ensuite, compression après coup, en option** : `save-compression none | task | thread`. `task` = tâche découpée sur le thread de service, compression légère (LZ4 / zstd 1) ; `thread` = thread dédié, niveau élevé (zstd 9–19). Elle relit `data.rxd` et écrit `data.rxd.zst`, puis MANIFEST à jour et rename : le dump brut reste valide si la compression échoue ou est interrompue. Coûts : double écriture disque, deux fichiers sur disque le temps de la compression ; zstd 19 ≈ 5–10 MB/s (20–30 min pour 10 GB), à mesurer contre zstd 9–12 sur des données réelles.
-- **Format compressé** : le flux brut découpé en morceaux de taille fixe (1–4 MB) **sans tenir compte des enregistrements**, chacun compressé seul : `u8 algo (raw | lz4 | zstd) | varint len_brut | varint len_compressé | données`. La concaténation des morceaux décompressés redonne exactement le flux v1, lu comme aujourd'hui (lcp inchangé). Un morceau qui ne gagne rien reste `raw`. Le crc32c du MANIFEST porte sur le flux brut.
+- **Ensuite, compression après coup, en option** : `save-compression none | task | thread`. `task` = tâche découpée sur le thread de service, compression légère (LZ4 / zstd 1) ; `thread` = thread dédié, niveau élevé (zstd 9–19). Elle relit `dump.rxd` et écrit `dump.rxd.zst` (temporaire puis rename) : le dump brut reste valide si la compression échoue ou est interrompue. Coûts : double écriture disque, deux fichiers sur disque le temps de la compression ; zstd 19 ≈ 5–10 MB/s (20–30 min pour 10 GB), à mesurer contre zstd 9–12 sur des données réelles.
+- **Format compressé** : le flux brut découpé en morceaux de taille fixe (1–4 MB) **sans tenir compte des enregistrements**, chacun compressé seul : `u8 algo (raw | lz4 | zstd) | varint len_brut | varint len_compressé | données`. La concaténation des morceaux décompressés redonne exactement le flux v1, lu comme aujourd'hui (lcp inchangé). Un morceau qui ne gagne rien reste `raw`. Le crc du pied porte sur le flux brut.
 - **Reload** : la décompression (≈ 1,2 GB/s zstd, ≈ 4 GB/s LZ4, quel que soit le niveau) se fait sur un thread qui précède la reconstruction de l'ART (au démarrage, rien n'est servi) : masquée tant qu'elle est plus rapide que l'insertion.
 - Écartés pour l'instant : compression au fil de l'eau dans un thread via un canal borné (garde la barrière ouverte au rythme du compresseur, à reconsidérer avec zstd 1) ; compression par valeur façon Redis (allonge les tranches, mauvais ratio sur petites valeurs) ; dictionnaire zstd (inutile avec des morceaux de 1–4 MB).
 
 ## 5bis. Comportement côté serveur (valeurs par défaut)
 
 - **`SAVE`** répond quand la save est terminée (seule la connexion qui l'a lancée attend) ; **`BGSAVE`** répond tout de suite. Une seconde demande pendant une save → erreur `Background save already in progress`. Saves automatiques : plus tard, avec l'AOF.
-- **Fichier** : chemin réglable (équivalent `dir` + `dbfilename`), `dump.rxdb` par défaut. Au démarrage, on recharge le dump existant **avant** d'accepter des connexions.
+- **Fichier** : `RADIXOX_DIR/dump.rxd` (nom fixe en v1). Au démarrage, on recharge le dump existant **avant** d'accepter des connexions.
 - **FLUSHDB et `deln` synchrones pendant une save** : correct sans règle spéciale (chaque libération passe par la barrière), mais capture tout le sous-arbre. Pour éviter cette dérive mémoire, les faire passer par le chemin async (waker).
 - **Mémoire** : images + liste différée exposées dans `INFO`, sans limite en v1.
-- **Erreur disque** (ENOSPC, fsync) : abandon de la save, suppression du dossier temporaire, le dump précédent reste intact ; la liste différée est vidée normalement.
+- **Erreur disque** (ENOSPC, fsync) : abandon de la save (le DFS s'arrête, la barrière se ferme), suppression du fichier temporaire, le dump précédent reste intact ; la liste différée est vidée normalement.
 - **TTL** : oxidart stocke des secondes ; unité « secondes » dans l'en-tête.
 - **Une seule save à la fois** (assertion, y compris côté valart qui est un `static` global).
 
@@ -331,6 +330,15 @@ dump.tmp/
 - Lecture : débit et p99/p99.9 intacts (les écarts sont du bruit entre deux runs) ; seul le p99.99 GET prend ~8 ms, cohérent avec la tranche max de 4,3 ms plus la file accumulée derrière. Piste : budget de tranche en temps plutôt qu'en nœuds, ou budget plus petit (1024 nœuds Hash/valeurs longues → tranches inégales).
 - Attention, lancer `systemd-run --scope` dans un pipe a renvoyé des 143 : écrire dans un fichier.
 
+### Étape 7 faite (2026-10-10)
+- `radixox/src/bin/resp_cmd/bgsave.rs` (remplace `delayed::bgsave_task`). `SaveFile` partagé (`Rc<RefCell>`) : fichier monoio, offset, `fill` (rempli par `save_step`), `spare`, crc, `in_flight`, `walk_done`, erreur.
+- Double buffer, modèle proactif : quand `fill` ≥ 2 MB et rien en vol, la tâche de save échange les buffers et lance `write_loop`. Celle-ci, son `write_all_at` fini, réécrit tout ce qui s'est accumulé dans `fill` ; sinon elle s'arrête, ou finalise si le DFS est terminé. Si une écriture est en vol et `fill` ≥ 2 MB, le DFS ne produit plus et cède seulement (backpressure).
+- La barrière se ferme à la fin du DFS, sans attendre le disque ; `save_running()` (thread-local) refuse un nouveau BGSAVE jusqu'à la finalisation. Le pied est ajouté à la fin du DFS (crc des morceaux déjà pris + reste de `fill`).
+- Erreur d'écriture : le DFS s'arrête au tour suivant (curseur libéré **avant** `finish_save`), le fichier temporaire est supprimé, l'emplacement de save est libéré.
+- Tests : `oxidart` `file_footer_detects_truncation_and_corruption` ; `radixox/tests/bgsave.rs` (30 000 clés + Int/Hash/Set/TTL, fichier relu par `check_footer` + `parse_dump` ; dossier absent → l'emplacement de save est libéré).
+- Mesure (pipeline 32, 1:4, run 5 s, fichier sur tmpfs) : sans save 3 019 203 ops/s, GET p99.99 1,535 ms ; avec save 2 828 976 ops/s, GET p99 1,303 / p99.9 2,159 / p99.99 2,575 ms. BGSAVE : 105 MB en 128 ms (DFS 124 ms, fsync + rename 2,2 ms), 4100 tranches, tranche max 82 µs, 51 écritures, écriture max 2,9 ms. Pic mémoire du scope 184,5 → 289,4 MB, soit +105 MB = le fichier lui-même sur tmpfs : aucun surcoût RAM visible au pic.
+- Reste : `SAVE` synchrone ; `rename` et ouverture du dossier passent par `std::fs` / monoio sur le thread de service (rapides, mais bloquants pour `rename`) ; vidage par tranches de la liste différée ; reload (étape 8).
+
 ## 5quinquies. Méthode de travail
 
 - **Tests** : mono-thread obligatoire (`RUST_TEST_THREADS=1` dans `.cargo/config.toml`, statics globaux). `cargo test -p radixox-lib -p oxidart -p valart`.
@@ -346,6 +354,6 @@ dump.tmp/
 4. ✅ Liste différée, drop différé des conteneurs, pause de l'évicteur, waker UNLINK, copie profonde des buckets au T0 (reste : vidage par tranches).
 5. ✅ DFS (synchrone d'abord) et test aléatoire sur un vrai `OxidArt` (SET, DEL, HSET, SADD, UNLINK, expirations mélangés aux pas de la save) comparé à l'état T0, sous ASan.
 6. DFS par tranches + prefetch (valeur, compression, overflow, haut de pile), testé contre le DFS synchrone ; bench ns/clé.
-7. Format, fichier de données, crc32c, section ZSet/List, MANIFEST, I/O.
+7. ✅ Format, fichier de données, crc, section ZSet/List, I/O (fichier unique avec pied, plus de MANIFEST).
 8. Reload en masse depuis le fichier, et test aller-retour.
 9. (Optionnel, plus tard) Compression.

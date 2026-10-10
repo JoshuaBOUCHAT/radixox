@@ -315,11 +315,10 @@ async fn dispatch(
                 conn_state.encode(frame);
             }
             Cmd::BgSave => {
-                let frame = if art.borrow().is_saving() {
-                    Frame::Error("ERR Background save already in progress".into())
-                } else {
-                    monoio::spawn(resp_cmd::delayed::bgsave_task(art.clone()));
+                let frame = if resp_cmd::bgsave::start_bgsave(&art) {
                     Frame::SimpleString(SharedByte::from_slice(b"Background saving started"))
+                } else {
+                    Frame::Error("ERR Background save already in progress".into())
                 };
                 conn_state.encode(frame);
             }
