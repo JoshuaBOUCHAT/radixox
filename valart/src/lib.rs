@@ -101,6 +101,22 @@ impl ValTrees {
         }
     }
 
+    // ─── Points de passage (SAVE_DESIGN.md §3) ──────────────────────────────
+    //
+    // `hash_node_mut` / `set_node_mut` sont les seuls accès `&mut` à un nœud,
+    // `free_hash_node` / `free_set_node` les seules libérations : la barrière
+    // de save y sera branchée. Une clé ou valeur qui *sort* d'un nœud
+    // (suppression, remplacement) passe par `dispose`. Les buckets de
+    // collision n'ont pas de barrière (copiés au T0).
+
+    /// Seul point où une clé/valeur sortie du nœud `node` est détruite.
+    /// Étape 4 : liste différée si le nœud a été capturé par la save en cours.
+    #[inline]
+    fn dispose(&mut self, node: u32, bytes: SharedByte) {
+        let _ = node;
+        drop(bytes);
+    }
+
     pub fn seed(&self) -> u64 {
         self.seed
     }

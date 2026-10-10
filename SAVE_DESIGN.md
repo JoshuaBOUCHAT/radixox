@@ -236,6 +236,12 @@ dump.tmp/
 - `del(key) -> bool` (ne ramène pas la valeur, ne compte pas une clé expirée) ; `take(key) -> Option<Value>` pour GETDEL.
 - Corrections au passage : `get_zset_mut` ne libérait pas une valeur expirée et héritait de son TTL ; un Hash/Set/ZSet créé avec TTL est maintenant tagué pour l'évicteur (le Hash/Set ne l'était pas) ; `deln("")` / `deln_async("")` vident vraiment la valeur de la racine (`deln_async` ne la supprimait pas) ; DEL d'une clé expirée renvoie 0.
 
+### Étape 2 faite (2026-10-10)
+- valart : seuls accès mutables au slab = `hash_node_mut` / `set_node_mut`, seules libérations = `free_hash_node` / `free_set_node` (maintenant `&mut self`, pour la barrière).
+- `ValTrees::dispose(node, bytes)` : seul point où une clé/valeur sortie d'un nœud est détruite (HDEL, SREM, SPOP, valeur écrasée par HSET). Étape 4 : liste différée si `captured[node]`. Les entrées *déplacées* entre nœuds (remontée de feuille, relocation overflow, refill) ne passent pas par là : rien n'est détruit.
+- `hash_set -> bool` (champ nouveau), `hash_remove -> bool` ; `hash_get_mut` supprimé (HINCRBY passe par `hash_set`). `set_pop` renvoie un clone, l'original passe par `dispose`.
+- Buckets de collision : modifiés et droppés sans barrière ; la copie au T0 (§2.E) devra donc être **profonde** (clone rc+1 des `SharedByte`), pas bit à bit.
+
 ## 5quinquies. Méthode de travail
 
 - **Tests** : mono-thread obligatoire (`RUST_TEST_THREADS=1` dans `.cargo/config.toml`, statics globaux). `cargo test -p radixox-lib -p oxidart -p valart`.
@@ -246,7 +252,7 @@ dump.tmp/
 ## 6. Ordre de réalisation
 
 1. ✅ Points de passage oxidart, lectures sans `NodeValMut` dans les commandes de lecture, signatures sans valeur de retour, lectures sans modification pendant une save. Refactor pur : tous les tests existants passent.
-2. Points de passage valart, même principe.
+2. ✅ Points de passage valart, même principe.
 3. `SaveBarrier` avec closure de capture, `NodeImage` / `ValNodeImage`, barrières branchées.
 4. Liste différée, drop différé des conteneurs, waker UNLINK dans la barrière, pause de l'évicteur.
 5. DFS (synchrone d'abord) et test aléatoire sur un vrai `OxidArt` (SET, DEL, HSET, SADD, UNLINK, expirations mélangés aux pas de la save) comparé à l'état T0, sous ASan.

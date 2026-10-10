@@ -155,13 +155,13 @@ impl MapLike for Valart {
         self.trees.slab_bytes() + self.trees.hash_overflow_bytes(self.root)
     }
     fn add(&mut self, k: SharedByte, v: SharedByte) -> bool {
-        self.trees.hash_set(self.root, k, v).is_none()
+        self.trees.hash_set(self.root, k, v)
     }
     fn has(&self, k: &SharedByte) -> bool {
         self.trees.hash_get(self.root, k).is_some()
     }
     fn rem(&mut self, k: &SharedByte) -> bool {
-        self.trees.hash_remove(self.root, k).is_some()
+        self.trees.hash_remove(self.root, k)
     }
 }
 

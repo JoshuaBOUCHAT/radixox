@@ -38,7 +38,7 @@ impl OxidArt {
         let trees = valart();
         let mut added = 0;
         for (field, value) in field_values {
-            if trees.hash_set(root, field.clone(), value.clone()).is_none() {
+            if trees.hash_set(root, field.clone(), value.clone()) {
                 added += 1;
             }
         }
@@ -80,7 +80,7 @@ impl OxidArt {
         let trees = valart();
         let deleted = fields
             .iter()
-            .filter(|field| trees.hash_remove(root, field).is_some())
+            .filter(|field| trees.hash_remove(root, field))
             .count() as u32;
         if trees.hash_len(root) == 0 {
             self.del(key);
@@ -164,13 +164,7 @@ impl OxidArt {
         };
 
         let new_val = current.checked_add(increment).ok_or(TypeError::NotAInt)?;
-        let new_bytes = SharedByte::from_slice(new_val.to_string());
-        match trees.hash_get_mut(root, &field) {
-            Some(slot) => *slot = new_bytes,
-            None => {
-                trees.hash_set(root, field, new_bytes);
-            }
-        }
+        trees.hash_set(root, field, SharedByte::from_slice(new_val.to_string()));
         Ok(new_val)
     }
 }

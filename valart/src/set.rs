@@ -428,7 +428,7 @@ impl ValTrees {
         })
     }
 
-    fn free_set_node(&self, idx: u32) {
+    fn free_set_node(&mut self, idx: u32) {
         drop(self.nodes.remove(idx));
     }
 
@@ -545,18 +545,20 @@ impl ValTrees {
                 continue;
             }
 
-            if child == NO_CHILD {
-                drop(self.remove_leaf(idx, slot, parent));
+            let old = if child == NO_CHILD {
+                self.remove_leaf(idx, slot, parent)
             } else {
                 // Invariant 2 : pas de trou, on remonte une feuille du
                 // sous-arbre (toutes partagent h[0..=depth] avec ce slot).
                 let (key, key_ctrl, child_emptied) = self.take_leaf(child, depth + 1);
                 let node = self.set_node_mut(idx);
-                drop(node.replace_key(slot, key, key_ctrl));
+                let old = node.replace_key(slot, key, key_ctrl);
                 if child_emptied {
                     node.set_child(slot, NO_CHILD);
                 }
-            }
+                old
+            };
+            self.dispose(idx, old);
             self.set_card_add(root, -1);
             return true;
         }
@@ -577,6 +579,9 @@ impl ValTrees {
     /// aléatoire jusqu'à une feuille (`rnd` fourni par l'appelant). Ne
     /// déclenche jamais de remontée. Biaisé vers les feuilles, quasi uniforme
     /// quand le Set est grand (l'essentiel des entrées sont des feuilles).
+    ///
+    /// Retourne un clone du membre : l'original passe par `dispose` comme
+    /// toute entrée sortie d'un nœud (SAVE_DESIGN.md §2.B).
     pub fn set_pop(&mut self, root: u32, rnd: u64) -> Option<SharedByte> {
         if self.set_card(root) == 0 {
             return None;
@@ -591,8 +596,10 @@ impl ValTrees {
             let child = node.child(slot);
             if child == NO_CHILD {
                 let key = self.remove_leaf(idx, slot, parent);
+                let out = key.clone();
+                self.dispose(idx, key);
                 self.set_card_add(root, -1);
-                return Some(key);
+                return Some(out);
             }
             parent = Some((idx, slot));
             idx = child;

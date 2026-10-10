@@ -457,7 +457,7 @@ impl ValTrees {
         })
     }
 
-    fn free_hash_node(&self, idx: u32) {
+    fn free_hash_node(&mut self, idx: u32) {
         drop(self.nodes.remove(idx));
     }
 
@@ -511,22 +511,15 @@ impl ValTrees {
         }
     }
 
-    /// Accès mutable à la valeur d'un champ (HINCRBY, APPEND de champ…).
-    pub fn hash_get_mut(&mut self, root: u32, field: &[u8]) -> Option<&mut SharedByte> {
-        match self.hash_locate(root, field)? {
-            Loc::Node(idx, slot) => Some(self.hash_node_mut(idx).val_mut(slot)),
-            Loc::Bucket(b, i) => Some(&mut self.hash_collisions.get_mut(b)[i].1),
-        }
-    }
-
     /// HEXISTS.
     pub fn hash_contains(&self, root: u32, field: &[u8]) -> bool {
         self.hash_locate(root, field).is_some()
     }
 
-    /// HSET d'un champ. Retourne l'ancienne valeur si le champ existait
-    /// (`None` = nouveau champ, à compter dans la réponse de HSET).
-    pub fn hash_set(&mut self, root: u32, field: SharedByte, val: SharedByte) -> Option<SharedByte> {
+    /// HSET d'un champ. Retourne `true` si le champ est nouveau (à compter
+    /// dans la réponse de HSET). L'ancienne valeur n'est pas ramenée : lire
+    /// avec [`Self::hash_get`] avant si besoin.
+    pub fn hash_set(&mut self, root: u32, field: SharedByte, val: SharedByte) -> bool {
         let h = self.member_hash(&field);
         let ctrl = h.ctrl();
         let mut idx = root;
@@ -536,10 +529,12 @@ impl ValTrees {
             let Some(slot) = node.find(radix) else {
                 self.hash_node_mut(idx).push(radix, ctrl, field, val, NO_CHILD);
                 self.hash_len_add(root, 1);
-                return None;
+                return true;
             };
             if node.ctrl_of(slot) == ctrl && node.key(slot).as_slice() == field.as_slice() {
-                return Some(std::mem::replace(self.hash_node_mut(idx).val_mut(slot), val));
+                let old = std::mem::replace(self.hash_node_mut(idx).val_mut(slot), val);
+                self.dispose(idx, old);
+                return false;
             }
             let child = node.child(slot);
             if child != NO_CHILD {
@@ -556,63 +551,71 @@ impl ValTrees {
             };
             self.hash_node_mut(idx).set_child(slot, new_child);
             self.hash_len_add(root, 1);
-            return None;
+            return true;
         }
         let bucket = self.hash_collisions.get_mut(idx);
         if let Some(entry) = bucket.iter_mut().find(|(k, _)| k.as_slice() == field.as_slice()) {
-            return Some(std::mem::replace(&mut entry.1, val));
+            entry.1 = val;
+            return false;
         }
         bucket.push((field, val));
         self.hash_len_add(root, 1);
-        None
+        true
     }
 
-    /// HDEL d'un champ. Retourne la valeur retirée.
+    /// HDEL d'un champ. Retourne `true` s'il était présent (la valeur n'est
+    /// pas ramenée).
     ///
     /// Si le Hash devient vide, la racine reste allouée (`hash_len == 0`) :
     /// à l'appelant de supprimer la clé et d'appeler [`Self::hash_drop`].
-    pub fn hash_remove(&mut self, root: u32, field: &[u8]) -> Option<SharedByte> {
+    pub fn hash_remove(&mut self, root: u32, field: &[u8]) -> bool {
         let h = self.member_hash(field);
         let ctrl = h.ctrl();
         let mut idx = root;
         let mut parent: Option<(u32, Slot)> = None;
         for depth in 0..DISPATCH_LEVELS {
             let node = self.hash_node(idx);
-            let slot = node.find(h.radix(depth))?;
+            let Some(slot) = node.find(h.radix(depth)) else {
+                return false;
+            };
             let child = node.child(slot);
             if node.ctrl_of(slot) != ctrl || node.key(slot).as_slice() != field {
                 if child == NO_CHILD {
-                    return None;
+                    return false;
                 }
                 parent = Some((idx, slot));
                 idx = child;
                 continue;
             }
 
-            let val = if child == NO_CHILD {
-                self.hash_remove_leaf(idx, slot, parent).1
+            let (old_key, old_val) = if child == NO_CHILD {
+                self.hash_remove_leaf(idx, slot, parent)
             } else {
                 // Invariant 2 : on remonte une feuille du sous-arbre.
                 let (key, val, key_ctrl, child_emptied) = self.hash_take_leaf(child, depth + 1);
                 let node = self.hash_node_mut(idx);
-                let (_, old_val) = node.replace_entry(slot, key, val, key_ctrl);
+                let old = node.replace_entry(slot, key, val, key_ctrl);
                 if child_emptied {
                     node.set_child(slot, NO_CHILD);
                 }
-                old_val
+                old
             };
+            self.dispose(idx, old_key);
+            self.dispose(idx, old_val);
             self.hash_len_add(root, -1);
-            return Some(val);
+            return true;
         }
 
         let bucket = self.hash_collisions.get_mut(idx);
-        let pos = bucket.iter().position(|(k, _)| k.as_slice() == field)?;
-        let (_, val) = bucket.swap_remove(pos);
+        let Some(pos) = bucket.iter().position(|(k, _)| k.as_slice() == field) else {
+            return false;
+        };
+        drop(bucket.swap_remove(pos));
         if bucket.is_empty() {
             self.hash_release_bucket(idx, parent);
         }
         self.hash_len_add(root, -1);
-        Some(val)
+        true
     }
 
     /// HRANDFIELD : un champ pseudo-aléatoire (descente aléatoire jusqu'à une
@@ -828,6 +831,20 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_owned())
     }
 
+    /// HSET qui renvoie l'ancienne valeur (lue avant), et vérifie le booléen.
+    fn set_old(t: &mut ValTrees, root: u32, field: &str, val: &str) -> Option<String> {
+        let old = get(t, root, field);
+        assert_eq!(t.hash_set(root, sb(field), sb(val)), old.is_none(), "{field}");
+        old
+    }
+
+    /// HDEL qui renvoie la valeur retirée (lue avant), et vérifie le booléen.
+    fn remove_old(t: &mut ValTrees, root: u32, field: &str) -> Option<String> {
+        let old = get(t, root, field);
+        assert_eq!(t.hash_remove(root, field.as_bytes()), old.is_some(), "{field}");
+        old
+    }
+
     #[test]
     fn layout() {
         assert_eq!(size_of::<HashNode>(), 128);
@@ -838,17 +855,16 @@ mod tests {
     fn set_get_overwrite_remove() {
         let mut t = trees();
         let root = t.hash_create();
-        assert_eq!(t.hash_set(root, sb("a"), sb("1")), None);
-        assert_eq!(t.hash_set(root, sb("b"), sb("2")), None);
-        let old = t.hash_set(root, sb("a"), sb("3")).unwrap();
-        assert_eq!(old.as_slice(), b"1");
+        assert!(t.hash_set(root, sb("a"), sb("1")));
+        assert!(t.hash_set(root, sb("b"), sb("2")));
+        assert_eq!(set_old(&mut t, root, "a", "3").as_deref(), Some("1"));
         assert_eq!(t.hash_len(root), 2);
         assert_eq!(get(&t, root, "a").as_deref(), Some("3"));
         assert_eq!(get(&t, root, "c"), None);
-        *t.hash_get_mut(root, b"b").unwrap() = sb("20");
+        assert!(!t.hash_set(root, sb("b"), sb("20")));
         assert_eq!(get(&t, root, "b").as_deref(), Some("20"));
-        assert_eq!(t.hash_remove(root, b"a").unwrap().as_slice(), b"3");
-        assert!(t.hash_remove(root, b"a").is_none());
+        assert_eq!(remove_old(&mut t, root, "a").as_deref(), Some("3"));
+        assert!(!t.hash_remove(root, b"a"));
         assert!(!t.hash_contains(root, b"a"));
         assert_eq!(t.hash_len(root), 1);
         t.hash_check(root);
@@ -861,7 +877,7 @@ mod tests {
         let root = t.hash_create();
         let fields = ["10", "1", "user:1", "user", "", "field0", "field1", "field10"];
         for (i, f) in fields.iter().enumerate() {
-            assert!(t.hash_set(root, sb(f), sb(i.to_string())).is_none(), "{f}");
+            assert!(t.hash_set(root, sb(f), sb(i.to_string())), "{f}");
         }
         for (i, f) in fields.iter().enumerate() {
             assert_eq!(get(&t, root, f), Some(i.to_string()), "{f}");
@@ -876,16 +892,13 @@ mod tests {
         let mut reference = HashMap::new();
         for i in 0..100_000u32 {
             let (f, v) = (format!("field:{i}"), format!("v{i}"));
-            assert!(t.hash_set(root, sb(&f), sb(&v)).is_none());
+            assert!(t.hash_set(root, sb(&f), sb(&v)));
             reference.insert(f, v);
         }
         t.hash_check(root);
         for i in (0..100_000u32).step_by(3) {
             let f = format!("field:{i}");
-            assert_eq!(
-                t.hash_remove(root, f.as_bytes()).map(|v| v.as_str().unwrap().to_owned()),
-                reference.remove(&f)
-            );
+            assert_eq!(remove_old(&mut t, root, &f), reference.remove(&f));
         }
         t.hash_check(root);
         for i in 0..100_000u32 {
@@ -917,16 +930,10 @@ mod tests {
             match (rnd >> 32) % 4 {
                 0 | 1 => {
                     let v = step.to_string();
-                    let old = t.hash_set(root, sb(&f), sb(&v));
-                    assert_eq!(
-                        old.map(|o| o.as_str().unwrap().to_owned()),
-                        reference.insert(f, v)
-                    );
+                    let old = set_old(&mut t, root, &f, &v);
+                    assert_eq!(old, reference.insert(f, v));
                 }
-                2 => assert_eq!(
-                    t.hash_remove(root, f.as_bytes()).map(|v| v.as_str().unwrap().to_owned()),
-                    reference.remove(&f)
-                ),
+                2 => assert_eq!(remove_old(&mut t, root, &f), reference.remove(&f)),
                 _ => assert_eq!(get(&t, root, &f).as_ref(), reference.get(&f)),
             }
             if step % 10_000 == 0 {
@@ -936,7 +943,7 @@ mod tests {
         assert_eq!(t.hash_check(root), reference.len());
         let fields: Vec<String> = reference.keys().cloned().collect();
         for f in fields {
-            assert!(t.hash_remove(root, f.as_bytes()).is_some());
+            assert!(t.hash_remove(root, f.as_bytes()));
         }
         assert_eq!(t.hash_len(root), 0);
         t.hash_check(root);
@@ -950,10 +957,10 @@ mod tests {
         t.hash_mask = 0;
         let root = t.hash_create();
         for i in 0..50u32 {
-            assert!(t.hash_set(root, sb(i.to_string()), sb(format!("v{i}"))).is_none());
+            assert!(t.hash_set(root, sb(i.to_string()), sb(format!("v{i}"))));
         }
-        assert_eq!(t.hash_set(root, sb("7"), sb("x")).unwrap().as_slice(), b"v7");
-        assert_eq!(t.hash_set(root, sb("49"), sb("y")).unwrap().as_slice(), b"v49");
+        assert_eq!(set_old(&mut t, root, "7", "x").as_deref(), Some("v7"));
+        assert_eq!(set_old(&mut t, root, "49", "y").as_deref(), Some("v49"));
         t.hash_check(root);
         for i in 0..50u32 {
             let expected = match i {
@@ -964,7 +971,7 @@ mod tests {
             assert_eq!(get(&t, root, &i.to_string()), Some(expected));
         }
         for i in 0..50u32 {
-            assert!(t.hash_remove(root, i.to_string().as_bytes()).is_some(), "{i}");
+            assert!(t.hash_remove(root, i.to_string().as_bytes()), "{i}");
             t.hash_check(root);
             assert!(!t.hash_contains(root, i.to_string().as_bytes()));
         }
@@ -985,13 +992,10 @@ mod tests {
             let f = format!("{}", rnd % 3_000);
             if rnd >> 63 == 0 {
                 let v = step.to_string();
-                let old = t.hash_set(root, sb(&f), sb(&v));
-                assert_eq!(old.map(|o| o.as_str().unwrap().to_owned()), reference.insert(f, v));
+                let old = set_old(&mut t, root, &f, &v);
+                assert_eq!(old, reference.insert(f, v));
             } else {
-                assert_eq!(
-                    t.hash_remove(root, f.as_bytes()).map(|v| v.as_str().unwrap().to_owned()),
-                    reference.remove(&f)
-                );
+                assert_eq!(remove_old(&mut t, root, &f), reference.remove(&f));
             }
         }
         assert_eq!(t.hash_check(root), reference.len());
