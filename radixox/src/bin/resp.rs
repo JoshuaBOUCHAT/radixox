@@ -314,6 +314,15 @@ async fn dispatch(
                 let frame = cmd_keys(pattern, art.clone()).await;
                 conn_state.encode(frame);
             }
+            Cmd::BgSave => {
+                let frame = if art.borrow().is_saving() {
+                    Frame::Error("ERR Background save already in progress".into())
+                } else {
+                    monoio::spawn(resp_cmd::delayed::bgsave_task(art.clone()));
+                    Frame::SimpleString(SharedByte::from_slice(b"Background saving started"))
+                };
+                conn_state.encode(frame);
+            }
             Cmd::FlushDb if art.borrow().is_saving() => {
                 // Pendant une save : libération par tranches après la save
                 // (sinon tout l'arbre serait capturé).
@@ -404,6 +413,7 @@ fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         | Cmd::Publish { .. }
         | Cmd::Keys(_)
         | Cmd::Unlink(_)
+        | Cmd::BgSave
         | Cmd::Info
         | Cmd::HMSet { .. }
         | Cmd::Unknown => unreachable!(),

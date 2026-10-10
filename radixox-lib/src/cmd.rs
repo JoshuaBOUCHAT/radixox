@@ -71,6 +71,8 @@ pub enum Cmd<'a> {
     DbSize,
     /// FLUSHDB
     FlushDb,
+    /// BGSAVE
+    BgSave,
 
     // --- String / clés -----------------------------------------------
     /// GET key
@@ -414,6 +416,9 @@ fn dispatch<'a>(raw: &[&'a [u8]]) -> Option<Cmd<'a>> {
             },
             _ => None,
         },
+
+        // ── B : BGSAVE ────────────────────────────────────────────────────
+        b'b' => if cmd.eq_ignore_ascii_case(b"bgsave") { Some(Cmd::BgSave) } else { None },
 
         // ── F : FLUSHDB ───────────────────────────────────────────────────
         b'f' => if cmd.len() == 7 { Some(Cmd::FlushDb) } else { None },

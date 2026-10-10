@@ -287,6 +287,12 @@ dump.tmp/
 ### Pipeline d'écriture (2026-10-10, mergé)
 - Voir §4bis (algorithme et invariants I1–I10). Mesure (1M insertions) : String 149–162 → 118–122 ms, Hash 1 champ 256 → 147 ms.
 
+### BGSAVE minimal + test de stress (2026-10-10, en cours)
+- `BGSAVE` (parser `Cmd::BgSave`, `resp.rs`, `resp_cmd/delayed.rs::bgsave_task`) : task monoio, tranches de `SAVE_TRANCHE_BUDGET = 1024`, `yield` entre deux tranches ; le dump est sérialisé en mémoire puis **jeté** (pas d'I/O, étape 7). Log serveur : `[bgsave] X MB en T, N tranches, tranche max M`. monoio repasse par io_uring après `2 × nb_tâches` tâches (`max_round`), donc la save ne peut pas affamer les connexions.
+- Script `scripts/stress_save.sh` (~45 s au total) : load 1M clés 100 B, puis 15 s de 80 % GET / 20 % SET (memtier 4×20, serveur CPU 0-1), sans puis avec BGSAVE lancé 1 s après le début du run.
+- Résultat partiel (sans save seulement, le run avec save n'a pas abouti) : load 185 882 SET/s ; run 187 644 ops/s, GET p99 0,575 ms, p99.9 0,847 ms, p99.99 1,351 ms.
+- **À faire** : run « avec save » (durée de la save sous charge, tranche max, impact p99/p99.99). Attention, lancer `systemd-run --scope` dans un pipe a renvoyé des 143 : écrire dans un fichier.
+
 ## 5quinquies. Méthode de travail
 
 - **Tests** : mono-thread obligatoire (`RUST_TEST_THREADS=1` dans `.cargo/config.toml`, statics globaux). `cargo test -p radixox-lib -p oxidart -p valart`.
