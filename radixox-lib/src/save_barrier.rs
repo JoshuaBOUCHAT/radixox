@@ -158,6 +158,17 @@ impl<I> SaveBarrier<I> {
         self.intact.clear(idx as usize);
     }
 
+    /// Version T0 du nœud `idx` sans la consommer.
+    pub fn peek(&self, idx: u32) -> Option<T0<'_, I>> {
+        if !self.active {
+            return None;
+        }
+        if self.intact.get(idx as usize) {
+            return Some(T0::Slab);
+        }
+        self.images.get(&idx).map(T0::Image)
+    }
+
     /// Indice pour prefetcher : le nœud sera-t-il lu dans le slab ?
     #[inline]
     pub fn is_intact(&self, idx: u32) -> bool {

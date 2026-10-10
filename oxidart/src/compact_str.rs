@@ -78,6 +78,18 @@ impl CompactStr {
     }
 }
 
+impl CompactStr {
+    /// Prefetch du bloc heap (rien si inline).
+    #[inline]
+    pub fn prefetch(&self) {
+        unsafe {
+            if self.0.inline[0] & 1 == 0 {
+                radixox_lib::prefetch::prefetch_l1(self.0.heap);
+            }
+        }
+    }
+}
+
 impl Deref for CompactStr {
     type Target = [u8];
 

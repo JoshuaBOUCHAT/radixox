@@ -440,9 +440,10 @@ mod tests {
     #[monoio::test]
     async fn deln_async_waits_for_save() {
         let art = make_art();
-        let expect = art.borrow().snapshot();
+        let expect = crate::save::reference::expected(&art.borrow());
         let nodes = art.borrow().node_count();
-        art.borrow_mut().begin_save();
+        let mut out = Vec::new();
+        let mut cur = art.borrow_mut().save_start(&mut out);
         let mut unlink = Box::pin(art.deln_async(SharedByte::from_str("user:")));
         // Premier poll : coupe, puis attente de la fin de la save.
         let mut cx = Context::from_waker(std::task::Waker::noop());
@@ -450,9 +451,11 @@ mod tests {
         assert!(unlink.as_mut().poll(&mut cx).is_pending());
         assert!(art.borrow().getn(SharedByte::from_str("user:")).is_empty());
         assert_eq!(art.borrow().node_count(), nodes, "rien n'est libéré pendant la save");
-        let got = art.borrow_mut().dump_t0(|_| {});
-        assert_eq!(got, expect);
+        while !art.borrow_mut().save_step(&mut cur, &mut out, 1) {
+            assert!(unlink.as_mut().poll(&mut cx).is_pending());
+        }
         art.borrow_mut().finish_save();
+        assert_eq!(crate::save::reference::decoded(&out), expect);
         assert_eq!(unlink.await, 5);
         assert!(art.borrow().node_count() < nodes);
     }

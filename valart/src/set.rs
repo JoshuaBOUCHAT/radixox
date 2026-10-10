@@ -36,8 +36,9 @@ use radixox_lib::shared_byte::SharedByte;
 
 use crate::common::{DISPATCH_LEVELS, Slot, mix64};
 use crate::overflow::{NO_CHILD, swar_find};
-use crate::{NodeType, SetOverflow, ValNode, ValNodeImage, ValTrees};
+use crate::{NodeType, SetOverflow, ValNode, ValNodeImage, ValSer, ValTrees, prefetch_slot};
 use radixox_lib::save_barrier::T0;
+use radixox_lib::varint::{put_bytes, put_varint};
 
 /// Entrées inline max (nœud sans enfant).
 pub(crate) const INLINE_SET_LEN: usize = 11;
@@ -641,32 +642,67 @@ impl ValTrees {
         Some(key)
     }
 
-    /// Parcours de la vue T0 pendant une save (nœuds modifiés lus dans leur
-    /// image). Consomme les nœuds dans la barrière : un conteneur n'est
-    /// parcouru qu'une fois par save. Référence synchrone ; le sérialiseur
-    /// par tranches viendra à l'étape 6.
-    pub fn set_for_each_t0(&mut self, root: u32, mut f: impl FnMut(&SharedByte)) {
-        let mut stack = vec![(root, 0usize)];
+    /// Démarre la sérialisation du conteneur `root` pendant une save : écrit
+    /// sa cardinalité T0 et prépare `ser`. Format : `varint nb | (varint len | membre)*`.
+    pub fn set_ser_begin(&mut self, root: u32, ser: &mut ValSer, out: &mut Vec<u8>) {
+        let card = match self.save.peek(root) {
+            Some(T0::Slab) => self.set_node(root).parent_or_card,
+            Some(T0::Image(ValNodeImage::Set(n))) => n.parent_or_card,
+            _ => panic!("racine valart {root} absente de la vue T0"),
+        };
+        put_varint(out, card as u64);
+        ser.stack.clear();
+        ser.stack.push((root, 0));
+    }
+
+    /// Sérialise des nœuds du conteneur jusqu'à épuiser `budget` (1 par
+    /// nœud + 1 par entrée ; un nœud est toujours traité en entier).
+    /// Retourne `true` quand le conteneur est fini.
+    ///
+    /// Par nœud : prefetch des entrées, empilement des enfants, prefetch du
+    /// nouveau haut de pile, puis écriture des entrées (en cache).
+    pub fn set_ser_step(&mut self, ser: &mut ValSer, out: &mut Vec<u8>, budget: &mut u32) -> bool {
         let Self { nodes, save, set_collisions: collisions, .. } = self;
-        while let Some((idx, depth)) = stack.pop() {
-            if depth == DISPATCH_LEVELS {
-                collisions.get_t0(idx).iter().for_each(&mut f);
-                continue;
-            }
-            let node: &SetNode = match save.take(idx) {
-                Some(T0::Slab) => unsafe { &nodes.get_unchecked(idx).set },
-                Some(T0::Image(ValNodeImage::Set(n))) => n,
-                _ => panic!("nœud valart {idx} absent de la vue T0"),
-            };
-            for n in 0..node.len() {
-                let slot = node.slot_at(n);
-                f(node.key(slot));
-                let child = node.child(slot);
-                if child != NO_CHILD {
-                    stack.push((child, depth + 1));
+        while let Some((idx, depth)) = ser.stack.pop() {
+            if depth as usize == DISPATCH_LEVELS {
+                let bucket = collisions.get_t0(idx);
+                for k in bucket {
+                    put_bytes(out, k);
                 }
+                *budget = budget.saturating_sub(1 + bucket.len() as u32);
+            } else {
+                let node: &SetNode = match save.take(idx) {
+                    Some(T0::Slab) => unsafe { &nodes.get_unchecked(idx).set },
+                    Some(T0::Image(ValNodeImage::Set(n))) => n,
+                    _ => panic!("nœud valart {idx} absent de la vue T0"),
+                };
+                let len = node.len();
+                for n in 0..len {
+                    let slot = node.slot_at(n);
+                    node.key(slot).prefetch();
+                }
+                for n in 0..len {
+                    let child = node.child(node.slot_at(n));
+                    if child != NO_CHILD {
+                        ser.stack.push((child, depth + 1));
+                    }
+                }
+                if let Some(&(top, d)) = ser.stack.last()
+                    && (d as usize) < DISPATCH_LEVELS
+                {
+                    prefetch_slot(nodes, top);
+                }
+                for n in 0..len {
+                    let slot = node.slot_at(n);
+                    put_bytes(out, node.key(slot));
+                }
+                *budget = budget.saturating_sub(1 + len as u32);
+            }
+            if *budget == 0 {
+                return ser.stack.is_empty();
             }
         }
+        true
     }
 
     /// SMEMBERS : parcours complet. Ordre = ordre du trie, sans signification.

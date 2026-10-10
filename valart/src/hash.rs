@@ -15,8 +15,9 @@ use radixox_lib::shared_byte::SharedByte;
 
 use crate::common::{DISPATCH_LEVELS, Slot, mix64};
 use crate::overflow::{NO_CHILD, swar_find};
-use crate::{HashOverflow, NodeType, ValNode, ValNodeImage, ValTrees};
+use crate::{HashOverflow, NodeType, ValNode, ValNodeImage, ValSer, ValTrees, prefetch_slot};
 use radixox_lib::save_barrier::T0;
+use radixox_lib::varint::{put_bytes, put_varint};
 
 /// Entrées inline max (nœud sans enfant).
 pub(crate) const INLINE_HASH_LEN: usize = 6;
@@ -669,34 +670,70 @@ impl ValTrees {
         Some((k, v))
     }
 
-    /// Parcours de la vue T0 pendant une save (nœuds modifiés lus dans leur
-    /// image). Consomme les nœuds dans la barrière : un conteneur n'est
-    /// parcouru qu'une fois par save. Référence synchrone ; le sérialiseur
-    /// par tranches viendra à l'étape 6.
-    pub fn hash_for_each_t0(&mut self, root: u32, mut f: impl FnMut(&SharedByte, &SharedByte)) {
-        let mut stack = vec![(root, 0usize)];
+    /// Démarre la sérialisation du conteneur `root` pendant une save : écrit
+    /// sa cardinalité T0 et prépare `ser`. Format : `varint nb | (varint len | champ | varint len | valeur)*`.
+    pub fn hash_ser_begin(&mut self, root: u32, ser: &mut ValSer, out: &mut Vec<u8>) {
+        let card = match self.save.peek(root) {
+            Some(T0::Slab) => self.hash_node(root).parent_or_card,
+            Some(T0::Image(ValNodeImage::Hash(n))) => n.parent_or_card,
+            _ => panic!("racine valart {root} absente de la vue T0"),
+        };
+        put_varint(out, card as u64);
+        ser.stack.clear();
+        ser.stack.push((root, 0));
+    }
+
+    /// Sérialise des nœuds du conteneur jusqu'à épuiser `budget` (1 par
+    /// nœud + 1 par entrée ; un nœud est toujours traité en entier).
+    /// Retourne `true` quand le conteneur est fini.
+    ///
+    /// Par nœud : prefetch des entrées, empilement des enfants, prefetch du
+    /// nouveau haut de pile, puis écriture des entrées (en cache).
+    pub fn hash_ser_step(&mut self, ser: &mut ValSer, out: &mut Vec<u8>, budget: &mut u32) -> bool {
         let Self { nodes, save, hash_collisions: collisions, .. } = self;
-        while let Some((idx, depth)) = stack.pop() {
-            if depth == DISPATCH_LEVELS {
-                for (k, v) in collisions.get_t0(idx) {
-                    f(k, v);
+        while let Some((idx, depth)) = ser.stack.pop() {
+            if depth as usize == DISPATCH_LEVELS {
+                let bucket = collisions.get_t0(idx);
+                for (k, v) in bucket {
+                    put_bytes(out, k);
+                    put_bytes(out, v);
                 }
-                continue;
+                *budget = budget.saturating_sub(1 + bucket.len() as u32);
+            } else {
+                let node: &HashNode = match save.take(idx) {
+                    Some(T0::Slab) => unsafe { &nodes.get_unchecked(idx).hash },
+                    Some(T0::Image(ValNodeImage::Hash(n))) => n,
+                    _ => panic!("nœud valart {idx} absent de la vue T0"),
+                };
+                let len = node.len();
+                for n in 0..len {
+                    let slot = node.slot_at(n);
+                    node.key(slot).prefetch();
+                    node.val(slot).prefetch();
+                }
+                for n in 0..len {
+                    let child = node.child(node.slot_at(n));
+                    if child != NO_CHILD {
+                        ser.stack.push((child, depth + 1));
+                    }
+                }
+                if let Some(&(top, d)) = ser.stack.last()
+                    && (d as usize) < DISPATCH_LEVELS
+                {
+                    prefetch_slot(nodes, top);
+                }
+                for n in 0..len {
+                    let slot = node.slot_at(n);
+                    put_bytes(out, node.key(slot));
+                    put_bytes(out, node.val(slot));
+                }
+                *budget = budget.saturating_sub(1 + len as u32);
             }
-            let node: &HashNode = match save.take(idx) {
-                Some(T0::Slab) => unsafe { &nodes.get_unchecked(idx).hash },
-                Some(T0::Image(ValNodeImage::Hash(n))) => n,
-                _ => panic!("nœud valart {idx} absent de la vue T0"),
-            };
-            for n in 0..node.len() {
-                let slot = node.slot_at(n);
-                f(node.key(slot), node.val(slot));
-                let child = node.child(slot);
-                if child != NO_CHILD {
-                    stack.push((child, depth + 1));
-                }
+            if *budget == 0 {
+                return ser.stack.is_empty();
             }
         }
+        true
     }
 
     /// HGETALL / HKEYS / HVALS : parcours complet, ordre sans signification.
@@ -884,9 +921,6 @@ impl ValTrees {
 
 #[cfg(test)]
 mod tests {
-    use radixox_lib::save_barrier::T0;
-
-    use crate::ValNodeImage;
     use super::*;
     use std::collections::HashMap;
 
@@ -917,22 +951,36 @@ mod tests {
         old
     }
 
-    /// Une étape du parcours T0 : lit le nœud `idx` (slab ou image),
-    /// collecte ses entrées et empile ses enfants.
-    fn visit_t0(t: &mut ValTrees, idx: u32, got: &mut Vec<(Vec<u8>, Vec<u8>)>, stack: &mut Vec<u32>) {
-        let ValTrees { nodes, save, .. } = t;
-        let node: &HashNode = match save.take(idx) {
-            Some(T0::Slab) => unsafe { &nodes.get_unchecked(idx).hash },
-            Some(T0::Image(ValNodeImage::Hash(n))) => n,
-            _ => panic!("nœud {idx} absent de la vue T0"),
-        };
-        for n in 0..node.len() {
-            let slot = node.slot_at(n);
-            got.push((node.key(slot).to_vec(), node.val(slot).to_vec()));
-            if node.child(slot) != NO_CHILD {
-                stack.push(node.child(slot));
+    /// Sérialise le Hash `root` pendant une save, tranche par tranche
+    /// (`budget` par tranche, `between` appelé entre deux tranches), et
+    /// décode le résultat.
+    fn ser_all(
+        t: &mut ValTrees,
+        root: u32,
+        budget: u32,
+        mut between: impl FnMut(&mut ValTrees),
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        use radixox_lib::varint::{get_bytes, get_varint};
+        let (mut out, mut ser) = (Vec::new(), crate::ValSer::default());
+        t.hash_ser_begin(root, &mut ser, &mut out);
+        loop {
+            let mut b = budget;
+            if t.hash_ser_step(&mut ser, &mut out, &mut b) {
+                break;
             }
+            between(t);
         }
+        let mut pos = 0;
+        let n = get_varint(&out, &mut pos).unwrap();
+        let mut got: Vec<_> = (0..n)
+            .map(|_| {
+                let k = get_bytes(&out, &mut pos).unwrap().to_vec();
+                (k, get_bytes(&out, &mut pos).unwrap().to_vec())
+            })
+            .collect();
+        assert_eq!(pos, out.len());
+        got.sort();
+        got
     }
 
     /// Un conteneur sérialisé sur plusieurs tranches : la racine est déjà
@@ -954,16 +1002,16 @@ mod tests {
         expect.sort();
 
         t.begin_save();
-        let (mut got, mut stack) = (Vec::new(), Vec::new());
-        visit_t0(&mut t, root, &mut got, &mut stack); // tranche 1 : la racine
-        for i in 0..6 {
-            assert!(t.hash_remove(root, format!("f{i}").as_bytes()));
-        }
-        while let Some(idx) = stack.pop() {
-            visit_t0(&mut t, idx, &mut got, &mut stack); // tranches suivantes
-        }
+        // Budget 1 : la racine est écrite seule dans la première tranche.
+        let mut first = true;
+        let got = ser_all(&mut t, root, 1, |t| {
+            if std::mem::take(&mut first) {
+                for i in 0..6 {
+                    assert!(t.hash_remove(root, format!("f{i}").as_bytes()));
+                }
+            }
+        });
         t.finish_save();
-        got.sort();
         assert_eq!(got, expect);
         assert_eq!(t.hash_len(root), 0);
     }
@@ -983,17 +1031,19 @@ mod tests {
         expect.sort();
 
         t.begin_save();
-        for i in (0..40).step_by(2) {
-            assert!(t.hash_remove(root, format!("f{i}").as_bytes()));
-        }
-        for i in 40..60 {
-            t.hash_set(root, sb(format!("f{i}")), sb("nouveau"));
-        }
-        assert!(!t.hash_set(root, sb("f39"), sb("écrasé")));
-        let mut got = Vec::new();
-        t.hash_for_each_t0(root, |k, v| got.push((k.to_vec(), v.to_vec())));
+        let mut first = true;
+        let got = ser_all(&mut t, root, 1, |t| {
+            if std::mem::take(&mut first) {
+                for i in (0..40).step_by(2) {
+                    assert!(t.hash_remove(root, format!("f{i}").as_bytes()));
+                }
+                for i in 40..60 {
+                    t.hash_set(root, sb(format!("f{i}")), sb("nouveau"));
+                }
+                assert!(!t.hash_set(root, sb("f39"), sb("écrasé")));
+            }
+        });
         t.finish_save();
-        got.sort();
         assert_eq!(got, expect);
         t.hash_check(root);
     }

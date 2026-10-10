@@ -235,6 +235,15 @@ dump.tmp/
 - Buckets de collision copiés en profondeur au T0 (test `save_collision_buckets_t0`).
 - Reste en TODO : vider la liste différée par tranches (aujourd'hui d'un coup à `finish_save`).
 
+### Étape 5 faite (+ format de l'étape 7 et tranches de l'étape 6), 2026-10-10
+- Le DFS écrit directement le binaire (pas de couche intermédiaire) : `OxidArt::save_start(out) -> SaveCursor` (fige T0, écrit en-tête + section ZSet/List), `save_step(cur, out, budget) -> bool` (tranche), `finish_save()`. Un pas : `take` T0, prefetch de la valeur, chemin, enfants empilés, prefetch du nouveau haut de pile, puis écriture de l'enregistrement. `lcp = min(min_trunc, prev_len)` en O(1).
+- Hash/Set : `ValSer` + `hash_ser_begin/step`, `set_ser_begin/step` (monomorphes, reprenables, prefetch des entrées et du haut de pile ; cardinalité T0 lue par `SaveBarrier::peek`).
+- Format v1 dans `save.rs::format` : un seul flux `en-tête | section ZSet/List | enregistrements | T_END` (la section ZSet/List est dans le même flux, plus de `zl.rxd`). Varints à préfixe : `radixox_lib::varint`.
+- `parse_dump(buf) -> Dump` (servira au reload). Le DFS de référence de test et `*_for_each_t0` sont supprimés : tous les tests passent par le chemin binaire (`save.rs::reference::{save_all, expected, decoded}`).
+- Tests : aller-retour avec tranches de budget aléatoire et mutations entre tranches (TTL compris), compression lcp, rejet des dumps corrompus.
+- Mesure (`oxidart/examples/save_bench.rs`, 1M insertions ≈ 880k clés, valeurs 100 B, sans I/O) : String 149 ms / 93 MB, Hash 1 champ 276 ms / 100 MB.
+- Reste : fichier + I/O io_uring + crc32c + MANIFEST + rename (étape 7), BGSAVE/SAVE côté serveur, reload (étape 8), vidage par tranches de la liste différée.
+
 ## 5quinquies. Méthode de travail
 
 - **Tests** : mono-thread obligatoire (`RUST_TEST_THREADS=1` dans `.cargo/config.toml`, statics globaux). `cargo test -p radixox-lib -p oxidart -p valart`.
@@ -248,7 +257,7 @@ dump.tmp/
 2. ✅ Points de passage valart, même principe.
 3. ✅ `SaveBarrier` avec closure de capture, `NodeImage` / `ValNodeImage`, barrières branchées.
 4. ✅ Liste différée, drop différé des conteneurs, pause de l'évicteur, waker UNLINK, copie profonde des buckets au T0 (reste : vidage par tranches).
-5. DFS (synchrone d'abord) et test aléatoire sur un vrai `OxidArt` (SET, DEL, HSET, SADD, UNLINK, expirations mélangés aux pas de la save) comparé à l'état T0, sous ASan.
+5. ✅ DFS (synchrone d'abord) et test aléatoire sur un vrai `OxidArt` (SET, DEL, HSET, SADD, UNLINK, expirations mélangés aux pas de la save) comparé à l'état T0, sous ASan.
 6. DFS par tranches + prefetch (valeur, compression, overflow, haut de pile), testé contre le DFS synchrone ; bench ns/clé.
 7. Format, fichier de données, crc32c, section ZSet/List, MANIFEST, I/O.
 8. Reload en masse depuis le fichier, et test aller-retour.

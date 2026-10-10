@@ -11,3 +11,4 @@ pub mod small_vec;
 #[cfg(test)]
 mod test;
 pub mod thin_vec;
+pub mod varint;

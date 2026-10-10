@@ -135,6 +135,16 @@ pub(crate) fn zset_mut(idx: u32) -> &'static mut InnerZCommand {
     zset_slab().get_mut(idx).unwrap()
 }
 
+/// Parcourt tous les ZSet du slab (section ZSet de la save).
+pub(crate) fn for_each_zset(f: impl FnMut(u32, &InnerZCommand)) {
+    zset_slab().for_each_occupied(f);
+}
+
+/// Parcourt toutes les List du slab (section List de la save).
+pub(crate) fn for_each_list(f: impl FnMut(u32, &VecDeque<SharedByte>)) {
+    list_slab().for_each_occupied(f);
+}
+
 pub(crate) fn alloc_list(val: VecDeque<SharedByte>) -> u32 {
     list_slab().insert(val)
 }

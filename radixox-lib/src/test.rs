@@ -519,3 +519,15 @@ fn cmd_invalid_returns_none() {
     let r = resp(&[b"FOOBAR"]); // commande inconnue
     assert!(matches!(Cmd::from_slice(&r), Some(Cmd::Unknown)));
 }
+
+/// Au-delà de u16::MAX clones, le compteur sature : plus de libération
+/// prématurée (avant : retour à 0, use-after-free).
+#[test]
+fn shared_byte_rc_saturates() {
+    let a = SharedByte::from_str("valeur partagée");
+    let clones: Vec<SharedByte> = (0..70_000).map(|_| a.clone()).collect();
+    assert_eq!(a.rc(), u16::MAX);
+    drop(clones);
+    assert_eq!(a.rc(), u16::MAX);
+    assert_eq!(a.as_slice(), b"valeur partag\xc3\xa9e");
+}

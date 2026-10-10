@@ -55,6 +55,22 @@ impl Drop for ValNode {
     }
 }
 
+/// Curseur de sérialisation d'un conteneur (Hash ou Set), reprenable d'une
+/// tranche à l'autre : seuls des idx `(nœud ou bucket, profondeur)` y
+/// restent entre deux appels. Réutilisable (capacité gardée).
+#[derive(Default)]
+pub struct ValSer {
+    stack: Vec<(u32, u8)>,
+}
+
+/// Prefetch des 128 B d'un nœud du slab (occupé ou non : la zone est mappée).
+#[inline(always)]
+fn prefetch_slot(nodes: &HiSlab<ValNode>, idx: u32) {
+    let p = unsafe { nodes.get_unchecked(idx) } as *const ValNode as *const u8;
+    radixox_lib::prefetch::prefetch_l1(p);
+    radixox_lib::prefetch::prefetch_l1(unsafe { p.add(64) });
+}
+
 /// Image T0 d'un nœud valart (SAVE_DESIGN.md §2.A) : copie bit à bit, bloc
 /// overflow copié, entrées non clonées. Sûr parce que valart ne détruit
 /// aucune entrée pendant une save (liste différée, §2.B).
