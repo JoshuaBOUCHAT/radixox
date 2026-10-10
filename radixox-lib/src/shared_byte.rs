@@ -68,6 +68,12 @@ impl SharedByte {
         unsafe { self.len_ptr().read() as usize }
     }
 
+    /// Prefetch de l'en-tête et du début des données.
+    #[inline]
+    pub fn prefetch(&self) {
+        crate::prefetch::prefetch_l1(self.ptr.as_ptr());
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -123,10 +129,14 @@ impl SharedByte {
 impl Clone for SharedByte {
     #[inline]
     fn clone(&self) -> Self {
+        // Saturation (comme les refcount du noyau) : à u16::MAX le compteur
+        // ne bouge plus et le bloc n'est jamais libéré. Une fuite plutôt
+        // qu'un use-after-free si une valeur est clonée plus de 65 535 fois.
         unsafe {
             let rc = self.rc_ptr();
-            debug_assert!(*rc < u16::MAX, "rc overflow");
-            *rc += 1;
+            if *rc != u16::MAX {
+                *rc += 1;
+            }
         }
 
         Self { ptr: self.ptr }
@@ -138,6 +148,9 @@ impl Drop for SharedByte {
     fn drop(&mut self) {
         unsafe {
             let rc = self.rc_ptr();
+            if *rc == u16::MAX {
+                return; // saturé : immortel
+            }
             *rc -= 1;
             if *rc == 0 {
                 mi_free(self.ptr.as_ptr() as *mut u8);
