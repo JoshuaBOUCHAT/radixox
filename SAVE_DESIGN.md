@@ -113,22 +113,62 @@ Audit : plus aucun `map.get_mut`, `map.remove` ou `nodes.get_unchecked_mut` hors
 
 - **DFS** (jamais BFS : la frontière d'un BFS peut contenir des millions de feuilles).
 - **Un seul DFS classique** : une pile, un buffer de chemin (préfixe de la clé courante), un buffer de sortie. Pas de voies multiples ni de vol de travail (décision 2026-10-10, voir §5ter).
-- **Un pas** : pop d'un idx → `barrier.take(idx)` → lire le nœud (image ou vivant) → **prefetch** de la valeur heap (`SharedByte`), de la compression heap et du bloc overflow s'il y en a → empiler les enfants → **prefetch du nouveau haut de pile** (dernier enfant empilé, ou frère déjà présent si le nœud est une feuille) → revenir sur la valeur et sérialiser l'enregistrement.
-- Recouvrement : le nœud suivant est en vol pendant la sérialisation du courant. Les premiers nœuds d'une branche restent séquentiels, c'est accepté. Le bloc overflow peut quand même fauter (lu juste après son prefetch pour empiler les enfants) : accepté en v1.
-- **La pile DFS ne contient que des nœuds oxidart** : frame `Ox{idx, depth, radix}`. Pas de pile polymorphique.
-- **Conteneurs : deux sérialiseurs monomorphes, `HashSer` et `SetSer`** (un arbre valart ne contient qu'un type), chacun avec sa pile d'idx valart et ses buckets de collision, et une boucle interne sans test de type :
-  ```rust
-  struct HashSer { stack: Vec<u32>, .. }   // idem SetSer
-  fn step(&mut self, budget: &mut u32, out: &mut Out) -> Poll<()>;  // Ready = conteneur fini
-  ```
-  Le DFS garde au plus un sérialiseur en cours (`Option` d'un enum à deux variantes, ou deux champs `Option`) : le choix Hash/Set se fait **une fois par démarrage ou reprise**, jamais par nœud ni par entrée. Si `HashSer` et `SetSer` restent copiés l'un de l'autre comme `hash.rs`/`set.rs`, un `ValSer<K>` générique monomorphisé est équivalent.
-  Quand le DFS tombe sur une clé Hash/Set, il écrit l'en-tête de l'enregistrement (tag, lcp, suffixe, TTL, cardinalité T0) puis démarre le sérialiseur. Au début de chaque tranche, s'il y en a un en cours, on le reprend avant de dépiler un nouveau nœud oxidart. Un gros conteneur s'étale donc sur plusieurs tranches dans le même flux, sans découpage.
+- **Visite d'un nœud** (`save_node`) : pop d'une frame → `barrier.take(idx)` → lire le nœud (slab ou image) → **prefetch de la valeur** (bloc `SharedByte`, ou racine valart d'un Hash/Set) → étendre le chemin avec la compression → empiler les enfants → **prefetch du nouveau haut de pile** → encoder l'en-tête de l'enregistrement et le **mettre en attente** (pas encore écrit). Voir §4bis.
+- **Écriture différée** (`emit_oldest`) : un enregistrement est écrit `PIPE_DEPTH = 2` enregistrements après sa visite, quand sa valeur est en cache. Pour un conteneur, la visite intermédiaire prefetch ses entrées.
+- Le bloc overflow d'oxidart et une compression heap peuvent encore fauter (lus juste après la visite) : accepté.
+- **La pile DFS ne contient que des nœuds oxidart** : `Frame { idx, depth, radix }`. Pas de pile polymorphique.
+- **Conteneurs : sérialiseurs monomorphes** `hash_ser_begin/step` et `set_ser_begin/step` (valart), un curseur `ValSer` (pile d'idx valart) partagé. Le DFS garde au plus un conteneur en cours (`Container::{None, Hash, Set}`) : le choix Hash/Set se fait une fois par démarrage ou reprise, jamais par entrée. `*_ser_begin` écrit la cardinalité T0 (lue par `SaveBarrier::peek`, sans consommer la racine) ; `*_ser_step` traite des nœuds entiers jusqu'à épuiser le budget (par nœud : prefetch des entrées, enfants empilés, prefetch du haut de pile, écriture). Un gros conteneur s'étale sur plusieurs tranches dans le même flux, sans découpage.
 - **Un nœud (oxidart ou valart) est traité en entier dans une tranche** : le budget peut déborder d'un nœud. Après une pause, seuls des idx restent dans les deux piles.
 - Ordre des frères indifférent : seule la contiguïté des sous-arbres compte (voir §5).
-- **Tranches** : la save est une task monoio ; elle fait une tranche puis `yield_now().await` (comme `deln_async`). Elle rend la main quand un budget de travail est épuisé, pas après N nœuds. Budget partagé entre le DFS et le sérialiseur de conteneur. Coûts : 1 par nœud lu (oxidart ou valart), 1 par bloc annexe lu (overflow, compression heap, bucket de collision), 1 par valeur/champ/membre écrit, +1 par 4 KB copiés pour une grosse valeur. Constante `SAVE_TRANCHE_BUDGET = 1024`, à ajuster sur le p99.99 de memtier pendant une save.
+- **Tranches** : la save est une task monoio ; elle fait une tranche puis `yield_now().await` (comme `deln_async`). Elle rend la main quand un budget de travail est épuisé, pas après N nœuds. Budget partagé entre le DFS et le sérialiseur de conteneur. Coûts : 1 par nœud lu (oxidart ou valart), 1 par bloc annexe lu (overflow, compression heap, bucket de collision), 1 par valeur/champ/membre écrit, +1 par 4 KB copiés pour une grosse valeur. Constante `SAVE_TRANCHE_BUDGET = 1024` (à créer côté serveur), à ajuster sur le p99.99 de memtier pendant une save.
 - Clés expirées au T0 : non écrites.
 
 Mesures (10M nœuds, idx mélangés, parcours seul sans sérialisation) : linéaire 3,9 ns/nœud ; DFS strict + prefetch des enfants 13,4 ; 16 voies 11,1 ; 32 voies 10,6 ; plancher matériel aléatoire ~7 ns/ligne. L'écart DFS/voies (~3 ns/nœud, ~30 ms pour 10M) devient marginal une fois la sérialisation ajoutée, et la save tourne par tranches : sa durée totale compte peu.
+
+## 4bis. Pipeline d'écriture : algorithme et invariants
+
+Code : `oxidart/src/save.rs` (`save_step`, `save_node`, `emit_oldest`, `SaveCursor`, `Pending`, `PVal`). Mesure : −25 % sur les String, −42 % sur les Hash à 1 champ (1M clés).
+
+### Pourquoi
+Sans pipeline, un enregistrement est écrit à la fin de sa propre visite. Pour une String, le prefetch de la valeur n'a que l'empilement des enfants pour se masquer. Pour un Hash, c'est pire : la racine valart, puis le champ et la valeur (dont on ne connaît l'adresse qu'après avoir lu la racine) sont trois accès dépendants, payés en série.
+
+### Algorithme
+`SaveCursor::pending` est une file (FIFO) d'au plus `PIPE_DEPTH + 1 = 3` enregistrements visités mais pas encore écrits. Chaque enregistrement en attente (`Pending`) contient :
+- `head` : l'en-tête déjà encodé (tag, lcp, longueur du suffixe, TTL, suffixe), buffer recyclé ;
+- `val` (`PVal`) : de quoi écrire la valeur plus tard (`Bytes`, `Int`, racine `Hash`/`Set`, idx `ZSet`/`List`).
+
+```
+visite k     : take, prefetch valeur (SharedByte ou racine valart), enfants, en-tête → file
+               si la file a ≥ 2 éléments : warm(file[n-2])   // conteneur visité à k-1 :
+                                                             // racine en cache → prefetch entrées
+               si la file a > 2 éléments : emit_oldest()     // écrit l'enregistrement de k-2
+pile vide    : warm(file[1]) puis emit_oldest(), jusqu'à vider la file ; puis T_END
+conteneur    : emit_oldest d'un Hash/Set écrit l'en-tête + la cardinalité et démarre son
+               sérialiseur ; save_step le termine (sur plusieurs tranches s'il le faut)
+               avant toute autre écriture ou visite
+```
+
+### Invariants (à respecter par toute modification de ce code)
+
+**I1 — Ordre.** Les enregistrements sont écrits exactement dans l'ordre de leur visite DFS : la file est une FIFO, et un conteneur démarré bloque la file jusqu'à sa fin (`cur.container` est traité en tête de boucle, avant toute visite ou écriture). C'est ce qui rend le **lcp calculé à la visite** valide à l'écriture : `prev_len` et `min_trunc` sont mis à jour à la visite, jamais à l'écriture.
+
+**I2 — Aucune mutation pendant une tranche.** `save_step` tient `&mut OxidArt` du début à la fin ; valart (global) n'est touché que par `take`/`peek`/sérialiseurs. Toutes les mutations de la base ont lieu **entre** deux appels à `save_step`. C'est l'hypothèse qui rend I3 sûr. Ne jamais appeler une commande, un `yield`, ou quoi que ce soit qui mute l'arbre à l'intérieur d'une tranche.
+
+**I3 — Copie sans refcount = durée de vie d'une tranche.** `PVal::Bytes { owned: false }` est une copie bit à bit de la `SharedByte` d'un nœud lu dans le **slab** (`T0::Slab`). Elle ne possède rien : elle reste valide seulement tant que le nœud n'est pas modifié, c'est-à-dire jusqu'à la fin de la tranche (I2). Après le `take`, le nœud n'est plus intact : une mutation ultérieure ne le capturerait pas et pourrait libérer la valeur. D'où I5.
+
+**I4 — Valeur lue dans une image : clone immédiat.** Une image n'existe que jusqu'au `take` suivant (`SaveBarrier::last`). La `SharedByte` d'un nœud lu en `T0::Image` est donc clonée (`owned: true`) dès la visite.
+
+**I5 — `own_pending()` avant toute pause.** Chaque `return false` de `save_step` (budget épuisé, conteneur pas fini) appelle `cur.own_pending()`, qui clone les copies sans refcount. Entre deux tranches, `pending` ne contient que des valeurs possédées, des entiers et des idx. **Tout nouveau point de sortie de `save_step` doit faire de même.** Contrôle négatif : sans `own_pending`, use-after-free sous ASan dans `test_save`.
+
+**I6 — Conteneur en attente = un idx de racine, consommé seulement à l'écriture.** `PVal::Hash/Set(root)` ne garde que l'idx. La racine reste dans la vue T0 (intacte ou en image) jusqu'à son `take` par `*_ser_step` : `warm` et `*_ser_begin` utilisent `peek`, jamais `take`. L'idx reste valide entre les tranches grâce à la barrière valart et au drop différé des conteneurs (§2.B).
+
+**I7 — Le prefetch ne lit que la vue T0.** `prefetch_root_entries` passe par `peek` : il lit l'image si le nœud a été modifié, sinon le slab. Il ne fait que des prefetch (aucune donnée lue n'est utilisée), mais il déréférence des pointeurs d'entrées : il doit donc lire une version valide du nœud, jamais le vivant d'un nœud capturé.
+
+**I8 — Fin.** `T_END` n'est écrit que si la pile est vide, la file vide et aucun conteneur en cours.
+
+**I9 — Granularité.** Une tranche ne s'arrête jamais au milieu d'un nœud (oxidart ou valart) ni d'un enregistrement : le budget peut être dépassé d'un nœud plus un enregistrement. Entre deux tranches : seulement des idx dans les piles, le chemin courant, et la file (I5).
+
+**I10 — Abandon.** Dropper un `SaveCursor` entre deux tranches est sûr (valeurs possédées, `PVal::drop`). `finish_save` libère les images et la liste différée.
 
 ## 5. Format et fichiers
 
@@ -244,10 +284,8 @@ dump.tmp/
 - Mesure (`oxidart/examples/save_bench.rs`, 1M insertions ≈ 880k clés, valeurs 100 B, sans I/O) : String 149 ms / 93 MB, Hash 1 champ 276 ms / 100 MB.
 - Reste : fichier + I/O io_uring + crc32c + MANIFEST + rename (étape 7), BGSAVE/SAVE côté serveur, reload (étape 8), vidage par tranches de la liste différée.
 
-### Pipeline d'écriture (branche `save-pipeline`, 2026-10-10)
-- Un enregistrement est écrit `PIPE_DEPTH = 2` enregistrements après sa visite : visite k = prefetch de la valeur (bloc `SharedByte` ou racine valart) ; visite k+1 = conteneur → racine en cache, prefetch de ses entrées (`ValTrees::prefetch_root_entries`) ; visite k+2 = écriture. En-tête (tag, lcp, suffixe, TTL) encodé à la visite, ordre DFS inchangé.
-- Valeurs en attente : copie bit à bit de la `SharedByte` du slab (sans refcount, valide pendant la tranche), clone possédé si elle vient d'une image (droppée au `take` suivant), et `own_pending()` clone tout avant de rendre la main. Contrôle négatif sans `own_pending` : use-after-free sous ASan.
-- Mesure (1M insertions) : String 149–162 → 118–122 ms, Hash 1 champ 256 → 147 ms.
+### Pipeline d'écriture (2026-10-10, mergé)
+- Voir §4bis (algorithme et invariants I1–I10). Mesure (1M insertions) : String 149–162 → 118–122 ms, Hash 1 champ 256 → 147 ms.
 
 ## 5quinquies. Méthode de travail
 

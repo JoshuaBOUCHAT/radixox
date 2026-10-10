@@ -1,4 +1,30 @@
-//! Save progressive, côté oxidart : images T0 des nœuds (SAVE_DESIGN.md §2.A).
+//! Save progressive, côté oxidart : images T0 des nœuds (SAVE_DESIGN.md §2.A),
+//! DFS qui sérialise directement le format binaire (§4, §5) et lecture du
+//! dump.
+//!
+//! # Pipeline d'écriture (SAVE_DESIGN.md §4bis)
+//!
+//! Un enregistrement est visité (`save_node` : `take` T0, prefetch de la
+//! valeur, enfants, en-tête encodé) puis mis en attente dans
+//! `SaveCursor::pending` ; il est écrit (`emit_oldest`) `PIPE_DEPTH`
+//! enregistrements plus tard, quand sa valeur est en cache. Pour un Hash/Set,
+//! la visite intermédiaire prefetch les entrées de la racine (`warm`).
+//!
+//! Invariants (détail et justification dans SAVE_DESIGN.md §4bis) :
+//! - **I1 ordre** : FIFO + conteneur bloquant ⇒ écriture dans l'ordre de
+//!   visite ; le lcp est calculé à la visite.
+//! - **I2** : aucune mutation de la base pendant une tranche (`save_step`).
+//! - **I3** : `PVal::Bytes { owned: false }` (copie sans refcount d'une
+//!   valeur du slab) ne vit que pendant la tranche.
+//! - **I4** : valeur lue dans une image ⇒ clone immédiat (image droppée au
+//!   `take` suivant).
+//! - **I5** : `own_pending()` avant **chaque** `return false` de `save_step`.
+//! - **I6** : conteneur en attente = idx de racine ; `peek` jusqu'à l'écriture,
+//!   `take` seulement dans `*_ser_step`.
+//! - **I7** : les prefetch ne lisent que la vue T0 (`peek`).
+//! - **I8** : `T_END` seulement si pile, file et conteneur sont vides.
+//! - **I9** : jamais de pause au milieu d'un nœud ou d'un enregistrement.
+//! - **I10** : dropper un `SaveCursor` entre deux tranches est sûr.
 
 use std::mem::ManuallyDrop;
 
@@ -405,12 +431,12 @@ impl OxidArt {
                 Container::Set => valart().set_ser_step(&mut cur.ser, out, &mut budget),
             };
             if !finished {
-                cur.own_pending();
+                cur.own_pending(); // I5
                 return false;
             }
             cur.container = Container::None;
             if budget == 0 {
-                cur.own_pending();
+                cur.own_pending(); // I5
                 return false;
             }
             match cur.stack.pop() {
@@ -504,6 +530,7 @@ impl OxidArt {
             Tag::List => format::T_LIST,
             Tag::None => unreachable!(),
         };
+        // I1 : lcp calculé à la visite, valide à l'écriture (ordre FIFO).
         let lcp = cur.min_trunc.min(cur.prev_len);
         let ttl = exp.map(|e| e - t0);
         let mut head = cur.spare.pop().unwrap_or_default();
@@ -517,11 +544,12 @@ impl OxidArt {
         head.extend_from_slice(&cur.path[lcp..]);
         let val = unsafe {
             match tag {
-                // L'image est droppée au prochain `take` : clone possédé.
+                // I4 : l'image est droppée au prochain `take` : clone possédé.
                 Tag::Bytes if from_image => PVal::Bytes {
                     sb: ManuallyDrop::new((*val.bytes).clone()),
                     owned: true,
                 },
+                // I3 : copie sans refcount, valide jusqu'à la fin de la tranche.
                 Tag::Bytes => PVal::Bytes {
                     sb: ManuallyDrop::new(std::ptr::read(&*val.bytes)),
                     owned: false,
