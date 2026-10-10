@@ -203,8 +203,18 @@ dump.tmp/
 ### Contiguïté des préfixes et reload en masse
 - **Pas de tri entre frères.** Le DFS garantit qu'un sous-arbre est écrit d'un bloc : toutes les clés sous un préfixe sont contiguës (`user:1…` juste après `user:`), quel que soit l'ordre `user:b, user:c, user:a`. C'est tout ce qu'il faut : dans oxidart, l'ordre entre frères n'a pas d'importance.
 - **Reload en masse** : clés codées par rapport à la précédente (`lcp` + suffixe) ; le constructeur garde la pile des nœuds ouverts, remonte à la profondeur `lcp` et ajoute la suite comme nouvel enfant. Pas de recherche ni de split par clé, nœuds alloués dans l'ordre DFS. Le fichier est un seul flux depuis la racine.
+- **Zéro split (décidé 2026-10-10)** : le constructeur lit un enregistrement d'avance. Pour chaque clé il connaît alors `lcp` avec la précédente et avec la suivante ; le nœud de la clé commence à `max(lcp_préc, lcp_suiv)`, donc chaque nœud est créé directement avec sa compression finale (construction de trie par tableau LCP). Aucun nœud n'est repris après création.
+- **Clés expirées au reload** : on les saute sans casser le chaînage, car en ordre DFS `lcp(A, C) = min(lcp(A, B), lcp(B, C))` (profondeur de l'ancêtre commun) ; le constructeur garde ce minimum à travers les clés sautées.
+- Comparaison Redis : chargement par `dictAdd` (taille pré-annoncée par `RESIZEDB`, mais un accès aléatoire au tableau de buckets par clé, donc un défaut de cache par clé dès qu'il dépasse le cache). Ici : parent en haut de pile, nœuds alloués à la suite dans le HiSlab, sous-arbres contigus en mémoire après le reload. Coût dominant attendu : l'allocation des valeurs (`mi_malloc`, ~20–50 ns par valeur). À mesurer à l'étape 8.
 - Le T0 (et l'unité du TTL) est dans le `MANIFEST` **et** dans l'en-tête de `data.rxd`, pour qu'un fichier se lise seul.
-- Compression (lz4/zstd en flux) plus tard. Écriture : buffers de 256 KB–1 MB soumis à io_uring dès qu'ils sont pleins ; ordre temp → fsync → rename.
+- Écriture : buffers de 256 KB–1 MB soumis à io_uring dès qu'ils sont pleins ; ordre temp → fsync → rename.
+
+### Compression (décidé 2026-10-10)
+- **v1 : dump brut**, sans compression. La barrière se ferme dès la fin de la save brute (~135 ms pour 1M clés sous charge, ~48 ms à vide).
+- **Ensuite, compression après coup, en option** : `save-compression none | task | thread`. `task` = tâche découpée sur le thread de service, compression légère (LZ4 / zstd 1) ; `thread` = thread dédié, niveau élevé (zstd 9–19). Elle relit `data.rxd` et écrit `data.rxd.zst`, puis MANIFEST à jour et rename : le dump brut reste valide si la compression échoue ou est interrompue. Coûts : double écriture disque, deux fichiers sur disque le temps de la compression ; zstd 19 ≈ 5–10 MB/s (20–30 min pour 10 GB), à mesurer contre zstd 9–12 sur des données réelles.
+- **Format compressé** : le flux brut découpé en morceaux de taille fixe (1–4 MB) **sans tenir compte des enregistrements**, chacun compressé seul : `u8 algo (raw | lz4 | zstd) | varint len_brut | varint len_compressé | données`. La concaténation des morceaux décompressés redonne exactement le flux v1, lu comme aujourd'hui (lcp inchangé). Un morceau qui ne gagne rien reste `raw`. Le crc32c du MANIFEST porte sur le flux brut.
+- **Reload** : la décompression (≈ 1,2 GB/s zstd, ≈ 4 GB/s LZ4, quel que soit le niveau) se fait sur un thread qui précède la reconstruction de l'ART (au démarrage, rien n'est servi) : masquée tant qu'elle est plus rapide que l'insertion.
+- Écartés pour l'instant : compression au fil de l'eau dans un thread via un canal borné (garde la barrière ouverte au rythme du compresseur, à reconsidérer avec zstd 1) ; compression par valeur façon Redis (allonge les tranches, mauvais ratio sur petites valeurs) ; dictionnaire zstd (inutile avec des morceaux de 1–4 MB).
 
 ## 5bis. Comportement côté serveur (valeurs par défaut)
 
@@ -287,11 +297,39 @@ dump.tmp/
 ### Pipeline d'écriture (2026-10-10, mergé)
 - Voir §4bis (algorithme et invariants I1–I10). Mesure (1M insertions) : String 149–162 → 118–122 ms, Hash 1 champ 256 → 147 ms.
 
-### BGSAVE minimal + test de stress (2026-10-10, en cours)
-- `BGSAVE` (parser `Cmd::BgSave`, `resp.rs`, `resp_cmd/delayed.rs::bgsave_task`) : task monoio, tranches de `SAVE_TRANCHE_BUDGET = 1024`, `yield` entre deux tranches ; le dump est sérialisé en mémoire puis **jeté** (pas d'I/O, étape 7). Log serveur : `[bgsave] X MB en T, N tranches, tranche max M`. monoio repasse par io_uring après `2 × nb_tâches` tâches (`max_round`), donc la save ne peut pas affamer les connexions.
+### BGSAVE minimal + test de stress (2026-10-10)
+- `BGSAVE` (parser `Cmd::BgSave`, `resp.rs`, `resp_cmd/delayed.rs::bgsave_task`) : task monoio, tranches de `SAVE_TRANCHE_BUDGET = 512` (1024 au départ), `yield` entre deux tranches ; le dump est sérialisé en mémoire puis **jeté** (pas d'I/O, étape 7). Log serveur : `[bgsave] X MB en T, N tranches, tranche max M`. monoio repasse par io_uring après `2 × nb_tâches` tâches (`max_round`), donc la save ne peut pas affamer les connexions.
 - Script `scripts/stress_save.sh` (~45 s au total) : load 1M clés 100 B, puis 15 s de 80 % GET / 20 % SET (memtier 4×20, serveur CPU 0-1), sans puis avec BGSAVE lancé 1 s après le début du run.
-- Résultat partiel (sans save seulement, le run avec save n'a pas abouti) : load 185 882 SET/s ; run 187 644 ops/s, GET p99 0,575 ms, p99.9 0,847 ms, p99.99 1,351 ms.
-- **À faire** : run « avec save » (durée de la save sous charge, tranche max, impact p99/p99.99). Attention, lancer `systemd-run --scope` dans un pipe a renvoyé des 143 : écrire dans un fichier.
+- Script `scripts/stress_save.sh` : `MODES="nosave save"` et `RUN_TIME` (s) en variables. Bug corrigé : le `wait` attendait aussi le serveur lancé en `&`, donc le script ne rendait jamais la main ; il n'attend plus que le `redis-cli BGSAVE`.
+- Résultats (1M clés 100 B ; sans save : run 15 s ; avec save : run 8 s, BGSAVE à t+1 s) :
+
+  | | sans save | avec save |
+  |--|--|--|
+  | load | 185 882 SET/s | 187 205 SET/s |
+  | run | 187 644 ops/s | 195 076 ops/s |
+  | GET p99 | 0,575 ms | 0,471 ms |
+  | GET p99.9 | 0,847 ms | 0,671 ms |
+  | GET p99.99 | 1,351 ms | **9,727 ms** |
+
+  BGSAVE sous charge : 105 MB en 79 ms, 2050 tranches, tranche max 4,3 ms. Pic mémoire du scope serveur 193,5 MB, aucun OOM kill (journal noyau sur 7 jours).
+- Re-run même environnement, 2 × 8 s de run (32 s au total) : sans save 165 936 ops/s, GET p99 0,783 / p99.9 1,047 / p99.99 2,143 ms ; avec save 168 494 ops/s, GET p99 0,695 / p99.9 1,055 / p99.99 **5,279 ms**. BGSAVE 105 MB en 87 ms, 2050 tranches, tranche max 688 µs. Pics mémoire du scope 183,5 / 192,7 MB. Machine globalement plus lente que le premier run (load 169k contre 187k SET/s).
+- Même test sur Valkey 9.1.2 (`SERVER=valkey`, 1 thread, CPU 0-1, RDB sur tmpfs) : sans save 152 680 ops/s, GET p99 1,023 / p99.9 1,127 / p99.99 1,479 ms ; avec save 149 962 ops/s, GET p99 1,047 / p99.9 1,183 / p99.99 1,735 ms. BGSAVE par fork : ~2,1 s, RDB 22,9 MB (LZF, les valeurs memtier se compressent bien), CoW 8 MB, pic mémoire du scope 183,4 MB. Le fork coûte peu à 1M clés ; RadixOx sérialise 25× plus vite (87 ms) mais en tranches dans le thread de service, d'où le p99.99 plus touché (+3 ms contre +0,25 ms).
+- `SAVE_TRANCHE_BUDGET = 512` (au lieu de 1024) : sans save 169 660 ops/s, GET p99 0,735 / p99.9 0,959 / p99.99 2,511 ms. Avec save, run 1 : p99.99 43 ms (blocage ponctuel non reproduit, tranche max 614 µs, `TCP_NODELAY` actif) ; run 2 : 169 728 ops/s, GET p99 0,719 / p99.9 0,975 / p99.99 **2,783 ms**. BGSAVE 82 ms, 4100 tranches, tranche max 667 µs. À 512, le surcoût de la save sur le p99.99 tombe à ~+0,3 ms (contre ~+3 ms à 1024), sans coût mesurable sur la durée de la save.
+- **Bug de famine trouvé en pipeline** (`--pipeline=32`) : p99.99 = durée exacte de la save (48,9 ms pour 48,9 ms de save, 71 ms pour 71 ms). Instrumentation : 70,4 ms sur 71,5 ms passés *dans* les tranches. Cause : monoio remet en tête de file (`push_front`, `scheduler.rs`) une tâche qui se réveille pendant son propre poll ; le `YieldNow` par `wake_by_ref` repassait donc avant les connexions à chaque tour, jusqu'à épuiser `max_round`, et les connexions réveillées par les CQE restaient derrière jusqu'à la fin de la save. Même défaut dans `oxidart::async_command::yield_now` (KEYS, UNLINK). Fix : réveil via une micro-tâche (`monoio::spawn(async move { waker.wake() })`), rangé en queue ; `yield_now` d'oxidart est maintenant public et partagé par la save. Les mesures sans pipeline ci-dessus datent d'avant ce fix.
+- Après fix, `--pipeline=32`, run 5 s, `SAVE_TRANCHE_BUDGET = 512` :
+
+  | | 1:4 sans save | 1:4 avec save | 1:1 sans save | 1:1 avec save |
+  |--|--|--|--|--|
+  | run | 2 888 397 ops/s | 2 734 550 ops/s | 2 616 697 ops/s | 2 614 162 ops/s |
+  | GET p99 | 1,279 ms | 1,495 ms | 1,503 ms | 1,463 ms |
+  | GET p99.9 | 1,447 ms | 2,287 ms | 1,839 ms | 2,223 ms |
+  | GET p99.99 | 1,703 ms | 2,863 ms | 3,183 ms | 2,831 ms |
+
+  BGSAVE : 136 ms (1:4) / 134 ms (1:1) dont ~48–52 ms de calcul, 4100 tranches, tranche max 595–723 µs, plus long écart sans la main 1,0 ms. Avant fix : p99.99 48–49 ms en pipeline.
+- Valkey, même config pipeline 32 / run 5 s : 1:4 sans save 1 820 114 ops/s, GET p99.99 3,183 ms ; avec save 1 792 116 ops/s, p99.99 4,095 ms. 1:1 sans save 1 678 484 ops/s, p99.99 3,871 ms ; avec save 1 667 792 ops/s, p99.99 3,999 ms. Fork 2,0–2,3 ms (`latest_fork_usec`), BGSAVE ~2 s, CoW 48 MB (1:4) / 79 MB (1:1).
+- Mémoire (pic cgroup du scope = parent + fils, pages partagées comptées une fois ; **le RDB de 22,9 MB sur tmpfs y est compté**) : Valkey 154 → 224 MB (1:4) et 154 → 255 MB (1:1), soit CoW + fichier ; RadixOx 184 → 193 MB dans les deux ratios (+9 MB dont le tampon de sortie de 4 MB ; dump jeté, rien d'écrit). Correction du run sans pipeline plus haut : les +29 MB de Valkey étaient ~8 MB de CoW + ~23 MB de fichier.
+- Lecture : débit et p99/p99.9 intacts (les écarts sont du bruit entre deux runs) ; seul le p99.99 GET prend ~8 ms, cohérent avec la tranche max de 4,3 ms plus la file accumulée derrière. Piste : budget de tranche en temps plutôt qu'en nœuds, ou budget plus petit (1024 nœuds Hash/valeurs longues → tranches inégales).
+- Attention, lancer `systemd-run --scope` dans un pipe a renvoyé des 143 : écrire dans un fichier.
 
 ## 5quinquies. Méthode de travail
 

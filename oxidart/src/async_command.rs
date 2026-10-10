@@ -11,22 +11,29 @@ use crate::node_childs::ChildAble;
 
 // ─── Yield primitive ─────────────────────────────────────────────────────────
 
-struct YieldNow(bool);
+/// Rend la main en se plaçant **derrière** les tâches prêtes.
+///
+/// Sous monoio, un `wake_by_ref` pendant son propre poll remet la tâche en tête
+/// de file (`push_front`, monoio scheduler.rs) : elle repasse aussitôt et
+/// affame les connexions jusqu'à la fin du travail découpé (KEYS, UNLINK,
+/// BGSAVE). Le réveil passe donc par une micro-tâche : venu d'une autre tâche,
+/// il est rangé en queue (`push_back`).
+pub struct YieldNow(bool);
 
 impl Future for YieldNow {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         if self.0 {
-            Poll::Ready(())
-        } else {
-            self.0 = true;
-            cx.waker().wake_by_ref();
-            Poll::Pending
+            return Poll::Ready(());
         }
+        self.0 = true;
+        let waker = cx.waker().clone();
+        ::monoio::spawn(async move { waker.wake() });
+        Poll::Pending
     }
 }
 
-fn yield_now() -> YieldNow {
+pub fn yield_now() -> YieldNow {
     YieldNow(false)
 }
 

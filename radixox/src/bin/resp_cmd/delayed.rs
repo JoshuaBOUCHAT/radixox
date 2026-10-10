@@ -4,7 +4,7 @@ use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::shared_frame::SharedFrame as Frame;
 
 use crate::SharedART;
-use oxidart::async_command::OxidArtAsync;
+use oxidart::async_command::{OxidArtAsync, yield_now};
 
 use super::{glob_to_regex, is_simple_prefix};
 
@@ -32,21 +32,7 @@ async fn handle_unlink(keys: Vec<SharedByte>, art: SharedART) -> Frame {
 // ─── BGSAVE ───────────────────────────────────────────────────────────────────
 
 /// Budget d'une tranche de save (SAVE_DESIGN.md §4) : à régler sur le p99.99.
-const SAVE_TRANCHE_BUDGET: u32 = 1024;
-
-struct YieldNow(bool);
-
-impl Future for YieldNow {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-        if self.0 {
-            return std::task::Poll::Ready(());
-        }
-        self.0 = true;
-        cx.waker().wake_by_ref();
-        std::task::Poll::Pending
-    }
-}
+const SAVE_TRANCHE_BUDGET: u32 = 512;
 
 /// Save en arrière-plan, par tranches avec `yield` entre deux tranches.
 /// v1 (mesure) : le dump est sérialisé en mémoire puis jeté, pas encore
@@ -56,11 +42,16 @@ pub(crate) async fn bgsave_task(art: SharedART) {
     let mut out = Vec::with_capacity(4 << 20);
     let (mut total, mut tranches) = (0usize, 0u64);
     let mut max_tranche = std::time::Duration::ZERO;
+    let (mut in_tranches, mut max_gap) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+    let t_start = std::time::Instant::now();
     let mut cur = art.borrow_mut().save_start(&mut out);
+    let d_start = t_start.elapsed();
     loop {
         let t = std::time::Instant::now();
         let done = art.borrow_mut().save_step(&mut cur, &mut out, SAVE_TRANCHE_BUDGET);
-        max_tranche = max_tranche.max(t.elapsed());
+        let el = t.elapsed();
+        max_tranche = max_tranche.max(el);
+        in_tranches += el;
         tranches += 1;
         if done || out.len() >= 4 << 20 {
             total += out.len();
@@ -69,14 +60,23 @@ pub(crate) async fn bgsave_task(art: SharedART) {
         if done {
             break;
         }
-        YieldNow(false).await;
+        let y = std::time::Instant::now();
+        yield_now().await;
+        max_gap = max_gap.max(y.elapsed());
     }
+    let t_fin = std::time::Instant::now();
     art.borrow_mut().finish_save();
+    let d_fin = t_fin.elapsed();
     eprintln!(
-        "[bgsave] {:.1} MB en {:.2?}, {tranches} tranches, tranche max {:.1?}",
+        "[bgsave] {:.1} MB en {:.2?}, {tranches} tranches, tranche max {:.1?}, \
+         dans les tranches {:.2?}, save_start {:.2?}, finish_save {:.2?}, yield max {:.2?}",
         total as f64 / 1e6,
         start.elapsed(),
-        max_tranche
+        max_tranche,
+        in_tranches,
+        d_start,
+        d_fin,
+        max_gap
     );
 }
 
