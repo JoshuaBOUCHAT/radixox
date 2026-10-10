@@ -6,6 +6,39 @@
 > Remplace §3.2bis (format par nœud) d'`ARCHITECTURE.md` ; le reste du §3
 > (undo-log, atomicité fichier, recovery) reste valable.
 
+## Reprise — état au 2026-10-10 (à lire en premier)
+
+**Fait** (branche `custom_parser`) : étapes 1 à 7. `BGSAVE` écrit `RADIXOX_DIR/dump.rxd` (défaut `.`) : DFS par tranches de 512 nœuds, double buffer de 2 Mo, fichier unique avec pied crc32 (§5 « Fichier », §5quater « Étape 7 »). Commits : `ffe6d63` (fix famine du yield monoio), `886d792` (étape 7), `7536903` (fix SETNX/HINCRBY, hors save). Tous les tests passent (`cargo test --release -p oxidart`, `-p radixox-lib`, `-p radixox`).
+
+**Prochaine tâche : étape 8, reload au démarrage.** Rien n'est commencé.
+- Où : `radixox/src/bin/resp.rs`, `main` ; aujourd'hui l'arbre est créé par `OxidArt::shared_with_evictor(...)` **après** `TcpListener::bind`. Charger le dump avant d'accepter des connexions (idéalement avant le bind). Fichier absent → démarrage à vide ; pied ou dump invalide → refuser de démarrer (ne pas écraser silencieusement).
+- Lecture : `std::fs::read` (ou monoio) → `oxidart::check_footer(&file)` → flux v1. `oxidart::parse_dump` (save.rs) décode déjà tout en `Vec<DumpEntry>` : il sert de référence et de premier jet (reload par insertions `set` / `hash_set` / `set_add`), **mais** la cible est la construction en masse décrite au §5 « Contiguïté des préfixes et reload en masse » :
+  - un seul passage dans l'ordre DFS, pile des nœuds ouverts, nœuds alloués à la suite dans le HiSlab ;
+  - **zéro split** : lire un enregistrement d'avance ; le nœud d'une clé commence à `max(lcp_préc, lcp_suiv)` ;
+  - **clés expirées** : expiration absolue = `T0 + ttl` (horloge oxidart = secondes Unix, `OxidArt::now`, `tick()` dans `oxidart/src/monoio.rs`) ; si ≤ maintenant, sauter la clé en gardant `lcp = min(...)` sur les clés sautées ;
+  - clés avec TTL : nœud alloué par `insert_tagged` (`oxidart/src/lib.rs`, `TaggedHiSlab`) pour que l'évicteur les échantillonne ;
+  - Hash/Set → valart ; ZSet/List → section en tête du flux (déjà décodée par `parse_dump`, idx → valeur).
+  - Points d'entrée existants utiles : `oxidart/src/lib.rs` `insert` / `insert_tagged`, `push_child_idx`, `create_node_with_val`, `ensure_key`, `set_internal` ; `valart/src/hash.rs` `hash_set`, `valart/src/set.rs` `set_add`.
+  - À décider : le dump contient la seed valart (`T0` + seed dans l'en-tête). La reprendre (`ValTrees::with_seed`, `valart/src/lib.rs`) n'est utile que si on reconstruit valart en masse dans l'ordre du dump ; avec `hash_set`/`set_add`, la seed courante suffit.
+- Tests : aller-retour (état aléatoire → save → reload dans un nouvel arbre → comparaison avec `save::reference::expected`, `pub(crate)` dans `oxidart/src/save.rs`), avec TTL et clés expirées entre save et reload ; test d'intégration serveur (BGSAVE, redémarrage avec le même `RADIXOX_DIR`, relecture des clés), sur le modèle de `radixox/tests/bgsave.rs`.
+- Mesure : temps de reload de 1M clés (100 B) ; coût attendu dominé par l'allocation des valeurs (`mi_malloc`, ~20–50 ns/valeur), à comparer au DFS de save (~48 ms à vide).
+
+**Ensuite, pour clore la save** : commande `SAVE` synchrone (§5bis) ; vidage par tranches de la liste différée valart (aujourd'hui d'un coup dans `finish_save`) ; `rename` final via `std::fs` sur le thread de service (bloquant, à passer en io_uring) ; mémoire des images et de la liste différée dans `INFO` ; `hislab` en dépendance `path` (`oxidart/Cargo.toml`) à repasser sur une version publiée. Plus tard : compression après coup en option (§5 « Compression », étape 9).
+
+**Pièges connus**
+- **Yield sous monoio** : ne jamais écrire un `yield` à base de `cx.waker().wake_by_ref()` ; monoio remet alors la tâche en tête de file et elle affame les connexions. Utiliser `oxidart::async_command::yield_now` (réveil par micro-tâche). Détail et mesures : §5quater « BGSAVE minimal ».
+- **Le curseur de save** se libère **avant** `finish_save` (il peut contenir des valeurs possédées).
+- **`SET n 42` stocke une chaîne** ; seul `INCR`/`INCRBY` crée un `Value::Int`.
+- `CLAUDE.md` du dépôt est en partie périmé : oxidart n'a plus de feature `monoio` (dépendance inconditionnelle), le binaire s'appelle `radixox` (plus `radixox-resp`), les nœuds font 64 B.
+
+**Benchs** (`scripts/stress_save.sh`)
+- Variables : `MODES="nosave save"`, `RUN_TIME` (s), `PIPELINE` (défaut 1), `RATIO` (défaut `1:4`), `SERVER=valkey`, `OUT_DIR` (le dump y est écrit ; prendre un tmpfs pour comparer à Valkey). Serveur sur CPU 0-1 sous `systemd-run --scope -p MemoryMax=4G`, memtier sur CPU 2-7, 1M clés de 100 B.
+- Durée ≈ 2 × (load + `RUN_TIME` + ~2 s) ; viser < 30 s par lancement, l'annoncer avant. Écrire la sortie dans un fichier (`systemd-run` lancé dans un pipe a renvoyé des 143).
+- Mémoire : le pic du scope (`journalctl --user | grep "run-p.*memory peak"`) compte parent + fils de fork une seule fois, **et le fichier dump s'il est en tmpfs**.
+- Sans pipeline, 93 % du CPU serveur est du temps noyau (réseau) et memtier (4 threads) est probablement la limite : pour mesurer un gain serveur, utiliser `PIPELINE=32` ou un client plus fort.
+- Les mesures sans pipeline faites avant `ffe6d63` sont faussées par la famine du yield.
+- À faire un jour : comparaison avec Valkey sur 3–5M clés en forte écriture (CoW du fork), en relevant `MemoryMax`.
+
 ## 0. Vocabulaire
 
 | Terme | Sens |
