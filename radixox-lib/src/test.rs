@@ -1,7 +1,7 @@
 use std::mem::MaybeUninit;
 
 use crate::shared_byte::SharedByte;
-use crate::small_vec::SmallVec;
+use crate::small_vec::{SmallVec, SmallVecIterator};
 use crate::cmd::{Cmd, SetCondition};
 
 #[test]
@@ -110,6 +110,72 @@ fn smallvec_into_iter_yields_reverse_order() {
     v.push(3);
     let collected: Vec<u32> = v.into_iter().collect();
     assert_eq!(collected, vec![3, 2, 1]);
+}
+
+/// Mode inline avec des éléments qui possèdent du heap : l'itérateur ne
+/// doit pas lire l'ancien emplacement du vec (déplacé dans l'itérateur).
+#[test]
+fn smallvec_into_iter_inline_owned_items() {
+    let mut v: SmallVec<4, String> = SmallVec::new();
+    for i in 0..4 {
+        v.push(format!("element-numero-{i}"));
+    }
+    let collected: Vec<String> = v.into_iter().collect();
+    let expect: Vec<String> = (0..4).rev().map(|i| format!("element-numero-{i}")).collect();
+    assert_eq!(collected, expect);
+}
+
+#[test]
+fn smallvec_into_iter_heap_mode() {
+    let mut v: SmallVec<2, String> = SmallVec::new();
+    for i in 0..20 {
+        v.push(i.to_string());
+    }
+    let it = v.into_iter();
+    assert_eq!(it.len(), 20);
+    let collected: Vec<String> = it.collect();
+    let expect: Vec<String> = (0..20).rev().map(|i| i.to_string()).collect();
+    assert_eq!(collected, expect);
+}
+
+/// Itération partielle puis drop : chaque élément est droppé exactement une
+/// fois (consommés par l'appelant, restants avec l'itérateur).
+#[test]
+fn smallvec_into_iter_partial_drops_rest() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    for n in [3usize, 4, 9] {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut v: SmallVec<4, Arc<AtomicUsize>> = SmallVec::new();
+        for _ in 0..n {
+            v.push(Arc::clone(&counter));
+        }
+        assert_eq!(Arc::strong_count(&counter), n + 1);
+        let mut it = v.into_iter();
+        let first = it.next().unwrap();
+        let second = it.next().unwrap();
+        assert_eq!(it.len(), n - 2);
+        drop(it);
+        assert_eq!(Arc::strong_count(&counter), 3, "n = {n}");
+        drop((first, second));
+        assert_eq!(Arc::strong_count(&counter), 1);
+    }
+}
+
+/// Le vec est déplacé (renvoyé par une fonction) entre la création de
+/// l'itérateur et sa consommation.
+#[test]
+fn smallvec_into_iter_survives_moves() {
+    fn make() -> SmallVecIterator<4, u64> {
+        let mut v: SmallVec<4, u64> = SmallVec::new();
+        v.push(10);
+        v.push(20);
+        v.push(30);
+        v.into_iter()
+    }
+    let it = make();
+    let boxed = Box::new(it);
+    assert_eq!(boxed.collect::<Vec<_>>(), vec![30, 20, 10]);
 }
 
 #[test]

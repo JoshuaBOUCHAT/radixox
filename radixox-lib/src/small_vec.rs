@@ -77,7 +77,7 @@ impl<const S: usize, T> SmallVec<S, T> {
         };
         unsafe {
             std::ptr::copy_nonoverlapping(
-                self.data.inline.as_ptr(),
+                self.data.inline_ptr(),
                 ptr.as_ptr(),
                 self.len as usize,
             );
@@ -127,7 +127,7 @@ impl<const S: usize, T> SmallVec<S, T> {
             if self.is_heap() {
                 self.data.ptr
             } else {
-                NonNull::new_unchecked((*self.data.inline).as_mut_ptr())
+                NonNull::new_unchecked(self.data.inline_mut_ptr())
             }
         }
     }
@@ -148,7 +148,7 @@ impl<const S: usize, T> Deref for SmallVec<S, T> {
             if self.is_heap() {
                 std::slice::from_raw_parts(self.data.ptr.as_ptr(), self.len as usize)
             } else {
-                std::slice::from_raw_parts(self.data.inline.as_ptr(), self.len as usize)
+                std::slice::from_raw_parts(self.data.inline_ptr(), self.len as usize)
             }
         }
     }
@@ -159,7 +159,7 @@ impl<const S: usize, T> std::ops::DerefMut for SmallVec<S, T> {
             if self.is_heap() {
                 std::slice::from_raw_parts_mut(self.data.ptr.as_ptr(), self.len as usize)
             } else {
-                std::slice::from_raw_parts_mut((*self.data.inline).as_mut_ptr(), self.len as usize)
+                std::slice::from_raw_parts_mut(self.data.inline_mut_ptr(), self.len as usize)
             }
         }
     }
@@ -167,48 +167,60 @@ impl<const S: usize, T> std::ops::DerefMut for SmallVec<S, T> {
 impl<const S: usize, T> IntoIterator for SmallVec<S, T> {
     type Item = T;
     type IntoIter = SmallVecIterator<S, T>;
-    fn into_iter(mut self) -> Self::IntoIter {
-        let ptr = if self.len == 0 {
-            unsafe { self.get_ptr() }
-        } else {
-            unsafe { self.get_ptr().add(self.len as usize - 1) }
-        };
-        SmallVecIterator { ptr, vec: self }
+    fn into_iter(self) -> Self::IntoIter {
+        SmallVecIterator { vec: self }
     }
 }
+/// Itère du dernier élément au premier. Ne garde pas de pointeur : en mode
+/// inline, les données vivent dans `vec` lui-même, qui est déplacé avec
+/// l'itérateur. Les éléments non consommés sont droppés avec `vec`.
 pub struct SmallVecIterator<const S: usize, T> {
-    ptr: NonNull<T>,
     vec: SmallVec<S, T>,
 }
 impl<const S: usize, T> Iterator for SmallVecIterator<S, T> {
     type Item = T;
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.vec.len == 0 {
-            return None;
-        }
-        self.vec.len -= 1;
-        let item = unsafe { self.ptr.read() };
-        unsafe { self.ptr = self.ptr.sub(1) };
-        Some(item)
+        self.vec.pop()
+    }
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.vec.len as usize;
+        (len, Some(len))
     }
 }
+impl<const S: usize, T> ExactSizeIterator for SmallVecIterator<S, T> {}
 
 #[repr(align(8))]
 union SmallVecData<const S: usize, T> {
-    inline: ManuallyDrop<[T; S]>,
+    /// Seuls les `len` premiers éléments sont initialisés.
+    inline: ManuallyDrop<MaybeUninit<[T; S]>>,
     ptr: NonNull<T>,
 }
 
 impl<const S: usize, T> SmallVecData<S, T> {
     fn new() -> Self {
-        let inline = unsafe { std::mem::MaybeUninit::assume_init(MaybeUninit::uninit()) };
-        Self { inline }
+        Self {
+            inline: ManuallyDrop::new(MaybeUninit::uninit()),
+        }
+    }
+    /// # Safety
+    /// Mode inline.
+    #[inline]
+    unsafe fn inline_ptr(&self) -> *const T {
+        unsafe { self.inline.as_ptr() as *const T }
+    }
+    /// # Safety
+    /// Mode inline.
+    #[inline]
+    unsafe fn inline_mut_ptr(&mut self) -> *mut T {
+        unsafe { (*self.inline).as_mut_ptr() as *mut T }
     }
     ///Safety the unrderlying data should represente an inline array and count the number on initialise and valide item
     unsafe fn free_inline(&mut self, count: usize) {
         if std::mem::needs_drop::<T>() {
             unsafe {
-                let base_ptr = self.inline.as_mut_ptr() as *mut T;
+                let base_ptr = self.inline_mut_ptr();
 
                 let slice = std::slice::from_raw_parts_mut(base_ptr, count);
 
