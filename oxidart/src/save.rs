@@ -248,6 +248,20 @@ impl SaveCursor {
     }
 }
 
+/// Prefetch de la valeur d'un nœud dès sa lecture : le traitement de ses
+/// enfants masque la latence. String : bloc `SharedByte` ; Hash/Set : racine
+/// valart.
+#[inline(always)]
+fn prefetch_value(tag: Tag, val: &ValUnion) {
+    unsafe {
+        match tag {
+            Tag::Bytes => val.bytes.prefetch(),
+            Tag::Hash | Tag::Set => valart().prefetch_root(val.idx),
+            _ => {}
+        }
+    }
+}
+
 #[inline(always)]
 fn sub(budget: &mut u32, n: u32) {
     *budget = budget.saturating_sub(n);
@@ -349,9 +363,7 @@ impl OxidArt {
         let (tag, val, exp) = match barrier.take(f.idx) {
             Some(T0::Slab) => {
                 let n = map.get(f.idx).expect("intact à T0 ⇒ occupé");
-                if n.tag == Tag::Bytes {
-                    unsafe { n.val.bytes.prefetch() };
-                }
+                prefetch_value(n.tag, &n.val);
                 cur.path.extend_from_slice(&n.compression);
                 let depth = cur.path.len() as u32;
                 for (radix, idx) in n.childs.iter() {
@@ -368,9 +380,7 @@ impl OxidArt {
                 (n.tag, &n.val, n.exp_and_radix.exp())
             }
             Some(T0::Image(img)) => {
-                if img.tag == Tag::Bytes {
-                    unsafe { img.val.bytes.prefetch() };
-                }
+                prefetch_value(img.tag, &img.val);
                 cur.path.extend_from_slice(&img.compression);
                 let depth = cur.path.len() as u32;
                 let s = img.childs_start as usize;

@@ -211,6 +211,12 @@ impl ValTrees {
         }
     }
 
+    /// Prefetch de la racine d'un conteneur (128 B), avant de le sérialiser.
+    #[inline]
+    pub fn prefetch_root(&self, root: u32) {
+        prefetch_slot(&self.nodes, root);
+    }
+
     pub fn is_saving(&self) -> bool {
         self.save.is_active()
     }
