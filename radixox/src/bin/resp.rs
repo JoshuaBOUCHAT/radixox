@@ -17,6 +17,7 @@ use monoio::time::TimeDriver;
 use monoio::{IoUringDriver, Runtime, RuntimeBuilder};
 
 use oxidart::OxidArt;
+use oxidart::async_command::OxidArtAsync;
 use radixox_lib::cmd::Cmd;
 use radixox_lib::shared_byte::SharedByte;
 pub(crate) use radixox_lib::shared_frame::SharedFrame as Frame;
@@ -312,6 +313,12 @@ async fn dispatch(
             Cmd::Keys(pattern) => {
                 let frame = cmd_keys(pattern, art.clone()).await;
                 conn_state.encode(frame);
+            }
+            Cmd::FlushDb if art.borrow().is_saving() => {
+                // Pendant une save : libération par tranches après la save
+                // (sinon tout l'arbre serait capturé).
+                art.deln_async(SharedByte::from_slice(b"")).await;
+                conn_state.encode(Frame::SimpleString(SharedByte::from_slice(b"OK")));
             }
             Cmd::Unlink(keys) => {
                 let v: Vec<SharedByte> = keys.into_iter().collect();

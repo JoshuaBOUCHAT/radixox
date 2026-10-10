@@ -39,6 +39,9 @@ pub(crate) enum Slot {
 pub(crate) struct CollisionBuckets<T> {
     buckets: Vec<Vec<T>>,
     pub(crate) free: Vec<u32>,
+    /// Copie profonde au T0 d'une save (SAVE_DESIGN.md §2.E) : les buckets
+    /// sont modifiés et droppés sans barrière.
+    t0: Vec<Vec<T>>,
 }
 
 impl<T> Default for CollisionBuckets<T> {
@@ -46,7 +49,15 @@ impl<T> Default for CollisionBuckets<T> {
         Self {
             buckets: Vec::new(),
             free: Vec::new(),
+            t0: Vec::new(),
         }
+    }
+}
+
+impl<T: Clone> CollisionBuckets<T> {
+    /// Copie tous les buckets (clones, rc+1 pour les `SharedByte`).
+    pub(crate) fn snapshot_t0(&mut self) {
+        self.t0.clone_from(&self.buckets);
     }
 }
 
@@ -70,6 +81,15 @@ impl<T> CollisionBuckets<T> {
 
     pub(crate) fn get_mut(&mut self, idx: u32) -> &mut Vec<T> {
         &mut self.buckets[idx as usize]
+    }
+
+    /// Bucket tel qu'au T0 de la save en cours.
+    pub(crate) fn get_t0(&self, idx: u32) -> &Vec<T> {
+        &self.t0[idx as usize]
+    }
+
+    pub(crate) fn clear_t0(&mut self) {
+        self.t0.clear();
     }
 
     pub(crate) fn release(&mut self, idx: u32) {

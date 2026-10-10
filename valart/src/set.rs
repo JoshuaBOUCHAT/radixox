@@ -645,13 +645,12 @@ impl ValTrees {
     /// image). Consomme les nœuds dans la barrière : un conteneur n'est
     /// parcouru qu'une fois par save. Référence synchrone ; le sérialiseur
     /// par tranches viendra à l'étape 6.
-    /// TODO : buckets de collision lus vivants (copie au T0 pas faite).
     pub fn set_for_each_t0(&mut self, root: u32, mut f: impl FnMut(&SharedByte)) {
         let mut stack = vec![(root, 0usize)];
         let Self { nodes, save, set_collisions: collisions, .. } = self;
         while let Some((idx, depth)) = stack.pop() {
             if depth == DISPATCH_LEVELS {
-                collisions.get(idx).iter().for_each(&mut f);
+                collisions.get_t0(idx).iter().for_each(&mut f);
                 continue;
             }
             let node: &SetNode = match save.take(idx) {

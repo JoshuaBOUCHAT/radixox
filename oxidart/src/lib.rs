@@ -191,6 +191,9 @@ impl OxidArt {
         self.save.barrier.finish();
         self.save.childs.clear();
         valart().finish_save();
+        for waker in self.save.waiters.drain(..) {
+            waker.wake();
+        }
     }
 
     /// Returns the number of Overflow slots currently allocated.

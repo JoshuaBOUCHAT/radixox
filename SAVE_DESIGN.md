@@ -90,7 +90,7 @@ deferred_drops: Vec<(NodeType, u32)>,   // hash_drop / set_drop pendant une save
 Sérialisés **intégralement au `begin`**, de façon bloquante, dans une section du fichier indexée par idx de slab. L'enregistrement d'une clé ZSet/List référence cet idx T0. Pas de barrière sur leurs slabs.
 
 ### E. Buckets de collision valart
-Copiés intégralement au T0 (rarissimes), **en profondeur** (clones rc+1) : ils sont modifiés et droppés sans barrière ni liste différée. Pas encore fait : les parcours T0 lisent les buckets vivants.
+Copiés intégralement au T0 (rarissimes), **en profondeur** (clones rc+1) : ils sont modifiés et droppés sans barrière ni liste différée. Fait : `CollisionBuckets::snapshot_t0` au `begin_save`, `get_t0` dans les parcours T0, `clear_t0` à `finish_save`.
 
 ### F. UNLINK
 - Avant chaque `free_chunk`, `deln_async` regarde si une save est active ; si oui, il **attend un waker** enregistré dans la barrière. `finish` réveille tous les wakers et les libérations reprennent.
@@ -226,8 +226,14 @@ dump.tmp/
 - Valart : `ValNodeImage`, barrière dans `hash_node_mut` / `set_node_mut` / `free_*_node`, `dispose` différé pendant une save, `hash_drop` / `set_drop` différés (`*_drop_now` à `finish_save`).
 - Tests : DFS T0 synchrone de référence (`save.rs::reference`, `hash_for_each_t0` / `set_for_each_t0`) ; `test_save.rs` (mutations aléatoires SET/DEL/TTL/INCR/HSET/HDEL/SADD/SREM/SPOP/deln entrelacées, FLUSHDB pendant une save) ; contrôles négatifs (barrière oxidart coupée → échec ; `dispose` sans différé → use-after-free ASan).
 - `radixox_lib::raw_alloc` + `--cfg radixox_sysalloc` pour ASan.
-- Bug préexistant vu sous ASan, hors save : `SmallVecIterator` (`radixox-lib/src/small_vec.rs:190`) lit la pile après déplacement sur `into_iter` d'un SmallVec inline (test `smallvec_into_iter_yields_reverse_order`).
-- Reste de l'étape 4 : waker UNLINK dans la barrière, vidage par tranches, copie profonde des buckets au T0.
+- Bug préexistant vu sous ASan, hors save, corrigé (0082b1a) : `SmallVecIterator` lisait l'ancien emplacement du vec sur `into_iter` en mode inline.
+
+
+### Étape 4 faite (2026-10-10)
+- UNLINK : `SaveDone` (future dans `async_command.rs`) attendu avant chaque `free_chunk` ; les wakers sont dans `OxidSave::waiters`, réveillés par `finish_save`. Test `deln_async_waits_for_save` (coupe immédiate, rien libéré pendant la save, vue T0 complète).
+- Serveur : FLUSHDB pendant une save passe par `deln_async("")` (sinon capture de tout l'arbre) ; hors save, `deln` synchrone comme avant.
+- Buckets de collision copiés en profondeur au T0 (test `save_collision_buckets_t0`).
+- Reste en TODO : vider la liste différée par tranches (aujourd'hui d'un coup à `finish_save`).
 
 ## 5quinquies. Méthode de travail
 
@@ -241,7 +247,7 @@ dump.tmp/
 1. ✅ Points de passage oxidart, lectures sans `NodeValMut` dans les commandes de lecture, signatures sans valeur de retour, lectures sans modification pendant une save. Refactor pur : tous les tests existants passent.
 2. ✅ Points de passage valart, même principe.
 3. ✅ `SaveBarrier` avec closure de capture, `NodeImage` / `ValNodeImage`, barrières branchées.
-4. Liste différée ✅, drop différé des conteneurs ✅, pause de l'évicteur ✅, waker UNLINK dans la barrière, copie profonde des buckets au T0.
+4. ✅ Liste différée, drop différé des conteneurs, pause de l'évicteur, waker UNLINK, copie profonde des buckets au T0 (reste : vidage par tranches).
 5. DFS (synchrone d'abord) et test aléatoire sur un vrai `OxidArt` (SET, DEL, HSET, SADD, UNLINK, expirations mélangés aux pas de la save) comparé à l'état T0, sous ASan.
 6. DFS par tranches + prefetch (valeur, compression, overflow, haut de pile), testé contre le DFS synchrone ; bench ns/clé.
 7. Format, fichier de données, crc32c, section ZSet/List, MANIFEST, I/O.

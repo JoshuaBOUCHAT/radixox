@@ -673,13 +673,12 @@ impl ValTrees {
     /// image). Consomme les nœuds dans la barrière : un conteneur n'est
     /// parcouru qu'une fois par save. Référence synchrone ; le sérialiseur
     /// par tranches viendra à l'étape 6.
-    /// TODO : buckets de collision lus vivants (copie au T0 pas faite).
     pub fn hash_for_each_t0(&mut self, root: u32, mut f: impl FnMut(&SharedByte, &SharedByte)) {
         let mut stack = vec![(root, 0usize)];
         let Self { nodes, save, hash_collisions: collisions, .. } = self;
         while let Some((idx, depth)) = stack.pop() {
             if depth == DISPATCH_LEVELS {
-                for (k, v) in collisions.get(idx) {
+                for (k, v) in collisions.get_t0(idx) {
                     f(k, v);
                 }
                 continue;
@@ -967,6 +966,36 @@ mod tests {
         got.sort();
         assert_eq!(got, expect);
         assert_eq!(t.hash_len(root), 0);
+    }
+
+    /// Buckets de collision modifiés pendant la save : le parcours T0 lit
+    /// la copie faite au `begin_save`.
+    #[test]
+    fn save_collision_buckets_t0() {
+        let mut t = trees();
+        t.hash_mask = 0;
+        let root = t.hash_create();
+        for i in 0..40 {
+            t.hash_set(root, sb(format!("f{i}")), sb(format!("valeur-longue-{i}")));
+        }
+        let mut expect = Vec::new();
+        t.hash_for_each(root, |k, v| expect.push((k.to_vec(), v.to_vec())));
+        expect.sort();
+
+        t.begin_save();
+        for i in (0..40).step_by(2) {
+            assert!(t.hash_remove(root, format!("f{i}").as_bytes()));
+        }
+        for i in 40..60 {
+            t.hash_set(root, sb(format!("f{i}")), sb("nouveau"));
+        }
+        assert!(!t.hash_set(root, sb("f39"), sb("écrasé")));
+        let mut got = Vec::new();
+        t.hash_for_each_t0(root, |k, v| got.push((k.to_vec(), v.to_vec())));
+        t.finish_save();
+        got.sort();
+        assert_eq!(got, expect);
+        t.hash_check(root);
     }
 
     #[test]

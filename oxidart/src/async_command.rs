@@ -30,6 +30,23 @@ fn yield_now() -> YieldNow {
     YieldNow(false)
 }
 
+/// Prête quand aucune save n'est en cours. Les libérations d'UNLINK
+/// attendent la fin de la save (SAVE_DESIGN.md §2.F) : le sous-arbre coupé
+/// reste intact, sans capture en masse. `finish_save` réveille les tâches.
+struct SaveDone<'a>(&'a Rc<RefCell<OxidArt>>);
+
+impl Future for SaveDone<'_> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let mut art = self.0.borrow_mut();
+        if !art.is_saving() {
+            return Poll::Ready(());
+        }
+        art.save.waiters.push(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
 // ─── Number of nodes visited per borrow before yielding ──────────────────────
 
 const YIELD_BUDGET: usize = 256;
@@ -294,8 +311,10 @@ impl OxidArtAsync for Rc<RefCell<OxidArt>> {
         }
 
         // Phase 2 — chunked free: borrow_mut → YIELD_BUDGET nodes → drop → yield.
+        // Pendant une save, chaque tranche attend la fin de la save.
         let mut total = initial_count;
         while !free_stack.is_empty() {
+            SaveDone(self).await;
             total += self.borrow_mut().free_chunk(&mut free_stack, YIELD_BUDGET);
             // borrow_mut dropped at end of statement
             if !free_stack.is_empty() {
@@ -414,6 +433,28 @@ mod tests {
         let art = make_art();
         assert_eq!(art.deln_async(SharedByte::from_str("")).await, 8);
         assert!(art.getn_async(SharedByte::from_str("")).await.is_empty());
+    }
+
+    /// UNLINK pendant une save : coupe immédiate (la clé disparaît de la vue
+    /// vivante), libération seulement après `finish_save`, vue T0 complète.
+    #[monoio::test]
+    async fn deln_async_waits_for_save() {
+        let art = make_art();
+        let expect = art.borrow().snapshot();
+        let nodes = art.borrow().node_count();
+        art.borrow_mut().begin_save();
+        let mut unlink = Box::pin(art.deln_async(SharedByte::from_str("user:")));
+        // Premier poll : coupe, puis attente de la fin de la save.
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(unlink.as_mut().poll(&mut cx).is_pending());
+        assert!(unlink.as_mut().poll(&mut cx).is_pending());
+        assert!(art.borrow().getn(SharedByte::from_str("user:")).is_empty());
+        assert_eq!(art.borrow().node_count(), nodes, "rien n'est libéré pendant la save");
+        let got = art.borrow_mut().dump_t0(|_| {});
+        assert_eq!(got, expect);
+        art.borrow_mut().finish_save();
+        assert_eq!(unlink.await, 5);
+        assert!(art.borrow().node_count() < nodes);
     }
 
     #[monoio::test]

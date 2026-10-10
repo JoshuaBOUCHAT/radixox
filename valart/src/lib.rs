@@ -175,12 +175,16 @@ impl ValTrees {
         self.save.begin_with(|buf| {
             nodes.copy_occupancy(buf);
         });
+        self.set_collisions.snapshot_t0();
+        self.hash_collisions.snapshot_t0();
     }
 
     /// Termine la save : images libérées, libérations différées exécutées.
     /// TODO : vider par tranches (SAVE_DESIGN.md §2.B).
     pub fn finish_save(&mut self) {
         self.save.finish();
+        self.set_collisions.clear_t0();
+        self.hash_collisions.clear_t0();
         self.deferred_bytes.clear();
         for (kind, root) in std::mem::take(&mut self.deferred_drops) {
             match kind {
