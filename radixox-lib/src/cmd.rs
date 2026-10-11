@@ -609,6 +609,34 @@ fn dispatch<'a>(raw: &[&'a [u8]]) -> Option<Cmd<'a>> {
 }
 
 impl<'a> Cmd<'a> {
+    /// Clé unique de la commande, pour le préchargement par lots
+    /// (`OxidArt::prefetch_keys`). `None` : pas de clé, ou plusieurs.
+    pub fn main_key(&self) -> Option<&'a [u8]> {
+        match *self {
+            Cmd::Get(k)
+            | Cmd::Type(k)
+            | Cmd::Ttl(k)
+            | Cmd::Pttl(k)
+            | Cmd::Persist(k)
+            | Cmd::Incr(k)
+            | Cmd::Decr(k)
+            | Cmd::HGetAll(k)
+            | Cmd::HLen(k)
+            | Cmd::HKeys(k)
+            | Cmd::HVals(k) => Some(k),
+            Cmd::Set { key, .. }
+            | Cmd::SetNx { key, .. }
+            | Cmd::Expire { key, .. }
+            | Cmd::IncrBy { key, .. }
+            | Cmd::DecrBy { key, .. }
+            | Cmd::HSet { key, .. }
+            | Cmd::HMSet { key, .. }
+            | Cmd::HGet { key, .. }
+            | Cmd::HExists { key, .. } => Some(key),
+            _ => None,
+        }
+    }
+
     /// Parse a Cmd from already-decoded parts (cmd name + args as byte slices).
     pub fn from_raw(parts: &[&'a [u8]]) -> Option<Self> {
         if parts.is_empty() {

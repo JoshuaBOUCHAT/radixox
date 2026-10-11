@@ -362,7 +362,7 @@ fn warm(p: &Pending) {
 /// enfants masque la latence. String : bloc `SharedByte` ; Hash/Set : racine
 /// valart.
 #[inline(always)]
-fn prefetch_value(tag: Tag, val: &ValUnion) {
+pub(crate) fn prefetch_value(tag: Tag, val: &ValUnion) {
     unsafe {
         match tag {
             Tag::Bytes => val.bytes.prefetch(),

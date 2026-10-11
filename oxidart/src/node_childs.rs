@@ -326,6 +326,14 @@ impl OverflowArena {
         self.count -= 1;
     }
 
+    /// Précharge le bloc `idx` (sans le lire).
+    #[inline(always)]
+    pub(crate) fn prefetch(&self, idx: u32) {
+        if let Some(slot) = self.slots.get(idx as usize) {
+            radixox_lib::prefetch::prefetch_l1(slot as *const OverflowSlot as *const u8);
+        }
+    }
+
     pub(crate) fn get(&self, idx: u32) -> Option<&Overflow> {
         match &self.slots[idx as usize] {
             OverflowSlot::Item(o) => Some(o),

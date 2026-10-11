@@ -49,6 +49,8 @@ pub mod compress;
 pub mod error;
 
 pub mod hcommand;
+mod prefetch_batch;
+pub use prefetch_batch::PREFETCH_BATCH;
 mod node_childs;
 mod load;
 pub mod save;
@@ -333,6 +335,18 @@ impl OxidArt {
     fn try_get_node(&self, idx: u32) -> Option<&Node> {
         self.map.get(idx)
     }
+    /// Nœud désigné par `root_idx` ou par une entrée d'enfant d'un nœud
+    /// vivant, lu sans consulter le bitmap d'occupation (une ligne de cache
+    /// de moins par étage). Réservé aux descentes synchrones : un idx gardé
+    /// d'un tour à l'autre passe par `try_get_node`.
+    #[inline(always)]
+    fn child_node(&self, idx: u32) -> &Node {
+        debug_assert!(self.map.is_occupied(idx), "idx d'enfant {idx} libre");
+        // SAFETY: un nœud n'est libéré qu'après avoir été détaché de son
+        // parent, dans le même appel synchrone ; une entrée d'enfant vivante
+        // désigne donc toujours un slot occupé.
+        unsafe { self.map.get_unchecked(idx) }
+    }
 
     // ─── Points de passage (SAVE_DESIGN.md §3) ──────────────────────────────
     //
@@ -374,7 +388,7 @@ impl OxidArt {
         }
     }
     fn find(&self, idx: u32, radix: u8) -> Option<u32> {
-        let node = self.try_get_node(idx)?;
+        let node = self.child_node(idx);
 
         if let Some(index) = node.childs.find(radix) {
             return Some(index);
@@ -406,12 +420,12 @@ impl OxidArt {
         let idx = self.get_idx(key)?;
         debug_assert!(key.is_ascii(), "key must be ASCII");
         let now = self.now;
-        self.get_node(idx).get_value(now)
+        self.child_node(idx).get_value(now)
     }
     /// Valeur vivante à `key`, par référence (aucune capture de save).
     pub(crate) fn get_ref(&mut self, key: &[u8]) -> Option<NodeValRef<'_>> {
         let idx = self.get_idx(key)?;
-        self.get_node(idx).get_value_ref(self.now)
+        self.child_node(idx).get_value_ref(self.now)
     }
     fn get_idx(&mut self, key: &[u8]) -> Option<u32> {
         debug_assert!(key.is_ascii(), "key must be ASCII");
@@ -434,7 +448,7 @@ impl OxidArt {
         let mut cursor = 1;
 
         loop {
-            let node = self.try_get_node(idx)?;
+            let node = self.child_node(idx);
             match node.compare_compression_key(&key[cursor..]) {
                 CompResult::Final => {
                     if node.is_expired(self.now) {
@@ -544,7 +558,7 @@ impl OxidArt {
         let mut cursor = 1;
 
         loop {
-            let node = self.try_get_node(idx)?;
+            let node = self.child_node(idx);
             match node.compare_compression_key(&key[cursor..]) {
                 CompResult::Final => return Some(idx),
                 CompResult::Partial(_) => return None,
@@ -569,9 +583,7 @@ impl OxidArt {
         let mut cursor = 1;
 
         loop {
-            let node = self
-                .try_get_node(idx)
-                .expect("idx exist so node should exist");
+            let node = self.child_node(idx);
             match node.compare_compression_key(&key[cursor..]) {
                 CompResult::Final => return idx,
                 CompResult::Partial(common_len) => {
@@ -1103,7 +1115,7 @@ impl OxidArt {
         let mut cursor = 1;
 
         let target_idx = loop {
-            let node = self.try_get_node(idx)?;
+            let node = self.child_node(idx);
             match node.compare_compression_key(&key[cursor..]) {
                 CompResult::Final => break idx,
                 CompResult::Partial(_) => return None,

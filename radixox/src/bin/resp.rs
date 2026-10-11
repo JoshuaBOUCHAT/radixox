@@ -248,12 +248,53 @@ async fn handle_buffer(
     registry: &SharedRegistry,
     art: &SharedART,
 ) -> IOResult<usize> {
-    let mut offset = 0;
-    while let Some((cmd, n)) = Cmd::parse(&read_buf[offset..]) {
-        offset += n;
-        dispatch(cmd, conn_state, registry, art).await?;
+    let window = prefetch_window();
+    if window == 0 {
+        let mut offset = 0;
+        while let Some((cmd, n)) = Cmd::parse(&read_buf[offset..]) {
+            offset += n;
+            dispatch(cmd, conn_state, registry, art).await?;
+        }
+        return Ok(offset);
     }
-    Ok(offset)
+    // Par fenêtres : parse jusqu'à `window` commandes, précharge leurs clés
+    // ensemble (miss superposés), puis exécution dans l'ordre, inchangée.
+    let read_buf = &*read_buf;
+    let mut offset = 0;
+    let mut batch: Vec<Cmd<'_>> = Vec::with_capacity(window);
+    let mut keys: Vec<&[u8]> = Vec::with_capacity(window);
+    loop {
+        while batch.len() < window
+            && let Some((cmd, n)) = Cmd::parse(&read_buf[offset..])
+        {
+            offset += n;
+            keys.extend(cmd.main_key());
+            batch.push(cmd);
+        }
+        if batch.is_empty() {
+            return Ok(offset);
+        }
+        if keys.len() > 1 {
+            art.borrow().prefetch_keys(&keys);
+        }
+        keys.clear();
+        for cmd in batch.drain(..) {
+            dispatch(cmd, conn_state, registry, art).await?;
+        }
+    }
+}
+
+/// Taille des fenêtres de préchargement (`RADIXOX_PREFETCH`, 8 par défaut,
+/// 0 = désactivé).
+fn prefetch_window() -> usize {
+    static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("RADIXOX_PREFETCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+            .min(oxidart::PREFETCH_BATCH)
+    })
 }
 
 async fn dispatch(
