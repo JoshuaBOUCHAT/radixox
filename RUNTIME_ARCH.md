@@ -406,6 +406,39 @@ Remplace dans `CONN_DESIGN.md` le « transfert complet + respawn de task » pour
 les commandes async de `delayed.rs`. Même esprit (proactif, sans waker, sans oneshot),
 sans aucune tâche.
 
+### 7.1 Multishot et parquage : pas de `select!` (2026-10-12)
+
+Avec monoio, une connexion en BLPOP attendait trois choses à la fois (réveil, timeout,
+lecture pour QUIT / FIN) : d'où le `select!`. Ici ce sont trois événements qui arrivent
+seuls, et **celui qui produit l'événement fait la transition** :
+
+| Événement | Source | Transition |
+|---|---|---|
+| octets reçus | CQE du recv multishot (toujours armé) | copiés dans `rx`, non exécutés |
+| fin de connexion | CQE recv `res == 0` / erreur | `Draining` |
+| LPUSH sur la clé | le LPUSH, même thread | réponse dans `out`, `Normal`, `rx` rejoué |
+| échéance | tas de timers | réponse `nil`, `Normal`, `rx` rejoué |
+
+Le multishot reste : c'est la moitié noyau de la logique proactive (la lecture est toujours
+en vol), les machines à états la moitié userland.
+
+**Pièges et parades :**
+1. **Le multishot lit pendant le parquage** : un client parqué qui continue d'envoyer fait
+   grossir `rx` sans fin, et un recv multishot ne se met pas en pause. Au-delà d'une limite
+   de `rx` : **annuler le recv** de la connexion (`ASYNC_CANCEL`, elle garde son `refs`),
+   réarmer quand elle repart. Ne jamais compter sur `ENOBUFS` pour freiner : l'anneau est
+   partagé, ce serait affamer toutes les connexions. Même règle pour la backpressure §6.2 :
+   « arrêter de parser » ne suffit pas tant que le recv reste armé.
+2. **Slot réutilisé** : une inscription dans une file d'attente BLPOP prend une référence
+   (`refs += 1`, §4.2) ; le slot ne peut pas être redonné tant qu'elle existe. Le LPUSH ou
+   le timer qui retire l'inscription rend la référence. Connexion en `Draining` trouvée dans
+   une file : sautée.
+3. **Événement d'un parquage précédent** : `park_seq` par connexion, incrémenté à chaque
+   parquage ; timers et inscriptions portent `(slot, park_seq)`, un événement dont le numéro
+   ne correspond plus est ignoré. Règle aussi BLPOP multi-clés : inscrit dans plusieurs
+   files, le premier réveil gagne, les autres inscriptions deviennent obsolètes et sont
+   retirées paresseusement.
+
 ---
 
 ## 8. Jobs
