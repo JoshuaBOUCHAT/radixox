@@ -1,4 +1,4 @@
-//! Allocation brute des blocs `SharedByte`, `CompactStr` et overflows valart.
+//! Allocation brute des blocs `SharedByte`, `CompactPath` et overflows valart.
 //!
 //! mimalloc en direct (`mi_malloc` et pas `MiMalloc.alloc`, qui passe par
 //! `mi_malloc_aligned` et sur-alloue). Avec `--cfg radixox_sysalloc`

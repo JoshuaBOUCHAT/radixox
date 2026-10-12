@@ -45,7 +45,7 @@
 ## 1. Ce qui peut changer pendant une save
 
 ### Oxidart — `TaggedHiSlab<Node>` (64 B)
-- Champs écrits dans le dump : `compression` (`CompactStr`, inline ≤ 7 octets sinon heap), `childs` (6 inline), `tag`+`val`, l'expiration dans `exp_and_radix`, `overflow_idx`.
+- Champs écrits dans le dump : `compression` (`CompactPath`, inline ≤ 7 octets sinon heap), `childs` (6 inline), `tag`+`val`, l'expiration dans `exp_and_radix`, `overflow_idx`.
 - Champs **non écrits** (pas de barrière) : `parent_idx`, `parent_radix`, et le tag TTL de HiSlab (`map.tag`/`untag`).
 - Hors du nœud mais modifiés sur place : `OverflowArena` (Vec + freelist) et `HugeOverflow` (HiSlab `thread_local`).
 - Mutations : `set_internal`, `set_cond`, `split_node`, `create_node_with_val`, `push_child_idx`, `remove_child`, `try_recompress`, `del`, `deln`, `free_subtree_iterative`, `delete_node_inline` (expiration paresseuse dans `get`), `delete_node_for_eviction`, `expire`, `persist`, `get_or_create_hash`/`set`, `get_zset_mut`, `incrby` (via `node_value_mut`).
@@ -68,7 +68,7 @@
 **Oxidart** — `NodeImage` autonome (`oxidart/src/save.rs`) :
 ```rust
 struct NodeImage {
-    compression: CompactStr,   // copie profonde
+    compression: CompactPath,   // copie profonde
     tag: Tag,
     val: ValUnion,             // Bytes : clone (rc+1), droppé avec l'image ; Int : copie ; conteneurs : idx
     exp_and_radix: ExpAndRadix,
@@ -294,7 +294,7 @@ pied          u32 LE crc32 (IEEE, crc32fast) de tout ce qui précède | "RXDE"
 
 - `radixox-lib/src/save_barrier.rs` : `BitSet` (`get`/`set`/`clear`/`next_set`/`words_mut`) et `SaveBarrier<T>` (`begin_with(snapshot)`, `before_write(idx, &T)` qui fait un `ptr::read`, `forget`, `is_intact`, `unsafe take(idx) -> T0::{Slab, Image(&T)}`, `epoch`, `finish`). 6 tests sur un arbre jouet, propres sous ASan. *(Historique : remplacé à l'étape 3, voir plus bas.)*
 - `~/rust/hislab` : `copy_occupancy(&self, out: &mut Vec<u64>) -> u32` sur `HiSlab` et `TaggedHiSlab` (+ test). Oxidart et valart en dépendance `path = "../../hislab"` le temps du chantier (repasser sur une version publiée ensuite). Commité dans hislab (ed38da3, non publié), avec la croissance eager de lvl2/lvl3 dans `bitmap_tree.rs`.
-- Fix mimalloc : `SharedByte`, `CompactStr` et les blocs overflow valart appellent `mi_malloc`/`mi_zalloc`/`mi_free` (crate `libmimalloc-sys`) au lieu de `MiMalloc.alloc`, qui passe par `mi_malloc_aligned` et sur-alloue (−8 % de RSS à 100 B).
+- Fix mimalloc : `SharedByte`, `CompactPath` et les blocs overflow valart appellent `mi_malloc`/`mi_zalloc`/`mi_free` (crate `libmimalloc-sys`) au lieu de `MiMalloc.alloc`, qui passe par `mi_malloc_aligned` et sur-alloue (−8 % de RSS à 100 B).
 
 ### Étape 1 faite (2026-10-10)
 - `oxidart/src/lib.rs` : points de passage `node_mut` / `try_node_mut` / `remove_node` / `set_parent_idx` (exception sans barrière) ; `get_node_mut` supprimé. `create_node_with_val` passe par `push_child_idx`. `free_subtree_iterative` et `free_chunk` (UNLINK) retirent le nœud **avant** de libérer son overflow.
@@ -399,7 +399,7 @@ pied          u32 LE crc32 (IEEE, crc32fast) de tout ce qui précède | "RXDE"
 ## 5quinquies. Méthode de travail
 
 - **Tests** : mono-thread obligatoire (`RUST_TEST_THREADS=1` dans `.cargo/config.toml`, statics globaux). `cargo test -p radixox-lib -p oxidart -p valart`.
-- **ASan** (nightly installé) : `ASAN_OPTIONS=detect_leaks=0 RUSTFLAGS="-Zsanitizer=address -C target-cpu=native --cfg radixox_sysalloc" cargo +nightly test -p <crate> --target x86_64-unknown-linux-gnu --target-dir <scratch>`. `--cfg radixox_sysalloc` bascule `radixox_lib::raw_alloc` (SharedByte, CompactStr, overflows valart) sur malloc/free : sans lui ASan ne voit pas les blocs mimalloc. `detect_leaks=0` : les tests monoio d'oxidart fuient leur runtime (préexistant). Pour chaque test de COW, faire un **contrôle négatif** (désactiver la protection, vérifier qu'ASan signale un use-after-free).
+- **ASan** (nightly installé) : `ASAN_OPTIONS=detect_leaks=0 RUSTFLAGS="-Zsanitizer=address -C target-cpu=native --cfg radixox_sysalloc" cargo +nightly test -p <crate> --target x86_64-unknown-linux-gnu --target-dir <scratch>`. `--cfg radixox_sysalloc` bascule `radixox_lib::raw_alloc` (SharedByte, CompactPath, overflows valart) sur malloc/free : sans lui ASan ne voit pas les blocs mimalloc. `detect_leaks=0` : les tests monoio d'oxidart fuient leur runtime (préexistant). Pour chaque test de COW, faire un **contrôle négatif** (désactiver la protection, vérifier qu'ASan signale un use-after-free).
 - **Test de référence de l'étape 5** : mutations aléatoires sur un vrai `OxidArt` (SET, DEL, HSET, HDEL, SADD, SREM, UNLINK, EXPIRE, expirations) entrelacées avec les pas de la save ; le dump doit être identique à un `getn("")` + contenu des conteneurs pris à T0.
 - **Benchs** : profil `powerprofilesctl set performance` avant toute mesure ; runs courts (`TEST_TIME=10 LOAD_TIME=5 ./bench_memtier.sh`, `MT_PIPELINE=1` puis `256`), ordres de grandeur suffisants. Memtier avant/après l'étape 1 (le refactor touche le hot path), puis pendant une save (p99.99) pour régler `SAVE_TRANCHE_BUDGET`.
 

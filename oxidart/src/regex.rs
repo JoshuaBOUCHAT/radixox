@@ -1,5 +1,9 @@
+use std::fmt::Write;
+
 use regex_automata::dfa::{Automaton, dense::DFA};
+use regex_automata::nfa::thompson;
 use regex_automata::util::primitives::StateID;
+use regex_automata::util::syntax;
 use regex_automata::{Anchored, Input, MatchError};
 
 use crate::OxidArt;
@@ -58,13 +62,31 @@ impl OxidArt {
     /// // The "post:" subtree is pruned immediately (dead state on 'p')
     /// assert_eq!(results.len(), 2);
     /// ```
+    ///
+    /// The regex works on **bytes**, not on Unicode text: keys are binary.
+    /// `.` matches any single byte (including `\n`), and `\xNN` matches the
+    /// raw byte `NN` (e.g. `\xFF`, which is not valid UTF-8 on its own).
     pub fn getn_regex(&self, pattern: &str) -> Result<Vec<(SharedByte, Value)>, RegexError> {
-        let dfa = DFA::new(pattern)?;
+        let dfa = DFA::builder()
+            .syntax(
+                syntax::Config::new()
+                    .unicode(false)
+                    .utf8(false)
+                    .dot_matches_new_line(true),
+            )
+            .thompson(thompson::Config::new().utf8(false))
+            .build(pattern)?;
         let mut results = Vec::new();
         let start = dfa.start_state_forward(&Input::new(b"").anchored(Anchored::Yes))?;
 
         self.collect_regex(&dfa, self.root_idx, start, &mut results);
         Ok(results)
+    }
+
+    /// Keys matching a Redis glob pattern (`*`, `?`, `[...]`, `\x`), byte-wise.
+    /// See [`glob_to_regex`].
+    pub fn getn_glob(&self, glob: &[u8]) -> Result<Vec<(SharedByte, Value)>, RegexError> {
+        self.getn_regex(&glob_to_regex(glob))
     }
 
     /// Iterative DFA-guided traversal of the radix tree.
@@ -117,6 +139,114 @@ impl OxidArt {
                 }
             });
         }
+    }
+}
+
+/// How a Redis glob pattern can be answered.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GlobKind<'a> {
+    /// No special character: matches only this exact key.
+    Exact(&'a [u8]),
+    /// Literal prefix followed by a single trailing `*` (`""` = every key).
+    Prefix(&'a [u8]),
+    /// Anything else: needs the DFA ([`glob_to_regex`]).
+    Pattern,
+}
+
+/// Classifies a glob so that `KEYS user:1` is an exact lookup and `KEYS user:*`
+/// a plain prefix scan (no DFA). `\` counts as special: `user\*` is the
+/// literal key `user*`, not a prefix.
+pub fn glob_kind(glob: &[u8]) -> GlobKind<'_> {
+    let special = |b: &u8| matches!(b, b'*' | b'?' | b'[' | b'\\');
+    match glob.split_last() {
+        Some((b'*', head)) if !head.iter().any(special) => GlobKind::Prefix(head),
+        _ if !glob.iter().any(special) => GlobKind::Exact(glob),
+        _ => GlobKind::Pattern,
+    }
+}
+
+/// Converts a Redis glob into an anchored **byte-wise** regex for
+/// [`OxidArt::getn_regex`].
+///
+/// Redis semantics (`stringmatchlen`):
+///   `*`      any sequence of bytes (including `\n` and none)
+///   `?`      exactly one byte
+///   `[abc]`  one byte of the set ; `[^abc]` negation ; `[a-z]` range (bounds
+///            swapped if reversed) ; `\` escapes inside a class too ;
+///            unterminated class = closed at the end of the pattern
+///   `\x`     the literal byte `x`
+/// Every byte except ASCII alphanumerics is emitted as `\xNN`, so binary keys
+/// (and regex metacharacters) are matched literally.
+pub fn glob_to_regex(glob: &[u8]) -> String {
+    let mut re = String::with_capacity(glob.len() * 4 + 2);
+    re.push('^');
+    let mut i = 0;
+    while i < glob.len() {
+        match glob[i] {
+            b'*' => re.push_str(".*"),
+            b'?' => re.push('.'),
+            b'\\' if i + 1 < glob.len() => {
+                i += 1;
+                push_byte(&mut re, glob[i]);
+            }
+            b'[' => {
+                i += 1;
+                let negate = glob.get(i) == Some(&b'^');
+                if negate {
+                    i += 1;
+                }
+                let mut class = String::new();
+                while i < glob.len() && glob[i] != b']' {
+                    let mut lo = glob[i];
+                    if lo == b'\\' && i + 1 < glob.len() {
+                        i += 1;
+                        lo = glob[i];
+                    }
+                    // range `lo-hi` (a `-` right before `]` is a literal)
+                    if i + 2 < glob.len() && glob[i + 1] == b'-' && glob[i + 2] != b']' {
+                        let mut j = i + 2;
+                        if glob[j] == b'\\' && j + 1 < glob.len() {
+                            j += 1;
+                        }
+                        let hi = glob[j];
+                        let (a, b) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+                        push_byte(&mut class, a);
+                        class.push('-');
+                        push_byte(&mut class, b);
+                        i = j + 1;
+                        continue;
+                    }
+                    push_byte(&mut class, lo);
+                    i += 1;
+                }
+                // `i` est sur le `]` (ou en fin de motif) : sauté par le `i += 1` final.
+                match (class.is_empty(), negate) {
+                    (true, false) => re.push_str("[^\\x00-\\xFF]"), // `[]` : ne matche rien
+                    (true, true) => re.push_str("[\\x00-\\xFF]"),   // `[^]` : n'importe quel octet
+                    (false, neg) => {
+                        re.push('[');
+                        if neg {
+                            re.push('^');
+                        }
+                        re.push_str(&class);
+                        re.push(']');
+                    }
+                }
+            }
+            b => push_byte(&mut re, b),
+        }
+        i += 1;
+    }
+    re.push('$');
+    re
+}
+
+#[inline]
+fn push_byte(re: &mut String, b: u8) {
+    if b.is_ascii_alphanumeric() {
+        re.push(b as char);
+    } else {
+        let _ = write!(re, "\\x{b:02X}");
     }
 }
 

@@ -41,10 +41,11 @@
 //!
 //! ## Key Requirements
 //!
-//! Keys must be valid ASCII bytes. Non-ASCII keys will trigger a debug assertion.
+//! Keys are arbitrary bytes (binary-safe): every byte value 0x00–0xFF, `\0` included.
+//! Ordered operations (`krange`, prefix scans) use unsigned byte order (`memcmp`), like Redis.
 
 pub mod async_command;
-pub mod compact_str;
+pub mod compact_path;
 pub mod compress;
 pub mod error;
 
@@ -76,13 +77,16 @@ mod test_structures;
 #[cfg(test)]
 mod test_save;
 
+#[cfg(test)]
+mod test_binary;
+
 use std::mem::ManuallyDrop;
 
 use hislab::TaggedHiSlab;
 use radixox_lib::shared_byte::SharedByte;
 use rand::rngs::ThreadRng;
 
-use crate::compact_str::CompactStr;
+use crate::compact_path::CompactPath;
 
 use crate::node_childs::ChildAble;
 use crate::node_childs::Childs;
@@ -422,10 +426,9 @@ impl OxidArt {
     ///
     /// # Arguments
     ///
-    /// * `key` - The key to look up. Must be valid ASCII.
+    /// * `key` - The key to look up (arbitrary bytes).
     pub fn get(&mut self, key: &[u8]) -> Option<Value> {
         let idx = self.get_idx(key)?;
-        debug_assert!(key.is_ascii(), "key must be ASCII");
         let now = self.now;
         self.child_node(idx).get_value(now)
     }
@@ -435,7 +438,6 @@ impl OxidArt {
         self.child_node(idx).get_value_ref(self.now)
     }
     fn get_idx(&mut self, key: &[u8]) -> Option<u32> {
-        debug_assert!(key.is_ascii(), "key must be ASCII");
         let key_len = key.len();
         if key_len == 0 {
             if self.get_node(self.root_idx).is_expired(self.now) {
@@ -488,7 +490,6 @@ impl OxidArt {
     /// - `TtlResult::KeyWithTtl(remaining)` - The key exists with remaining seconds until expiration
     /// - `TtlResult::KeyWithoutTtl` - The key exists but has no TTL (permanent)
     pub fn get_ttl(&self, key: SharedByte) -> TtlResult {
-        debug_assert!(key.is_ascii(), "key must be ASCII");
         let idx = match self.traverse_to_key(&key) {
             Some(idx) => idx,
             None => return TtlResult::KeyNotExist,
@@ -508,7 +509,6 @@ impl OxidArt {
     ///
     /// Returns `true` if the key exists and the TTL was set, `false` otherwise.
     pub fn expire(&mut self, key: SharedByte, ttl: std::time::Duration) -> bool {
-        debug_assert!(key.is_ascii(), "key must be ASCII");
         let now = self.now;
         let Some(idx) = self.traverse_to_key(&key) else {
             return false;
@@ -534,7 +534,6 @@ impl OxidArt {
     ///
     /// Returns `true` if the key exists and had a TTL, `false` otherwise.
     pub fn persist(&mut self, key: SharedByte) -> bool {
-        debug_assert!(key.is_ascii(), "key must be ASCII");
 
         let Some(idx) = self.traverse_to_key(&key) else {
             return false;
@@ -673,7 +672,7 @@ impl OxidArt {
     ///
     /// # Arguments
     ///
-    /// * `prefix` - The prefix to match. Must be valid ASCII.
+    /// * `prefix` - The prefix to match (arbitrary bytes).
     ///
     /// # Returns
     ///
@@ -694,7 +693,6 @@ impl OxidArt {
     /// assert_eq!(users.len(), 2);
     /// ```
     pub fn getn(&self, prefix: SharedByte) -> Vec<(SharedByte, Value)> {
-        debug_assert!(prefix.is_ascii(), "prefix must be ASCII");
         let mut results = Vec::new();
         let prefix_len = prefix.len();
 
@@ -816,7 +814,7 @@ impl OxidArt {
     ///
     /// # Arguments
     ///
-    /// * `key` - The key to insert. Must be valid ASCII.
+    /// * `key` - The key to insert (arbitrary bytes).
     /// * `val` - The value to associate with the key.
     ///
     /// # Example
@@ -846,7 +844,7 @@ impl OxidArt {
     ///
     /// # Arguments
     ///
-    /// * `key` - The key to insert. Must be valid ASCII.
+    /// * `key` - The key to insert (arbitrary bytes).
     /// * `ttl` - Duration after which the key expires.
     /// * `val` - The value to associate with the key.
     ///
@@ -885,7 +883,6 @@ impl OxidArt {
         val: Value,
         if_exists: Option<bool>,
     ) -> bool {
-        debug_assert!(key.is_ascii(), "key must be ASCII");
         let idx = self.ensure_key(key);
 
         if let Some(want_exists) = if_exists {
@@ -905,7 +902,6 @@ impl OxidArt {
     }
 
     fn set_internal(&mut self, key: SharedByte, ttl: u64, val: Value) {
-        debug_assert!(key.is_ascii(), "key must be ASCII");
         let key_len = key.len();
         if key_len == 0 {
             self.node_mut(self.root_idx).set_val(val, ttl);
@@ -960,7 +956,7 @@ impl OxidArt {
             let old_childs = std::mem::take(&mut node.childs);
             let old_overflow_idx = std::mem::replace(&mut node.overflow_idx, u32::MAX);
 
-            node.compression = CompactStr::from_slice(&old_compression[..common_len]);
+            node.compression = CompactPath::from_slice(&old_compression[..common_len]);
             if val_on_intermediate && let Some(val) = val.take() {
                 let (t, v) = value_into_raw(val);
                 node.tag = t;
@@ -992,7 +988,7 @@ impl OxidArt {
         };
         let old_child = Node {
             overflow_idx: old_overflow_idx,
-            compression: CompactStr::from_slice(&old_compression[common_len + 1..]),
+            compression: CompactPath::from_slice(&old_compression[common_len + 1..]),
             tag: old_tag,
             val: old_val_bits,
             childs: old_childs,
@@ -1109,7 +1105,6 @@ impl OxidArt {
     /// s'il a des enfants, sinon sur le nœud sorti du slab), puis supprime /
     /// recompresse. `None` si la clé n'a pas de nœud.
     fn remove_key<R>(&mut self, key: &[u8], f: impl FnOnce(&mut Node) -> R) -> Option<R> {
-        debug_assert!(key.is_ascii(), "key must be ASCII");
         if key.is_empty() {
             if !self.get_node(self.root_idx).has_val() {
                 return None;
@@ -1177,7 +1172,7 @@ impl OxidArt {
     ///
     /// # Arguments
     ///
-    /// * `prefix` - The prefix to match. Must be valid ASCII.
+    /// * `prefix` - The prefix to match (arbitrary bytes).
     ///
     /// # Example
     ///
@@ -1198,7 +1193,6 @@ impl OxidArt {
     /// assert_eq!(tree.getn(SharedByte::from_str("")).len(), 1);
     /// ```
     pub fn deln(&mut self, prefix: &[u8]) -> usize {
-        debug_assert!(prefix.is_ascii(), "prefix must be ASCII");
         let prefix_len = prefix.len();
 
         if prefix_len == 0 {
@@ -1442,7 +1436,7 @@ impl OxidArt {
 
 #[repr(C, align(64))]
 struct Node {
-    compression: CompactStr,
+    compression: CompactPath,
     childs: Childs,
     tag: Tag,
     val: ValUnion,
@@ -1453,7 +1447,7 @@ struct Node {
 }
 
 struct ValNode {
-    compression: CompactStr,
+    compression: CompactPath,
     parent_idx: u32,
     childs: u32,
     exp_and_radix: ExpAndRadix,
@@ -1522,7 +1516,7 @@ impl Default for Node {
         Self {
             overflow_idx: u32::MAX,
             childs: Childs::default(),
-            compression: CompactStr::new(),
+            compression: CompactPath::new(),
             tag: Tag::None,
             val: ValUnion { idx: 0 },
             parent_idx: u32::MAX,
@@ -1655,7 +1649,7 @@ impl Node {
         let (tag, val_bits) = value_into_raw(val);
         Node {
             overflow_idx: u32::MAX,
-            compression: CompactStr::from_slice(compression),
+            compression: CompactPath::from_slice(compression),
             tag,
             val: val_bits,
             childs: Childs::default(),
@@ -1666,7 +1660,7 @@ impl Node {
     fn new_empty_leaf(compression: &[u8], parent_idx: u32, parent_radix: u8) -> Self {
         Self {
             childs: Childs::default(),
-            compression: CompactStr::from_slice(compression),
+            compression: CompactPath::from_slice(compression),
             tag: Tag::None,
             val: ValUnion { idx: 0 },
             overflow_idx: u32::MAX,

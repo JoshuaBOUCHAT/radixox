@@ -7,7 +7,7 @@
 > par membre de set** avec la même mécanique que le TTL par clé top-level.
 >
 > Date : 2026-07-29. Basé sur lecture directe de `oxidart/src/{lib,value,hcommand,
-> scommand,zset_inner,node_childs,compact_str}.rs` et `radixox-lib/src/shared_byte.rs`.
+> scommand,zset_inner,node_childs,compact_path}.rs` et `radixox-lib/src/shared_byte.rs`.
 
 ---
 
@@ -31,7 +31,7 @@ Le document a été écrit sans le code sous les yeux ; quelques inexactitudes f
   ```rust
   #[repr(C, align(64))]
   struct Node {
-      compression: CompactStr,   // 8 (union ptr/inline)
+      compression: CompactPath,   // 8 (union ptr/inline)
       childs: Childs,            // 31 (packed: 6×u32 + 6×u8 + u8 len)
       tag: Tag,                  // 1
       val: ValUnion,             // 8
@@ -59,7 +59,7 @@ L'idée : au lieu de `Tag::Hash → idx dans HASH_SLAB<InnerHCommand>`, faire po
 |---|---|---|
 | `InnerHCommand::Small` (actuel, petit hash) | ~16 B (2×`SharedByte` = 2×8B pointeur) + alloc heap champ (6B header + N) + alloc heap valeur (6B header + M) | Pas d'indirection de structure — juste 2 pointeurs dans un `SmallVec` inline |
 | `InnerHCommand::Large` (actuel, gros hash) | ~16 B pointeurs + overhead `HashMap` (facteur de charge std ~1.1×, pas de métadonnée SwissTable ici car `std::collections::HashMap`) + mêmes allocs heap champ/valeur | Resize O(n) au grandissement — le vrai problème identifié |
-| **Champ = `Node` ART complet (proposition)** | **64 B fixes** (le `Node` entier) + alloc heap champ si >7B (sinon inline dans `CompactStr`) + alloc heap valeur si Bytes non-inline | Le nœud lui-même remplace l'entrée `HashMap`, mais son overhead fixe (`Childs` 31B, `overflow_idx`, `parent_idx`, `exp_and_radix`) est payé **même pour un champ qui n'a jamais besoin de TTL ni d'enfants** |
+| **Champ = `Node` ART complet (proposition)** | **64 B fixes** (le `Node` entier) + alloc heap champ si >7B (sinon inline dans `CompactPath`) + alloc heap valeur si Bytes non-inline | Le nœud lui-même remplace l'entrée `HashMap`, mais son overhead fixe (`Childs` 31B, `overflow_idx`, `parent_idx`, `exp_and_radix`) est payé **même pour un champ qui n'a jamais besoin de TTL ni d'enfants** |
 
 **Verdict chiffré** : pour un hash à 1M de champs courts (~10-20B chacun, cas fréquent — compteurs, flags, petits attributs), passer de `HashMap` à "champ = Node" multiplie le coût de structure par **~3-4×** (64B fixes vs ~16-24B). Sur 1M champs, ça représente ~48 MB de plus *par hash*, juste en overhead de structure, avant même de compter les données. Ce n'est pas rédhibitoire (RadixOx tourne déjà avec des RSS de plusieurs GB sur 5M clés dans les benchmarks archivés), mais ce n'est **pas neutre** — à mettre en face du bénéfice avant de trancher.
 
@@ -276,7 +276,7 @@ latency — l'allocateur mimalloc en prend aussi sa part sous forte charge).
 ### 9.3 Deuxième temps (pas immédiat) : pousser `&[u8]` à l'intérieur de l'ART lui-même
 
 Idée notée pour plus tard, pas pour maintenant : réduire l'usage de `SharedByte` *dans les
-structures internes de l'ART* (`CompactStr`, chemins de compression, `Childs`) au profit de
+structures internes de l'ART* (`CompactPath`, chemins de compression, `Childs`) au profit de
 `&[u8]` là où c'est possible, dans un objectif de **recyclage** (réutiliser des buffers/slots
 plutôt que réallouer à chaque insertion). Contrainte à respecter avant de s'y attaquer :
 l'ART **doit** posséder ce qu'il stocke durablement (une clé de nœud vit potentiellement
@@ -299,7 +299,7 @@ COW déjà architecturé, cf. §9). Notes de travail, rien d'implémenté.
 
 ```rust
 struct ValNode {
-    compression: CompactStr,      // 8
+    compression: CompactPath,      // 8
     parent_idx: u32,               // 4
     len: u8,
     tag: Tag,
@@ -316,7 +316,7 @@ union NodeData {
 
 En `repr(Rust)` (packing auto), ça tombe pile à 128B. **En `repr(C)`** (nécessaire vu
 l'unsafe/allocation manuelle par slab), il faut revérifier avec `size_of` — le padding
-d'alignement (8B pour `CompactStr`/`ExpAndRadix`/`Option<SharedByte>`) n'est plus
+d'alignement (8B pour `CompactPath`/`ExpAndRadix`/`Option<SharedByte>`) n'est plus
 optimisé automatiquement, le total peut dépasser 128B sans réordonnancement manuel des
 champs.
 
@@ -434,6 +434,13 @@ trancher N plus tard :
 - Benchmark réel à faire une fois le reste posé, pas de choix a priori.
 
 ### 11.3 Flag TTL — bit volé dans le byte de radix, zéro coût structurel
+
+> ⚠️ **Caduc depuis le 2026-10-12** : les clés sont désormais **binaires** (tous les octets
+> 0x00–0xFF, palier dense de 256 enfants, `assert!(radix != 0)` et `is_ascii` retirés,
+> tests `oxidart/src/test_binary.rs`). Le bit 7 d'un octet de clé n'est plus libre : ce
+> flag ne peut pas être volé dans le radix. Un flag TTL doit prendre un vrai bit ailleurs
+> (octet de tag du record, ou bit de longueur). Le §11.4 (« plafonné par l'espace ASCII
+> (127) ») est caduc pour la même raison. Texte d'origine conservé ci-dessous.
 
 Les clés/champs sont garanties ASCII par construction dans RadixOx (contrainte déjà
 implicite dans le code existant — `HUGE_OVERFLOW_CAPACITY = ASCII_MAX_CHAR(127) -

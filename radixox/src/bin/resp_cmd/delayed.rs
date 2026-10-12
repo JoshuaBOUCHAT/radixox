@@ -6,7 +6,7 @@ use radixox_lib::shared_frame::SharedFrame as Frame;
 use crate::SharedART;
 use oxidart::async_command::OxidArtAsync;
 
-use super::{glob_to_regex, is_simple_prefix};
+use oxidart::regex::{GlobKind, glob_kind};
 
 pub(crate) type AsyncFrame = Pin<Box<dyn Future<Output = Frame>>>;
 
@@ -36,24 +36,26 @@ pub(crate) fn cmd_keys(pattern: SharedByte, art: SharedART) -> AsyncFrame {
 }
 
 async fn handle_keys(pattern: SharedByte, art: SharedART) -> Frame {
-    if pattern.is_empty() || pattern.as_ref() == b"*" {
-        let keys = art.getn_async(SharedByte::from_slice(b"")).await;
-        return Frame::Array(keys.into_iter().map(Frame::BulkString).collect());
+    match glob_kind(&pattern) {
+        // `KEYS user:1` : la clé exacte seulement (pas user:10, user:100…)
+        GlobKind::Exact(key) => {
+            let mut expired = Vec::new();
+            let found = art.borrow().exists_count(&[key], &mut expired) == 1;
+            if !expired.is_empty() {
+                art.borrow_mut().purge_expired(&[key], &expired);
+            }
+            let keys = if found { vec![Frame::BulkString(SharedByte::from_slice(key))] } else { Vec::new() };
+            return Frame::Array(keys);
+        }
+        GlobKind::Prefix(prefix) => {
+            let keys = art.getn_async(SharedByte::from_slice(prefix)).await;
+            return Frame::Array(keys.into_iter().map(Frame::BulkString).collect());
+        }
+        GlobKind::Pattern => {}
     }
 
-    if is_simple_prefix(&pattern) {
-        let prefix = if pattern.ends_with(b"*") {
-            SharedByte::from_slice(&pattern[..pattern.len() - 1])
-        } else {
-            pattern
-        };
-        let keys = art.getn_async(prefix).await;
-        return Frame::Array(keys.into_iter().map(Frame::BulkString).collect());
-    }
-
-    let regex = glob_to_regex(&pattern);
     let borrowed = art.borrow();
-    match borrowed.getn_regex(&regex) {
+    match borrowed.getn_glob(&pattern) {
         Ok(pairs) => Frame::Array(
             pairs
                 .into_iter()

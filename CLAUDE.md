@@ -82,8 +82,8 @@ O(k) key-value operations where k is key length.
 - With TTL: `now: u64` timestamp for expiration checks
 
 **Node structure** (`repr(C)`, **128 bytes** with TTL — fits allocator bucket exactly):
-- With TTL: `childs: Childs`, `compression: CompactStr` (16 bytes, inline ≤14), `val: Option<(Value, u64)>`, `huge_childs_idx: u32`, `parent_idx: u32`, `parent_radix: u8`
-- Without TTL: `compression: CompactStr`, `val: Option<Value>`, `childs: Childs`
+- With TTL: `childs: Childs`, `compression: CompactPath` (16 bytes, inline ≤14), `val: Option<(Value, u64)>`, `huge_childs_idx: u32`, `parent_idx: u32`, `parent_radix: u8`
+- Without TTL: `compression: CompactPath`, `val: Option<Value>`, `childs: Childs`
 
 **Two-tier child storage (`node_childs.rs`)**:
 - `Childs`: Inline, up to 9 children (64-byte aligned)
@@ -206,7 +206,7 @@ Port 8379. Length-prefixed protobuf messages (4-byte big-endian size + payload).
 - [x] ✅ BTreeSet for Set (ordered iteration, deterministic)
 - [x] ✅ ZSetInner double-index (BTreeSet for range + HashMap for O(1) score lookup)
 - [x] ✅ Node size = 128 bytes (cache-line optimized)
-- [x] ✅ CompactStr with tinypointers (2byteid → 65k slots)
+- [x] ✅ CompactPath with tinypointers (2byteid → 65k slots)
 
 ## Bug Fix — `split_node` / `ensure_key` (2025-02)
 

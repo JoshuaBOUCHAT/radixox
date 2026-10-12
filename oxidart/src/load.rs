@@ -48,7 +48,7 @@ use std::mem::ManuallyDrop;
 use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::varint::{get_bytes, get_varint, unzigzag};
 
-use crate::compact_str::CompactStr;
+use crate::compact_path::CompactPath;
 use crate::node_childs::{CHILDS_SIZE, ChildAble, Childs};
 use crate::save::{DumpError, format};
 use crate::value::{Tag, ValUnion, alloc_list, alloc_zset, drop_raw, valart};
@@ -582,7 +582,7 @@ impl OxidArt {
     fn load_node(&mut self, p: Open, start: usize, kept: &[u8], childs: &mut Vec<(u8, u32)>) -> u32 {
         let radix = kept[start];
         let mut node = Node {
-            compression: CompactStr::from_slice(&kept[start + 1..p.end]),
+            compression: CompactPath::from_slice(&kept[start + 1..p.end]),
             childs: Childs::default(),
             tag: Tag::None,
             val: ValUnion { idx: 0 },

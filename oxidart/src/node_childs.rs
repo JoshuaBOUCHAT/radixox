@@ -76,7 +76,7 @@ impl ChildAble for Childs {
     }
 
     fn push(&mut self, radix: u8, idx: u32) {
-        assert!(!self.is_full() && radix != 0);
+        assert!(!self.is_full());
         let len = self.len();
         self.idxs[len] = idx;
         self.radixs[len] = radix;

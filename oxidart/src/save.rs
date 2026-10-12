@@ -30,7 +30,7 @@ use std::mem::ManuallyDrop;
 
 use radixox_lib::save_barrier::SaveBarrier;
 
-use crate::compact_str::CompactStr;
+use crate::compact_path::CompactPath;
 use crate::node_childs::{ChildAble, OverflowArena};
 use crate::value::{Tag, ValUnion};
 use crate::{ExpAndRadix, Node};
@@ -45,7 +45,7 @@ use crate::{ExpAndRadix, Node};
 ///
 /// Jamais converti en `Node` : le `Drop` de `Node` détruirait le conteneur.
 pub(crate) struct NodeImage {
-    pub(crate) compression: CompactStr,
+    pub(crate) compression: CompactPath,
     pub(crate) tag: Tag,
     pub(crate) val: ValUnion,
     pub(crate) exp_and_radix: ExpAndRadix,
@@ -70,7 +70,7 @@ impl NodeImage {
             _ => unsafe { std::ptr::read(&node.val) },
         };
         Self {
-            compression: CompactStr::from_slice(&node.compression),
+            compression: CompactPath::from_slice(&node.compression),
             tag: node.tag,
             val,
             exp_and_radix: node.exp_and_radix,

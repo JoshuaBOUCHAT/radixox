@@ -11,9 +11,9 @@ union Inner {
     inline: [u8; 8],
 }
 
-pub struct CompactStr(Inner);
+pub struct CompactPath(Inner);
 
-impl CompactStr {
+impl CompactPath {
     const INLINE_CAP: usize = 7;
     const HEAP_HEADER: usize = 4; // u32 len seulement — pas de capacity, immuable
 
@@ -78,7 +78,7 @@ impl CompactStr {
     }
 }
 
-impl CompactStr {
+impl CompactPath {
     /// Prefetch du bloc heap (rien si inline).
     #[inline]
     pub fn prefetch(&self) {
@@ -90,7 +90,7 @@ impl CompactStr {
     }
 }
 
-impl Deref for CompactStr {
+impl Deref for CompactPath {
     type Target = [u8];
 
     #[inline]
@@ -112,13 +112,13 @@ impl Deref for CompactStr {
     }
 }
 
-impl Default for CompactStr {
+impl Default for CompactPath {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Drop for CompactStr {
+impl Drop for CompactPath {
     fn drop(&mut self) {
         unsafe {
             if self.0.inline[0] & 1 == 0 {

@@ -168,7 +168,8 @@ impl std::ops::Deref for SharedByte {
 
 impl std::fmt::Debug for SharedByte {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SharedString({:?}, rc={})", self.as_str(), self.rc())
+        // octets échappés : une clé binaire (non UTF-8) reste lisible
+        write!(f, "SharedByte(\"{}\", rc={})", self.as_slice().escape_ascii(), self.rc())
     }
 }
 
