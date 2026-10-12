@@ -31,6 +31,9 @@ impl From<MatchError> for RegexError {
     }
 }
 
+/// Taille maximale d'une DFA (et de sa construction), en octets.
+const DFA_SIZE_LIMIT: usize = 4 << 20;
+
 impl OxidArt {
     /// Returns all key-value pairs whose key matches the given regex pattern.
     ///
@@ -68,6 +71,14 @@ impl OxidArt {
     /// raw byte `NN` (e.g. `\xFF`, which is not valid UTF-8 on its own).
     pub fn getn_regex(&self, pattern: &str) -> Result<Vec<(SharedByte, Value)>, RegexError> {
         let dfa = DFA::builder()
+            // Bornes : un motif comme `*a` + 40 `?` (`.*a.{40}`) a ~2^40 états
+            // déterministes ; sans limite, un seul KEYS fige le serveur. Au-delà,
+            // erreur (« motif trop complexe ») en quelques ms.
+            .configure(
+                DFA::config()
+                    .dfa_size_limit(Some(DFA_SIZE_LIMIT))
+                    .determinize_size_limit(Some(DFA_SIZE_LIMIT)),
+            )
             .syntax(
                 syntax::Config::new()
                     .unicode(false)
