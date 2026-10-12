@@ -51,8 +51,8 @@ pub mod error;
 pub mod hcommand;
 mod prefetch_batch;
 pub use prefetch_batch::PREFETCH_BATCH;
-mod node_childs;
 mod load;
+mod node_childs;
 pub mod save;
 pub mod scommand;
 pub mod value;
@@ -93,8 +93,7 @@ pub use crate::save::{Dump, DumpEntry, DumpError, SaveCursor, check_footer, pars
 pub use crate::value::Value;
 use crate::value::{
     NodeValMut, NodeValRef, Tag, ValUnion, drop_raw, init_slabs, valart, value_from_raw_ref,
-    value_into_raw,
-    value_take_raw,
+    value_into_raw, value_take_raw,
 };
 
 /// Internal sentinel value indicating no expiration (never expires)
@@ -374,8 +373,15 @@ impl OxidArt {
     /// Barrière : capture l'image T0 du nœud s'il est encore intact.
     #[inline]
     fn before_write(&mut self, idx: u32) {
-        let Self { map, overflow_arena, save, .. } = self;
-        let OxidSave { barrier, childs, .. } = save;
+        let Self {
+            map,
+            overflow_arena,
+            save,
+            ..
+        } = self;
+        let OxidSave {
+            barrier, childs, ..
+        } = save;
         barrier.before_write(idx, || {
             let node = map.get(idx).expect("intact à T0 ⇒ encore occupé");
             NodeImage::capture(node, overflow_arena, childs)
@@ -619,7 +625,13 @@ impl OxidArt {
     /// Pose une valeur neuve (conteneur créé par une commande) sur un nœud
     /// sans valeur vivante. Une valeur expirée encore en place est libérée et
     /// son TTL n'est pas hérité.
-    pub(crate) fn install_value_raw(&mut self, idx: u32, tag: Tag, val: ValUnion, ttl: Option<u64>) {
+    pub(crate) fn install_value_raw(
+        &mut self,
+        idx: u32,
+        tag: Tag,
+        val: ValUnion,
+        ttl: Option<u64>,
+    ) {
         let node = self.node_mut(idx);
         node.clear_val();
         match ttl {
