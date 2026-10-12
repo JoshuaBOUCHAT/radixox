@@ -138,3 +138,19 @@ pub fn extend_encode(dst: &mut Vec<u8>, frame: &SharedFrame) {
     dst.reserve(frame.encode_len());
     encode_frame(dst, frame);
 }
+
+/// `*n\r\n` : en-tête de tableau, pour les réponses encodées sans `SharedFrame`.
+pub fn encode_array_len(dst: &mut Vec<u8>, n: usize) {
+    dst.push(b'*');
+    write_usize(dst, n);
+    dst.extend_from_slice(b"\r\n");
+}
+
+/// `$len\r\n<bytes>\r\n`.
+pub fn encode_bulk(dst: &mut Vec<u8>, bytes: &[u8]) {
+    dst.push(b'$');
+    write_usize(dst, bytes.len());
+    dst.extend_from_slice(b"\r\n");
+    dst.extend_from_slice(bytes);
+    dst.extend_from_slice(b"\r\n");
+}

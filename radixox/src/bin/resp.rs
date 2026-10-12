@@ -393,6 +393,13 @@ async fn dispatch(
                 let frame = cmd_unlink(v, art.clone()).await;
                 conn_state.encode(frame);
             }
+            Cmd::KRange { prefix, from, count, rev } => {
+                // Encodé pendant l'emprunt de l'arbre : les valeurs sont des
+                // références (pas de clone/refcount), préchargées au parcours.
+                let art = art.borrow();
+                let range = art.krange(prefix, from, count, rev);
+                conn_state.encode_with(|buf| encode_krange(buf, &range));
+            }
             Cmd::Unknown => {
                 conn_state.encode(Frame::Error("ERR unknown command".into()));
             }
@@ -472,6 +479,7 @@ fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         | Cmd::Unsubscribe(_)
         | Cmd::Publish { .. }
         | Cmd::Keys(_)
+        | Cmd::KRange { .. }
         | Cmd::Unlink(_)
         | Cmd::BgSave
         | Cmd::Save
@@ -482,6 +490,36 @@ fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn encode_krange(buf: &mut Vec<u8>, range: &oxidart::krange::RangeOut<'_>) {
+    use oxidart::krange::RangeVal;
+    use radixox_lib::shared_frame::{encode_array_len, encode_bulk};
+    encode_array_len(buf, 2 * range.len());
+    for (key, val) in range.iter() {
+        encode_bulk(buf, key);
+        match val {
+            RangeVal::Bytes(b) => encode_bulk(buf, b.as_slice()),
+            RangeVal::Int(n) => {
+                let mut tmp = [0u8; 20];
+                let mut i = tmp.len();
+                let mut m = n.unsigned_abs();
+                loop {
+                    i -= 1;
+                    tmp[i] = b'0' + (m % 10) as u8;
+                    m /= 10;
+                    if m == 0 {
+                        break;
+                    }
+                }
+                if n < 0 {
+                    i -= 1;
+                    tmp[i] = b'-';
+                }
+                encode_bulk(buf, &tmp[i..]);
+            }
+        }
+    }
+}
 
 fn resp_pong(msg: Option<&[u8]>) -> Frame {
     match msg {

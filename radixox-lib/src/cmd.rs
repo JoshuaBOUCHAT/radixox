@@ -114,6 +114,11 @@ pub enum Cmd<'a> {
     /// KEYS pattern — async (regex scan potentiellement long) : owned.
     Keys(SharedByte),
 
+    /// KRANGE prefix from count / KREVRANGE prefix from count : `count`
+    /// entrées string sous `prefix`, triées, strictement après (resp. avant)
+    /// `from` ("" = depuis le début / la fin). Réponse [k1, v1, k2, v2, …].
+    KRange { prefix: &'a [u8], from: &'a [u8], count: usize, rev: bool },
+
     // --- TTL ---------------------------------------------------------
     /// TTL key  (retourne secondes)
     Ttl(&'a [u8]),
@@ -488,8 +493,18 @@ fn dispatch<'a>(raw: &[&'a [u8]]) -> Option<Cmd<'a>> {
             _ => None,
         },
 
-        // ── K : KEYS ──────────────────────────────────────────────────────
-        b'k' => if cmd.len() == 4 { need!(1); Some(Cmd::Keys(sb(args[0]))) } else { None },
+        // ── K : KEYS KRANGE KREVRANGE ─────────────────────────────────────
+        b'k' => match cmd.len() {
+            4 => { need!(1); Some(Cmd::Keys(sb(args[0]))) }
+            6 | 9 => {
+                let rev = cmd.len() == 9;
+                let name: &[u8] = if rev { b"krevrange" } else { b"krange" };
+                if !cmd.eq_ignore_ascii_case(name) { return None; }
+                need!(3);
+                Some(Cmd::KRange { prefix: args[0], from: args[1], count: arg_u64(args[2])? as usize, rev })
+            }
+            _ => None,
+        },
 
         // ── M : MGET MSET ─────────────────────────────────────────────────
         b'm' => if cmd.len() == 4 {

@@ -356,6 +356,14 @@ impl ConnState {
         };
         extend_encode(buf, &frame);
     }
+
+    /// Encode directement dans le buffer d'écriture (réponse construite sans `Frame`).
+    pub(crate) fn encode_with(&mut self, f: impl FnOnce(&mut Vec<u8>)) {
+        let Self::Normal(_, buf) = self else {
+            unreachable!()
+        };
+        f(buf);
+    }
     pub(crate) async fn flush(&mut self) -> IOResult<()> {
         if let Self::Normal(_, buffer) = self
             && !buffer.is_empty()

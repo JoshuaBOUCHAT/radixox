@@ -49,6 +49,7 @@ pub mod compress;
 pub mod error;
 
 pub mod hcommand;
+pub mod krange;
 mod prefetch_batch;
 pub use prefetch_batch::PREFETCH_BATCH;
 mod load;
@@ -805,9 +806,7 @@ impl OxidArt {
         if let Some(overflow_idx) = node.get_overflow_idx()
             && let Some(overflow) = self.overflow_arena.get(overflow_idx)
         {
-            for (radix, child_idx) in overflow.iter() {
-                f(radix, child_idx);
-            }
+            overflow.for_each_child(f);
         }
     }
 

@@ -319,9 +319,30 @@ impl Overflow {
     }
 
     /// Parcourt tous les enfants (léger puis huge) sans allouer.
+    /// Boucles simples : la chaîne d'itérateurs de `iter()` (Chain/Flatten/FlatMap)
+    /// compile mal (~11 % d'un KRANGE 1 au profil).
+    #[inline]
     pub(crate) fn for_each_child(&self, mut f: impl FnMut(u8, u32)) {
-        for (r, i) in self.iter() {
-            f(r, i);
+        for i in 0..self.len as usize {
+            f(self.radixs[i], self.idxs[i]);
+        }
+        match self.huge_kind {
+            HugeKind::Groups => {
+                let len = self.huge_len as usize;
+                for (g, grp) in self.groups().iter().enumerate() {
+                    for j in 0..(len - 8 * g).min(8) {
+                        f(grp.radixs[j], grp.idxs[j]);
+                    }
+                }
+            }
+            HugeKind::Dense => {
+                for (r, &v) in self.dense().iter().enumerate() {
+                    if v != DENSE_EMPTY {
+                        f(r as u8, v);
+                    }
+                }
+            }
+            HugeKind::None | HugeKind::Free => {}
         }
     }
 
