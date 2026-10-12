@@ -27,3 +27,12 @@ zstd-safe = { version = "8.1", default-features = false, features = ["experiment
 
 [dev-dependencies]
 redis = "0.27"
+
+# Used by `cargo install radixox` (the workspace root profile is not published).
+# In this workspace, the root profile applies; keep both in sync.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3

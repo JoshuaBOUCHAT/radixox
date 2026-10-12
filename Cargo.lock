@@ -529,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "oxidart"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -616,7 +616,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "radixox"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "crc32fast",
  "io-uring",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "radixox-lib"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "libmimalloc-sys",
  "mimalloc",
@@ -839,7 +839,7 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "valart"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "fastrand",
  "foldhash",

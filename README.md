@@ -43,10 +43,8 @@ Plus what Redis doesn't have:
 ## Quick start
 
 ```bash
-git clone https://github.com/JoshuaBOUCHAT/radixox
-cd radixox
-cargo build --release --bin radixox
-./target/release/radixox                 # listens on 6379
+cargo install radixox                    # or: git clone … && cargo build --release --bin radixox
+radixox                                  # listens on 6379
 
 redis-cli SET user:10:message:1 hello
 redis-cli SET user:10:message:2 world

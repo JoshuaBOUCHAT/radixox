@@ -5,6 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Compact radix trees for the Hash and Set values of OxidArt / RadixOx"
+readme = "README.md"
+keywords = ["radix-tree", "hash", "set", "data-structure"]
+categories = ["data-structures"]
 
 [dependencies]
 radixox-lib = { workspace = true }
