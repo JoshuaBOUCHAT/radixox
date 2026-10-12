@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crate::Frame;
-use oxidart::{OxidArt, TtlResult, counter::CounterError, value::Value};
+use oxidart::{OxidArt, PREFETCH_BATCH, TtlResult, counter::CounterError, value::Value};
 use radixox_lib::cmd::{SetCondition, SetOpts};
 use radixox_lib::shared_byte::SharedByte;
 
@@ -76,9 +76,13 @@ pub(crate) fn cmd_decrby(art: &mut OxidArt, key: &[u8], delta: i64) -> Frame {
 
 pub(crate) fn cmd_del(art: &mut OxidArt, keys: &[&[u8]]) -> Frame {
     let mut count = 0i64;
-    for key in keys {
-        if art.del(key) {
-            count += 1;
+    // descentes préchargées ensemble, puis suppressions dans un cache chaud
+    for chunk in keys.chunks(PREFETCH_BATCH) {
+        art.prefetch_keys(chunk);
+        for key in chunk {
+            if art.del(key) {
+                count += 1;
+            }
         }
     }
     Frame::Integer(count)
@@ -109,32 +113,24 @@ pub(crate) fn cmd_persist(art: &mut OxidArt, key: &[u8]) -> Frame {
 }
 
 pub(crate) fn cmd_exists(art: &mut OxidArt, keys: &[&[u8]]) -> Frame {
-    let mut count = 0i64;
-    for key in keys {
-        if art.get(key).is_some() {
-            count += 1;
-        }
+    let mut expired = Vec::new();
+    let n = art.exists_count(keys, &mut expired);
+    if !expired.is_empty() {
+        art.purge_expired(keys, &expired);
     }
-    Frame::Integer(count)
-}
-
-pub(crate) fn cmd_mget(art: &mut OxidArt, keys: &[&[u8]]) -> Frame {
-    let results: Vec<Frame> = keys
-        .iter()
-        .map(|key| match art.get(key) {
-            Some(val) => match val.as_bytes() {
-                Some(b) => Frame::BulkString(b),
-                None => Frame::Null,
-            },
-            None => Frame::Null,
-        })
-        .collect();
-    Frame::Array(results)
+    Frame::Integer(n as i64)
 }
 
 pub(crate) fn cmd_mset(art: &mut OxidArt, pairs: &[(&[u8], SharedByte)]) -> Frame {
-    for (k, v) in pairs {
-        art.set(SharedByte::from_slice(k), Value::String(v.clone()));
+    let mut keys: [&[u8]; PREFETCH_BATCH] = [&[]; PREFETCH_BATCH];
+    for chunk in pairs.chunks(PREFETCH_BATCH) {
+        for (slot, (k, _)) in keys.iter_mut().zip(chunk) {
+            *slot = k;
+        }
+        art.prefetch_keys(&keys[..chunk.len()]);
+        for (k, v) in chunk {
+            art.set(SharedByte::from_slice(k), Value::String(v.clone()));
+        }
     }
     Frame::SimpleString(SharedByte::from_slice(b"OK"))
 }

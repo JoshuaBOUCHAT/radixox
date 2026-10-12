@@ -27,6 +27,19 @@ pub enum RangeVal<'a> {
     Int(i64),
 }
 
+/// Valeur string vivante d'un nœud, par référence (`None` : pas de valeur,
+/// expirée, ou pas une string).
+#[inline]
+pub(crate) fn str_ref(node: &crate::Node, now: u64) -> Option<RangeVal<'_>> {
+    let v = node.get_value_ref(now)?;
+    match v.tag {
+        // SAFETY: le tag indique le champ actif de l'union.
+        Tag::Bytes => Some(RangeVal::Bytes(unsafe { &v.val.bytes })),
+        Tag::Int => Some(RangeVal::Int(unsafe { v.val.integer })),
+        _ => None,
+    }
+}
+
 /// Résultat d'un range : clés concaténées dans un seul buffer (aucune
 /// allocation par clé) + (fin de la clé dans `keys`, valeur).
 #[derive(Default, Debug)]
@@ -187,19 +200,12 @@ impl<'a> Walker<'a, '_> {
         let Some(node) = self.art.try_get_node(idx) else {
             return;
         };
-        let Some(v) = node.get_value_ref(self.art.now) else {
+        let Some(val) = str_ref(node, self.art.now) else {
             return;
         };
-        let val = match v.tag {
-            // SAFETY: le tag indique le champ actif de l'union.
-            Tag::Bytes => {
-                let b: &'a SharedByte = unsafe { &v.val.bytes };
-                b.prefetch();
-                RangeVal::Bytes(b)
-            }
-            Tag::Int => RangeVal::Int(unsafe { v.val.integer }),
-            _ => return,
-        };
+        if let RangeVal::Bytes(b) = val {
+            b.prefetch();
+        }
         self.out.keys.extend_from_slice(&self.key[..key_len]);
         self.out.entries.push((self.out.keys.len() as u32, val));
     }

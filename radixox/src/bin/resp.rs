@@ -26,7 +26,7 @@ use resp_cmd::delayed::{cmd_keys, cmd_unlink};
 use resp_cmd::pub_sub::{cmd_publish, cmd_subscribe, cmd_unsubscribe};
 use resp_cmd::string::{
     cmd_dbsize, cmd_decr, cmd_decrby, cmd_del, cmd_exists, cmd_expire, cmd_flushdb, cmd_get,
-    cmd_incr, cmd_incrby, cmd_mget, cmd_mset, cmd_persist, cmd_pttl, cmd_set, cmd_setnx, cmd_ttl,
+    cmd_incr, cmd_incrby, cmd_mset, cmd_persist, cmd_pttl, cmd_set, cmd_setnx, cmd_ttl,
     cmd_type,
 };
 use resp_cmd::{
@@ -393,6 +393,20 @@ async fn dispatch(
                 let frame = cmd_unlink(v, art.clone()).await;
                 conn_state.encode(frame);
             }
+            Cmd::MGet(keys) => {
+                // Descentes entrelacées + valeurs par référence, encodées
+                // pendant l'emprunt (ni clone ni Vec<Frame>).
+                let mut expired = Vec::new();
+                {
+                    let art = art.borrow();
+                    let vals = art.mget_ref(&keys, &mut expired);
+                    conn_state.encode_with(|buf| encode_mget(buf, &vals));
+                }
+                // Suppression à la volée des expirées croisées, après l'encodage.
+                if !expired.is_empty() {
+                    art.borrow_mut().purge_expired(&keys, &expired);
+                }
+            }
             Cmd::KRange { prefix, from, count, rev } => {
                 // Encodé pendant l'emprunt de l'arbre : les valeurs sont des
                 // références (pas de clone/refcount), préchargées au parcours.
@@ -422,7 +436,6 @@ fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         Cmd::Get(key) => cmd_get(art, key),
         Cmd::Set { key, val, opts } => cmd_set(art, key, val, opts),
         Cmd::SetNx { key, val } => cmd_setnx(art, key, val),
-        Cmd::MGet(keys) => cmd_mget(art, &keys),
         Cmd::MSet(pairs) => cmd_mset(art, &pairs),
         Cmd::Del(keys) => cmd_del(art, &keys),
         Cmd::Exists(keys) => cmd_exists(art, &keys),
@@ -480,6 +493,7 @@ fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         | Cmd::Publish { .. }
         | Cmd::Keys(_)
         | Cmd::KRange { .. }
+        | Cmd::MGet(_)
         | Cmd::Unlink(_)
         | Cmd::BgSave
         | Cmd::Save
@@ -499,26 +513,42 @@ fn encode_krange(buf: &mut Vec<u8>, range: &oxidart::krange::RangeOut<'_>) {
         encode_bulk(buf, key);
         match val {
             RangeVal::Bytes(b) => encode_bulk(buf, b.as_slice()),
-            RangeVal::Int(n) => {
-                let mut tmp = [0u8; 20];
-                let mut i = tmp.len();
-                let mut m = n.unsigned_abs();
-                loop {
-                    i -= 1;
-                    tmp[i] = b'0' + (m % 10) as u8;
-                    m /= 10;
-                    if m == 0 {
-                        break;
-                    }
-                }
-                if n < 0 {
-                    i -= 1;
-                    tmp[i] = b'-';
-                }
-                encode_bulk(buf, &tmp[i..]);
-            }
+            RangeVal::Int(n) => encode_int_bulk(buf, n),
         }
     }
+}
+
+fn encode_mget(buf: &mut Vec<u8>, vals: &[Option<oxidart::krange::RangeVal<'_>>]) {
+    use oxidart::krange::RangeVal;
+    use radixox_lib::shared_frame::{encode_array_len, encode_bulk};
+    encode_array_len(buf, vals.len());
+    for v in vals {
+        match *v {
+            Some(RangeVal::Bytes(b)) => encode_bulk(buf, b.as_slice()),
+            Some(RangeVal::Int(n)) => encode_int_bulk(buf, n),
+            None => buf.extend_from_slice(b"$-1\r\n"),
+        }
+    }
+}
+
+/// Entier en bulk string (GET/MGET d'une valeur Int), sans allocation.
+fn encode_int_bulk(buf: &mut Vec<u8>, n: i64) {
+    let mut tmp = [0u8; 20];
+    let mut i = tmp.len();
+    let mut m = n.unsigned_abs();
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (m % 10) as u8;
+        m /= 10;
+        if m == 0 {
+            break;
+        }
+    }
+    if n < 0 {
+        i -= 1;
+        tmp[i] = b'-';
+    }
+    radixox_lib::shared_frame::encode_bulk(buf, &tmp[i..]);
 }
 
 fn resp_pong(msg: Option<&[u8]>) -> Frame {
