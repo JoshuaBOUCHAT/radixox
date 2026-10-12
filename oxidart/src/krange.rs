@@ -151,6 +151,14 @@ struct Frame {
     self_pending: bool,
 }
 
+/// Nombre de nœuds frères préchargés en avance dans le sens du parcours.
+const PREFETCH_NODES_AHEAD: usize = 3;
+
+#[inline(always)]
+fn prefetch_node(art: &OxidArt, idx: u32) {
+    radixox_lib::prefetch::prefetch_l1(art.child_node(idx) as *const _ as *const u8);
+}
+
 /// Buffers de travail réutilisés d'un appel à l'autre (par thread).
 #[derive(Default)]
 struct Scratch {
@@ -196,7 +204,9 @@ impl<'a> Walker<'a, '_> {
         self.out.entries.push((self.out.keys.len() as u32, val));
     }
 
-    /// Pousse les enfants de `idx` acceptés par `keep` dans `kids`, triés.
+    /// Pousse les enfants de `idx` acceptés par `keep` dans `kids`, triés, et
+    /// précharge les premiers à visiter : leurs défauts de cache se
+    /// chevauchent au lieu de s'enchaîner.
     fn collect_sorted(&mut self, idx: u32, keep: impl Fn(u8) -> bool) {
         let base = self.kids.len();
         let kids = &mut self.kids;
@@ -205,7 +215,13 @@ impl<'a> Walker<'a, '_> {
                 kids.push((r, c));
             }
         });
-        self.kids[base..].sort_unstable_by_key(|&(r, _)| r);
+        let slice = &mut self.kids[base..];
+        slice.sort_unstable_by_key(|&(r, _)| r);
+        let n = slice.len().min(PREFETCH_NODES_AHEAD);
+        let first = if self.rev { slice.len() - n } else { 0 };
+        for i in first..first + n {
+            prefetch_node(self.art, self.kids[base + i].1);
+        }
     }
 
     /// Entre dans `idx` ; `self.key` contient déjà sa clé jusqu'au radix inclus.
@@ -302,12 +318,22 @@ impl<'a> Walker<'a, '_> {
                 continue;
             }
             let next = if f.lo < f.hi {
+                let (lo, hi) = (f.lo as usize, f.hi as usize);
                 if self.rev {
                     f.hi -= 1;
-                    Some(self.kids[f.hi as usize])
+                    // le frère qui sera visité PREFETCH_NODES_AHEAD rangs plus tard
+                    if hi - lo > PREFETCH_NODES_AHEAD {
+                        let ahead = self.kids[hi - 1 - PREFETCH_NODES_AHEAD].1;
+                        prefetch_node(self.art, ahead);
+                    }
+                    Some(self.kids[hi - 1])
                 } else {
                     f.lo += 1;
-                    Some(self.kids[f.lo as usize - 1])
+                    if hi - lo > PREFETCH_NODES_AHEAD {
+                        let ahead = self.kids[lo + PREFETCH_NODES_AHEAD].1;
+                        prefetch_node(self.art, ahead);
+                    }
+                    Some(self.kids[lo])
                 }
             } else {
                 None
