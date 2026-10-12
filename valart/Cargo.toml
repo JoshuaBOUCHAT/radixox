@@ -8,8 +8,7 @@ repository.workspace = true
 
 [dependencies]
 radixox-lib = { workspace = true }
-# path le temps du chantier save (copy_occupancy), repasser en version publiée ensuite
-hislab = { path = "../../hislab", features = ["rand"] }
+hislab = { version = "0.2.3", features = ["rand"] }
 foldhash = "0.2"
 mimalloc = { workspace = true }
 libmimalloc-sys = { workspace = true }

@@ -43,8 +43,6 @@ Plus what Redis doesn't have:
 ## Quick start
 
 ```bash
-# hislab (the slab allocator) is currently a path dependency: clone it next to radixox
-git clone https://github.com/JoshuaBOUCHAT/hislab
 git clone https://github.com/JoshuaBOUCHAT/radixox
 cd radixox
 cargo build --release --bin radixox
