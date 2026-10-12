@@ -54,6 +54,40 @@ attente                enter(GETEVENTS) ; timeout = prochaine échéance de time
 | Parseur | frame entière · remplissage de valeur |
 | Job | curseur + `step(&mut Server, budget) -> Done \| More` |
 
+### 1.1 Garder la complexité sous contrôle (2026-10-12)
+
+La boucle est un ensemble de machines à états. C'est plus lisible que des futures et des
+`select!` (avec monoio, l'état d'une connexion était dispersé entre tâches, channels, wakers
+et points d'`await`, avec des invariants implicites jamais vérifiés), **à condition** de
+tenir ces cinq règles :
+
+1. **Un `enum` par machine, un `match` exhaustif, des transitions centralisées.** L'état ne
+   change que dans quelques fonctions nommées (`park`, `wake`, `drain`…), comme les points de
+   passage de la save. Le compilateur force à traiter chaque état : aucun cas oublié.
+2. **Un vérificateur d'invariants du serveur** (`Server::check_invariants`), appelé en debug
+   à la fin de chaque tour, comme `assert_canonical` pour l'arbre :
+   - `refs` d'une connexion = ce qui la référence vraiment (recv armé, send en vol,
+     inscriptions en file d'attente, jobs) ;
+   - une connexion parquée est dans exactement les files qu'elle déclare, avec son
+     `park_seq` ;
+   - au plus un send en vol par connexion ;
+   - aucun tampon de l'anneau retenu après le tour.
+   Une incohérence explose tout de suite, au bon endroit.
+3. **Tests déterministes sur un faux anneau** (§16) : séquences de CQE fabriquées (envoi
+   partiel, connexion qui meurt en plein BLPOP, LPUSH et timeout dans le même tour,
+   `ENOBUFS`), puis vérification de l'état et des invariants ; aussi tirées au hasard, comme
+   les tests de `krange` contre une `BTreeMap`. Les bugs io_uring deviennent reproductibles.
+4. **Une boucle mince** : récolte → `dispatch(kind)` → un handler par type d'événement.
+   Aucune logique métier dans la boucle ; les commandes restent dans `execute_sync`, inchangé.
+5. **Pas d'optimisation prématurée — le mot important est « prématurée ».** On optimise
+   tard, pas jamais. Le premier prototype vise un squelette **correct et mesuré** : pas de
+   lot sur tout le tour, pas de délégation des envois, pas de modes extrêmes (§17). Mais le
+   design leur garde leur place dès le départ (idx de slot stables, `out` par connexion,
+   dispatch par lots possible), pour que les optimiser plus tard ne demande pas de tout
+   réécrire. Chaque optimisation arrive ensuite **avec sa mesure avant/après**, comme les
+   chantiers de l'arbre (SWAR, prefetch des frères, multi-clés : chaque gain chiffré avant
+   commit).
+
 ---
 
 ## 2. La boucle
