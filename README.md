@@ -1,397 +1,342 @@
-# RadixOx 🦀⚡
+# RadixOx
 
-**A blazingly fast Redis-compatible key-value store. Built with Rust, io_uring, and Adaptive Radix Trees.**
+**A Redis-compatible in-memory key-value store built on an Adaptive Radix Tree, in Rust, on io_uring.**
 
-RadixOx is a high-performance in-memory key-value store that speaks the Redis protocol. Drop-in replacement for Redis/Valkey with **lower tail latency** and **higher throughput**, built on a single-threaded io_uring architecture.
+RadixOx speaks RESP2, so `redis-cli` and existing Redis client libraries work with it. Its
+storage engine, **OxidArt**, keeps keys in an ordered radix tree instead of a hash table. That
+gives it lower tail latency than Valkey on a single core, and it makes ordered and prefix
+operations native: sorted pagination (`KRANGE`), prefix scans that only touch matching keys,
+and binary-safe keys.
 
----
-
-## 🚀 Performance Benchmarks
-
-### YCSB — Yahoo! Cloud Serving Benchmark
-
-Tested with [YCSB](https://github.com/brianfrankcooper/YCSB) — industry standard for NoSQL databases.
-
-**Configuration:** 5M records, Workload A (50% read / 50% update), fieldlength=100, 100 client threads, localhost *(2026-05-03)*
-
-> **Opponent:** Valkey 9.0.3 running with **2 threads** (its typical production configuration).
->
-> **RadixOx configuration:** 1 application thread + io_uring **SQ_POLL** (1 kernel polling thread). Total: 2 threads — same resource envelope as Valkey.
->
-> **Memory model:** HiSlab backing store uses anonymous `mmap` + `MADV_HUGEPAGE` (THP) + pre-fault of 10K nodes (1.25 MB). The load phase serves as natural THP warm-up.
-
-#### LOAD Phase (5,000,000 HMSET inserts)
-
-| Metric | Valkey 9.0.3 (2t) | RadixOx (1t+poll) | Improvement |
-|--------|-------------------|-------------------|-------------|
-| **Throughput** | 86,973 ops/sec | **133,708 ops/sec** | 🚀 **+54%** |
-| **P99 Latency** | 1,396 µs | **869 µs** | ✅ **-38%** |
-
-#### RUN Phase (10,000,000 operations — 50% READ / 50% UPDATE)
-
-| Metric | Valkey 9.0.3 (2t) | RadixOx (1t+poll) | Improvement |
-|--------|-------------------|-------------------|-------------|
-| **Throughput** | 172,491 ops/sec | **271,128 ops/sec** | 🚀 **+57%** |
-| **READ Avg** | 578 µs | **368 µs** | ⚡ **-36%** |
-| **READ P95** | 629 µs | **376 µs** | ✅ **-40%** |
-| **READ P99** | 683 µs | **456 µs** | ✅ **-33%** |
-| **READ P99.9** | 697 µs | **427 µs** | ✅ **-39%** |
-| **READ P99.99** | 1,014 µs | **982 µs** | ✅ **-3%** |
-| **UPDATE P99** | 684 µs | **456 µs** | ✅ **-33%** |
-| **Peak RSS** | 2,080 MB | **1,969 MB** | ✅ **-5%** |
-
-**Key Takeaways:**
-- 🚀 **+57% run throughput** — 271k vs 172k ops/sec, single ART traversal path, no hashtable rehashing
-- 🎯 **-39% P99.9 on reads** — 427 µs vs 697 µs; ART depth is bounded by key length, not dataset size
-- 📈 **ART is O(key_length)** — latency stays flat as dataset grows
-- 💾 **5% less RAM at 5M records** — `SharedByte` (no atomic ops) + mimalloc + THP coalesce live nodes
+OxidArt is also usable directly as an embedded Rust library.
 
 ---
 
-### memtier_benchmark — Real-World Workloads
+## Highlights
 
-**Configuration:** Same conditions — RadixOx (1t + SQ_POLL) vs Valkey (2t). Mixed GET/SET workloads, variable value sizes, Gaussian key distribution. *(2026-05-03)*
+Measured on 2026-10-12, one core each, 1M keys (see [Benchmarks](#benchmarks) for the setup
+and caveats):
 
-#### Load (pure SET, 20s sustained)
+| | RadixOx | Valkey 9.1.2 | |
+|---|---|---|---|
+| GET p99, no pipeline (80 conns) | **0.44 ms** | 0.75 ms | −42 % |
+| GET p99.9, no pipeline | **0.52 ms** | 0.84 ms | −38 % |
+| Throughput, no pipeline | **224 k ops/s** | 202 k ops/s | +11 % |
+| Throughput, pipeline 32 | **2.22 M ops/s** | 1.96 M ops/s | +13 % |
+| `KEYS user:*` (1,000 matches in 1M keys) | **0.15 ms** | 21.4 ms | ×140 |
+| `SAVE` of 1M keys | **71 ms** (raw) / 112 ms (zstd) | 1,989 ms | ×18–28 |
+| Restart with 1M keys | **~0.2 s** | ~0.45 s | ×2 |
+| Memory per key (100 B values) | 251 B | **152 B** | Valkey −40 % |
 
-| Metric | Valkey (2t) | RadixOx (1t+poll) | Improvement |
-|--------|-------------|-------------------|-------------|
-| **Throughput** | 203,297 ops/sec | **255,830 ops/sec** | 🚀 **+26%** |
+Plus what Redis doesn't have:
 
-#### Caching Workload (1:10 GET:SET, Gaussian, 100–500 B values)
-
-| Metric | Valkey (2t) | RadixOx (1t+poll) | Improvement |
-|--------|-------------|-------------------|-------------|
-| **Throughput** | 207,272 ops/sec | **243,804 ops/sec** | 🚀 **+18%** |
-| **GET avg latency** | 0.39 ms | **0.33 ms** | ⚡ **-15%** |
-| **GET P99** | 0.49 ms | **0.38 ms** | ✅ **-22%** |
-| **GET P99.9** | 0.51 ms | **0.47 ms** | ✅ **-8%** |
-| **GET P99.99** | **0.57 ms** | 1.67 ms | 🔴 Valkey **-66%** |
-| **SET P99** | 0.49 ms | **0.38 ms** | ✅ **-22%** |
-
-#### Session Store (1:1 GET:SET, TTL 10–300s, 50–200 B values)
-
-| Metric | Valkey (2t) | RadixOx (1t+poll) | Improvement |
-|--------|-------------|-------------------|-------------|
-| **Throughput** | 201,848 ops/sec | **249,495 ops/sec** | 🚀 **+24%** |
-| **GET avg latency** | 0.40 ms | **0.32 ms** | ⚡ **-20%** |
-| **GET P99** | 0.50 ms | **0.38 ms** | ✅ **-24%** |
-| **GET P99.9** | 0.54 ms | **0.39 ms** | ✅ **-28%** |
-| **SET P99** | 0.50 ms | **0.38 ms** | ✅ **-24%** |
-
-> **On P99.99:** The 1.67 ms outlier on the caching workload needs further investigation — it may simply be measurement noise on a short run. At scale (5M records, YCSB), P99.99 converges: RadixOx 982 µs vs Valkey 1,014 µs.
->
-> **On memory (small datasets):** Valkey uses two string encodings. For values ≤ 44 bytes (`embstr`), data is stored inline in a single allocation — no extra heap cost. Above 44 bytes (`raw`), Valkey allocates a separate SDS buffer; the `robj` (16 bytes) then only holds metadata and a pointer. For the memtier workloads here (100–500 B caching, 50–200 B session), all values exceed that threshold, so both implementations allocate string data separately. The RAM difference likely comes from structural overhead per key: RadixOx ART nodes are 64 bytes each, amortized via path compression on shared prefixes, while Valkey carries a `dictEntry` plus key and value `robj` wrappers. On random short keys (memtier default), prefix sharing is minimal and the per-node cost dominates. At scale (5M records, YCSB) with longer structured keys, compression kicks in — RadixOx ends up using 5% less RAM.
+- **`KRANGE` / `KREVRANGE`**: the next N keys under a prefix, in sorted order, after a cursor
+  key. Pagination for message threads, logs or feeds, without maintaining a sorted set.
+- **Prefix and glob queries that prune**: `KEYS user:*` walks only the `user:` subtree, and
+  complex globs are compiled to a DFA that skips whole subtrees.
+- **Binary-safe keys**: any byte 0x00–0xFF at any position, ordered like `memcmp`.
+- **Snapshots without `fork`**: an application-level copy-on-write barrier gives a consistent
+  point-in-time dump while the server keeps serving.
 
 ---
 
-### Scaling: Single Thread vs Multi-Thread
-
-What happens when Valkey is given more CPU resources?
-
-**Configuration:** RadixOx (1t + SQ_POLL) vs Valkey at 2 and 6 threads — all running on the same 6-core machine as client + server. Throughput and P99 are reliable; P99.9+ may include measurement noise from CPU contention between client threads and server threads, and would need an isolated client machine to be fully trusted.
-
-| Metric | RadixOx (1t+poll) | Valkey (2t) | Valkey (6t) |
-|--------|-------------------|-------------|-------------|
-| **Load throughput** | 133,708 ops/sec | 86,973 ops/sec | **172,485 ops/sec** |
-| **Load P99** | **869 µs** | 1,396 µs | 1,456 µs |
-| **Run throughput** | 271,275 ops/sec | 172,491 ops/sec | **366,032 ops/sec** |
-| **READ avg** | 367 µs | 578 µs | **253 µs** |
-| **READ P95** | 374 µs | 629 µs | **360 µs** |
-| **READ P99** | **460 µs** | 683 µs | 508 µs |
-| **READ P99.9** | **492 µs** | 697 µs | 3,465 µs |
-| **UPDATE P99** | **465 µs** | 684 µs | 573 µs |
-| **Peak RSS** | **1,967 MB** | 2,080 MB | 2,083 MB |
-
-**Observations:**
-- Valkey scales from 2t → 6t (3× the threads) and gains ~2.1× throughput — **71% scaling efficiency** — while RadixOx holds 271k ops/sec on a single app thread
-- At 6 threads, Valkey's P99.9 jumps from 697 µs to **3,465 µs** (+5×) — lock contention and scheduling jitter compound at high thread counts
-- RadixOx's tail latency stays stable regardless of server load: no locks, no scheduler interference
-
-The single-threaded model isn't just about simplicity — it's a deliberate trade-off: **predictable tail latency** at the cost of raw peak throughput.
-
----
-
-## ⚡ Why RadixOx?
-
-### Architecture Advantages
-
-- **🌳 Adaptive Radix Tree (ART)** - O(k) lookups where k = key length (not O(1) hash with collisions)
-- **🔥 io_uring** - Async I/O via [monoio](https://github.com/bytedance/monoio), not epoll
-- **🎯 Single-threaded** - No locks, no contention, predictable tail latency
-- **📊 BTreeMap/BTreeSet** - Deterministic O(log n) for Hash/Set operations, excellent p99.9
-- **💾 SharedByte** - `!Send` ref-counted byte buffer: 8-byte pointer, no `Arc` overhead, custom inline header
-- **🔌 Redis compatible** - Works with `redis-cli`, any Redis client library
-
-### Prefix Operations: Native to ART
-
-Redis/Valkey stores keys in a flat hash table. `KEYS user:*` must scan **every key in the database** — O(N) where N is the total number of keys.
-
-RadixOx stores keys in an Adaptive Radix Tree. `KEYS user:*` traverses directly to the `user:` subtree — **O(k)** where k is the number of results.
+## Quick start
 
 ```bash
-# 1M keys total, 1000 start with "user:"
-# Valkey:   KEYS user:*  →  scans 1,000,000 keys   O(N)  ~50ms
-# RadixOx:  KEYS user:*  →  visits 1,000 keys      O(k)  ~1ms
+# hislab (the slab allocator) is currently a path dependency: clone it next to radixox
+git clone https://github.com/JoshuaBOUCHAT/hislab
+git clone https://github.com/JoshuaBOUCHAT/radixox
+cd radixox
+cargo build --release --bin radixox
+./target/release/radixox                 # listens on 6379
+
+redis-cli SET user:10:message:1 hello
+redis-cli SET user:10:message:2 world
+redis-cli KRANGE user:10:message: "" 10  # 1) user:10:message:1  2) hello  3) …:2  4) world
+redis-cli KEYS "user:10:*"
+redis-cli BGSAVE                         # snapshot to ./dump.rxd, reloaded at next start
 ```
 
-Perfect for workloads with hierarchical keys: `user:123:session`, `config:app:feature`, `cache:region:item`
+Requirements: **Linux** with io_uring (developed on 6.12 LTS and 7.2), **Rust 2024 edition**
+(stable).
 
 ---
 
-## 🎯 Quick Start
+## Benchmarks
+
+### Setup
+
+- AMD Ryzen 5 7600X (6 cores / 12 threads), 30 GB RAM, Linux 7.2-zen, power profile
+  `performance`, loopback.
+- **One core each.** The server is pinned to CPU 0 with its SMT sibling idle. RadixOx runs
+  without SQ_POLL; Valkey 9.1.2 runs with `io-threads 1`, persistence off. memtier runs on
+  physical cores 2–5.
+- 1,000,000 keys (`key:1` … `key:1000000`), 100-byte values, uniform random access,
+  `memtier_benchmark --threads 4 --clients 20 --distinct-client-seed --randomize`,
+  10-second runs, **single run per configuration**.
+
+### Throughput and latency (1:4 SET:GET)
+
+| | Throughput | p50 | p99 | p99.9 |
+|---|---|---|---|---|
+| **No pipeline**, RadixOx | **224,212 ops/s** | **0.351 ms** | **0.439 ms** | **0.527 ms** |
+| No pipeline, Valkey | 202,053 ops/s | 0.375 ms | 0.751 ms | 0.839 ms |
+| **Pipeline 32**, RadixOx | **2,216,319 ops/s** | **0.991 ms** | **1.727 ms** | **1.975 ms** |
+| Pipeline 32, Valkey | 1,964,902 ops/s | 1.103 ms | 2.079 ms | 2.431 ms |
+
+Without pipelining, both servers are bounded by the TCP stack and the client's round trips:
+the kernel takes most of the core. The tail is where RadixOx stands out: p99 and p99.9 are
+about 40 % lower.
+
+### Memory
+
+| | RSS after loading 1M keys | Per key |
+|---|---|---|
+| RadixOx | 253 MB | 251 B |
+| Valkey | 168 MB | **152 B** |
+
+This is RadixOx's weak spot today. Each key costs a 64-byte tree node plus a separately
+allocated value (mimalloc), and random short keys get little benefit from path compression.
+Reducing the footprint (value compaction, leaf/value fusion) is on the roadmap.
+
+### Prefix queries
+
+`KEYS user:*` with 1,000 matching keys among 1,001,000, average of 50 calls, measured
+server-side (round trip subtracted):
+
+| RadixOx | Valkey |
+|---|---|
+| **0.15 ms** | 21.4 ms |
+
+Valkey has to scan the whole keyspace; RadixOx walks only the `user:` subtree. The gap grows
+with the size of the database.
+
+### Persistence (1M keys, 100-byte values)
+
+| | `SAVE` | Dump size | Restart until all keys are back |
+|---|---|---|---|
+| RadixOx, raw dump | **71 ms** | 105 MB | ~0.2 s |
+| RadixOx, zstd level 3 | 112 ms | (see note) | ~0.2 s |
+| Valkey (RDB, LZF) | 1,989 ms | 113 MB | ~0.45 s |
+
+memtier fills every value with the same bytes, so whole-stream compression (zstd) is
+unrealistically effective on this data; only the raw size is meaningful here. `BGSAVE` runs
+the same snapshot in slices while the server keeps serving, without `fork`.
+
+### Engine microbenchmarks (in-process, no network)
+
+1M random keys, one core:
+
+| Operation | Cost |
+|---|---|
+| `GET` of a random cold key | ~410 ns |
+| `MGET` of 64 random keys | **~105 ns per key** (was ~375 before interleaved lookups) |
+| `KRANGE` page of 64 entries | **5.2 µs** (~82 ns per entry; 64 separate GETs: 15.4 µs) |
+| `KRANGE` page of 1 entry | ~620 ns |
+
+### Caveats
+
+- Loopback only: the client's TCP receive path and netfilter are billed to the same machine.
+  Real two-machine numbers are planned.
+- Single runs, short durations: treat the numbers as orders of magnitude, not as precise
+  ratios.
+- Valkey can use more cores (`io-threads`); RadixOx is single-threaded by design. The
+  comparison is per core.
+
+---
+
+## Ordered keyspace
+
+Keys live in a radix tree, so they are always sorted (unsigned byte order, like Redis's
+`ZRANGEBYLEX`).
+
+```
+KRANGE    <prefix> <from> <count>   # up to <count> entries under <prefix>, keys > <from>, ascending
+KREVRANGE <prefix> <from> <count>   # keys < <from>, descending
+                                    # <from> = "" → from the start (or the end)
+                                    # reply: [key1, value1, key2, value2, …]
+```
+
+- `from` is **exclusive**: pass the last key of a page to get the next one. No server-side
+  cursor state, no duplicates, stable while the data changes.
+- Only string values are returned (and counted); hashes, sets and sorted sets under the
+  prefix are skipped.
+- Order is lexicographic: `msg:12` < `msg:120` < `msg:13`. Zero-pad numbers if you need
+  numeric order.
 
 ```bash
-# Install from crates.io (requires Linux 5.1+ for io_uring)
-cargo install radixox
-
-# Or build from source
-cargo build --bin radixox --release
-./target/release/radixox
-
-# Test with redis-cli
-redis-cli -p 6379 PING              # PONG
-redis-cli -p 6379 SET foo bar       # OK
-redis-cli -p 6379 GET foo           # "bar"
-redis-cli -p 6379 INCR counter      # 1
-redis-cli -p 6379 KEYS "user:*"     # Blazingly fast prefix query
-
-# Benchmark
-cd ~/ycsb-redis-binding-0.18.0-SNAPSHOT
-bin/ycsb.sh load redis -s -P workloads/workloada -p redis.port=6379
-bin/ycsb.sh run redis -s -P workloads/workloada -p redis.port=6379
+redis-cli KRANGE user:10:message: user:10:message:0042 30     # the 30 messages after #42
+redis-cli KREVRANGE user:10:message: "" 30                      # the 30 most recent
 ```
+
+Other prefix-aware operations: `KEYS prefix*` (subtree walk, no DFA), `KEYS` with any glob
+(compiled to a byte-wise DFA that prunes subtrees; pathological patterns are refused instead of
+freezing the server).
 
 ---
 
-## 📚 Supported Commands
+## Embedded use (OxidArt)
 
-Full Redis RESP2 protocol support with all major data structures:
+The engine is a regular Rust crate (`oxidart`) and can be used without the server:
 
-### 🔤 Strings & Keys
+```rust
+use oxidart::{OxidArt, Value};
+use oxidart::krange::RangeVal;
+use radixox_lib::shared_byte::SharedByte;
+
+let mut art = OxidArt::new();
+art.set(SharedByte::from_str("user:10:message:1"), Value::String(SharedByte::from_str("hello")));
+
+// Sorted page, values borrowed from the tree (no clone, no refcount traffic)
+for (key, val) in art.krange(b"user:10:message:", b"", 30, false).iter() {
+    if let RangeVal::Bytes(v) = val { /* … */ }
+}
+
+// Same page, owning its values (converted in place, no extra allocation)
+let page = art.krange_owned(b"user:10:message:", b"", 30, false);
+
+// Batched point lookups: the descents of all keys are interleaved
+let vals = art.mget_owned(&[b"user:10:name", b"user:10:email"]);
+```
+
+Also available: `get`, `set`, `set_ttl`, `del`, `incr`/`incrby`, hash / set / sorted-set
+commands, `getn` (prefix), `getn_glob` / `getn_regex` (feature `regex`), `mget_ref` /
+`exists_count`, snapshots (`save_start` / `save_step`, `load_dump`).
+
+The tree is single-threaded (`!Send` values): use one tree per thread, or put it behind your
+own synchronization.
+
+---
+
+## Supported commands
+
 | Category | Commands |
-|----------|----------|
-| **Connection** | `PING` `QUIT` `ECHO` `SELECT` |
-| **Strings** | `GET` `SET` `SETNX` `SETEX` `MGET` `MSET` |
-| **Counters** | `INCR` `DECR` `INCRBY` `DECRBY` |
-| **Keys** | `DEL` `EXISTS` `TYPE` `KEYS` `UNLINK` `DBSIZE` `FLUSHDB` |
-| **Expiration** | `TTL` `PTTL` `EXPIRE` `PEXPIRE` `PERSIST` |
+|---|---|
+| Connection / server | `PING` `ECHO` `QUIT` `SELECT` `INFO` `DBSIZE` `FLUSHDB` `SAVE` `BGSAVE` |
+| Strings | `GET` `SET` (`EX` `PX` `NX` `XX`) `SETNX` `SETEX` `MGET` `MSET` |
+| Counters | `INCR` `DECR` `INCRBY` `DECRBY` |
+| Keys | `DEL` `UNLINK` `EXISTS` `TYPE` `KEYS` |
+| Ordered keys | `KRANGE` `KREVRANGE` |
+| Expiration | `EXPIRE` `PEXPIRE` `PERSIST` `TTL` `PTTL` |
+| Hash | `HSET` `HMSET` `HGET` `HMGET` `HGETALL` `HDEL` `HEXISTS` `HLEN` `HKEYS` `HVALS` `HINCRBY` |
+| Set | `SADD` `SREM` `SISMEMBER` `SCARD` `SMEMBERS` `SPOP` |
+| Sorted set | `ZADD` `ZREM` `ZSCORE` `ZCARD` `ZRANGE` (`WITHSCORES`) `ZINCRBY` |
+| Pub/Sub | `SUBSCRIBE` `UNSUBSCRIBE` `PUBLISH` |
 
-### 🗂️ Hash
-`HSET` `HMSET` `HGET` `HGETALL` `HDEL` `HEXISTS` `HLEN` `HKEYS` `HVALS` `HMGET` `HINCRBY`
-
-**Vec → BTreeMap adaptive:** small hashes stay in cache-friendly Vec (≤16 fields), promote to BTreeMap for larger sets
-
-### 📦 Set
-`SADD` `SREM` `SISMEMBER` `SCARD` `SMEMBERS` `SPOP`
-
-**BTreeSet-based:** Ordered iteration, predictable performance
-
-### 📊 Sorted Set (ZSet)
-`ZADD` `ZCARD` `ZRANGE` `ZSCORE` `ZREM` `ZINCRBY`
-
-**Vec → double-index adaptive:** small ZSets stay in sorted Vec (≤16 members), promote to BTreeSet+HashMap with pre-allocated capacity
-
-### 📡 Pub/Sub
-`SUBSCRIBE` `UNSUBSCRIBE` `PUBLISH`
-
-**Monoio channels:** Lock-free, single-threaded message passing
+Not yet: list commands, `SCAN`, `MULTI`/`EXEC`, `CLIENT` / `CONFIG` / `HELLO`, Lua,
+replication, cluster.
 
 ---
 
-## 🏗️ Architecture
+## Persistence
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                              radixox                                      │
-│                                                                           │
-│   ┌──────────────┐     ┌──────────────┐     ┌──────────────────────┐      │
-│   │   monoio     │     │    RESP2     │     │      OxidArt         │      │
-│   │  (io_uring)  │──▶ │    Parser    │──▶ │  (Adaptive Radix     │      │
-│   │   SQ_POLL    │     │  zero-copy   │     │   Tree + TTL)        │      │
-│   └──────────────┘     └──────────────┘     └──────────────────────┘      │
-│                                                                           │
-│   io_buf ──▶ read_buf ──▶ BytesFrame ──▶ SharedByte args ──▶ OxidArt  │
-│                                                                           │ 
-│                             write_buf ◀─ SharedFrame ◀─────────────┘    │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+- **`SAVE`** (blocking) and **`BGSAVE`** (incremental, in slices between client requests)
+  write `RADIXOX_DIR/dump.rxd`. The dump is reloaded at startup.
+- Snapshots use an **application-level copy-on-write barrier** instead of `fork`: a node is
+  copied only if it is modified before the snapshot reaches it. No memory doubling, no fork
+  latency on a large heap.
+- `BGSAVE` compresses with zstd (level 3 by default); the file ends with a CRC footer, and a
+  truncated or corrupted dump prevents startup instead of loading partial data.
+- `RADIXOX_SAVE_ON_EXIT=1`: save on SIGINT / SIGTERM.
+- Not yet: AOF, automatic periodic saves.
 
-### Data Structures
-
-| Type | Implementation | Complexity | Use Case |
-|------|----------------|------------|----------|
-| **String** | `SharedByte` | O(1) | Raw data, hot path |
-| **Int** | `i64` | O(1) | Counters (INCR zero-parse) |
-| **Hash** | `Vec` (small) → `BTreeMap` (large) | O(n) / O(log n) | Field-value pairs, YCSB workloads |
-| **Set** | `BTreeSet<SharedByte>` | O(log n) | Unique members, ordered |
-| **ZSet** | `Vec` (small) → `BTreeSet + HashMap` (large) | O(n) / O(log n)+O(1) | Leaderboards, double-indexed |
-| **List** | `VecDeque<SharedByte>` | O(1) push/pop | Queues (planned) |
-
-### OxidArt Engine
-
-**Node Structure:** 64 bytes, cache-line optimized
-- Path compression for single-child chains
-- Two-tier child storage: inline (9 slots) + overflow — inline slots cover all ASCII digits, making keys like `user:1234` extremely cache-efficient
-- HiSlab allocator with O(1) insert/remove, `mmap` + THP backing
-- Lazy TTL expiration + active eviction (Redis-style)
-
-### SharedByte — Custom Reference-Counted Buffer
-
-`SharedByte` replaces `bytes::Bytes` — which relies on atomic reference counting for zero-copy cloning — with a `!Send` equivalent that eliminates all atomic operations:
-
-```
-Heap layout: [ len: u32 | rc: u16 | data: u8... ]
-```
-
-- **8-byte pointer** (niche-optimized: `Option<SharedByte>` = `SharedByte`)
-- **`!Send`** — single-threaded by design, no atomic ops
-- **u16 refcount** — 65k max clones, no `Arc` overhead
-- **Borrow<[u8]>** — zero-cost use in BTreeMap/BTreeSet without conversion
-- **mimalloc** — allocations backed by mimalloc instead of the system allocator, saving ~10% RSS
+Design: [`SAVE_DESIGN.md`](SAVE_DESIGN.md).
 
 ---
 
-## 🛠️ Building
+## Configuration
 
-```bash
-# Build everything
-cargo build --workspace --release
+Environment variables:
 
-# Build the server
-cargo build --bin radixox --release
-
-# Run tests
-cargo test -p oxidart
-
-# Generate docs
-cargo doc --workspace --no-deps --open
-```
+| Variable | Default | Effect |
+|---|---|---|
+| `RADIXOX_PORT` | `6379` | listening port |
+| `RADIXOX_DIR` | `.` | directory of `dump.rxd` |
+| `RADIXOX_CPU_PIN` | unset | pin the server thread to this CPU |
+| `RADIXOX_PREFETCH` | `8` | pipelined commands whose key lookups are interleaved (`0` = off) |
+| `RADIXOX_SAVE_ZSTD` | `3` | `BGSAVE` zstd level (`0` = raw) |
+| `RADIXOX_SAVE_SYNC_ZSTD` | raw | zstd level of `SAVE` and of the exit save |
+| `RADIXOX_SAVE_BACKLOG_MB` | `64` | compression backlog of `BGSAVE` |
+| `RADIXOX_SAVE_ON_EXIT` | off | save on SIGINT / SIGTERM |
+| `SQ_POLL` | off | io_uring SQ polling (idle time in ms) |
+| `RADIXOX_SQ_POLL_PIN` | unset | CPU of the SQ polling kernel thread (**required** with `SQ_POLL` today) |
 
 ---
 
-## 📦 Workspace Structure
+## Architecture
+
+```
+TCP ──io_uring (monoio)──▶ RESP parser ──▶ batch of commands ──▶ interleaved key lookups
+                              (borrows the                        (prefetch, misses overlap)
+                               read buffer)                                │
+                                                                           ▼
+      client ◀── one write per batch ◀── RESP encoder ◀── OxidArt (values by reference)
+```
+
+**OxidArt, the radix tree**
+- **64-byte nodes** in a slab (HiSlab) backed by anonymous `mmap` with transparent huge pages.
+  Stable `u32` indices instead of pointers.
+- **Path compression** (`CompactPath`: up to 7 bytes inline, longer segments on the heap) and
+  automatic re-compression after deletions: the tree always has the same canonical shape for
+  the same content.
+- **Child lookup without loops**: 6 children inline, 10 more in an overflow slot, searched with
+  a single 8-byte load and a bit trick (SWAR). Wider nodes use 8-child groups (up to 112)
+  then a direct 256-entry table.
+- **Interleaved descents**: when several keys are known at once (pipeline window, `MGET`,
+  `EXISTS`), their lookups advance level by level so cache misses overlap.
+- **TTL**: expired keys are invisible to reads and removed lazily or by an active sampling
+  evictor.
+
+**Values**
+- Strings: `SharedByte`, an 8-byte single-threaded reference-counted buffer (no atomics),
+  allocated with mimalloc. Integers are stored as `i64` and formatted on read.
+- Hash and Set: **valart**, a compact radix tree per container.
+- Sorted set: `BTreeSet<(score, member)>` + hash map for O(1) `ZSCORE`.
+
+**Single-threaded on purpose**: no locks, no contention, predictable tail latency. Scaling
+across cores is meant to come from sharding by namespace, not from shared-state threads.
+
+---
+
+## Roadmap
+
+- **Custom io_uring event loop** replacing monoio: no futures, no wakers, batches across all
+  ready connections, network work delegated to the kernel —
+  [`RUNTIME_ARCH.md`](RUNTIME_ARCH.md).
+- **Atomic conditional transactions**: `MULTI ATOMIC` where an empty read aborts the whole
+  block, `DELPREFIX` (delete a whole namespace in O(prefix length)), durable commits —
+  [`TX_DESIGN.md`](TX_DESIGN.md).
+- AOF and replication (sharing one stream of effects).
+- Lower memory per key.
+- Client compatibility commands (`HELLO`, `CLIENT`, `CONFIG`, `MULTI`/`EXEC`), `SCAN`, lists.
+
+---
+
+## Repository layout
 
 ```
 radixox/
-├── oxidart/        # Adaptive Radix Tree engine (ART + TTL + DFA regex)
-├── radixox/        # Server binary (RESP2, io_uring, monoio)
-├── radixox-lib/    # Shared types: SharedByte, SharedFrame, RESP2 encoder
-└── Cargo.toml      # Workspace manifest
+├── oxidart/        # radix tree engine: TTL, prefix / glob / range queries, snapshots
+├── valart/         # compact radix trees for Hash and Set values
+├── radixox-lib/    # SharedByte, RESP parser and encoder, save barrier
+├── radixox/        # server binary (RESP2 over io_uring)
+├── RUNTIME_ARCH.md # design of the custom io_uring loop
+├── SAVE_DESIGN.md  # design of copy-on-write snapshots
+└── TX_DESIGN.md    # design of atomic conditional transactions
 ```
 
----
-
-## 🎯 Use Cases
-
-**Perfect for:**
-- 🚀 High-throughput APIs (270k+ ops/sec, 2-thread budget)
-- 🎯 Latency-critical services (READ p99 < 500 µs at 5M records)
-- 🌳 Hierarchical key spaces (`user:*`, `cache:*`, prefix operations)
-- 📊 Real-time leaderboards (ZSet with O(1) ZSCORE)
-- 💾 Session stores, caching layers (p99 0.38 ms, p99.9 0.39 ms)
-- 🔥 YCSB-style workloads (Hash-heavy, large datasets)
-
-**Not recommended for:**
-- ❌ Multi-threaded workloads (single-threaded by design)
-- ❌ Persistence-critical (in-memory only, no RDB/AOF yet)
-- ❌ Complex transactions (no Lua scripting)
-- ⚠️ Tiny hot-cache workloads where p99.99 outliers matter more than throughput
+Tests: `cargo test -p oxidart --features regex`, `cargo test -p radixox-lib`,
+`cargo test -p radixox`.
 
 ---
 
-## 📊 Comparison: RadixOx vs Valkey 9.0.3
-
-Both configurations: 2 threads total. RadixOx = 1 app thread + io_uring SQ_POLL. Valkey = 2 user-space threads.
-
-| Feature | Valkey 9.0.3 (2t) | RadixOx (1t+poll) | Winner |
-|---------|-------------------|-------------------|--------|
-| Load throughput (5M inserts) | 87k ops/sec | **134k ops/sec** | 🦀 **+54%** |
-| Run throughput (10M ops) | 172k ops/sec | **271k ops/sec** | 🦀 **+57%** |
-| READ P99 (5M records) | 683 µs | **456 µs** | 🦀 **-33%** |
-| READ P99.9 (5M records) | 697 µs | **427 µs** | 🦀 **-39%** |
-| Load P99 | 1,396 µs | **869 µs** | 🦀 **-38%** |
-| memtier GET P99 | 0.49 ms | **0.38 ms** | 🦀 **-22%** |
-| memtier GET P99.99 | **0.57 ms** | 1.67 ms | 🔴 Valkey |
-| Peak RSS (5M records) | 2,080 MB | **1,969 MB** | 🦀 **-5%** |
-| Peak RSS (small dataset) | **45 MB** | 51 MB | 🔴 Valkey |
-| Prefix queries | O(N) scan | **O(k) native** | 🦀 |
-| Data structures | HashMap flat | **ART + BTree** | 🦀 |
-| Tail latency (large dataset) | Variable | **Predictable** | 🦀 |
-| Multi-threaded | ✅ Optional | ❌ No | 🔴 |
-| Persistence | ✅ RDB/AOF | ❌ Not yet | 🔴 |
-| Lua scripting | ✅ Yes | ❌ No | 🔴 |
-| Ecosystem | 🔴 Massive | 🦀 Growing | 🔴 |
-
----
-
-## 🔬 Technical Details
-
-### Why Single-Threaded?
-
-- **No lock contention** → predictable tail latency
-- **Cache-friendly** → all data in L1/L2 cache
-- **Simple to reason about** → no race conditions
-- **io_uring batching** → syscall amortization via SQ_POLL
-- Modern cores are fast enough for **270k+ ops/sec** with a single event loop
-
-### Why BTreeMap over HashMap?
-
-- **Deterministic O(log n)** vs O(1) average but O(n) worst-case
-- **Better tail latency** (p99.9) — no hash collision spikes
-- **Ordered iteration** — HGETALL/HKEYS consistent
-- **Cache-friendly** — sequential memory access
-- **Perfect for YCSB** — Workload A is Hash-heavy
-
----
-
-## 🗺️ Roadmap
-
-- [x] ✅ String, Int operations (GET, SET, INCR, DECR)
-- [x] ✅ TTL support (EXPIRE, PERSIST, TTL, PTTL)
-- [x] ✅ Hash (HSET, HGET, HGETALL, HINCRBY, etc.)
-- [x] ✅ Set (SADD, SREM, SMEMBERS, SPOP)
-- [x] ✅ Sorted Set (ZADD, ZRANGE, ZINCRBY with double-index)
-- [x] ✅ Pub/Sub (SUBSCRIBE, PUBLISH)
-- [x] ✅ Pattern matching (KEYS with glob/regex DFA)
-- [x] ✅ SharedByte — Arc-free single-threaded ref-counting
-- [ ] 🚧 List operations (LPUSH, RPUSH, LRANGE, BLPOP)
-- [ ] 🚧 SCAN cursor-based iteration
-- [ ] 🚧 Persistence (RDB snapshots, AOF)
-- [ ] 🚧 Cluster mode
-- [ ] 🚧 Replication
-
----
-
-## 📝 Requirements
-
-- **Linux 5.1+** (io_uring support)
-- **Rust 2024 edition** (stable, no nightly required)
-- **x86_64 or ARM64**
-
----
-
-## 📜 License
+## License
 
 MIT
 
----
-
-## 🙏 Acknowledgments
-
-Built with:
-- [monoio](https://github.com/bytedance/monoio) - Async io_uring runtime
-- [redis-protocol](https://github.com/aembke/redis-protocol.rs) - RESP parser
-- [bytes](https://github.com/tokio-rs/bytes) - Zero-copy byte buffers
-- [hislab](https://github.com/JoshuaBOUCHAT/hislab) - Hierarchical slab allocator with THP support
-
-Inspired by:
-- [Dragonfly](https://github.com/dragonflydb/dragonfly) - Multi-threaded Redis replacement
-- [Valkey](https://github.com/valkey-io/valkey) - The Redis fork we benchmark against
-- [Skytable](https://github.com/skytable/skytable) - Modern NoSQL database
-
----
-
-**Made with 🦀 and ⚡**
-
-*Benchmark your own workload and see the difference!*
+Built with [monoio](https://github.com/bytedance/monoio),
+[io-uring](https://github.com/tokio-rs/io-uring),
+[mimalloc](https://github.com/microsoft/mimalloc),
+[regex-automata](https://github.com/rust-lang/regex) and
+[hislab](https://github.com/JoshuaBOUCHAT/hislab). Benchmarked against
+[Valkey](https://github.com/valkey-io/valkey).
