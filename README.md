@@ -3,10 +3,10 @@
 **A Redis-compatible in-memory key-value store built on an Adaptive Radix Tree, in Rust, on io_uring.**
 
 RadixOx speaks RESP2, so `redis-cli` and existing Redis client libraries work with it. Its
-storage engine, **OxidArt**, keeps keys in an ordered radix tree instead of a hash table. That
-gives it lower tail latency than Valkey on a single core, and it makes ordered and prefix
-operations native: sorted pagination (`KRANGE`), prefix scans that only touch matching keys,
-and binary-safe keys.
+storage engine, **OxidArt**, keeps keys in an ordered radix tree instead of a hash table. On a
+single core it beats Valkey on throughput, tail latency and, with structured keys, memory, and
+it makes ordered and prefix operations native: sorted pagination (`KRANGE`), prefix scans that
+only touch matching keys, and binary-safe keys.
 
 OxidArt is also usable directly as an embedded Rust library.
 
@@ -14,19 +14,19 @@ OxidArt is also usable directly as an embedded Rust library.
 
 ## Highlights
 
-Measured on 2026-10-12, one core each, 1M keys (see [Benchmarks](#benchmarks) for the setup
+Measured on 2026-10-17, one core each, 1M keys (see [Benchmarks](#benchmarks) for the setup
 and caveats):
 
 | | RadixOx | Valkey 9.1.2 | |
 |---|---|---|---|
-| GET p99, no pipeline (80 conns) | **0.44 ms** | 0.75 ms | −42 % |
-| GET p99.9, no pipeline | **0.52 ms** | 0.84 ms | −38 % |
-| Throughput, no pipeline | **224 k ops/s** | 202 k ops/s | +11 % |
-| Throughput, pipeline 32 | **2.22 M ops/s** | 1.96 M ops/s | +13 % |
-| `KEYS user:*` (1,000 matches in 1M keys) | **0.15 ms** | 21.4 ms | ×140 |
-| `SAVE` of 1M keys | **71 ms** (raw) / 112 ms (zstd) | 1,989 ms | ×18–28 |
-| Restart with 1M keys | **~0.2 s** | ~0.45 s | ×2 |
-| Memory per key (100 B values) | 251 B | **152 B** | Valkey −40 % |
+| p99, no pipeline (80 conns) | **0.58 ms** | 0.89 ms | −34 % |
+| p99.9, no pipeline | **0.76 ms** | 1.17 ms | −35 % |
+| Throughput, no pipeline | **193 k ops/s** | 173 k ops/s | +11 % |
+| Throughput, pipeline 32 | **2.02 M ops/s** | 1.66 M ops/s | +22 % |
+| Memory after loading 1M keys (100 B values) | **151 MB** | 163 MB | −7 % |
+| `SAVE` of 1M keys | **84 ms** (raw) / 70 ms (zstd) | 1,810 ms | ×22–26 |
+| Restart with 1M keys | **~0.17 s** | ~0.53 s | ×3 |
+| `KEYS user:*` (1,000 matches in 1M keys, 2026-10-12) | **0.15 ms** | 21.4 ms | ×140 |
 
 Plus what Redis doesn't have:
 
@@ -63,7 +63,7 @@ Requirements: **Linux** with io_uring (developed on 6.12 LTS and 7.2), **Rust 20
 ### Setup
 
 - AMD Ryzen 5 7600X (6 cores / 12 threads), 30 GB RAM, Linux 7.2-zen, power profile
-  `performance`, loopback.
+  `performance`, loopback. Both servers measured in the same session (2026-10-17).
 - **One core each.** The server is pinned to CPU 0 with its SMT sibling idle. RadixOx runs
   without SQ_POLL; Valkey 9.1.2 runs with `io-threads 1`, persistence off. memtier runs on
   physical cores 2–5.
@@ -75,25 +75,53 @@ Requirements: **Linux** with io_uring (developed on 6.12 LTS and 7.2), **Rust 20
 
 | | Throughput | p50 | p99 | p99.9 |
 |---|---|---|---|---|
-| **No pipeline**, RadixOx | **224,212 ops/s** | **0.351 ms** | **0.439 ms** | **0.527 ms** |
-| No pipeline, Valkey | 202,053 ops/s | 0.375 ms | 0.751 ms | 0.839 ms |
-| **Pipeline 32**, RadixOx | **2,216,319 ops/s** | **0.991 ms** | **1.727 ms** | **1.975 ms** |
-| Pipeline 32, Valkey | 1,964,902 ops/s | 1.103 ms | 2.079 ms | 2.431 ms |
+| **No pipeline**, RadixOx | **192,623 ops/s** | **0.399 ms** | **0.583 ms** | **0.759 ms** |
+| No pipeline, Valkey | 173,130 ops/s | 0.439 ms | 0.887 ms | 1.167 ms |
+| **Pipeline 32**, RadixOx | **2,024,933 ops/s** | **1.127 ms** | **2.079 ms** | **2.431 ms** |
+| Pipeline 32, Valkey | 1,656,917 ops/s | 1.359 ms | 2.975 ms | 3.663 ms |
 
 Without pipelining, both servers are bounded by the TCP stack and the client's round trips:
 the kernel takes most of the core. The tail is where RadixOx stands out: p99 and p99.9 are
-about 40 % lower.
+about 35 % lower. The machine was slower that day than on 2026-10-12 (Valkey 173 k vs
+202 k ops/s without pipeline): compare the rows with each other, not across dates.
+
+### YCSB workload A
+
+5M records (one hash field of 100 B per record), 10M operations (50 % read / 50 % update),
+100 client threads, one server thread each, single run:
+
+| | Load | Run | READ avg | READ p99 | READ p99.9 | READ p99.99 | Peak RSS |
+|---|---|---|---|---|---|---|---|
+| RadixOx | **76 k ops/s** | **174 k ops/s** | **574 µs** | **749 µs** | **811 µs** | **1,112 µs** | **2,014 MB** |
+| Valkey | 60 k ops/s | 148 k ops/s | 673 µs | 1,308 µs | 1,438 µs | 1,826 µs | 2,053 MB |
 
 ### Memory
 
 | | RSS after loading 1M keys | Per key |
 |---|---|---|
-| RadixOx | 253 MB | 251 B |
-| Valkey | 168 MB | **152 B** |
+| **RadixOx** | **151 MB** | **158 B** |
+| Valkey | 163 MB | 171 B |
+| RadixOx on 2026-10-12 (64-byte nodes, 512 KiB connection buffers) | 253 MB | 251 B |
 
-This is RadixOx's weak spot today. Each key costs a 64-byte tree node plus a separately
-allocated value (mimalloc), and random short keys get little benefit from path compression.
-Reducing the footprint (value compaction, leaf/value fusion) is on the roadmap.
+Most of the gain comes from the tree: a key without descendants is now an **inline leaf**
+in its parent node instead of a node of its own. On these keys (`key:1` … `key:1000000`, ten
+keys per node) the tree costs **16 B per key**, against 72 B before; the rest is the value
+(100 B → 112 B in mimalloc). Smaller connection buffers (64 KiB instead of 512 KiB) saved
+another 42 MB with 80 connections.
+
+What to expect on other key shapes, tree only (in-process, 1M keys, integer values):
+
+| Keys | Before | Now |
+|---|---|---|
+| sequential ids (`key:N`, `memtier-N`) | 72 B | **16 B** |
+| `user:{id}:{email,uuid,name,age}` | 83 B | **37 B** |
+| random UUIDs, binary (16 B) | 102 B | **64 B** |
+| YCSB (`user<hash>`) | 112 B | **77 B** |
+| random UUIDs as text, session tokens | 135 B | **100 B** |
+| `user:{n}` + `user:{n}:email` (two keys per id) | 64 B | 68 B |
+
+Dense or structured keys gain the most; random keys fan out only two or three ways at the
+deepest levels, so each node holds fewer keys.
 
 ### Prefix queries
 
@@ -109,19 +137,22 @@ with the size of the database.
 
 ### Persistence (1M keys, 100-byte values)
 
+Dump written to tmpfs, same session (2026-10-17):
+
 | | `SAVE` | Dump size | Restart until all keys are back |
 |---|---|---|---|
-| RadixOx, raw dump | **71 ms** | 105 MB | ~0.2 s |
-| RadixOx, zstd level 3 | 112 ms | (see note) | ~0.2 s |
-| Valkey (RDB, LZF) | 1,989 ms | 113 MB | ~0.45 s |
+| RadixOx, raw dump | **84 ms** | 105 MB | **~0.17 s** |
+| RadixOx, zstd level 3 | **70 ms** | (see note) | **~0.16 s** |
+| Valkey (RDB, LZF) | 1,810 ms | 25 MB | ~0.53 s |
 
-memtier fills every value with the same bytes, so whole-stream compression (zstd) is
-unrealistically effective on this data; only the raw size is meaningful here. `BGSAVE` runs
-the same snapshot in slices while the server keeps serving, without `fork`.
+memtier fills every value with the same bytes, so compression (zstd for the whole stream,
+LZF per value in Valkey) is unrealistically effective on this data; only RadixOx's raw size
+is meaningful here. `BGSAVE` runs the same snapshot in slices while the server keeps serving,
+without `fork`.
 
 ### Engine microbenchmarks (in-process, no network)
 
-1M random keys, one core:
+1M random keys, one core (2026-10-12, previous 64-byte nodes):
 
 | Operation | Cost |
 |---|---|
@@ -135,7 +166,7 @@ the same snapshot in slices while the server keeps serving, without `fork`.
 - Loopback only: the client's TCP receive path and netfilter are billed to the same machine.
   Real two-machine numbers are planned.
 - Single runs, short durations: treat the numbers as orders of magnitude, not as precise
-  ratios.
+  ratios (run-to-run variation on this machine is around ±10 %).
 - Valkey can use more cores (`io-threads`); RadixOx is single-threaded by design. The
   comparison is per core.
 
@@ -270,14 +301,20 @@ TCP ──io_uring (monoio)──▶ RESP parser ──▶ batch of commands ─
 ```
 
 **OxidArt, the radix tree**
-- **64-byte nodes** in a slab (HiSlab) backed by anonymous `mmap` with transparent huge pages.
-  Stable `u32` indices instead of pointers.
+- **128-byte nodes with inline leaves** in a slab (HiSlab) backed by anonymous `mmap` with
+  transparent huge pages. Stable `u32` indices instead of pointers. A key without
+  descendants is not a node: it is a leaf stored in its parent (radix, suffix, value, TTL),
+  so the last level of the tree costs a few bytes per key instead of a whole node.
+- **Rank addressing**: entries are sorted; bitmaps say which ones are children, carry a TTL or
+  a suffix, and a popcount gives the offset of any entry. Children grow from one end of the
+  node's cells, leaves from the other.
+- **Four shapes**: 8 entries inline (radixes searched with one 8-byte load and a bit trick,
+  SWAR), 8 more in an overflow page sharing the same bitmaps, then up to 32 with the metadata
+  in the node and the cells in the page, then up to 256 with a 256-bit radix bitmap. Pages
+  are sized to mimalloc's size classes and shrink with hysteresis.
 - **Path compression** (`CompactPath`: up to 7 bytes inline, longer segments on the heap) and
   automatic re-compression after deletions: the tree always has the same canonical shape for
   the same content.
-- **Child lookup without loops**: 6 children inline, 10 more in an overflow slot, searched with
-  a single 8-byte load and a bit trick (SWAR). Wider nodes use 8-child groups (up to 112)
-  then a direct 256-entry table.
 - **Interleaved descents**: when several keys are known at once (pipeline window, `MGET`,
   `EXISTS`), their lookups advance level by level so cache misses overlap.
 - **TTL**: expired keys are invisible to reads and removed lazily or by an active sampling
@@ -303,7 +340,8 @@ across cores is meant to come from sharding by namespace, not from shared-state 
   block, `DELPREFIX` (delete a whole namespace in O(prefix length)), durable commits —
   [`TX_DESIGN.md`](TX_DESIGN.md).
 - AOF and replication (sharing one stream of effects).
-- Lower memory per key.
+- Lower memory per key: small hashes stored inline (like Redis's listpack), suffixes inline
+  on several cells for long random keys.
 - Client compatibility commands (`HELLO`, `CLIENT`, `CONFIG`, `MULTI`/`EXEC`), `SCAN`, lists.
 
 ---
@@ -313,6 +351,7 @@ across cores is meant to come from sharding by namespace, not from shared-state 
 ```
 radixox/
 ├── oxidart/        # radix tree engine: TTL, prefix / glob / range queries, snapshots
+├── oxidart-legacy/ # previous engine (64-byte nodes), test oracle only, not published
 ├── valart/         # compact radix trees for Hash and Set values
 ├── radixox-lib/    # SharedByte, RESP parser and encoder, save barrier
 ├── radixox/        # server binary (RESP2 over io_uring)
