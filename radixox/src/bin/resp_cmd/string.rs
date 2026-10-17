@@ -145,7 +145,7 @@ pub(crate) fn cmd_type(art: &mut OxidArt, key: &[u8]) -> Frame {
 }
 
 pub(crate) fn cmd_dbsize(art: &mut OxidArt) -> Frame {
-    let count = art.getn(SharedByte::from_slice(b"")).len() as i64;
+    let count = art.len() as i64;
     Frame::Integer(count)
 }
 

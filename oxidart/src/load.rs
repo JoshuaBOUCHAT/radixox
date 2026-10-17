@@ -51,6 +51,7 @@ use radixox_lib::varint::{get_bytes, get_varint, unzigzag};
 use crate::compact_path::CompactPath;
 use crate::node::{Entry, Leaf, Node};
 use crate::save::{DumpError, format};
+use crate::small::{self, SMALL_MAX};
 use crate::value::{RawVal, Tag, ValUnion, alloc_list, alloc_zset, valart};
 use crate::zcommand::InnerZCommand;
 use crate::{OxidArt, Value};
@@ -373,24 +374,40 @@ impl<R: Read> DumpReader<R> {
             format::T_INT => RawVal::new(Tag::Int, ValUnion { integer: unzigzag(self.varint()?) }),
             format::T_HASH => {
                 let n = self.varint()?;
-                let root = valart().hash_create();
-                // Possédée dès maintenant : libérée si la suite est illisible.
-                let raw = RawVal::new(Tag::Hash, ValUnion { idx: root });
-                for _ in 0..n {
-                    let (field, val) = (self.bytes()?, self.bytes()?);
-                    valart().hash_set(root, field, val);
+                if n as usize <= SMALL_MAX {
+                    let mut pairs = Vec::with_capacity(n as usize);
+                    for _ in 0..n {
+                        pairs.push([self.bytes()?, self.bytes()?]);
+                    }
+                    RawVal::new(Tag::HashSmall, ValUnion { ptr: small::from_entries::<2>(pairs.into_iter()) })
+                } else {
+                    let root = valart().hash_create();
+                    // Possédée dès maintenant : libérée si la suite est illisible.
+                    let raw = RawVal::new(Tag::Hash, ValUnion { idx: root });
+                    for _ in 0..n {
+                        let (field, val) = (self.bytes()?, self.bytes()?);
+                        valart().hash_set(root, field, val);
+                    }
+                    raw
                 }
-                raw
             }
             format::T_SET => {
                 let n = self.varint()?;
-                let root = valart().set_create();
-                let raw = RawVal::new(Tag::Set, ValUnion { idx: root });
-                for _ in 0..n {
-                    let member = self.bytes()?;
-                    valart().set_add(root, member);
+                if n as usize <= SMALL_MAX {
+                    let mut members = Vec::with_capacity(n as usize);
+                    for _ in 0..n {
+                        members.push([self.bytes()?]);
+                    }
+                    RawVal::new(Tag::SetSmall, ValUnion { ptr: small::from_entries::<1>(members.into_iter()) })
+                } else {
+                    let root = valart().set_create();
+                    let raw = RawVal::new(Tag::Set, ValUnion { idx: root });
+                    for _ in 0..n {
+                        let member = self.bytes()?;
+                        valart().set_add(root, member);
+                    }
+                    raw
                 }
-                raw
             }
             format::T_ZSET => {
                 let z = self.zset()?;
@@ -550,6 +567,7 @@ impl OxidArt {
         if self.node(root_idx).has_any_ttl() {
             self.map.tag(root_idx);
         }
+        self.key_count += stats.keys as usize;
         Ok(stats)
     }
 

@@ -42,14 +42,26 @@ fn image_val(tag: Tag, val: &ValUnion) -> ValUnion {
         Tag::Bytes => ValUnion {
             bytes: ManuallyDrop::new(unsafe { (*val.bytes).clone() }),
         },
+        // petit conteneur : le bloc appartient au nœud, copie profonde
+        Tag::HashSmall => ValUnion {
+            ptr: unsafe { crate::small::deep_clone::<2>(val.ptr) },
+        },
+        Tag::SetSmall => ValUnion {
+            ptr: unsafe { crate::small::deep_clone::<1>(val.ptr) },
+        },
         // SAFETY: pas de ressource possédée hors Bytes : copie bit à bit.
         _ => unsafe { std::ptr::read(val) },
     }
 }
 
 fn drop_image_val(tag: Tag, val: &mut ValUnion) {
-    if tag == Tag::Bytes {
-        unsafe { ManuallyDrop::drop(&mut val.bytes) };
+    unsafe {
+        match tag {
+            Tag::Bytes => ManuallyDrop::drop(&mut val.bytes),
+            Tag::HashSmall => crate::small::free::<2>(val.ptr),
+            Tag::SetSmall => crate::small::free::<1>(val.ptr),
+            _ => {}
+        }
     }
 }
 
@@ -360,6 +372,9 @@ enum PVal {
     Set(u32),
     /// ZSet/List : idx dans la section.
     Idx(u32),
+    /// Valeur déjà encodée (petit Hash/Set : sérialisé à la visite, aucun
+    /// pointeur vers le bloc ne survit à la tranche).
+    Encoded(Vec<u8>),
 }
 
 impl PVal {
@@ -404,6 +419,7 @@ pub(crate) fn prefetch_value(tag: Tag, val: &ValUnion) {
         match tag {
             Tag::Bytes => val.bytes.prefetch(),
             Tag::Hash | Tag::Set => valart().prefetch_root(val.idx),
+            Tag::HashSmall | Tag::SetSmall => prefetch_l1(val.ptr),
             _ => {}
         }
     }
@@ -599,8 +615,8 @@ impl SaveCursor {
         let ty = match tag {
             Tag::Bytes => format::T_STRING,
             Tag::Int => format::T_INT,
-            Tag::Hash => format::T_HASH,
-            Tag::Set => format::T_SET,
+            Tag::Hash | Tag::HashSmall => format::T_HASH,
+            Tag::Set | Tag::SetSmall => format::T_SET,
             Tag::ZSet => format::T_ZSET,
             Tag::List => format::T_LIST,
             Tag::None => unreachable!(),
@@ -632,6 +648,25 @@ impl SaveCursor {
                 Tag::Int => PVal::Int(val.integer),
                 Tag::Hash => PVal::Hash(val.idx),
                 Tag::Set => PVal::Set(val.idx),
+                Tag::HashSmall => {
+                    let pairs = crate::small::entries::<2>(val.ptr);
+                    let mut buf = Vec::new();
+                    put_varint(&mut buf, pairs.len() as u64);
+                    for [f, v] in pairs {
+                        put_bytes(&mut buf, f);
+                        put_bytes(&mut buf, v);
+                    }
+                    PVal::Encoded(buf)
+                }
+                Tag::SetSmall => {
+                    let members = crate::small::entries::<1>(val.ptr);
+                    let mut buf = Vec::new();
+                    put_varint(&mut buf, members.len() as u64);
+                    for [m] in members {
+                        put_bytes(&mut buf, m);
+                    }
+                    PVal::Encoded(buf)
+                }
                 Tag::ZSet | Tag::List => PVal::Idx(val.idx),
                 Tag::None => unreachable!(),
             }
@@ -662,6 +697,10 @@ fn emit_oldest(cur: &mut SaveCursor, out: &mut Vec<u8>, budget: &mut u32) {
             cur.container = Container::Set;
         }
         PVal::Idx(idx) => put_varint(out, *idx as u64),
+        PVal::Encoded(buf) => {
+            out.extend_from_slice(buf);
+            sub(budget, 1 + (buf.len() >> 12) as u32);
+        }
     }
     cur.spare.push(std::mem::take(&mut p.head));
 }

@@ -7,6 +7,7 @@ use hislab::HiSlab;
 use radixox_lib::shared_byte::SharedByte;
 use valart::ValTrees;
 
+use crate::small;
 use crate::zcommand::InnerZCommand;
 
 // ─── Tag ─────────────────────────────────────────────────────────────────────
@@ -21,6 +22,12 @@ pub(crate) enum Tag {
     Set = 4,
     ZSet = 5,
     List = 6,
+    /// Hash d'au plus `SMALL_MAX` champs : `ValUnion::ptr` vers un bloc
+    /// `crate::small` de paires (champ, valeur).
+    HashSmall = 7,
+    /// Set d'au plus `SMALL_MAX` membres : `ValUnion::ptr` vers un bloc
+    /// `crate::small`.
+    SetSmall = 8,
 }
 
 impl Tag {
@@ -28,9 +35,9 @@ impl Tag {
         match self {
             Tag::None => RedisType::None,
             Tag::Int | Tag::Bytes => RedisType::String,
-            Tag::Hash => RedisType::Hash,
+            Tag::Hash | Tag::HashSmall => RedisType::Hash,
             Tag::List => RedisType::List,
-            Tag::Set => RedisType::Set,
+            Tag::Set | Tag::SetSmall => RedisType::Set,
             Tag::ZSet => RedisType::ZSet,
         }
     }
@@ -42,6 +49,8 @@ pub(crate) union ValUnion {
     pub(crate) integer: i64,
     pub(crate) bytes: ManuallyDrop<SharedByte>,
     pub(crate) idx: u32,
+    /// Bloc d'un petit conteneur (`Tag::HashSmall`, `Tag::SetSmall`).
+    pub(crate) ptr: *mut u8,
 }
 
 // ─── Static slabs ─────────────────────────────────────────────────────────────
@@ -97,6 +106,58 @@ fn hash_from_pairs(pairs: Vec<(SharedByte, SharedByte)>) -> u32 {
         trees.hash_set(root, field, val);
     }
     root
+}
+
+/// Hash neuf : petit bloc jusqu'à `SMALL_MAX` champs distincts, valart au-delà.
+/// Un champ répété garde sa dernière valeur.
+pub(crate) fn hash_into_raw(pairs: Vec<(SharedByte, SharedByte)>) -> (Tag, ValUnion) {
+    let mut p = small::alloc::<2>(1);
+    let mut rest = pairs.into_iter();
+    for (f, v) in rest.by_ref() {
+        unsafe {
+            if let Some(i) = small::find::<2>(p, &f) {
+                drop(small::remove_at::<2>(p, i));
+            }
+            if let Err([f, v]) = small::push::<2>(&mut p, [f, v]) {
+                // trop de champs : tout part en valart
+                let root = hash_from_pairs(
+                    small::into_entries::<2>(p)
+                        .into_iter()
+                        .map(|[f, v]| (f, v))
+                        .chain(std::iter::once((f, v)))
+                        .chain(rest)
+                        .collect(),
+                );
+                return (Tag::Hash, ValUnion { idx: root });
+            }
+        }
+    }
+    (Tag::HashSmall, ValUnion { ptr: p })
+}
+
+/// Set neuf : petit bloc jusqu'à `SMALL_MAX` membres distincts, valart au-delà.
+pub(crate) fn set_into_raw(members: Vec<SharedByte>) -> (Tag, ValUnion) {
+    let mut p = small::alloc::<1>(1);
+    let mut rest = members.into_iter();
+    for m in rest.by_ref() {
+        unsafe {
+            if small::find::<1>(p, &m).is_some() {
+                continue;
+            }
+            if let Err([m]) = small::push::<1>(&mut p, [m]) {
+                let root = set_from_members(
+                    small::into_entries::<1>(p)
+                        .into_iter()
+                        .map(|[m]| m)
+                        .chain(std::iter::once(m))
+                        .chain(rest)
+                        .collect(),
+                );
+                return (Tag::Set, ValUnion { idx: root });
+            }
+        }
+    }
+    (Tag::SetSmall, ValUnion { ptr: p })
 }
 
 fn hash_to_pairs(root: u32) -> Vec<(SharedByte, SharedByte)> {
@@ -168,8 +229,8 @@ pub(crate) fn value_into_raw(val: Value) -> (Tag, ValUnion) {
                 bytes: ManuallyDrop::new(b),
             },
         ),
-        Value::Hash(h) => (Tag::Hash, ValUnion { idx: hash_from_pairs(h) }),
-        Value::Set(s) => (Tag::Set, ValUnion { idx: set_from_members(s) }),
+        Value::Hash(h) => hash_into_raw(h),
+        Value::Set(s) => set_into_raw(s),
         Value::ZSet(z) => (Tag::ZSet, ValUnion { idx: alloc_zset(z) }),
         Value::List(l) => (Tag::List, ValUnion { idx: alloc_list(l) }),
     }
@@ -187,6 +248,13 @@ pub(crate) unsafe fn value_from_raw_ref(tag: Tag, val: &ValUnion) -> Value {
             Tag::Bytes => Value::String((*val.bytes).clone()),
             Tag::Hash => Value::Hash(hash_to_pairs(val.idx)),
             Tag::Set => Value::Set(set_to_members(val.idx)),
+            Tag::HashSmall => Value::Hash(
+                small::entries::<2>(val.ptr)
+                    .iter()
+                    .map(|[f, v]| (f.clone(), v.clone()))
+                    .collect(),
+            ),
+            Tag::SetSmall => Value::Set(small::entries::<1>(val.ptr).iter().map(|[m]| m.clone()).collect()),
             Tag::ZSet => Value::ZSet(zset_ref(val.idx).clone()),
             Tag::List => Value::List(list_ref(val.idx).clone()),
         }
@@ -213,6 +281,8 @@ pub(crate) unsafe fn value_take_raw(tag: Tag, val: ValUnion) -> Value {
                 valart().set_drop(val.idx);
                 Value::Set(members)
             }
+            Tag::HashSmall => Value::Hash(small::into_entries::<2>(val.ptr).into_iter().map(|[f, v]| (f, v)).collect()),
+            Tag::SetSmall => Value::Set(small::into_entries::<1>(val.ptr).into_iter().map(|[m]| m).collect()),
             Tag::ZSet => Value::ZSet(zset_slab().remove(val.idx).expect("zset slot")),
             Tag::List => Value::List(list_slab().remove(val.idx).expect("list slot")),
         }
@@ -229,6 +299,8 @@ pub(crate) unsafe fn drop_raw(tag: Tag, val: &mut ValUnion) {
             Tag::Bytes => ManuallyDrop::drop(&mut val.bytes),
             Tag::Hash => valart().hash_drop(val.idx),
             Tag::Set => valart().set_drop(val.idx),
+            Tag::HashSmall => small::free::<2>(val.ptr),
+            Tag::SetSmall => small::free::<1>(val.ptr),
             Tag::ZSet => free_zset(val.idx),
             Tag::List => free_list(val.idx),
             Tag::Int | Tag::None => {}

@@ -216,6 +216,8 @@ struct Stats {
     saves: usize,
     krange: usize,
     deln: usize,
+    /// conteneurs vus en fin de graine : Hash valart, Hash petit, Set valart, Set petit
+    containers: [usize; 4],
 }
 
 /// Save en cours sur le nouvel arbre : curseur, sortie, état T0 attendu.
@@ -228,7 +230,13 @@ struct Saving {
 fn fuzz(seed: u64, ops: usize, keys: Keys, stats: &mut Stats) {
     let mut rng = StdRng::seed_from_u64(seed);
     let pool: Vec<SharedByte> = (0..6).map(|i| SharedByte::from_slice(format!("v-{i}"))).collect();
-    let fields: Vec<SharedByte> = ["f", "g", "field-long-name", ""].iter().map(|s| sb(s.as_bytes())).collect();
+    // 12 champs / membres possibles : les petits conteneurs (≤ 8) passent en
+    // valart, et en reviennent par suppression de la clé
+    let fields: Vec<SharedByte> = ["f", "g", "field-long-name", "", "a", "b", "c", "d", "e", "h", "i", "j"]
+        .iter()
+        .map(|s| sb(s.as_bytes()))
+        .collect();
+    let members: Vec<SharedByte> = (0..12).map(|i| SharedByte::from_slice(format!("m-{i}"))).collect();
     let mut new = OxidArt::new();
     let mut old = Old::new();
     let mut now = 1_000;
@@ -290,7 +298,7 @@ fn fuzz(seed: u64, ops: usize, keys: Keys, stats: &mut Stats) {
                 assert_eq!(a, b, "incrby {key:?}");
             }
             17 => {
-                let n = rng.gen_range(1..3);
+                let n = rng.gen_range(1..5);
                 let fv: Vec<(SharedByte, SharedByte)> = (0..n)
                     .map(|_| (fields[rng.gen_range(0..fields.len())].clone(), pool[rng.gen_range(0..pool.len())].clone()))
                     .collect();
@@ -314,7 +322,7 @@ fn fuzz(seed: u64, ops: usize, keys: Keys, stats: &mut Stats) {
                 assert_eq!(format!("{:?}", new.cmd_hdel(k, &fs)), format!("{:?}", old.cmd_hdel(k, &fs)), "hdel");
             }
             20 => {
-                let m = [pool[rng.gen_range(0..pool.len())].clone()];
+                let m = [members[rng.gen_range(0..members.len())].clone()];
                 if rng.gen_bool(0.6) {
                     let a = format!("{:?}", new.cmd_sadd(k, &m, None));
                     assert_eq!(a, format!("{:?}", old.cmd_sadd(k, &m, None)), "sadd {key:?}");
@@ -435,6 +443,19 @@ fn fuzz(seed: u64, ops: usize, keys: Keys, stats: &mut Stats) {
         stats.saves += 1;
     }
 
+    {
+        use crate::value::Tag;
+        let mut path = Vec::new();
+        let c = &mut stats.containers;
+        new.walk(new.root_idx, &mut path, |_, tag, _, _| match tag {
+            Tag::Hash => c[0] += 1,
+            Tag::HashSmall => c[1] += 1,
+            Tag::Set => c[2] += 1,
+            Tag::SetSmall => c[3] += 1,
+            _ => {}
+        });
+    }
+
     // aller-retour save/reload, dans les deux sens (format commun)
     let want = content_old(&old, b"");
     assert_eq!(content_new(&new, b""), want);
@@ -522,6 +543,139 @@ fn diff_vs_legacy() {
         eprintln!("{keys:?} : {stats:?}");
         assert!(stats.saves >= 16 && stats.krange > 100 && stats.deln > 5);
     }
+}
+
+/// Conteneurs : 5 clés, surtout des opérations Hash et Set, pour traverser
+/// souvent la frontière petit bloc ↔ valart (> 8 entrées), avec une save sous
+/// mutations et des reloads croisés.
+fn fuzz_containers(seed: u64, ops: usize, seen: &mut [usize; 4]) {
+    use crate::value::Tag;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let names: Vec<SharedByte> = (0..14).map(|i| SharedByte::from_slice(format!("x{i}"))).collect();
+    let vals: Vec<SharedByte> = (0..5).map(|i| SharedByte::from_slice(format!("val-{i}"))).collect();
+    let keys: [&[u8]; 5] = [b"h", b"h:1", b"s", b"s:1", b"x"];
+    let mut new = OxidArt::new();
+    let mut old = Old::new();
+    new.set_now(1_000);
+    old.set_now(1_000);
+    let save_at = rng.gen_range(ops / 4..ops / 2);
+    let mut saving: Option<Saving> = None;
+    for step in 0..ops {
+        let k = keys[rng.gen_range(0..keys.len())];
+        let pick = |rng: &mut StdRng, n: usize| -> Vec<SharedByte> {
+            (0..rng.gen_range(1..=n)).map(|_| names[rng.gen_range(0..names.len())].clone()).collect()
+        };
+        match rng.gen_range(0..12) {
+            0..=2 => {
+                let fv: Vec<(SharedByte, SharedByte)> = pick(&mut rng, 4)
+                    .into_iter()
+                    .map(|f| (f, vals[rng.gen_range(0..vals.len())].clone()))
+                    .collect();
+                let ttl = rng.gen_bool(0.1).then(|| 1_000 + rng.gen_range(0..50));
+                assert_eq!(format!("{:?}", new.cmd_hset(k, &fv, ttl)), format!("{:?}", old.cmd_hset(k, &fv, ttl)), "hset");
+            }
+            3 => {
+                let fs = pick(&mut rng, 3);
+                assert_eq!(format!("{:?}", new.cmd_hdel(k, &fs)), format!("{:?}", old.cmd_hdel(k, &fs)), "hdel");
+            }
+            4 => {
+                let f = names[rng.gen_range(0..names.len())].clone();
+                let d = rng.gen_range(-3..3);
+                assert_eq!(
+                    format!("{:?}", new.cmd_hincrby(k, f.clone(), d).ok()),
+                    format!("{:?}", old.cmd_hincrby(k, f, d).ok()),
+                    "hincrby"
+                );
+            }
+            5..=6 => {
+                let ms = pick(&mut rng, 4);
+                assert_eq!(format!("{:?}", new.cmd_sadd(k, &ms, None)), format!("{:?}", old.cmd_sadd(k, &ms, None)), "sadd");
+            }
+            7 => {
+                let ms = pick(&mut rng, 3);
+                assert_eq!(format!("{:?}", new.cmd_srem(k, &ms)), format!("{:?}", old.cmd_srem(k, &ms)), "srem");
+            }
+            8 => {
+                let f = &names[rng.gen_range(0..names.len())];
+                let a = new.cmd_hget(k, f).map(|v| v.map(|b| b.to_vec()));
+                let b = old.cmd_hget(k, f).map(|v| v.map(|b| b.to_vec()));
+                assert_eq!(format!("{a:?}"), format!("{b:?}"), "hget");
+                assert_eq!(format!("{:?}", new.cmd_hlen(k)), format!("{:?}", old.cmd_hlen(k)), "hlen");
+                assert_eq!(format!("{:?}", new.cmd_scard(k)), format!("{:?}", old.cmd_scard(k)), "scard");
+                assert_eq!(
+                    format!("{:?}", new.cmd_sismember(k, f.clone())),
+                    format!("{:?}", old.cmd_sismember(k, f.clone())),
+                    "sismember"
+                );
+            }
+            9 => {
+                // SPOP : aléatoire, comparé par cardinalité seulement, puis
+                // l'oracle retire les mêmes membres
+                if let Ok(crate::scommand::SPOPResult::Multiple(popped)) = new.cmd_spop(k, Some(b"2")) {
+                    if !popped.is_empty() {
+                        old.cmd_srem(k, &popped).unwrap();
+                    }
+                }
+            }
+            10 => {
+                assert_eq!(new.del(k), old.del(k), "del");
+            }
+            _ => {
+                new.set_now(new.now + rng.gen_range(0..5));
+                old.set_now(new.now);
+            }
+        }
+        if step == save_at {
+            let mut out = Vec::new();
+            let cur = new.save_start(&mut out);
+            saving = Some(Saving { cur, out, want: content_old(&old, b"") });
+        }
+        if let Some(s) = saving.as_mut()
+            && new.save_step(&mut s.cur, &mut s.out, rng.gen_range(1..8))
+        {
+            let s = saving.take().unwrap();
+            drop(s.cur);
+            new.finish_save();
+            assert_eq!(content_dump(&s.out), s.want, "save sous mutations (seed {seed})");
+        }
+        new.check();
+        assert_eq!(content_new(&new, b""), content_old(&old, b""), "contenu (seed {seed}, pas {step})");
+        let mut path = Vec::new();
+        new.walk(new.root_idx, &mut path, |_, tag, _, _| match tag {
+            Tag::Hash => seen[0] += 1,
+            Tag::HashSmall => seen[1] += 1,
+            Tag::Set => seen[2] += 1,
+            Tag::SetSmall => seen[3] += 1,
+            _ => {}
+        });
+    }
+    if let Some(mut s) = saving.take() {
+        while !new.save_step(&mut s.cur, &mut s.out, 64) {}
+        drop(s.cur);
+        new.finish_save();
+        assert_eq!(content_dump(&s.out), s.want, "save sous mutations (seed {seed})");
+    }
+    let want = content_old(&old, b"");
+    let dump_new = save_all(&mut new);
+    let mut back = OxidArt::new();
+    back.set_now(new.now);
+    back.load_dump(&dump_new).expect("reload");
+    back.check();
+    assert_eq!(content_new(&back, b""), want, "reload des conteneurs");
+    let mut back_old = Old::new();
+    back_old.set_now(new.now);
+    back_old.load_dump(&dump_new).expect("reload ancien ← v2");
+    assert_eq!(content_old(&back_old, b""), want, "reload ancien ← v2");
+}
+
+#[test]
+fn diff_containers_small_and_valart() {
+    let mut seen = [0usize; 4];
+    for seed in 0..40 {
+        fuzz_containers(seed, 1_500, &mut seen);
+    }
+    eprintln!("conteneurs vus (Hash valart, Hash petit, Set valart, Set petit) : {seen:?}");
+    assert!(seen.iter().all(|&n| n > 1_000), "{seen:?}");
 }
 
 /// Graines longues : gros arbres, nœuds larges, saves sur beaucoup de clés.

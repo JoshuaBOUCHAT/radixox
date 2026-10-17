@@ -59,6 +59,7 @@ mod load;
 pub(crate) mod node;
 pub mod save;
 pub mod scommand;
+pub(crate) mod small;
 pub mod value;
 pub mod zcommand;
 pub mod zset_inner;
@@ -147,6 +148,9 @@ pub struct OxidArt {
     pub(crate) root_idx: u32,
     /// Save progressive : barrière COW sur `map` (SAVE_DESIGN.md).
     pub(crate) save: OxidSave,
+    /// Valeurs stockées, expirées pas encore nettoyées comprises (comme le
+    /// `DBSIZE` de Redis).
+    pub(crate) key_count: usize,
 }
 
 impl Default for OxidArt {
@@ -286,7 +290,20 @@ impl OxidArt {
             root_idx,
             now: 0,
             save: OxidSave::default(),
+            key_count: 0,
         }
+    }
+
+    /// Nombre de clés stockées, en O(1). Les clés expirées pas encore
+    /// supprimées comptent (comme le `DBSIZE` de Redis).
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.key_count
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.key_count == 0
     }
 
     /// Updates the current timestamp. Call this periodically from your async runtime.
@@ -664,7 +681,10 @@ impl OxidArt {
                 let node = self.node_mut(idx);
                 if node.has_val() {
                     drop(take_self(node));
+                } else {
+                    self.key_count += 1;
                 }
+                let node = self.node_mut(idx);
                 put_self(node, raw, exp);
                 self.retag(idx, before);
                 return true;
@@ -703,6 +723,7 @@ impl OxidArt {
                     continue;
                 }
                 Step::Absent => {
+                    self.key_count += 1;
                     let before = self.node(idx).has_any_ttl();
                     self.node_mut(idx).insert(r, leaf(raw, exp, sfx_of(rest)));
                     self.retag(idx, before);
@@ -714,8 +735,12 @@ impl OxidArt {
                     debug_assert!(updated);
                     self.retag(idx, before);
                 }
-                Step::SplitLeaf => self.split_leaf(idx, r, rest, raw, exp),
+                Step::SplitLeaf => {
+                    self.key_count += 1;
+                    self.split_leaf(idx, r, rest, raw, exp);
+                }
                 Step::SplitChild(c) => {
+                    self.key_count += 1;
                     let cp = self.node(c).prefix.to_vec();
                     self.split_child(idx, r, c, &cp, rest, raw, exp);
                 }
@@ -830,6 +855,7 @@ impl OxidArt {
     /// Retire la valeur à `loc` (propriété à l'appelant) puis rétablit
     /// l'invariant de forme.
     pub(crate) fn remove_loc(&mut self, loc: Loc) -> RawVal {
+        self.key_count -= 1;
         let before = self.node(loc.node).has_any_ttl();
         let raw = match loc.slot {
             Slot::SelfVal => take_self(self.node_mut(loc.node)).0,
@@ -1038,17 +1064,23 @@ impl OxidArt {
                 let root = self.root_idx;
                 let mut freed = 0;
                 let mut kids = Vec::new();
+                let mut removed = 0;
                 let root_node = self.node_mut(root);
                 if root_node.has_val() {
                     let (_, exp) = take_self(root_node);
                     freed += !expired(exp, now) as usize;
+                    removed += 1;
                 }
                 while let Some(r) = (root_node.len() > 0).then(|| root_node.radix_at(0)) {
                     match root_node.remove(r).expect("entrée") {
                         Entry::Child(c) => kids.push(c),
-                        Entry::Leaf(l) => freed += !expired(l.ttl, now) as usize,
+                        Entry::Leaf(l) => {
+                            freed += !expired(l.ttl, now) as usize;
+                            removed += 1;
+                        }
                     }
                 }
+                self.key_count -= removed;
                 self.map.untag(root);
                 (kids, freed)
             }
@@ -1076,12 +1108,17 @@ impl OxidArt {
             };
             let node = self.node(idx);
             count += (node.has_val() && !expired(node.exp_and_radix.exp(), now)) as usize;
+            let mut removed = node.has_val() as usize;
             for (_, e) in node.iter() {
                 match e {
                     EntryRef::Child(c) => stack.push(c),
-                    EntryRef::Leaf { ttl, .. } => count += !expired(ttl, now) as usize,
+                    EntryRef::Leaf { ttl, .. } => {
+                        count += !expired(ttl, now) as usize;
+                        removed += 1;
+                    }
                 }
             }
+            self.key_count -= removed;
             // le Drop du nœud libère ses feuilles, sa page et sa self-val
             drop(self.remove_node(idx));
             done += 1;
@@ -1157,7 +1194,9 @@ impl OxidArt {
         }
         self.retag(idx, before);
         self.normalize(idx);
-        self_exp as usize + radixes.len()
+        let n = self_exp as usize + radixes.len();
+        self.key_count -= n;
+        n
     }
 
     // ─── Invariants (tests) ─────────────────────────────────────────────────
@@ -1189,6 +1228,10 @@ impl OxidArt {
             }
         }
         assert_eq!(seen, self.node_count(), "nœuds orphelins dans le slab");
+        let mut keys = 0;
+        let mut path = Vec::new();
+        self.walk(self.root_idx, &mut path, |_, _, _, _| keys += 1);
+        assert_eq!(self.key_count, keys, "compteur de clés");
         seen
     }
 }
