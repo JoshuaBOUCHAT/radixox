@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use crate::{
     OxidArt,
     error::TypeError,
-    value::{RedisType, Tag, ValUnion, alloc_zset, zset_mut},
+    value::{RedisType, Tag, alloc_zset, zset_mut},
 };
 
 const THRESHOLD: usize = 16;
@@ -166,16 +166,10 @@ impl OxidArt {
         ttl: Option<u64>,
         key: SharedByte,
     ) -> Result<&'static mut InnerZCommand, TypeError> {
-        let node_key = self.ensure_key(&key);
-        // Lecture d'abord : un ZSet existant ne modifie pas le nœud oxidart.
-        let idx = match self.get_node(node_key).get_value_ref(self.now) {
-            Some(v) => v.zset_idx().map_err(|_| TypeError::ValueNotSet)?,
-            None => {
-                let idx = alloc_zset(InnerZCommand::default());
-                self.install_value_raw(node_key, Tag::ZSet, ValUnion { idx }, ttl);
-                idx
-            }
-        };
+        // Un ZSet existant ne modifie pas le nœud oxidart.
+        let idx = self
+            .ensure_container(&key, ttl, Tag::ZSet, || alloc_zset(InnerZCommand::default()))
+            .map_err(|_| TypeError::ValueNotSet)?;
         Ok(zset_mut(idx))
     }
 

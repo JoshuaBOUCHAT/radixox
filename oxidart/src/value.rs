@@ -236,6 +236,48 @@ pub(crate) unsafe fn drop_raw(tag: Tag, val: &mut ValUnion) {
     }
 }
 
+// ─── RawVal ───────────────────────────────────────────────────────────────────
+
+/// `(Tag, ValUnion)` possédé hors de l'arbre, libéré s'il n'est pas posé.
+pub(crate) struct RawVal {
+    pub(crate) tag: Tag,
+    pub(crate) val: ValUnion,
+}
+
+impl RawVal {
+    #[inline]
+    pub(crate) fn new(tag: Tag, val: ValUnion) -> Self {
+        Self { tag, val }
+    }
+
+    #[inline]
+    pub(crate) fn from_value(val: Value) -> Self {
+        let (tag, val) = value_into_raw(val);
+        Self { tag, val }
+    }
+
+    /// Propriété transférée à l'appelant (rien n'est libéré).
+    #[inline]
+    pub(crate) fn into_parts(self) -> (Tag, ValUnion) {
+        let me = ManuallyDrop::new(self);
+        // SAFETY: `me` n'est jamais droppé.
+        (me.tag, unsafe { std::ptr::read(&me.val) })
+    }
+
+    pub(crate) fn into_value(self) -> Value {
+        let (tag, val) = self.into_parts();
+        // SAFETY: tag et val cohérents, tag != None (valeur réelle).
+        unsafe { value_take_raw(tag, val) }
+    }
+}
+
+impl Drop for RawVal {
+    fn drop(&mut self) {
+        // SAFETY: tag et val construits ensemble.
+        unsafe { drop_raw(self.tag, &mut self.val) };
+    }
+}
+
 // ─── NodeValMut ───────────────────────────────────────────────────────────────
 
 /// Mutable accessor into a node's value fields.

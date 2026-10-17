@@ -6,8 +6,8 @@ use std::task::{Context, Poll};
 
 use radixox_lib::shared_byte::SharedByte;
 
-use crate::OxidArt;
-use crate::node_childs::ChildAble;
+use crate::node::EntryRef;
+use crate::{OxidArt, PrefixHit, expired};
 
 // ─── Yield primitive ─────────────────────────────────────────────────────────
 
@@ -59,203 +59,47 @@ impl Future for SaveDone<'_> {
 const YIELD_BUDGET: usize = 256;
 
 // ─── Internal helpers on OxidArt ─────────────────────────────────────────────
-//
-// All the traversal and free logic lives here so lib.rs stays sync-only.
+
+/// Étage du parcours de KEYS : nœud, clé jusqu'à son radix inclus (son
+/// préfixe pas encore ajouté, sauf pour le nœud de départ).
+type KeysFrame = (u32, Vec<u8>, bool);
 
 impl OxidArt {
-    /// Traverses to the node that exactly covers `prefix` and returns
-    /// `(node_idx, full_key_path)` where `key_path` already includes the
-    /// matched node's own compression bytes.
-    fn find_prefix_node(&self, prefix: &[u8]) -> Option<(u32, Vec<u8>)> {
-        use crate::CompResult;
-
-        let prefix_len = prefix.len();
-
-        if prefix_len == 0 {
-            return Some((self.root_idx, Vec::new()));
-        }
-
-        let mut idx = self.root_idx;
-        let mut cursor = 0;
-        let mut key_path: Vec<u8> = Vec::new();
-
-        loop {
-            let radix = prefix[cursor];
-            let child_idx = self.find(idx, radix)?;
-            idx = child_idx;
-            key_path.push(radix);
-
-            let node = self.try_get_node(idx)?;
-            cursor += 1;
-
-            match node.compare_compression_key(&prefix[cursor..]) {
-                CompResult::Final => {
-                    key_path.extend_from_slice(&node.compression);
-                    return Some((idx, key_path));
-                }
-                CompResult::Partial(common_len) => {
-                    let prefix_rest_len = prefix_len - cursor;
-                    if common_len == prefix_rest_len {
-                        key_path.extend_from_slice(&node.compression);
-                        return Some((idx, key_path));
-                    }
-                    return None;
-                }
-                CompResult::Path => {
-                    key_path.extend_from_slice(&node.compression);
-                    cursor += node.compression.len();
-                }
-            }
-        }
-    }
-
-    /// Handles the start node of a collect: pushes its key into `keys` if it
-    /// has a live value, then seeds `stack` with its children.
-    ///
-    /// `key_path` must already include the start node's own compression bytes.
-    fn init_keys_stack(
-        &self,
-        start_idx: u32,
-        key_path: Vec<u8>,
-        keys: &mut Vec<SharedByte>,
-        stack: &mut Vec<(u32, Vec<u8>)>,
-    ) {
-        let Some(node) = self.try_get_node(start_idx) else {
-            return;
-        };
-        if node.get_value(self.now).is_some() {
-            keys.push(SharedByte::from_slice(&key_path));
-        }
-        self.iter_all_children(start_idx, |radix, child_idx| {
-            let mut child_key = key_path.clone();
-            child_key.push(radix);
-            stack.push((child_idx, child_key));
-        });
-    }
-
-    /// Pops up to `budget` entries from `stack`, appends live keys to `keys`,
-    /// and pushes each visited node's children back onto `stack`.
-    ///
-    /// Stack entry format: `(node_idx, key_prefix_before_this_nodes_compression)`.
-    fn collect_keys_chunk(
-        &self,
-        stack: &mut Vec<(u32, Vec<u8>)>,
-        keys: &mut Vec<SharedByte>,
-        budget: usize,
-    ) {
-        let mut processed = 0;
-        while processed < budget {
-            let Some((node_idx, key_prefix)) = stack.pop() else {
+    /// Visite au plus `budget` nœuds de `stack`, ajoute les clés vivantes à
+    /// `keys`. Les idx sont relus par `try_get_node` : entre deux tranches,
+    /// l'arbre a pu changer (lecture au mieux, comme le KEYS de Redis).
+    fn collect_keys_chunk(&self, stack: &mut Vec<KeysFrame>, keys: &mut Vec<SharedByte>, budget: usize) {
+        let now = self.now;
+        for _ in 0..budget {
+            let Some((idx, mut key, is_start)) = stack.pop() else {
                 break;
             };
-            let Some(node) = self.try_get_node(node_idx) else {
+            let Some(node) = self.try_get_node(idx) else {
                 continue;
             };
-            let mut full_key = key_prefix;
-            full_key.extend_from_slice(&node.compression);
-            if node.get_value(self.now).is_some() {
-                keys.push(SharedByte::from_slice(&full_key));
+            if !is_start {
+                key.extend_from_slice(&node.prefix);
             }
-            self.iter_all_children(node_idx, |radix, child_idx| {
-                let mut child_key = full_key.clone();
-                child_key.push(radix);
-                stack.push((child_idx, child_key));
-            });
-            processed += 1;
-        }
-    }
-
-    /// Traverses to the subtree covered by `prefix`, severs it from the tree,
-    /// and returns `(free_stack, parent_idx, initial_count)`.
-    ///
-    /// - `free_stack`     : node indices to free iteratively via `free_chunk`
-    /// - `parent_idx`     : node to recompress after freeing (`root_idx` → skip)
-    /// - `initial_count`  : deletions already counted (root val for empty prefix)
-    fn find_and_cut_prefix(&mut self, prefix: &[u8]) -> (Vec<u32>, u32, usize) {
-        let prefix_len = prefix.len();
-
-        if prefix_len == 0 {
-            let now = self.now;
-            let childs = self.collect_child_indices(self.root_idx);
-            let root = self.node_mut(self.root_idx);
-            let had_val = root.has_val() && !root.is_expired(now);
-            root.clear_val();
-            root.childs = Default::default();
-            return (childs, self.root_idx, usize::from(had_val));
-        }
-
-        let mut parent_idx = self.root_idx;
-        let mut parent_radix = prefix[0];
-        let Some(mut idx) = self.find(parent_idx, parent_radix) else {
-            return (vec![], self.root_idx, 0);
-        };
-        let mut cursor = 1;
-
-        let target_idx = loop {
-            use crate::CompResult;
-            let Some(node) = self.try_get_node(idx) else {
-                return (vec![], self.root_idx, 0);
-            };
-            match node.compare_compression_key(&prefix[cursor..]) {
-                CompResult::Final => break idx,
-                CompResult::Partial(common_len) => {
-                    let prefix_rest_len = prefix_len - cursor;
-                    if common_len == prefix_rest_len {
-                        break idx;
+            if node.has_val() && !expired(node.exp_and_radix.exp(), now) {
+                keys.push(SharedByte::from_slice(&key));
+            }
+            let base = key.len();
+            for (r, e) in node.iter() {
+                key.push(r);
+                match e {
+                    EntryRef::Child(c) => stack.push((c, key.clone(), false)),
+                    EntryRef::Leaf { ttl, sfx, .. } => {
+                        if !expired(ttl, now) {
+                            if let Some(sfx) = sfx {
+                                key.extend_from_slice(sfx);
+                            }
+                            keys.push(SharedByte::from_slice(&key));
+                        }
                     }
-                    return (vec![], self.root_idx, 0);
                 }
-                CompResult::Path => {
-                    cursor += node.compression.len();
-                }
+                key.truncate(base);
             }
-            parent_idx = idx;
-            parent_radix = prefix[cursor];
-            let Some(child_idx) = self.find(idx, parent_radix) else {
-                return (vec![], self.root_idx, 0);
-            };
-            idx = child_idx;
-            cursor += 1;
-        };
-
-        self.remove_child(parent_idx, parent_radix);
-        (vec![target_idx], parent_idx, 0)
-    }
-
-    /// Pops up to `budget` node indices from `stack`, frees each one (and its
-    /// Overflow entry if present), returns the number of values deleted.
-    fn free_chunk(&mut self, stack: &mut Vec<u32>, budget: usize) -> usize {
-        let mut count = 0;
-        let mut processed = 0;
-        while processed < budget {
-            let Some(node_idx) = stack.pop() else {
-                break;
-            };
-            let (children, has_val, overflow_idx) = {
-                let Some(node) = self.try_get_node(node_idx) else {
-                    continue;
-                };
-                let mut children: Vec<u32> = node.childs.iter().map(|(_, idx)| idx).collect();
-                let overflow_idx = node.get_overflow_idx();
-                if let Some(oi) = overflow_idx
-                    && let Some(overflow) = self.overflow_arena.get(oi)
-                {
-                    children.extend(overflow.iter().map(|(_, idx)| idx));
-                }
-                (children, node.has_val(), overflow_idx)
-            };
-            stack.extend(children);
-            if has_val {
-                count += 1;
-            }
-            // Nœud d'abord, overflow ensuite (la capture copie l'overflow).
-            self.remove_node(node_idx);
-            if let Some(oi) = overflow_idx {
-                self.overflow_arena.free(oi);
-            }
-            processed += 1;
         }
-        count
     }
 }
 
@@ -282,62 +126,48 @@ impl OxidArtAsync for Rc<RefCell<OxidArt>> {
     async fn getn_async(&self, prefix: SharedByte) -> Vec<SharedByte> {
         let mut keys: Vec<SharedByte> = Vec::new();
 
-        // Phase 1 — find the prefix node, seed the DFS stack (single borrow).
-        let mut stack: Vec<(u32, Vec<u8>)> = {
+        // Phase 1 — descente vers le préfixe (un seul emprunt).
+        let mut stack: Vec<KeysFrame> = {
             let art = self.borrow();
-            let Some((start_idx, key_path)) = art.find_prefix_node(prefix.as_ref()) else {
-                return keys;
-            };
-            let mut stack = Vec::new();
-            art.init_keys_stack(start_idx, key_path, &mut keys, &mut stack);
-            stack
+            let mut path = Vec::new();
+            match art.find_prefix(prefix.as_ref(), &mut path) {
+                PrefixHit::None => return keys,
+                PrefixHit::Leaf { node, radix } => {
+                    if let Some(EntryRef::Leaf { ttl, .. }) = art.node(node).get(radix)
+                        && !expired(ttl, art.now)
+                    {
+                        keys.push(SharedByte::from_slice(&path));
+                    }
+                    return keys;
+                }
+                PrefixHit::Node(idx) => vec![(idx, path, true)],
+            }
         }; // borrow dropped
 
-        // Phase 2 — chunked DFS: borrow → YIELD_BUDGET nodes → drop → yield.
+        // Phase 2 — DFS par tranches : emprunt → YIELD_BUDGET nœuds → yield.
         while !stack.is_empty() {
-            self.borrow()
-                .collect_keys_chunk(&mut stack, &mut keys, YIELD_BUDGET);
-            // borrow dropped at end of statement
+            self.borrow().collect_keys_chunk(&mut stack, &mut keys, YIELD_BUDGET);
             if !stack.is_empty() {
                 yield_now().await;
             }
         }
-
         keys
     }
 
     async fn deln_async(&self, prefix: SharedByte) -> usize {
-        // Phase 1 — traverse + sever subtree (single borrow_mut).
-        let (mut free_stack, parent_idx, initial_count) = {
-            let mut art = self.borrow_mut();
-            art.find_and_cut_prefix(prefix.as_ref())
-        }; // borrow_mut dropped
+        // Phase 1 — coupe du sous-arbre et normalisation (un seul emprunt) :
+        // ce qui reste à libérer est déjà inaccessible.
+        let (mut free_stack, mut total) = self.borrow_mut().cut_prefix(prefix.as_ref());
 
-        if free_stack.is_empty() {
-            return initial_count;
-        }
-
-        // Phase 2 — chunked free: borrow_mut → YIELD_BUDGET nodes → drop → yield.
-        // Pendant une save, chaque tranche attend la fin de la save.
-        let mut total = initial_count;
+        // Phase 2 — libération par tranches. Pendant une save, chaque tranche
+        // attend la fin de la save (le sous-arbre coupé reste dans la vue T0).
         while !free_stack.is_empty() {
             SaveDone(self).await;
-            total += self.borrow_mut().free_chunk(&mut free_stack, YIELD_BUDGET);
-            // borrow_mut dropped at end of statement
+            total += self.borrow_mut().free_subtrees(&mut free_stack, YIELD_BUDGET);
             if !free_stack.is_empty() {
                 yield_now().await;
             }
         }
-
-        // Phase 3 — recompression (single borrow_mut).
-        {
-            let mut art = self.borrow_mut();
-            let root_idx = art.root_idx;
-            if parent_idx != root_idx {
-                art.try_recompress(parent_idx);
-            }
-        }
-
         total
     }
 }

@@ -396,6 +396,14 @@ pied          u32 LE crc32 (IEEE, crc32fast) de tout ce qui précède | "RXDE"
 - Mesure (même bench que l'étape 8) : en mémoire String 55 ms / Hash 80 ms (contre 50 / 77 ms avec le lecteur sur tranche, l'écart = copie dans la fenêtre + tests de bord) ; depuis un fichier sur tmpfs, crc compris : 58–61 ms / 92–93 ms.
 - Compression : branchée comme un `Read` (`ZstdReader`), voir §5 « Compression » ; pas de thread de décompression (architecture mono-boucle), la décompression se fait au fil de la lecture au démarrage.
 
+### Nœuds 128 o à feuilles inline (2026-10-17)
+- L'arbre passe aux nœuds v2 (`oxidart/src/node.rs`) : une clé sans descendant est une **feuille inline** dans le nœud parent (radix + suffixe + valeur + TTL éventuel), plus un nœud.
+- **Format de dump inchangé** (enregistrements lcp + suffixe) : un dump de l'ancien arbre se recharge dans le nouveau et inversement (testé dans `test_diff.rs`).
+- **Image** (`NodeImage`) : préfixe copié, self-val possédée, enfants aplatis dans `OxidSave::childs`, feuilles (radix, valeur possédée, échéance, suffixe copié) aplaties dans `OxidSave::leaves`. Modifier la page de débordement d'un nœud, c'est modifier le nœud : elle n'est accessible que par `node_mut`.
+- **Visite** (`save_node`) : un enregistrement pour la self-val puis un par feuille, enfants empilés ; le nœud est toujours traité en entier (I9), la file `pending` peut donc dépasser `PIPE_DEPTH + 1` le temps d'écrire ses feuilles. Après chaque feuille, le chemin est retronqué à la clé du nœud (`min_trunc`), ce qui garde le lcp exact (I1).
+- **Reload** : un nœud ouvert qui se ferme sans enfant devient une feuille inline de son parent ; les autres sont alloués comme avant.
+- Oracle des tests : l'ancien arbre est gardé dans le crate `oxidart-legacy` (non publié, dépendance de test).
+
 ## 5quinquies. Méthode de travail
 
 - **Tests** : mono-thread obligatoire (`RUST_TEST_THREADS=1` dans `.cargo/config.toml`, statics globaux). `cargo test -p radixox-lib -p oxidart -p valart`.

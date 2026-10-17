@@ -539,6 +539,28 @@ dependencies = [
  "mimalloc",
  "monoio",
  "ordered-float",
+ "oxidart-legacy",
+ "radixox-lib",
+ "rand",
+ "regex-automata",
+ "smallvec",
+ "thin-vec",
+ "valart",
+ "zstd-safe",
+]
+
+[[package]]
+name = "oxidart-legacy"
+version = "0.6.0"
+dependencies = [
+ "bytes",
+ "crc32fast",
+ "hashbrown",
+ "hislab",
+ "libmimalloc-sys",
+ "mimalloc",
+ "monoio",
+ "ordered-float",
  "radixox-lib",
  "rand",
  "regex-automata",

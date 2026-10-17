@@ -16,26 +16,57 @@
 
 use radixox_lib::prefetch::prefetch_l1;
 
-use crate::krange::{OwnedVal, RangeVal, str_ref};
-use crate::node_childs::ChildAble;
+use crate::krange::{OwnedVal, RangeVal, str_val};
+use crate::node::{EntryRef, Probe};
 use crate::save::prefetch_value;
-use crate::value::Tag;
-use crate::{CompResult, OxidArt};
+use crate::{Loc, OxidArt, Slot, eq_fast, expired as is_expired, starts_with_fast};
 
 /// Nombre maximal de clés suivies ensemble.
 pub const PREFETCH_BATCH: usize = 64;
 
-const NOT_FOUND: u32 = u32::MAX;
+/// Emplacement d'une valeur trouvée par la descente entrelacée, encodé sur
+/// 64 bits : `nœud << 9 | 0x100 | radix` pour une feuille, `nœud << 9` pour
+/// une self-val.
+const NOT_FOUND: u64 = u64::MAX;
 
+#[inline]
+fn encode(loc: Loc) -> u64 {
+    (loc.node as u64) << 9
+        | match loc.slot {
+            Slot::SelfVal => 0,
+            Slot::Leaf(r) => 0x100 | r as u64,
+        }
+}
+
+#[inline]
+fn decode(x: u64) -> Loc {
+    Loc {
+        node: (x >> 9) as u32,
+        slot: if x & 0x100 == 0 { Slot::SelfVal } else { Slot::Leaf(x as u8) },
+    }
+}
+
+/// Étape d'une clé dans la descente : chacune ne lit que de la mémoire
+/// préchargée au tour précédent.
 #[derive(Clone, Copy)]
 enum Step {
-    /// Nœud courant en cache : chercher l'enfant de `key[cursor]`.
-    Find,
-    /// Bloc d'overflow préchargé : y chercher l'enfant.
-    Overflow(u32),
-    /// Nœud courant préchargé : comparer sa compression.
-    Cmp,
+    /// Nœud courant préchargé (deux lignes) : comparer son préfixe, chercher
+    /// le radix suivant.
+    Enter,
+    /// En-tête de la page préchargé : y chercher le radix.
+    PageSearch,
+    /// Cellule de l'entrée de ce rang préchargée (dans la page).
+    Entry(u16),
+    /// Suffixe sur le tas préchargé : comparer la feuille de ce rang.
+    LeafSfx(u16),
     Done,
+}
+
+#[inline(always)]
+fn prefetch_node(art: &OxidArt, idx: u32) {
+    let node = art.node(idx);
+    prefetch_l1(node as *const _ as *const u8);
+    node.prefetch_body();
 }
 
 impl OxidArt {
@@ -48,61 +79,32 @@ impl OxidArt {
     }
 
     /// Descente entrelacée de `keys` (≤ [`PREFETCH_BATCH`]) : `found[i]` reçoit
-    /// le nœud de `keys[i]` ([`NOT_FOUND`] sinon), dont la valeur est préchargée.
-    /// Le nœud peut être expiré ou sans valeur : à l'appelant de vérifier.
-    fn descend_batch(&self, keys: &[&[u8]], found: &mut [u32]) {
+    /// l'emplacement de la valeur de `keys[i]` ([`NOT_FOUND`] sinon), valeur
+    /// préchargée. Elle peut être expirée : à l'appelant de vérifier.
+    fn descend_batch(&self, keys: &[&[u8]], found: &mut [u64]) {
         debug_assert!(keys.len() <= PREFETCH_BATCH && found.len() == keys.len());
         let n = keys.len();
         if n == 1 {
             // Rien à entrelacer : descente directe, sans initialiser les états
             // des 64 voies (~1 Ko de pile, +20 % sur un MGET d'une clé).
-            let key = keys[0];
-            found[0] = if key.is_empty() { Some(self.root_idx) } else { self.traverse_to_key(key) }
-                .unwrap_or(NOT_FOUND);
+            found[0] = self.locate(keys[0]).map_or(NOT_FOUND, encode);
             return;
         }
         let mut idx = [self.root_idx; PREFETCH_BATCH];
         let mut cursor = [0usize; PREFETCH_BATCH];
-        let mut step = [Step::Find; PREFETCH_BATCH];
-        let mut active = 0;
-        for i in 0..n {
-            found[i] = NOT_FOUND;
-            if keys[i].is_empty() {
-                found[i] = self.root_idx;
-                step[i] = Step::Done;
-            } else {
-                active += 1;
-            }
-        }
+        let mut step = [Step::Enter; PREFETCH_BATCH];
+        found[..n].fill(NOT_FOUND);
+        let mut active = n;
         while active > 0 {
             for i in 0..n {
-                let key = keys[i];
                 let next = match step[i] {
                     Step::Done => continue,
-                    Step::Find => self.prefetch_child(key, &mut idx[i], &mut cursor[i]),
-                    Step::Overflow(o) => match self
-                        .overflow_arena
-                        .get(o)
-                        .and_then(|ov| ov.find(key[cursor[i]]))
-                    {
-                        Some(child) => self.goto_child(child, &mut idx[i], &mut cursor[i]),
-                        None => Step::Done,
-                    },
-                    Step::Cmp => {
-                        let node = self.child_node(idx[i]);
-                        match node.compare_compression_key(&key[cursor[i]..]) {
-                            CompResult::Final => {
-                                prefetch_value(node.tag, &node.val);
-                                found[i] = idx[i];
-                                Step::Done
-                            }
-                            CompResult::Partial(_) => Step::Done,
-                            CompResult::Path => {
-                                cursor[i] += node.compression.len();
-                                // Nœud déjà en cache : on enchaîne sur l'enfant.
-                                self.prefetch_child(key, &mut idx[i], &mut cursor[i])
-                            }
-                        }
+                    Step::Enter => self.batch_enter(keys[i], &mut idx[i], &mut cursor[i], &mut found[i]),
+                    Step::PageSearch => self.batch_search(keys[i], &mut idx[i], &mut cursor[i], &mut found[i]),
+                    Step::Entry(e) => self.batch_entry(keys[i], &mut idx[i], &mut cursor[i], e as usize, &mut found[i]),
+                    Step::LeafSfx(e) => {
+                        self.batch_leaf(keys[i], idx[i], cursor[i], e as usize, &mut found[i]);
+                        Step::Done
                     }
                 };
                 if matches!(next, Step::Done) {
@@ -113,32 +115,89 @@ impl OxidArt {
         }
     }
 
-    /// Cherche l'enfant de `key[*cursor]` dans le nœud `*idx` (en cache) :
-    /// inline → précharge l'enfant ; sinon précharge le bloc d'overflow.
+    /// Nœud en cache : préfixe, puis self-val (clé finie) ou recherche du radix.
     #[inline(always)]
-    fn prefetch_child(&self, key: &[u8], idx: &mut u32, cursor: &mut usize) -> Step {
+    fn batch_enter(&self, key: &[u8], idx: &mut u32, cursor: &mut usize, found: &mut u64) -> Step {
+        let node = self.node(*idx);
+        // sans test : sans page, le pointeur vise une ligne poubelle chaude
+        node.prefetch_page();
+        let p: &[u8] = &node.prefix;
+        if !starts_with_fast(&key[*cursor..], p) {
+            return Step::Done;
+        }
+        *cursor += p.len();
         let Some(&radix) = key.get(*cursor) else {
+            if node.has_val() {
+                prefetch_value(node.tag, &node.val);
+                *found = encode(Loc { node: *idx, slot: Slot::SelfVal });
+            }
             return Step::Done;
         };
-        let node = self.child_node(*idx);
-        if let Some(child) = node.childs.find(radix) {
-            return self.goto_child(child, idx, cursor);
+        if node.search_needs_page(radix) {
+            return Step::PageSearch;
         }
-        match node.get_overflow_idx() {
-            Some(o) => {
-                self.overflow_arena.prefetch(o);
-                Step::Overflow(o)
+        self.batch_search(key, idx, cursor, found)
+    }
+
+    /// Recherche du radix (nœud et, s'il le faut, en-tête de page en cache).
+    /// Entrée dans le nœud : traitée tout de suite ; dans la page : sa cellule
+    /// est préchargée pour le tour suivant.
+    #[inline(always)]
+    fn batch_search(&self, key: &[u8], idx: &mut u32, cursor: &mut usize, found: &mut u64) -> Step {
+        match self.node(*idx).probe(key[*cursor]) {
+            Probe::Miss => Step::Done,
+            Probe::Page(e, addr) => {
+                prefetch_l1(addr);
+                Step::Entry(e as u16)
             }
-            None => Step::Done,
+            Probe::Here(entry) => self.batch_entry_ref(key, idx, cursor, entry, found),
         }
     }
 
+    /// Entrée de la page (cellule préchargée au tour précédent).
     #[inline(always)]
-    fn goto_child(&self, child: u32, idx: &mut u32, cursor: &mut usize) -> Step {
-        *idx = child;
-        *cursor += 1;
-        prefetch_l1(self.child_node(child) as *const _ as *const u8);
-        Step::Cmp
+    fn batch_entry(&self, key: &[u8], idx: &mut u32, cursor: &mut usize, e: usize, found: &mut u64) -> Step {
+        let entry = self.node(*idx).entry_ref(e);
+        self.batch_entry_ref(key, idx, cursor, entry, found)
+    }
+
+    /// Entrée en cache : enfant → on le précharge ; feuille → comparaison du
+    /// suffixe (après préchargement s'il est sur le tas).
+    #[inline(always)]
+    fn batch_entry_ref(&self, key: &[u8], idx: &mut u32, cursor: &mut usize, entry: EntryRef<'_>, found: &mut u64) -> Step {
+        match entry {
+            EntryRef::Child(c) => {
+                prefetch_node(self, c);
+                *idx = c;
+                *cursor += 1;
+                Step::Enter
+            }
+            EntryRef::Leaf { sfx: Some(sfx), .. } if sfx.len() > 7 => {
+                sfx.prefetch();
+                let e = self.node(*idx).find(key[*cursor]).expect("feuille trouvée");
+                Step::LeafSfx(e as u16)
+            }
+            EntryRef::Leaf { tag, val, sfx, .. } => {
+                let s: &[u8] = sfx.map_or(&[], |p| p);
+                if eq_fast(s, &key[*cursor + 1..]) {
+                    prefetch_value(tag, val);
+                    *found = encode(Loc { node: *idx, slot: Slot::Leaf(key[*cursor]) });
+                }
+                Step::Done
+            }
+        }
+    }
+
+    /// Feuille de rang `e` dont le suffixe (sur le tas) est en cache.
+    #[inline(always)]
+    fn batch_leaf(&self, key: &[u8], idx: u32, cursor: usize, e: usize, found: &mut u64) {
+        if let EntryRef::Leaf { tag, val, sfx, .. } = self.node(idx).entry_ref(e) {
+            let s: &[u8] = sfx.map_or(&[], |p| p);
+            if eq_fast(s, &key[cursor + 1..]) {
+                prefetch_value(tag, val);
+                *found = encode(Loc { node: idx, slot: Slot::Leaf(key[cursor]) });
+            }
+        }
     }
 }
 
@@ -165,16 +224,16 @@ impl OxidArt {
         for (c, chunk) in keys.chunks(PREFETCH_BATCH).enumerate() {
             let found = &mut found[..chunk.len()];
             self.descend_batch(chunk, found);
-            for (i, &idx) in found.iter().enumerate() {
-                if idx == NOT_FOUND {
+            for (i, &x) in found.iter().enumerate() {
+                if x == NOT_FOUND {
                     out.push(None);
                     continue;
                 }
-                let node = self.child_node(idx);
-                if node.tag != Tag::None && node.is_expired(self.now) {
-                    expired.push((c * PREFETCH_BATCH + i) as u32);
+                let (tag, val, exp) = self.loc_value(decode(x));
+                if is_expired(exp, self.now) {
+                    expired_push(expired, c, i);
                 }
-                out.push(str_ref(node, self.now));
+                out.push(str_val(tag, val, exp, self.now));
             }
         }
         out
@@ -186,7 +245,7 @@ impl OxidArt {
     /// save, ne supprime rien (comme GET).
     pub fn purge_expired(&mut self, keys: &[&[u8]], expired: &[u32]) {
         for &pos in expired {
-            let _ = self.get_idx(keys[pos as usize]);
+            let _ = self.live_loc(keys[pos as usize]);
         }
     }
 
@@ -233,20 +292,24 @@ impl OxidArt {
         for (c, chunk) in keys.chunks(PREFETCH_BATCH).enumerate() {
             let found = &mut found[..chunk.len()];
             self.descend_batch(chunk, found);
-            for (i, &idx) in found.iter().enumerate() {
-                if idx == NOT_FOUND {
+            for (i, &x) in found.iter().enumerate() {
+                if x == NOT_FOUND {
                     continue;
                 }
-                let node = self.child_node(idx);
-                if node.tag != Tag::None && node.is_expired(self.now) {
-                    expired.push((c * PREFETCH_BATCH + i) as u32);
-                } else if node.get_value_ref(self.now).is_some() {
+                if is_expired(self.loc_value(decode(x)).2, self.now) {
+                    expired_push(expired, c, i);
+                } else {
                     n += 1;
                 }
             }
         }
         n
     }
+}
+
+#[inline]
+fn expired_push(expired: &mut Vec<u32>, chunk: usize, i: usize) {
+    expired.push((chunk * PREFETCH_BATCH + i) as u32);
 }
 
 #[cfg(test)]
@@ -349,9 +412,10 @@ mod tests {
             }))
             .collect();
         assert_eq!(owned, want);
-        // mget_owned a supprimé les 50 valeurs expirées croisées (les nœuds
-        // préfixes d'autres clés restent, sans valeur)
-        assert!(art.node_count() < nodes_before);
+        // mget_owned a supprimé les 50 valeurs expirées croisées (souvent des
+        // feuilles inline : le nombre de nœuds ne baisse pas forcément)
+        assert!(art.node_count() <= nodes_before);
+        art.check();
         let mut expired3 = Vec::new();
         art.mget_ref(&refs, &mut expired3);
         assert!(expired3.is_empty(), "plus aucune expirée : {expired3:?}");
@@ -366,32 +430,12 @@ mod purge_tests {
     use radixox_lib::shared_byte::SharedByte;
 
     use crate::OxidArt;
-    use crate::value::{Tag, Value};
+    use crate::value::Value;
 
     impl OxidArt {
-        /// Forme canonique : hors racine, aucun nœud sans valeur à 0 enfant
-        /// (aurait dû être supprimé) ou à 1 enfant (aurait dû être absorbé) ;
-        /// chaque enfant pointe vers son parent avec le bon radix.
+        /// Forme canonique : voir [`OxidArt::check`].
         pub(crate) fn assert_canonical(&self) -> usize {
-            let mut stack = vec![self.root_idx];
-            let mut seen = 0;
-            while let Some(idx) = stack.pop() {
-                seen += 1;
-                let node = self.get_node(idx);
-                let mut kids = Vec::new();
-                self.iter_all_children(idx, |r, c| kids.push((r, c)));
-                if idx != self.root_idx && node.tag == Tag::None {
-                    assert!(kids.len() >= 2, "nœud {idx} sans valeur à {} enfant(s) : non recompressé", kids.len());
-                }
-                for (r, c) in kids {
-                    let child = self.get_node(c);
-                    assert_eq!(child.parent_idx, idx, "parent_idx de {c}");
-                    assert_eq!(child.exp_and_radix.parent_radix(), r, "parent_radix de {c}");
-                    stack.push(c);
-                }
-            }
-            assert_eq!(seen, self.node_count(), "nœuds orphelins (alloués mais inaccessibles)");
-            seen
+            self.check()
         }
     }
 
@@ -421,15 +465,17 @@ mod purge_tests {
     /// Le vérificateur détecte un nœud sans valeur à un seul enfant : c'est
     /// l'état intermédiaire pendant une save (suppression sans recompression).
     #[test]
-    #[should_panic(expected = "non recompressé")]
+    #[should_panic(expected = "non nécessaire")]
     fn assert_canonical_detects_uncompressed_node() {
         let mut art = OxidArt::new();
         art.set(SharedByte::from_str("ab"), Value::String(SharedByte::from_str("1")));
         art.set(SharedByte::from_str("abcd"), Value::String(SharedByte::from_str("2")));
         art.assert_canonical();
-        // valeur retirée sans recompression : « ab » reste avec un seul enfant
-        let idx = art.traverse_to_key(b"ab").unwrap();
-        art.node_mut(idx).clear_val();
+        // self-val de « ab » retirée sans normalisation : nœud à une seule entrée
+        let loc = art.locate(b"ab").unwrap();
+        let node = art.node_mut(loc.node);
+        unsafe { crate::value::drop_raw(node.tag, &mut node.val) };
+        node.tag = crate::value::Tag::None;
         art.assert_canonical();
     }
 
@@ -514,7 +560,10 @@ mod purge_tests {
             let n_fresh = fresh.assert_canonical();
             assert_eq!(listing(&art), listing(&fresh), "round {round} : contenu");
             assert_eq!(n_art, n_fresh, "round {round} : nœuds après purge vs arbre neuf");
-            assert!(nodes_before > n_fresh + 100, "round {round} : purge non exercée ({nodes_before} vs {n_fresh})");
+            // avec les feuilles inline, une clé purgée n'est souvent qu'une cellule :
+            // on compte les clés, pas les nœuds
+            assert!(nodes_before >= n_fresh, "round {round} : nœuds {nodes_before} → {n_fresh}");
+            assert!(all.len() > live.len() + 100, "round {round} : purge non exercée");
             let mut expired = Vec::new();
             let refs: Vec<&[u8]> = all.iter().map(Vec::as_slice).collect();
             assert_eq!(art.exists_count(&refs, &mut expired), live.len() - 1, "round {round}");
@@ -527,12 +576,14 @@ mod purge_tests {
 impl OxidArt {
     /// Valeur string via la lecture pure (sans suppression d'expirée), format MGET.
     fn clone_get_for_test(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let idx = if key.is_empty() { Some(self.root_idx) } else { self.traverse_to_key(key) }?;
-        let v = self.child_node(idx).get_value(self.now)?;
+        let (tag, val, exp) = self.loc_value(self.locate(key)?);
+        if is_expired(exp, self.now) {
+            return None;
+        }
+        let v = unsafe { crate::value::value_from_raw_ref(tag, val) };
         v.as_bytes().map(|b| b.as_slice().to_vec())
     }
     fn exists_for_test(&self, key: &[u8]) -> bool {
-        let idx = if key.is_empty() { Some(self.root_idx) } else { self.traverse_to_key(key) };
-        idx.is_some_and(|i| self.child_node(i).get_value(self.now).is_some())
+        self.locate(key).is_some_and(|loc| !is_expired(self.loc_value(loc).2, self.now))
     }
 }

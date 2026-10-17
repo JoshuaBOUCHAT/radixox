@@ -34,3 +34,7 @@ zstd-safe = { version = "8.1", default-features = false, features = ["experiment
 
 [features]
 regex = ["dep:regex-automata"]
+
+[dev-dependencies]
+# Ancien arbre, oracle des tests différentiels (retiré à la publication).
+oxidart-legacy = { path = "../oxidart-legacy", features = ["regex"] }

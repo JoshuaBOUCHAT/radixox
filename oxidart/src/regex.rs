@@ -6,8 +6,9 @@ use regex_automata::util::primitives::StateID;
 use regex_automata::util::syntax;
 use regex_automata::{Anchored, Input, MatchError};
 
-use crate::OxidArt;
-use crate::value::Value;
+use crate::node::EntryRef;
+use crate::value::{Value, value_from_raw_ref};
+use crate::{OxidArt, expired};
 use radixox_lib::shared_byte::SharedByte;
 
 /// Error type for regex-based operations.
@@ -102,53 +103,74 @@ impl OxidArt {
 
     /// Iterative DFA-guided traversal of the radix tree.
     ///
-    /// At each node we feed the compression bytes into the DFA.
-    /// - Dead state → prune entire subtree
-    /// - Match state + node has value → collect
-    /// - Otherwise → push children onto stack
-    fn collect_regex<'a>(
-        &'a self,
+    /// Each node feeds its prefix into the DFA, then each entry its radix
+    /// (and a leaf its suffix). A dead state prunes the subtree or the leaf;
+    /// a match on end of input collects the value.
+    fn collect_regex(
+        &self,
         dfa: &DFA<Vec<u32>>,
         root_idx: u32,
         start_state: StateID,
         results: &mut Vec<(SharedByte, Value)>,
     ) {
-        // Stack entries: (node_idx, key_path, dfa_state after radix byte)
-        let mut stack: Vec<(u32, Vec<u8>, StateID)> = vec![(root_idx, Vec::new(), start_state)];
+        let now = self.now;
+        let mut path: Vec<u8> = Vec::new();
+        // (nœud, longueur de la clé du parent, radix vers le nœud, état après
+        // le radix ; la racine n'a pas de radix)
+        let mut stack: Vec<(u32, u32, Option<u8>, StateID)> = vec![(root_idx, 0, None, start_state)];
 
-        'loo: while let Some((node_idx, mut key_path, mut state)) = stack.pop() {
-            let Some(node) = self.try_get_node(node_idx) else {
-                continue;
-            };
-
-            // Feed compression bytes into the DFA
-
-            for &b in node.compression.iter() {
+        'node: while let Some((idx, depth, radix, mut state)) = stack.pop() {
+            path.truncate(depth as usize);
+            if let Some(r) = radix {
+                path.push(r);
+            }
+            let node = self.node(idx);
+            for &b in node.prefix.iter() {
                 state = dfa.next_state(state, b);
                 if dfa.is_dead_state(state) {
-                    continue 'loo;
+                    continue 'node;
                 }
             }
-
-            key_path.extend_from_slice(&node.compression);
-
-            // Check if this node's key is a full match via EOI transition
-            let eoi_state = dfa.next_eoi_state(state);
-            if dfa.is_match_state(eoi_state)
-                && let Some(val) = node.get_value(self.now)
+            path.extend_from_slice(&node.prefix);
+            if node.has_val()
+                && !expired(node.exp_and_radix.exp(), now)
+                && dfa.is_match_state(dfa.next_eoi_state(state))
             {
-                results.push((SharedByte::from_slice(&key_path), val));
+                // SAFETY: valeur réelle, tag cohérent.
+                results.push((SharedByte::from_slice(&path), unsafe { value_from_raw_ref(node.tag, &node.val) }));
             }
-
-            // Push children onto stack, pruning dead branches at the radix byte
-            self.iter_all_children(node_idx, |radix, child_idx| {
-                let child_state = dfa.next_state(state, radix);
-                if !dfa.is_dead_state(child_state) {
-                    let mut child_key = key_path.clone();
-                    child_key.push(radix);
-                    stack.push((child_idx, child_key, child_state));
+            let base = path.len();
+            'entry: for (radix, e) in node.iter() {
+                let mut s = dfa.next_state(state, radix);
+                if dfa.is_dead_state(s) {
+                    continue;
                 }
-            });
+                if let EntryRef::Child(c) = e {
+                    stack.push((c, base as u32, Some(radix), s));
+                    continue;
+                }
+                path.push(radix);
+                match e {
+                    EntryRef::Child(_) => unreachable!(),
+                    EntryRef::Leaf { tag, val, ttl, sfx } => {
+                        if let Some(sfx) = sfx {
+                            for &b in sfx.iter() {
+                                s = dfa.next_state(s, b);
+                                if dfa.is_dead_state(s) {
+                                    path.truncate(base);
+                                    continue 'entry;
+                                }
+                            }
+                            path.extend_from_slice(sfx);
+                        }
+                        if !expired(ttl, now) && dfa.is_match_state(dfa.next_eoi_state(s)) {
+                            // SAFETY: valeur réelle, tag cohérent.
+                            results.push((SharedByte::from_slice(&path), unsafe { value_from_raw_ref(tag, val) }));
+                        }
+                    }
+                }
+                path.truncate(base);
+            }
         }
     }
 }

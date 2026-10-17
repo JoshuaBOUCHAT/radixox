@@ -17,8 +17,9 @@
 
 use radixox_lib::shared_byte::SharedByte;
 
-use crate::value::Tag;
-use crate::{CompResult, OxidArt};
+use crate::node::EntryRef;
+use crate::value::{Tag, ValUnion};
+use crate::{OxidArt, PrefixHit, expired};
 
 /// Valeur d'une entrée de range, empruntée à l'arbre.
 #[derive(Clone, Copy, Debug)]
@@ -27,15 +28,16 @@ pub enum RangeVal<'a> {
     Int(i64),
 }
 
-/// Valeur string vivante d'un nœud, par référence (`None` : pas de valeur,
-/// expirée, ou pas une string).
+/// Valeur string vivante, par référence (`None` : expirée, ou pas une string).
 #[inline]
-pub(crate) fn str_ref(node: &crate::Node, now: u64) -> Option<RangeVal<'_>> {
-    let v = node.get_value_ref(now)?;
-    match v.tag {
+pub(crate) fn str_val(tag: Tag, val: &ValUnion, exp: Option<u64>, now: u64) -> Option<RangeVal<'_>> {
+    if expired(exp, now) {
+        return None;
+    }
+    match tag {
         // SAFETY: le tag indique le champ actif de l'union.
-        Tag::Bytes => Some(RangeVal::Bytes(unsafe { &v.val.bytes })),
-        Tag::Int => Some(RangeVal::Int(unsafe { v.val.integer })),
+        Tag::Bytes => Some(RangeVal::Bytes(unsafe { &val.bytes })),
+        Tag::Int => Some(RangeVal::Int(unsafe { val.integer })),
         _ => None,
     }
 }
@@ -146,37 +148,28 @@ impl RangeOut<'_> {
     }
 }
 
-/// Étage de pile : un nœud dont les enfants triés restant à visiter sont
-/// `kids[lo..hi]`.
+/// Étage de pile : un nœud dont les entrées (déjà triées dans le nœud)
+/// restent à visiter à partir du rang `next`.
 struct Frame {
     idx: u32,
-    /// Longueur de la clé du nœud (compression incluse).
+    /// Longueur de la clé du nœud (préfixe inclus).
     key_len: u32,
-    /// Début de la tranche du nœud dans `kids` (tronquée au dépilement).
-    kids_base: u32,
-    lo: u32,
-    hi: u32,
-    /// Étage paresseux du chemin vers `from` : on est descendu dans l'enfant
-    /// de ce radix sans rien collecter ; ses frères au-delà (resp. en deçà)
-    /// ne sont collectés et triés que si on remonte ici.
-    lazy: Option<u8>,
-    /// KREVRANGE : la valeur du nœud sort après ses enfants.
+    /// Prochain rang à visiter (croissant, ou décroissant en KREVRANGE ;
+    /// négatif = fini).
+    next: i32,
+    /// Radix de l'entrée sur le chemin de `from` : elle seule reste bornée.
+    bound: Option<u8>,
+    /// KREVRANGE : la valeur du nœud sort après ses entrées.
     self_pending: bool,
 }
 
-/// Nombre de nœuds frères préchargés en avance dans le sens du parcours.
-const PREFETCH_NODES_AHEAD: usize = 3;
-
-#[inline(always)]
-fn prefetch_node(art: &OxidArt, idx: u32) {
-    radixox_lib::prefetch::prefetch_l1(art.child_node(idx) as *const _ as *const u8);
-}
+/// Nombre d'entrées regardées en avance pour précharger les nœuds enfants.
+const PREFETCH_AHEAD: i32 = 2;
 
 /// Buffers de travail réutilisés d'un appel à l'autre (par thread).
 #[derive(Default)]
 struct Scratch {
     key: Vec<u8>,
-    kids: Vec<(u8, u32)>,
     stack: Vec<Frame>,
 }
 
@@ -190,172 +183,127 @@ struct Walker<'a, 'f> {
     rev: bool,
     count: usize,
     key: Vec<u8>,
-    kids: Vec<(u8, u32)>,
     stack: Vec<Frame>,
     out: RangeOut<'a>,
 }
 
 impl<'a> Walker<'a, '_> {
-    fn emit(&mut self, idx: u32, key_len: usize) {
-        let Some(node) = self.art.try_get_node(idx) else {
+    /// Ajoute la clé `self.key` si sa valeur est une string vivante.
+    fn emit(&mut self, tag: Tag, val: &'a ValUnion, exp: Option<u64>) {
+        let Some(v) = str_val(tag, val, exp, self.art.now) else {
             return;
         };
-        let Some(val) = str_ref(node, self.art.now) else {
-            return;
-        };
-        if let RangeVal::Bytes(b) = val {
+        if let RangeVal::Bytes(b) = v {
             b.prefetch();
         }
-        self.out.keys.extend_from_slice(&self.key[..key_len]);
-        self.out.entries.push((self.out.keys.len() as u32, val));
+        self.out.keys.extend_from_slice(&self.key);
+        self.out.entries.push((self.out.keys.len() as u32, v));
     }
 
-    /// Pousse les enfants de `idx` acceptés par `keep` dans `kids`, triés, et
-    /// précharge les premiers à visiter : leurs défauts de cache se
-    /// chevauchent au lieu de s'enchaîner.
-    fn collect_sorted(&mut self, idx: u32, keep: impl Fn(u8) -> bool) {
-        let base = self.kids.len();
-        let kids = &mut self.kids;
-        self.art.iter_all_children(idx, |r, c| {
-            if keep(r) {
-                kids.push((r, c));
-            }
-        });
-        let slice = &mut self.kids[base..];
-        slice.sort_unstable_by_key(|&(r, _)| r);
-        let n = slice.len().min(PREFETCH_NODES_AHEAD);
-        let first = if self.rev { slice.len() - n } else { 0 };
-        for i in first..first + n {
-            prefetch_node(self.art, self.kids[base + i].1);
+    /// La clé `self.key` est-elle du bon côté (strict) de `from` ?
+    #[inline]
+    fn past_from(&self) -> bool {
+        if self.rev {
+            self.key.as_slice() < self.from
+        } else {
+            self.key.as_slice() > self.from
         }
     }
 
-    /// Entre dans `idx` ; `self.key` contient déjà sa clé jusqu'au radix inclus.
-    fn enter(&mut self, idx: u32, bounded: bool) {
-        let Some(node) = self.art.try_get_node(idx) else {
-            return;
-        };
-        self.key.extend_from_slice(&node.compression);
+    /// Entre dans `idx` ; `self.key` contient sa clé jusqu'au radix inclus
+    /// (préfixe inclus aussi si `prefix_in_key`). `bounded` : le nœud est sur
+    /// le chemin de `from`.
+    fn enter(&mut self, idx: u32, bounded: bool, prefix_in_key: bool) {
+        let art = self.art;
+        let node = art.node(idx);
+        if !prefix_in_key {
+            self.key.extend_from_slice(&node.prefix);
+        }
         let key_len = self.key.len();
+        let n = node.len() as i32;
 
-        let mut bound = None;
         let mut self_ok = true;
-        let mut kids_ok = true;
+        let mut bound = None;
+        // rangs à visiter : [first, n) en croissant, [0, first] en décroissant
+        let mut first = if self.rev { n - 1 } else { 0 };
         if bounded {
             let f = self.from;
             if f.starts_with(&self.key) {
-                // Clé du nœud = préfixe de `from` (ou égale).
                 let eq = f.len() == key_len;
-                if self.rev {
-                    // nœud < from (sauf égalité) ; enfants > from si égalité
-                    self_ok = !eq;
-                    kids_ok = !eq;
+                // nœud ≤ from ; nœud < from sauf égalité
+                self_ok = self.rev && !eq;
+                if eq {
+                    // toutes les entrées sont > from
+                    first = if self.rev { -1 } else { 0 };
                 } else {
-                    // nœud ≤ from : exclu ; enfants tous > from si égalité
-                    self_ok = false;
-                }
-                if !eq {
-                    bound = Some(f[key_len]);
+                    let b = f[key_len];
+                    bound = Some(b);
+                    first = match node.search(b) {
+                        Ok(e) => e as i32,
+                        Err(e) if self.rev => e as i32 - 1,
+                        Err(e) => e as i32,
+                    };
                 }
             } else if (self.key.as_slice() > f) == self.rev {
                 // Sous-arbre entièrement du mauvais côté de `from`.
+                self.key.truncate(key_len - if prefix_in_key { 0 } else { node.prefix.len() });
                 return;
             }
             // Sinon : entièrement du bon côté, plus de borne.
         }
 
-        if self_ok && !self.rev {
-            self.emit(idx, key_len);
-        }
-
-        let kids_base = self.kids.len() as u32;
-        if let Some(b) = bound {
-            // Chemin vers `from` : descente directe (recherche SWAR, comme un
-            // GET), frères collectés seulement si on remonte ici.
-            self.stack.push(Frame {
-                idx,
-                key_len: key_len as u32,
-                kids_base,
-                lo: kids_base,
-                hi: kids_base,
-                lazy: Some(b),
-                self_pending: self_ok && self.rev,
-            });
-            if let Some(child) = self.art.find(idx, b) {
-                self.key.push(b);
-                self.enter(child, true);
-            }
-            return;
-        }
-
-        if kids_ok {
-            self.collect_sorted(idx, |_| true);
+        if self_ok && !self.rev && node.has_val() {
+            self.emit(node.tag, &node.val, node.exp_and_radix.exp());
         }
         self.stack.push(Frame {
             idx,
             key_len: key_len as u32,
-            kids_base,
-            lo: kids_base,
-            hi: self.kids.len() as u32,
-            lazy: None,
-            self_pending: self_ok && self.rev,
+            next: first,
+            bound,
+            self_pending: self_ok && self.rev && node.has_val(),
         });
     }
 
     fn run(&mut self) {
+        let art = self.art;
         while self.out.len() < self.count {
             let Some(f) = self.stack.last_mut() else {
                 return;
             };
-            if f.lo == f.hi
-                && let Some(b) = f.lazy.take()
-            {
-                // On remonte sur le chemin de `from` : frères strictement
-                // après (resp. avant) `b`, triés.
-                let idx = f.idx;
-                debug_assert_eq!(self.kids.len(), f.kids_base as usize);
-                if self.rev {
-                    self.collect_sorted(idx, |r| r < b);
-                } else {
-                    self.collect_sorted(idx, |r| r > b);
+            let node = art.node(f.idx);
+            let n = node.len() as i32;
+            if f.next < 0 || f.next >= n {
+                let f = self.stack.pop().expect("non vide");
+                self.key.truncate(f.key_len as usize);
+                if f.self_pending {
+                    self.emit(node.tag, &node.val, node.exp_and_radix.exp());
                 }
-                let f = self.stack.last_mut().expect("non vide");
-                f.hi = self.kids.len() as u32;
                 continue;
             }
-            let next = if f.lo < f.hi {
-                let (lo, hi) = (f.lo as usize, f.hi as usize);
-                if self.rev {
-                    f.hi -= 1;
-                    // le frère qui sera visité PREFETCH_NODES_AHEAD rangs plus tard
-                    if hi - lo > PREFETCH_NODES_AHEAD {
-                        let ahead = self.kids[hi - 1 - PREFETCH_NODES_AHEAD].1;
-                        prefetch_node(self.art, ahead);
+            let e = f.next;
+            let step = if self.rev { -1 } else { 1 };
+            f.next += step;
+            let (key_len, bound) = (f.key_len as usize, f.bound);
+            let ahead = e + step * PREFETCH_AHEAD;
+            if (0..n).contains(&ahead)
+                && let EntryRef::Child(c) = node.entry_ref(ahead as usize)
+            {
+                let child = art.node(c);
+                radixox_lib::prefetch::prefetch_l1(child as *const _ as *const u8);
+            }
+            self.key.truncate(key_len);
+            let r = node.radix_at(e as usize);
+            self.key.push(r);
+            let bounded = bound == Some(r);
+            match node.entry_ref(e as usize) {
+                EntryRef::Child(c) => self.enter(c, bounded, false),
+                EntryRef::Leaf { tag, val, ttl, sfx } => {
+                    if let Some(sfx) = sfx {
+                        self.key.extend_from_slice(sfx);
                     }
-                    Some(self.kids[hi - 1])
-                } else {
-                    f.lo += 1;
-                    if hi - lo > PREFETCH_NODES_AHEAD {
-                        let ahead = self.kids[lo + PREFETCH_NODES_AHEAD].1;
-                        prefetch_node(self.art, ahead);
+                    if !bounded || self.past_from() {
+                        self.emit(tag, val, ttl);
                     }
-                    Some(self.kids[lo])
-                }
-            } else {
-                None
-            };
-            match next {
-                Some((radix, child)) => {
-                    self.key.truncate(f.key_len as usize);
-                    self.key.push(radix);
-                    self.enter(child, false);
-                }
-                None => {
-                    let f = self.stack.pop().expect("non vide");
-                    if f.self_pending {
-                        self.emit(f.idx, f.key_len as usize);
-                    }
-                    self.kids.truncate(f.kids_base as usize);
                 }
             }
         }
@@ -379,22 +327,30 @@ impl OxidArt {
             rev,
             count,
             key: sc.key,
-            kids: sc.kids,
             stack: sc.stack,
             out: RangeOut {
                 keys: Vec::with_capacity(cap * (prefix.len() + 16)),
                 entries: Vec::with_capacity(cap),
             },
         };
-        if let Some(idx) = self.locate_prefix(prefix, &mut w.key) {
-            w.enter(idx, !from.is_empty());
-            w.run();
+        match self.find_prefix(prefix, &mut w.key) {
+            PrefixHit::None => {}
+            PrefixHit::Node(idx) => {
+                w.enter(idx, !from.is_empty(), true);
+                w.run();
+            }
+            PrefixHit::Leaf { node, radix } => {
+                if let Some(EntryRef::Leaf { tag, val, ttl, .. }) = self.node(node).get(radix)
+                    && (from.is_empty() || w.past_from())
+                {
+                    w.emit(tag, val, ttl);
+                }
+            }
         }
-        let Walker { mut key, mut kids, mut stack, out, .. } = w;
+        let Walker { mut key, mut stack, out, .. } = w;
         key.clear();
-        kids.clear();
         stack.clear();
-        SCRATCH.with(|s| *s.borrow_mut() = Scratch { key, kids, stack });
+        SCRATCH.with(|s| *s.borrow_mut() = Scratch { key, stack });
         out
     }
 
@@ -402,33 +358,6 @@ impl OxidArt {
     /// à l'emprunt de l'arbre (valeurs à refcount +1, aucune allocation de plus).
     pub fn krange_owned(&self, prefix: &[u8], from: &[u8], count: usize, rev: bool) -> OwnedRange {
         self.krange(prefix, from, count, rev).into_owned()
-    }
-
-    /// Racine du sous-arbre des clés commençant par `prefix` ; `key` reçoit sa
-    /// clé jusqu'au radix inclus (sans la compression du nœud).
-    fn locate_prefix(&self, prefix: &[u8], key: &mut Vec<u8>) -> Option<u32> {
-        let mut idx = self.root_idx;
-        let mut cursor = 0;
-        loop {
-            if cursor == prefix.len() {
-                return Some(idx);
-            }
-            let radix = prefix[cursor];
-            idx = self.find(idx, radix)?;
-            key.push(radix);
-            let node = self.try_get_node(idx)?;
-            cursor += 1;
-            match node.compare_compression_key(&prefix[cursor..]) {
-                CompResult::Final => return Some(idx),
-                CompResult::Partial(common) => {
-                    return (common == prefix.len() - cursor).then_some(idx);
-                }
-                CompResult::Path => {
-                    key.extend_from_slice(&node.compression);
-                    cursor += node.compression.len();
-                }
-            }
-        }
     }
 }
 

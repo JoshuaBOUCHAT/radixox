@@ -49,11 +49,11 @@ use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::varint::{get_bytes, get_varint, unzigzag};
 
 use crate::compact_path::CompactPath;
-use crate::node_childs::{CHILDS_SIZE, ChildAble, Childs};
+use crate::node::{Entry, Leaf, Node};
 use crate::save::{DumpError, format};
-use crate::value::{Tag, ValUnion, alloc_list, alloc_zset, drop_raw, valart};
+use crate::value::{RawVal, Tag, ValUnion, alloc_list, alloc_zset, valart};
 use crate::zcommand::InnerZCommand;
-use crate::{ExpAndRadix, Node, OxidArt, Value};
+use crate::{OxidArt, Value};
 
 const TRUNC: DumpError = DumpError("dump tronqué");
 
@@ -405,30 +405,6 @@ impl<R: Read> DumpReader<R> {
     }
 }
 
-/// `(Tag, ValUnion)` possédé, libéré s'il n'est pas posé dans un nœud.
-struct RawVal {
-    tag: Tag,
-    val: ValUnion,
-}
-
-impl RawVal {
-    fn new(tag: Tag, val: ValUnion) -> Self {
-        Self { tag, val }
-    }
-    fn into_parts(self) -> (Tag, ValUnion) {
-        let me = ManuallyDrop::new(self);
-        // SAFETY: `me` n'est jamais droppé, la propriété passe à l'appelant.
-        (me.tag, unsafe { std::ptr::read(&me.val) })
-    }
-}
-
-impl Drop for RawVal {
-    fn drop(&mut self) {
-        // SAFETY: tag et val cohérents, construits ensemble.
-        unsafe { drop_raw(self.tag, &mut self.val) };
-    }
-}
-
 // ─── Construction ────────────────────────────────────────────────────────────
 
 /// Bilan d'un reload.
@@ -440,12 +416,15 @@ pub struct LoadStats {
     pub expired: u64,
 }
 
-/// Nœud ouvert : chemin `kept[..end]`, enfants dans `childs[childs_start..]`.
+/// Nœud ouvert : chemin `kept[..end]`, entrées dans `childs[childs_start..]`.
 struct Open {
     end: usize,
     val: Option<(RawVal, Option<u64>)>,
     childs_start: usize,
 }
+
+/// Entrée construite, en attente de son nœud parent.
+type Built = (u8, Entry);
 
 impl OxidArt {
     /// Charge un fichier de dump (flux + pied) depuis n'importe quelle
@@ -487,8 +466,8 @@ impl OxidArt {
 
     fn check_empty(&self) -> Result<(), DumpError> {
         assert!(!self.is_saving(), "reload pendant une save");
-        let root = self.get_node(self.root_idx);
-        if root.has_val() || !root.childs.is_empty() || root.get_overflow_idx().is_some() {
+        let root = self.node(self.root_idx);
+        if root.has_val() || root.len() > 0 {
             return Err(DumpError("arbre non vide"));
         }
         Ok(())
@@ -500,7 +479,7 @@ impl OxidArt {
 
         let mut kept: Vec<u8> = Vec::new();
         let mut stack = vec![Open { end: 0, val: None, childs_start: 0 }];
-        let mut childs: Vec<(u8, u32)> = Vec::new();
+        let mut childs: Vec<Built> = Vec::new();
         // lcp avec la dernière clé gardée = min des lcp lus depuis.
         let mut lcp = usize::MAX;
 
@@ -541,7 +520,7 @@ impl OxidArt {
         }
         self.load_close(&mut stack, &mut childs, &kept, 0);
 
-        // La racine existe déjà : on y pose sa valeur et ses enfants.
+        // La racine existe déjà : on y pose sa valeur et ses entrées.
         let root = stack.pop().expect("racine");
         debug_assert!(stack.is_empty() && root.childs_start == 0);
         let root_idx = self.root_idx;
@@ -552,72 +531,84 @@ impl OxidArt {
             node.val = val;
             if let Some(exp) = exp {
                 node.exp_and_radix.set_exp(exp);
-                self.map.tag(root_idx);
             }
         }
-        for &(radix, idx) in &childs {
-            self.push_child_idx(root_idx, idx, radix);
-            self.set_parent_idx(idx, root_idx);
+        let kids: Vec<(u8, u32)> = childs
+            .iter()
+            .filter_map(|(r, e)| match e {
+                Entry::Child(c) => Some((*r, *c)),
+                Entry::Leaf(_) => None,
+            })
+            .collect();
+        let node = self.node_mut(root_idx);
+        for (radix, entry) in childs.drain(..) {
+            node.insert(radix, entry);
+        }
+        for (radix, child) in kids {
+            self.set_parent(child, root_idx, radix);
+        }
+        if self.node(root_idx).has_any_ttl() {
+            self.map.tag(root_idx);
         }
         Ok(stats)
     }
 
     /// Ferme les nœuds ouverts au-delà de la profondeur `l` (voir le module).
-    fn load_close(&mut self, stack: &mut Vec<Open>, childs: &mut Vec<(u8, u32)>, kept: &[u8], l: usize) {
+    fn load_close(&mut self, stack: &mut Vec<Open>, childs: &mut Vec<Built>, kept: &[u8], l: usize) {
         while stack.last().expect("racine").end > l {
             let p = stack.pop().expect("au-dessus de la racine");
             let below = stack.last().expect("racine").end;
             let start = below.max(l);
-            let idx = self.load_node(p, start, kept, childs);
+            let entry = if childs.len() == p.childs_start {
+                // aucune clé ne prolonge p : feuille inline de son parent
+                let (val, exp) = p.val.expect("nœud ouvert sans valeur ni enfant");
+                let (tag, val) = val.into_parts();
+                let sfx = &kept[start + 1..p.end];
+                Entry::Leaf(Leaf {
+                    tag,
+                    val,
+                    ttl: exp,
+                    sfx: (!sfx.is_empty()).then(|| CompactPath::from_slice(sfx)),
+                })
+            } else {
+                Entry::Child(self.load_node(p, start, kept, childs))
+            };
             if below < l {
                 // `l` coupe p : nœud de branchement, parent de p.
                 stack.push(Open { end: l, val: None, childs_start: childs.len() });
             }
-            childs.push((kept[start], idx));
+            childs.push((kept[start], entry));
         }
     }
 
     /// Alloue le nœud fermé `p`, qui commence à `start` (son radix est
-    /// `kept[start]`), et lui rattache ses enfants.
-    fn load_node(&mut self, p: Open, start: usize, kept: &[u8], childs: &mut Vec<(u8, u32)>) -> u32 {
+    /// `kept[start]`), avec ses entrées.
+    fn load_node(&mut self, p: Open, start: usize, kept: &[u8], childs: &mut Vec<Built>) -> u32 {
         let radix = kept[start];
-        let mut node = Node {
-            compression: CompactPath::from_slice(&kept[start + 1..p.end]),
-            childs: Childs::default(),
-            tag: Tag::None,
-            val: ValUnion { idx: 0 },
-            exp_and_radix: ExpAndRadix::no_expiracy(radix),
-            overflow_idx: u32::MAX,
-            parent_idx: u32::MAX,
-        };
-        let mut tagged = false;
+        let mut node = Node::new(CompactPath::from_slice(&kept[start + 1..p.end]), u32::MAX, radix);
         if let Some((val, exp)) = p.val {
             let (tag, val) = val.into_parts();
             node.tag = tag;
             node.val = val;
             if let Some(exp) = exp {
-                node.exp_and_radix = ExpAndRadix::new(exp, radix);
-                tagged = true;
+                node.exp_and_radix.set_exp(exp);
             }
         }
-        let kids = &childs[p.childs_start..];
-        debug_assert!(node.tag != Tag::None || kids.len() >= 2, "nœud sans valeur à un seul enfant");
-        for &(r, i) in kids.iter().take(CHILDS_SIZE) {
-            node.childs.push(r, i);
-        }
-        if kids.len() > CHILDS_SIZE {
-            let slot = self.overflow_arena.alloc();
-            let ov = self.overflow_arena.get_mut(slot).expect("just allocated");
-            for &(r, i) in &kids[CHILDS_SIZE..] {
-                ov.push(r, i);
+        debug_assert!(
+            node.has_val() || childs.len() - p.childs_start >= 2,
+            "nœud sans valeur à une seule entrée"
+        );
+        let mut kids: smallvec::SmallVec<[(u8, u32); 16]> = smallvec::SmallVec::new();
+        for (r, entry) in childs.drain(p.childs_start..) {
+            if let Entry::Child(c) = entry {
+                kids.push((r, c));
             }
-            node.set_overflow_idx(slot);
+            node.insert(r, entry);
         }
-        let idx = if tagged { self.map.insert_tagged(node) } else { self.map.insert(node) };
-        for &(_, child) in kids {
-            self.set_parent_idx(child, idx);
+        let idx = if node.has_any_ttl() { self.map.insert_tagged(node) } else { self.map.insert(node) };
+        for (r, c) in kids {
+            self.set_parent(c, idx, r);
         }
-        childs.truncate(p.childs_start);
         idx
     }
 }

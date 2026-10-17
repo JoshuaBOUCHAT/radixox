@@ -41,7 +41,10 @@ pub(crate) type IOResult<T> = std::io::Result<T>;
 type SharedART = Rc<RefCell<OxidArt>>;
 pub(crate) type SharedRegistry = Rc<RefCell<SubRegistry>>;
 
-const BUFFER_SIZE: usize = 512 * 1024;
+/// Capacité initiale des buffers d'une connexion (lecture ×2, écriture). Ils
+/// grandissent au besoin (grosse valeur, gros pipeline). À 512 Kio, 80
+/// connexions memtier gardaient ~48 Mo de pages écrites en RSS.
+const BUFFER_SIZE: usize = 64 * 1024;
 static ERR_EMPTY_CMD: &str = "ERR empty command";
 const NB_ACCEPTOR: usize = 16;
 
@@ -224,6 +227,11 @@ async fn handle_loop(
     let mut io_buf_offset = 0;
 
     loop {
+        // Commande incomplète qui remplit tout le buffer (grosse valeur) : sans
+        // place libre, la lecture rendrait 0 et la connexion serait fermée.
+        if io_buf_offset == io_buf.capacity() {
+            io_buf.reserve(io_buf.capacity());
+        }
         let io_buf_cap = io_buf.capacity();
         let slice = SliceMut::new(io_buf, io_buf_offset, io_buf_cap);
         let (n, returned) = conn_state.read_and_flush(slice, registry, read).await?;

@@ -3,7 +3,7 @@ use radixox_lib::shared_byte::SharedByte;
 use crate::{
     OxidArt,
     error::TypeError,
-    value::{RedisType, Tag, ValUnion, valart},
+    value::{RedisType, Tag, valart},
 };
 
 pub enum SPOPResult {
@@ -13,14 +13,9 @@ pub enum SPOPResult {
 impl OxidArt {
     /// Racine valart du Set à `key`, créé vide s'il n'existe pas (ou a expiré).
     fn get_or_create_set(&mut self, ttl: Option<u64>, key: &[u8]) -> Result<u32, TypeError> {
-        let node_key = self.ensure_key(key);
-        // Lecture d'abord : un Set existant ne modifie pas le nœud oxidart.
-        if let Some(v) = self.get_node(node_key).get_value_ref(self.now) {
-            return v.set_root().map_err(|_| TypeError::ValueNotSet);
-        }
-        let root = valart().set_create();
-        self.install_value_raw(node_key, Tag::Set, ValUnion { idx: root }, ttl);
-        Ok(root)
+        // Un Set existant ne modifie pas le nœud oxidart.
+        self.ensure_container(key, ttl, Tag::Set, || valart().set_create())
+            .map_err(|_| TypeError::ValueNotSet)
     }
 
     /// Racine valart du Set à `key`, `None` si la clé n'existe pas.

@@ -31,60 +31,88 @@ use std::mem::ManuallyDrop;
 use radixox_lib::save_barrier::SaveBarrier;
 
 use crate::compact_path::CompactPath;
-use crate::node_childs::{ChildAble, OverflowArena};
+use crate::node::{EntryRef, Node};
 use crate::value::{Tag, ValUnion};
-use crate::{ExpAndRadix, Node};
 
-/// Copie T0 d'un nœud oxidart, autonome :
-/// - compression copiée en profondeur ;
-/// - String : clone de la valeur (rc+1), droppé avec l'image ;
-/// - Int : copié ; Hash/Set/ZSet/List : idx copié tel quel (le conteneur
-///   n'est pas détruit pendant la save, voir SAVE_DESIGN.md §2.B) ;
-/// - enfants (inline + overflow + huge) recopiés dans [`OxidSave::childs`],
-///   à `[childs_start, childs_start + childs_len)`.
-///
-/// Jamais converti en `Node` : le `Drop` de `Node` détruirait le conteneur.
-pub(crate) struct NodeImage {
-    pub(crate) compression: CompactPath,
+/// Copie possédée d'une valeur pour une image : String clonée (rc+1), le
+/// reste copié tel quel (Int, ou idx d'un conteneur qui n'est pas détruit
+/// pendant la save, SAVE_DESIGN.md §2.B).
+fn image_val(tag: Tag, val: &ValUnion) -> ValUnion {
+    match tag {
+        Tag::Bytes => ValUnion {
+            bytes: ManuallyDrop::new(unsafe { (*val.bytes).clone() }),
+        },
+        // SAFETY: pas de ressource possédée hors Bytes : copie bit à bit.
+        _ => unsafe { std::ptr::read(val) },
+    }
+}
+
+fn drop_image_val(tag: Tag, val: &mut ValUnion) {
+    if tag == Tag::Bytes {
+        unsafe { ManuallyDrop::drop(&mut val.bytes) };
+    }
+}
+
+/// Feuille d'une image (suffixe copié, valeur possédée).
+pub(crate) struct ImgLeaf {
+    pub(crate) radix: u8,
     pub(crate) tag: Tag,
     pub(crate) val: ValUnion,
-    pub(crate) exp_and_radix: ExpAndRadix,
-    pub(crate) childs_start: u32,
-    pub(crate) childs_len: u32,
+    pub(crate) exp: Option<u64>,
+    pub(crate) sfx: CompactPath,
+}
+
+impl Drop for ImgLeaf {
+    fn drop(&mut self) {
+        drop_image_val(self.tag, &mut self.val);
+    }
+}
+
+/// Copie T0 d'un nœud oxidart, autonome :
+/// - préfixe copié en profondeur ;
+/// - self-val possédée (voir `image_val`) ;
+/// - enfants recopiés dans [`OxidSave::childs`], feuilles (suffixe, valeur
+///   possédée) dans [`OxidSave::leaves`].
+///
+/// Jamais converti en `Node` : le `Drop` de `Node` détruirait les conteneurs.
+pub(crate) struct NodeImage {
+    pub(crate) prefix: CompactPath,
+    pub(crate) tag: Tag,
+    pub(crate) val: ValUnion,
+    pub(crate) exp: Option<u64>,
+    pub(crate) childs: (u32, u32),
+    pub(crate) leaves: (u32, u32),
 }
 
 impl NodeImage {
-    pub(crate) fn capture(node: &Node, overflow: &OverflowArena, childs: &mut Vec<(u8, u32)>) -> Self {
-        let start = childs.len();
-        childs.extend(node.childs.iter());
-        if let Some(oi) = node.get_overflow_idx()
-            && let Some(ov) = overflow.get(oi)
-        {
-            ov.for_each_child(|radix, idx| childs.push((radix, idx)));
+    pub(crate) fn capture(node: &Node, childs: &mut Vec<(u8, u32)>, leaves: &mut Vec<ImgLeaf>) -> Self {
+        let (c0, l0) = (childs.len(), leaves.len());
+        for (radix, e) in node.iter() {
+            match e {
+                EntryRef::Child(idx) => childs.push((radix, idx)),
+                EntryRef::Leaf { tag, val, ttl, sfx } => leaves.push(ImgLeaf {
+                    radix,
+                    tag,
+                    val: image_val(tag, val),
+                    exp: ttl,
+                    sfx: sfx.map_or_else(CompactPath::new, |p| CompactPath::from_slice(p)),
+                }),
+            }
         }
-        let val = match node.tag {
-            Tag::Bytes => ValUnion {
-                bytes: ManuallyDrop::new(unsafe { (*node.val.bytes).clone() }),
-            },
-            // SAFETY: pas de ressource possédée hors Bytes : copie bit à bit.
-            _ => unsafe { std::ptr::read(&node.val) },
-        };
         Self {
-            compression: CompactPath::from_slice(&node.compression),
+            prefix: CompactPath::from_slice(&node.prefix),
             tag: node.tag,
-            val,
-            exp_and_radix: node.exp_and_radix,
-            childs_start: start as u32,
-            childs_len: (childs.len() - start) as u32,
+            val: image_val(node.tag, &node.val),
+            exp: node.exp_and_radix.exp(),
+            childs: (c0 as u32, (childs.len() - c0) as u32),
+            leaves: (l0 as u32, (leaves.len() - l0) as u32),
         }
     }
 }
 
 impl Drop for NodeImage {
     fn drop(&mut self) {
-        if self.tag == Tag::Bytes {
-            unsafe { ManuallyDrop::drop(&mut self.val.bytes) };
-        }
+        drop_image_val(self.tag, &mut self.val);
     }
 }
 
@@ -94,10 +122,19 @@ pub(crate) struct OxidSave {
     pub(crate) barrier: SaveBarrier<NodeImage>,
     /// Enfants des images, aplatis. Vidé à `finish` (capacité gardée).
     pub(crate) childs: Vec<(u8, u32)>,
+    /// Feuilles des images, aplaties. Vidé à `finish`.
+    pub(crate) leaves: Vec<ImgLeaf>,
     /// `now` au begin : une clé expirée à T0 n'est pas écrite.
     pub(crate) t0: u64,
     /// Tâches (UNLINK) en attente de la fin de la save.
     pub(crate) waiters: Vec<std::task::Waker>,
+}
+
+impl OxidSave {
+    pub(crate) fn clear_images(&mut self) {
+        self.childs.clear();
+        self.leaves.clear();
+    }
 }
 
 #[cfg(test)]
@@ -451,18 +488,15 @@ impl OxidArt {
                 cur.own_pending(); // I5
                 return false;
             }
-            match cur.stack.pop() {
-                Some(frame) => {
-                    if self.save_node(cur, frame, &mut budget) {
-                        let n = cur.pending.len();
-                        if n >= 2 {
-                            warm(&cur.pending[n - 2]);
-                        }
-                        if n > PIPE_DEPTH {
-                            emit_oldest(cur, out, &mut budget);
-                        }
-                    }
+            if cur.pending.len() > PIPE_DEPTH {
+                if let Some(next) = cur.pending.get(1) {
+                    warm(next);
                 }
+                emit_oldest(cur, out, &mut budget);
+                continue;
+            }
+            match cur.stack.pop() {
+                Some(frame) => self.save_node(cur, frame, &mut budget),
                 None => {
                     if cur.pending.is_empty() {
                         out.push(format::T_END);
@@ -478,10 +512,11 @@ impl OxidArt {
         }
     }
 
-    /// Visite d'un nœud : `take` T0, prefetch de la valeur, chemin, enfants
-    /// empilés, prefetch du nouveau haut de pile, en-tête encodé. Retourne
-    /// `true` si un enregistrement a été mis en attente.
-    fn save_node(&mut self, cur: &mut SaveCursor, f: Frame, budget: &mut u32) -> bool {
+    /// Visite d'un nœud : `take` T0, chemin, puis un enregistrement pour sa
+    /// self-val et pour chacune de ses feuilles (valeurs préchargées), enfants
+    /// empilés, prefetch du nouveau haut de pile. Le nœud est traité en
+    /// entier (I9).
+    fn save_node(&mut self, cur: &mut SaveCursor, f: Frame, budget: &mut u32) {
         let depth = f.depth as usize;
         cur.path.truncate(depth);
         cur.min_trunc = cur.min_trunc.min(depth);
@@ -491,47 +526,75 @@ impl OxidArt {
         sub(budget, 1);
 
         let t0 = self.save.t0;
-        let OxidArt { map, overflow_arena, save, .. } = self;
-        let OxidSave { barrier, childs: img_childs, .. } = save;
-        let (tag, val, exp, from_image) = match barrier.take(f.idx) {
+        let OxidArt { map, save, .. } = self;
+        let OxidSave { barrier, childs: img_childs, leaves: img_leaves, .. } = save;
+        match barrier.take(f.idx) {
             Some(T0::Slab) => {
                 let n = map.get(f.idx).expect("intact à T0 ⇒ occupé");
-                prefetch_value(n.tag, &n.val);
-                cur.path.extend_from_slice(&n.compression);
-                let depth = cur.path.len() as u32;
-                for (radix, idx) in n.childs.iter() {
-                    cur.stack.push(Frame { idx, depth, radix: radix as u16 });
+                cur.path.extend_from_slice(&n.prefix);
+                let node_len = cur.path.len();
+                if n.has_val() {
+                    prefetch_value(n.tag, &n.val);
+                    cur.record(n.tag, &n.val, n.exp_and_radix.exp(), false, t0);
                 }
-                if let Some(oi) = n.get_overflow_idx()
-                    && let Some(ov) = overflow_arena.get(oi)
-                {
-                    sub(budget, 1);
-                    ov.for_each_child(|radix, idx| {
-                        cur.stack.push(Frame { idx, depth, radix: radix as u16 })
-                    });
+                for (radix, e) in n.iter() {
+                    match e {
+                        EntryRef::Child(idx) => {
+                            cur.stack.push(Frame { idx, depth: node_len as u32, radix: radix as u16 })
+                        }
+                        EntryRef::Leaf { tag, val, ttl, sfx } => {
+                            prefetch_value(tag, val);
+                            cur.path.push(radix);
+                            if let Some(sfx) = sfx {
+                                cur.path.extend_from_slice(sfx);
+                            }
+                            sub(budget, 1);
+                            cur.record(tag, val, ttl, false, t0);
+                            cur.path.truncate(node_len);
+                            cur.min_trunc = cur.min_trunc.min(node_len);
+                        }
+                    }
                 }
-                (n.tag, &n.val, n.exp_and_radix.exp(), false)
             }
             Some(T0::Image(img)) => {
-                prefetch_value(img.tag, &img.val);
-                cur.path.extend_from_slice(&img.compression);
-                let depth = cur.path.len() as u32;
-                let s = img.childs_start as usize;
-                for &(radix, idx) in &img_childs[s..s + img.childs_len as usize] {
-                    cur.stack.push(Frame { idx, depth, radix: radix as u16 });
+                cur.path.extend_from_slice(&img.prefix);
+                let node_len = cur.path.len();
+                if img.tag != Tag::None {
+                    prefetch_value(img.tag, &img.val);
+                    cur.record(img.tag, &img.val, img.exp, true, t0);
                 }
-                (img.tag, &img.val, img.exp_and_radix.exp(), true)
+                let (s, n) = (img.childs.0 as usize, img.childs.1 as usize);
+                for &(radix, idx) in &img_childs[s..s + n] {
+                    cur.stack.push(Frame { idx, depth: node_len as u32, radix: radix as u16 });
+                }
+                let (s, n) = (img.leaves.0 as usize, img.leaves.1 as usize);
+                for l in &img_leaves[s..s + n] {
+                    cur.path.push(l.radix);
+                    cur.path.extend_from_slice(&l.sfx);
+                    sub(budget, 1);
+                    cur.record(l.tag, &l.val, l.exp, true, t0);
+                    cur.path.truncate(node_len);
+                    cur.min_trunc = cur.min_trunc.min(node_len);
+                }
             }
             None => panic!("nœud {} absent de la vue T0", f.idx),
-        };
+        }
         if let Some(top) = cur.stack.last()
             && let Some(next) = map.get(top.idx)
         {
             prefetch_l1(next as *const Node as *const u8);
+            next.prefetch_body();
         }
+    }
+}
 
-        if tag == Tag::None || exp.is_some_and(|e| e < t0) {
-            return false;
+impl SaveCursor {
+    /// Met en attente l'enregistrement de la clé `self.path` (valeur `tag` /
+    /// `val`), sauf si elle est expirée à T0. `from_image` : valeur lue dans
+    /// une image, clonée tout de suite (I4).
+    fn record(&mut self, tag: Tag, val: &ValUnion, exp: Option<u64>, from_image: bool, t0: u64) {
+        if exp.is_some_and(|e| e < t0) {
+            return;
         }
         let ty = match tag {
             Tag::Bytes => format::T_STRING,
@@ -543,17 +606,17 @@ impl OxidArt {
             Tag::None => unreachable!(),
         };
         // I1 : lcp calculé à la visite, valide à l'écriture (ordre FIFO).
-        let lcp = cur.min_trunc.min(cur.prev_len);
+        let lcp = self.min_trunc.min(self.prev_len);
         let ttl = exp.map(|e| e - t0);
-        let mut head = cur.spare.pop().unwrap_or_default();
+        let mut head = self.spare.pop().unwrap_or_default();
         head.clear();
         head.push(ty | if ttl.is_some() { format::TTL_BIT } else { 0 });
         put_varint(&mut head, lcp as u64);
-        put_varint(&mut head, (cur.path.len() - lcp) as u64);
+        put_varint(&mut head, (self.path.len() - lcp) as u64);
         if let Some(ttl) = ttl {
             put_varint(&mut head, ttl);
         }
-        head.extend_from_slice(&cur.path[lcp..]);
+        head.extend_from_slice(&self.path[lcp..]);
         let val = unsafe {
             match tag {
                 // I4 : l'image est droppée au prochain `take` : clone possédé.
@@ -573,10 +636,9 @@ impl OxidArt {
                 Tag::None => unreachable!(),
             }
         };
-        cur.pending.push_back(Pending { head, val });
-        cur.prev_len = cur.path.len();
-        cur.min_trunc = usize::MAX;
-        true
+        self.pending.push_back(Pending { head, val });
+        self.prev_len = self.path.len();
+        self.min_trunc = usize::MAX;
     }
 }
 

@@ -938,10 +938,10 @@ fn save_mode_expired_root_kept() {
     art.set_now(200);
     art.begin_save();
     assert_eq!(art.get(b""), None);
-    assert!(art.get_node(art.root_idx).has_val());
+    assert!(art.node(art.root_idx).has_val());
     art.finish_save();
     assert_eq!(art.get(b""), None);
-    assert!(!art.get_node(art.root_idx).has_val());
+    assert!(!art.node(art.root_idx).has_val());
 }
 
 #[test]
@@ -982,4 +982,102 @@ fn deln_root_clears_root_value() {
     assert_eq!(art.deln(b""), 2);
     assert_eq!(art.get(b""), None);
     assert_eq!(art.get(b"a"), None);
+}
+
+// ─── Régressions : clé vide, EXPIRE, nœuds intermédiaires (2026-10-17) ──────
+
+mod regressions_2026_10_17 {
+    use super::*;
+    use crate::TtlResult;
+    use std::time::Duration;
+
+    #[test]
+    fn del_empty_key_keeps_single_sibling() {
+        // Supprimer "" fusionnait la racine avec son enfant unique : "x" devenait
+        // la clé vide, puis set("y") créait "xy".
+        let mut art = OxidArt::new();
+        art.set(SharedByte::from_str(""), Value::Int(1));
+        art.set(SharedByte::from_str("x"), Value::Int(2));
+        assert!(art.del(b""));
+        assert_eq!(art.get(b""), None);
+        assert_eq!(art.get(b"x"), Some(Value::Int(2)));
+        art.set(SharedByte::from_str("y"), Value::Int(3));
+        assert_eq!(art.get(b"y"), Some(Value::Int(3)));
+        assert_eq!(art.get(b"xy"), None);
+        let mut keys: Vec<SharedByte> = art
+            .getn(SharedByte::from_str(""))
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        keys.sort();
+        assert_eq!(keys, [SharedByte::from_str("x"), SharedByte::from_str("y")]);
+    }
+
+    #[test]
+    fn take_empty_key_keeps_single_sibling() {
+        let mut art = OxidArt::new();
+        art.set(SharedByte::from_str(""), Value::Int(1));
+        art.set(SharedByte::from_str("abc"), Value::Int(2));
+        assert_eq!(art.take(b""), Some(Value::Int(1)));
+        assert_eq!(art.get(b"abc"), Some(Value::Int(2)));
+        assert_eq!(art.get(b""), None);
+    }
+
+    #[test]
+    fn expired_empty_key_keeps_single_sibling() {
+        // même fusion par le chemin d'expiration paresseuse de get
+        let mut art = OxidArt::new();
+        art.set_now(100);
+        art.set_ttl(
+            SharedByte::from_str(""),
+            Duration::from_secs(5),
+            Value::Int(1),
+        );
+        art.set(SharedByte::from_str("x"), Value::Int(2));
+        art.set_now(200);
+        assert_eq!(art.get(b""), None);
+        assert_eq!(art.get(b"x"), Some(Value::Int(2)));
+        assert_eq!(art.get(b""), None);
+    }
+
+    #[test]
+    fn expire_on_key_with_ttl_returns_true() {
+        // Redis : EXPIRE répond 1 dès que le TTL est posé, même s'il en remplace un
+        let mut art = OxidArt::new();
+        art.set_now(100);
+        art.set(SharedByte::from_str("k"), Value::Int(1));
+        assert!(art.expire(SharedByte::from_str("k"), Duration::from_secs(10)));
+        assert!(art.expire(SharedByte::from_str("k"), Duration::from_secs(50)));
+        assert_eq!(
+            art.get_ttl(SharedByte::from_str("k")),
+            TtlResult::KeyWithTtl(50)
+        );
+        assert!(!art.expire(SharedByte::from_str("absent"), Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn ttl_commands_ignore_valueless_nodes() {
+        // "user" n'existe pas : c'est seulement le nœud commun à user1 et user2
+        let mut art = OxidArt::new();
+        art.set_now(100);
+        art.set(SharedByte::from_str("user1"), Value::Int(1));
+        art.set(SharedByte::from_str("user2"), Value::Int(2));
+        assert_eq!(
+            art.get_ttl(SharedByte::from_str("user")),
+            TtlResult::KeyNotExist
+        );
+        assert!(!art.expire(SharedByte::from_str("user"), Duration::from_secs(10)));
+        assert!(!art.persist(SharedByte::from_str("user")));
+        assert_eq!(art.get(b"user"), None);
+        assert_eq!(
+            art.get_ttl(SharedByte::from_str("user")),
+            TtlResult::KeyNotExist
+        );
+        // les vraies clés ne sont pas touchées
+        assert_eq!(
+            art.get_ttl(SharedByte::from_str("user1")),
+            TtlResult::KeyWithoutTtl
+        );
+        assert_eq!(art.get(b"user2"), Some(Value::Int(2)));
+    }
 }

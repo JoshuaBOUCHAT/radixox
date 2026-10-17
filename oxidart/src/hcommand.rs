@@ -3,20 +3,15 @@ use radixox_lib::shared_byte::SharedByte;
 use crate::{
     OxidArt,
     error::TypeError,
-    value::{RedisType, Tag, ValUnion, valart},
+    value::{RedisType, Tag, valart},
 };
 
 impl OxidArt {
     /// Racine valart du Hash à `key`, créé vide s'il n'existe pas (ou a expiré).
     fn get_or_create_hash(&mut self, ttl: Option<u64>, key: &[u8]) -> Result<u32, TypeError> {
-        let node_key = self.ensure_key(key);
-        // Lecture d'abord : un Hash existant ne modifie pas le nœud oxidart.
-        if let Some(v) = self.get_node(node_key).get_value_ref(self.now) {
-            return v.hash_root().map_err(|_| TypeError::ValueNotSet);
-        }
-        let root = valart().hash_create();
-        self.install_value_raw(node_key, Tag::Hash, ValUnion { idx: root }, ttl);
-        Ok(root)
+        // Un Hash existant ne modifie pas le nœud oxidart.
+        self.ensure_container(key, ttl, Tag::Hash, || valart().hash_create())
+            .map_err(|_| TypeError::ValueNotSet)
     }
 
     /// Racine valart du Hash à `key`, `None` si la clé n'existe pas.
