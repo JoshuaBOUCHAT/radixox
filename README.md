@@ -23,7 +23,10 @@ and caveats):
 | p99.9, no pipeline | **0.76 ms** | 1.17 ms | −35 % |
 | Throughput, no pipeline | **193 k ops/s** | 173 k ops/s | +11 % |
 | Throughput, pipeline 32 | **2.02 M ops/s** | 1.66 M ops/s | +22 % |
-| Memory after loading 1M keys (100 B values) | **151 MB** | 163 MB | −7 % |
+| Memory, 1M keys × 100 B values (structured keys) | **131 MB** | 163 MB | −20 % |
+| Memory, 1M random UUID keys × 100 B | 209 MB | 205 MB | ≈ |
+| Memory, 1M one-field hashes (YCSB-like) | **233 MB** | 344 MB | −32 % |
+| Memory, 1M two-field hashes (short values) | 161 MB | **129 MB** | Valkey −20 % |
 | `SAVE` of 1M keys | **84 ms** (raw) / 70 ms (zstd) | 1,810 ms | ×22–26 |
 | Restart with 1M keys | **~0.17 s** | ~0.53 s | ×3 |
 | `KEYS user:*` (1,000 matches in 1M keys, 2026-10-12) | **0.15 ms** | 21.4 ms | ×140 |
@@ -82,8 +85,13 @@ Requirements: **Linux** with io_uring (developed on 6.12 LTS and 7.2), **Rust 20
 
 Without pipelining, both servers are bounded by the TCP stack and the client's round trips:
 the kernel takes most of the core. The tail is where RadixOx stands out: p99 and p99.9 are
-about 35 % lower. The machine was slower that day than on 2026-10-12 (Valkey 173 k vs
-202 k ops/s without pipeline): compare the rows with each other, not across dates.
+about 35 % lower.
+
+**Caveat on these throughput numbers**: another program (a game) was running on the
+machine during this session, which explains why both servers are slower than on 2026-10-12
+(Valkey 173 k vs 202 k ops/s without pipeline). Both servers ran back to back under the same
+conditions, so the comparison between rows holds, but the absolute values are pessimistic
+and the tail latencies noisier. A clean re-run is planned.
 
 ### YCSB workload A
 
@@ -95,19 +103,40 @@ about 35 % lower. The machine was slower that day than on 2026-10-12 (Valkey 173
 | RadixOx | **76 k ops/s** | **174 k ops/s** | **574 µs** | **749 µs** | **811 µs** | **1,112 µs** | **2,014 MB** |
 | Valkey | 60 k ops/s | 148 k ops/s | 673 µs | 1,308 µs | 1,438 µs | 1,826 µs | 2,053 MB |
 
+Measured before small hashes were stored as compact blocks (see below): each one-field hash
+was then a full valart tree. Same caveat as above about the machine load.
+
 ### Memory
 
-| | RSS after loading 1M keys | Per key |
-|---|---|---|
-| **RadixOx** | **151 MB** | **158 B** |
-| Valkey | 163 MB | 171 B |
-| RadixOx on 2026-10-12 (64-byte nodes, 512 KiB connection buffers) | 253 MB | 251 B |
+RSS after loading 1M keys through a single connection (`redis-cli --pipe`), measured before
+any other command (2026-10-17):
 
-Most of the gain comes from the tree: a key without descendants is now an **inline leaf**
-in its parent node instead of a node of its own. On these keys (`key:1` … `key:1000000`, ten
-keys per node) the tree costs **16 B per key**, against 72 B before; the rest is the value
-(100 B → 112 B in mimalloc). Smaller connection buffers (64 KiB instead of 512 KiB) saved
-another 42 MB with 80 connections.
+| Data | Valkey | RadixOx | |
+|---|---|---|---|
+| `key:N` + 100 B string | 163 MB | **131 MB** | −20 % |
+| `key:N` + 1 KB string | 1,301 MB | **1,249 MB** | −4 % |
+| random UUID (text) + 100 B string | **205 MB** | 209 MB | ≈ |
+| hash, 1 field of 100 B, random keys (YCSB-like) | 344 MB | **233 MB** | −32 % |
+| hash, 2 short fields (`name`, `email`) | **129 MB** | 161 MB | +25 % |
+
+What drives these numbers:
+
+- **The tree**: a key without descendants is an **inline leaf** in its parent node, not a node
+  of its own. On structured keys (`key:1` … `key:1000000`, ten keys per node) the whole tree
+  costs **16 B per key**; on random keys each node holds only two or three keys and the tree
+  costs 60–100 B per key, which is about what Valkey's hash table and key strings cost: hence
+  the tie on UUIDs.
+- **Values**: a string is a separate allocation (100 B → 112 B in mimalloc); with large
+  values both servers converge.
+- **Small hashes and sets** (up to 8 entries) are one compact block of field/value pointers
+  instead of a tree. One-field hashes are much smaller than in Valkey; hashes with several
+  short fields are still larger, because each field and value stays a separately allocated
+  `SharedByte` (a deliberate trade-off: no copies on `HGET`/`HSET`).
+- **Connections**: each connection keeps three 64 KiB buffers while it is active (they grow
+  for large commands). With many concurrent clients this adds a few MB.
+- Before 2026-10-17, `DBSIZE` built the whole key list to count it, which permanently
+  inflated RSS (+16 to +46 MB on 1M keys); it is now an O(1) counter. The figure published
+  earlier (253 MB, then 151 MB on 2026-10-17 with 80 connections) included this effect.
 
 What to expect on other key shapes, tree only (in-process, 1M keys, integer values):
 
@@ -323,7 +352,8 @@ TCP ──io_uring (monoio)──▶ RESP parser ──▶ batch of commands ─
 **Values**
 - Strings: `SharedByte`, an 8-byte single-threaded reference-counted buffer (no atomics),
   allocated with mimalloc. Integers are stored as `i64` and formatted on read.
-- Hash and Set: **valart**, a compact radix tree per container.
+- Hash and Set: up to 8 entries, one compact block of `SharedByte` pointers; beyond that,
+  **valart**, a compact radix tree per container.
 - Sorted set: `BTreeSet<(score, member)>` + hash map for O(1) `ZSCORE`.
 
 **Single-threaded on purpose**: no locks, no contention, predictable tail latency. Scaling
@@ -340,8 +370,8 @@ across cores is meant to come from sharding by namespace, not from shared-state 
   block, `DELPREFIX` (delete a whole namespace in O(prefix length)), durable commits —
   [`TX_DESIGN.md`](TX_DESIGN.md).
 - AOF and replication (sharing one stream of effects).
-- Lower memory per key: small hashes stored inline (like Redis's listpack), suffixes inline
-  on several cells for long random keys.
+- Lower memory per key on random keys: long suffixes stored inline on several cells (no
+  separate allocation), a smaller node class for nodes with two or three entries.
 - Client compatibility commands (`HELLO`, `CLIENT`, `CONFIG`, `MULTI`/`EXEC`), `SCAN`, lists.
 
 ---
