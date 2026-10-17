@@ -134,9 +134,18 @@ fn main() {
     };
 
     if mode == "mem" {
+        // `fresh` : chaque valeur de 100 o est allouée au moment du SET, comme
+        // dans le serveur (sinon les valeurs, allouées avant, ne sont pas comptées)
+        let fresh = args.get(6).is_some_and(|s| s == "fresh100");
         let before = rss_bytes();
         for (i, k) in keys.iter().enumerate() {
-            t.set(k, val(i), i as i64, str_vals, ttl);
+            if fresh {
+                let mut v = [b'x'; 100];
+                v[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                t.set(k, &SharedByte::from_slice(v), i as i64, true, ttl);
+            } else {
+                t.set(k, val(i), i as i64, str_vals, ttl);
+            }
         }
         let rss = rss_bytes().saturating_sub(before);
         let nodes = match &t {
