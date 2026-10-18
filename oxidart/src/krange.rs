@@ -17,7 +17,7 @@
 
 use radixox_lib::shared_byte::SharedByte;
 
-use crate::node::EntryRef;
+use crate::node::{Cursor, EntryRef};
 use crate::value::{RedisType, Tag, ValUnion};
 use crate::{OxidArt, PrefixHit, expired};
 
@@ -152,6 +152,8 @@ impl RangeOut<'_> {
 /// restent à visiter à partir du rang `next`.
 struct Frame {
     idx: u32,
+    /// Nombre d'entrées du nœud.
+    n: i32,
     /// Longueur de la clé du nœud (préfixe inclus).
     key_len: u32,
     /// Prochain rang à visiter (croissant, ou décroissant en KREVRANGE ;
@@ -288,6 +290,7 @@ impl<'a, S: Sink<'a>> Walker<'a, '_, S> {
         }
         self.stack.push(Frame {
             idx,
+            n,
             key_len: key_len as u32,
             next: first,
             bound,
@@ -296,66 +299,85 @@ impl<'a, S: Sink<'a>> Walker<'a, '_, S> {
         });
     }
 
+    /// Parcours. Une boucle interne par visite de nœud, avec le curseur, le
+    /// rang et l'état d'anticipation en variables locales (registres) : on ne
+    /// la quitte que pour entrer dans un enfant ou en fin de nœud. Garder le
+    /// curseur dans `self` coûtait plus qu'il ne rapportait (lectures bloquées
+    /// derrière ses écritures, chevauchement de lignes).
     fn run(&mut self) {
         let art = self.art;
-        while !self.sink.full() {
-            let Some(f) = self.stack.last_mut() else {
+        let step = if self.rev { -1 } else { 1 };
+        'frames: while !self.sink.full() {
+            let Some(f) = self.stack.last() else {
                 return;
             };
-            let node = art.node(f.idx);
-            let n = node.len() as i32;
-            if f.next < 0 || f.next >= n {
+            let (idx, n, key_len, bound) = (f.idx, f.n, f.key_len as usize, f.bound);
+            let (mut e, mut staged) = (f.next, f.staged);
+            if e < 0 || e >= n {
                 let f = self.stack.pop().expect("non vide");
                 self.key.truncate(f.key_len as usize);
                 if f.self_pending {
+                    let node = art.node(f.idx);
                     self.emit(node.tag, &node.val, node.exp_and_radix.exp());
                 }
                 continue;
             }
-            let e = f.next;
-            let step = if self.rev { -1 } else { 1 };
-            f.next += step;
-            let (key_len, bound) = (f.key_len as usize, f.bound);
-            // Préchargement en deux étages. Sur des clés aléatoires, les nœuds
-            // du dernier niveau n'ont que 2 ou 3 feuilles : anticiper dans le
-            // nœud courant ne couvre presque rien, et les suffixes d'un enfant
-            // ne sont connus qu'une fois l'enfant arrivé. Donc :
-            // - étage 1, entrée e + 2 : les deux lignes de l'enfant (adresses
-            //   connues par l'idx), ou le suffixe d'une feuille ;
-            // - étage 2, entrée e + 1 : l'enfant préchargé au pas précédent
-            //   (gardé dans `staged`) est là ; sa page et les suffixes de ses
-            //   feuilles partent, avec tout le sous-arbre de l'entrée e comme
-            //   avance.
-            let staged = std::mem::replace(&mut f.staged, NO_CHILD);
-            if staged != NO_CHILD {
-                art.node(staged).prefetch_leaves();
-            }
-            let ahead = e + step * PREFETCH_AHEAD;
-            if (0..n).contains(&ahead) {
-                match node.entry_ref(ahead as usize) {
-                    EntryRef::Child(c) => {
-                        let child = art.node(c);
-                        radixox_lib::prefetch::prefetch_l1(child as *const _ as *const u8);
-                        child.prefetch_body();
-                        f.staged = c;
-                    }
-                    EntryRef::Leaf { sfx: Some(sfx), .. } => sfx.prefetch(),
-                    EntryRef::Leaf { .. } => {}
+            let node = art.node(idx);
+            let mut cur = Cursor::new(node, e as usize);
+            loop {
+                // Préchargement en deux étages. Sur des clés aléatoires, les
+                // nœuds du dernier niveau n'ont que 2 ou 3 feuilles : anticiper
+                // dans le nœud courant ne couvre presque rien, et les suffixes
+                // d'un enfant ne sont connus qu'une fois l'enfant arrivé. Donc :
+                // - étage 1, entrée e + 2 : les deux lignes de l'enfant (adresses
+                //   connues par l'idx), ou le suffixe d'une feuille ;
+                // - étage 2, entrée e + 1 : l'enfant préchargé au pas précédent
+                //   (`staged`) est là ; sa page et les suffixes de ses feuilles
+                //   partent, avec tout le sous-arbre de l'entrée e comme avance.
+                if staged != NO_CHILD {
+                    art.node(staged).prefetch_leaves();
+                    staged = NO_CHILD;
                 }
-            }
-            self.key.truncate(key_len);
-            let r = node.radix_at(e as usize);
-            self.key.push(r);
-            let bounded = bound == Some(r);
-            match node.entry_ref(e as usize) {
-                EntryRef::Child(c) => self.enter(c, bounded, false),
-                EntryRef::Leaf { tag, val, ttl, sfx } => {
-                    if let Some(sfx) = sfx {
-                        self.key.extend_from_slice(sfx);
+                let ahead = e + step * PREFETCH_AHEAD;
+                if (0..n).contains(&ahead) {
+                    // SAFETY: l'arbre n'est pas modifié pendant le parcours (`&OxidArt`).
+                    match unsafe { cur.peek(node, ahead as usize) } {
+                        EntryRef::Child(c) => {
+                            let child = art.node(c);
+                            radixox_lib::prefetch::prefetch_l1(child as *const _ as *const u8);
+                            child.prefetch_body();
+                            staged = c;
+                        }
+                        EntryRef::Leaf { sfx: Some(sfx), .. } => sfx.prefetch(),
+                        EntryRef::Leaf { .. } => {}
                     }
-                    if !bounded || self.past_from() {
-                        self.emit(tag, val, ttl);
+                }
+                // SAFETY: idem ; `cur` est le curseur de `node`.
+                let (r, entry) = unsafe { cur.get(node, e as usize) };
+                e += step;
+                self.key.truncate(key_len);
+                self.key.push(r);
+                let bounded = bound == Some(r);
+                match entry {
+                    EntryRef::Child(c) => {
+                        let f = self.stack.last_mut().expect("non vide");
+                        (f.next, f.staged) = (e, staged);
+                        self.enter(c, bounded, false);
+                        continue 'frames;
                     }
+                    EntryRef::Leaf { tag, val, ttl, sfx } => {
+                        if let Some(sfx) = sfx {
+                            self.key.extend_from_slice(sfx);
+                        }
+                        if !bounded || self.past_from() {
+                            self.emit(tag, val, ttl);
+                        }
+                    }
+                }
+                if e < 0 || e >= n || self.sink.full() {
+                    let f = self.stack.last_mut().expect("non vide");
+                    (f.next, f.staged) = (e, staged);
+                    continue 'frames;
                 }
             }
         }
@@ -401,7 +423,14 @@ impl OxidArt {
         on_stop: impl FnOnce(&[u8]) -> R,
     ) -> (S, Option<R>) {
         let sc = SCRATCH.with(|s| std::mem::take(&mut *s.borrow_mut()));
-        let mut w = Walker { art: self, from, rev, key: sc.key, stack: sc.stack, sink };
+        let mut w = Walker {
+            art: self,
+            from,
+            rev,
+            key: sc.key,
+            stack: sc.stack,
+            sink,
+        };
         match self.find_prefix(prefix, &mut w.key) {
             PrefixHit::None => {}
             PrefixHit::Node(idx) => {

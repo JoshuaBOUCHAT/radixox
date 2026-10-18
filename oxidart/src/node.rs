@@ -350,6 +350,30 @@ impl U256 {
         }
         unreachable!("select hors bornes")
     }
+
+    /// Premier bit à 1 en position ≥ `from` (il doit exister).
+    #[inline]
+    fn next_from(&self, from: usize) -> usize {
+        let mut w = from >> 6;
+        let mut x = self.0[w] & !mask64(from & 63);
+        while x == 0 {
+            w += 1;
+            x = self.0[w];
+        }
+        w * 64 + x.trailing_zeros() as usize
+    }
+
+    /// Dernier bit à 1 en position < `below` (il doit exister).
+    #[inline]
+    fn prev_below(&self, below: usize) -> usize {
+        let mut w = below >> 6;
+        let mut x = if w < 4 { self.0[w] & mask64(below & 63) } else { 0 };
+        while x == 0 {
+            w -= 1;
+            x = self.0[w];
+        }
+        w * 64 + 63 - x.leading_zeros() as usize
+    }
 }
 
 impl Bits for U256 {
@@ -1673,3 +1697,177 @@ impl Drop for Node {
         unsafe { drop_raw(self.tag, &mut self.val) };
     }
 }
+
+// ─── Curseur de parcours ─────────────────────────────────────────────────────
+
+/// Lecture par rangs pour les parcours ordonnés (KRANGE, SCAN). Le segment qui
+/// contient le rang courant est décodé une fois, masques sur 64 bits, au lieu
+/// de l'être à chaque entrée par [`Node::entry_ref`] (choix de la forme, vue du
+/// segment) ; le radix des formes larges est suivi pas à pas au lieu d'un
+/// `select` par entrée. `Wide256` (maps de 256 bits dans la page) garde
+/// `entry_ref`. Le parcours n'en tient qu'un, celui du nœud au sommet de sa
+/// pile : rien de gros dans les étages.
+///
+/// Pointeurs bruts : valide tant que le nœud n'est pas modifié.
+#[derive(Clone, Copy)]
+pub(crate) struct Cursor {
+    cells: *const u8,
+    /// Nul dans les formes larges.
+    radixs: *const u8,
+    tags: *const Tag,
+    c: u64,
+    t: u64,
+    s: u64,
+    cap: u32,
+    /// Rangs `[lo, hi)` du segment décodé.
+    lo: u16,
+    hi: u16,
+    /// Formes larges : rang et radix du dernier radix rendu (`last_e` à
+    /// `u16::MAX` : aucun).
+    last_e: u16,
+    last_radix: u16,
+    wide: bool,
+    wide256: bool,
+}
+
+impl Cursor {
+    pub(crate) const fn empty() -> Self {
+        Cursor {
+            cells: ptr::null(),
+            radixs: ptr::null(),
+            tags: ptr::null(),
+            c: 0,
+            t: 0,
+            s: 0,
+            cap: 0,
+            lo: 0,
+            hi: 0,
+            last_e: u16::MAX,
+            last_radix: 0,
+            wide: false,
+            wide256: false,
+        }
+    }
+
+    /// Curseur sur le segment qui contient le rang `e` (`e < node.len()`).
+    pub(crate) fn new(node: &Node, e: usize) -> Self {
+        let mut cur = Cursor::empty();
+        match node.kind {
+            Kind::Inline | Kind::Overflow8 => {
+                let n_in = node.n_in as usize;
+                // SAFETY: lecture des cellules / de la page du nœud vivant.
+                unsafe {
+                    if e < n_in {
+                        let m = mask64(n_in);
+                        cur.cells = node.body.cells.as_ptr() as *const u8;
+                        cur.radixs = node.keys.small.radixs.as_ptr();
+                        cur.tags = node.keys.small.tags.as_ptr();
+                        cur.cap = NODE_CELLS as u32;
+                        (cur.c, cur.t, cur.s) = (node.child_map as u64 & m, node.ttl_map as u64 & m, node.sfx_map as u64 & m);
+                        (cur.lo, cur.hi) = (0, n_in as u16);
+                    } else {
+                        let count = node.count as usize;
+                        let m = mask64(count - n_in);
+                        let p = node.ptr.as_ptr() as *const u8;
+                        cur.radixs = p;
+                        cur.tags = p.add(SMALL_ENTRIES) as *const Tag;
+                        cur.cells = p.add(SMALL_PAGE_HEADER);
+                        cur.cap = node.block().saturating_sub(SMALL_PAGE_HEADER) as u32;
+                        (cur.c, cur.t, cur.s) = (
+                            (node.child_map as u64 >> n_in) & m,
+                            (node.ttl_map as u64 >> n_in) & m,
+                            (node.sfx_map as u64 >> n_in) & m,
+                        );
+                        (cur.lo, cur.hi) = (n_in as u16, count as u16);
+                    }
+                }
+            }
+            Kind::Wide32 => unsafe {
+                let maps = node.keys.maps;
+                cur.cells = node.ptr.as_ptr();
+                cur.tags = node.body.wide.tags.as_ptr();
+                cur.cap = node.block() as u32;
+                (cur.c, cur.t, cur.s) = (maps[0] as u64, maps[1] as u64, maps[2] as u64);
+                (cur.lo, cur.hi) = (0, node.count as u16);
+                cur.wide = true;
+            },
+            Kind::Wide256 => {
+                (cur.lo, cur.hi) = (0, node.len() as u16);
+                cur.wide = true;
+                cur.wide256 = true;
+            }
+        }
+        cur
+    }
+
+    /// Entrée `i` du segment (masques sur 64 bits).
+    #[inline(always)]
+    unsafe fn decode<'a>(&self, i: usize) -> EntryRef<'a> {
+        let bit = 1u64 << i;
+        let below = bit - 1;
+        let kids = (self.c & below).count_ones() as usize;
+        unsafe {
+            if self.c & bit != 0 {
+                return EntryRef::Child((self.cells.add(4 * kids) as *const u32).read());
+            }
+            let leaves = i - kids + (self.t & below).count_ones() as usize + (self.s & below).count_ones() as usize;
+            let end = self.cap as usize - 8 * leaves;
+            let has_ttl = self.t & bit != 0;
+            EntryRef::Leaf {
+                tag: *self.tags.add(i),
+                val: &*(self.cells.add(end - 8) as *const ValUnion),
+                ttl: has_ttl.then(|| (self.cells.add(end - 16) as *const u64).read()),
+                sfx: (self.s & bit != 0)
+                    .then(|| &*(self.cells.add(end - 8 * (2 + has_ttl as usize)) as *const CompactPath)),
+            }
+        }
+    }
+
+    /// Radix et entrée du rang `e` de `node` (le nœud du curseur ; segment
+    /// rechargé s'il faut).
+    ///
+    /// # Safety
+    /// `node` n'a pas été modifié depuis la création du curseur.
+    #[inline(always)]
+    pub(crate) unsafe fn get<'a>(&mut self, node: &'a Node, e: usize) -> (u8, EntryRef<'a>) {
+        if e < self.lo as usize || e >= self.hi as usize {
+            *self = Cursor::new(node, e);
+        }
+        if self.wide256 {
+            return (self.wide_radix(node, e), node.entry_ref(e));
+        }
+        let i = e - self.lo as usize;
+        let radix = if self.wide { self.wide_radix(node, e) } else { unsafe { *self.radixs.add(i) } };
+        (radix, unsafe { self.decode(i) })
+    }
+
+    /// Entrée du rang `e < node.len()` pour l'anticipation, sans toucher au
+    /// curseur : décodée dans le segment courant, sinon (autre segment,
+    /// `Wide256`) par le chemin complet.
+    ///
+    /// # Safety
+    /// Comme [`get`](Self::get).
+    #[inline(always)]
+    pub(crate) unsafe fn peek<'a>(&self, node: &'a Node, e: usize) -> EntryRef<'a> {
+        if self.wide256 || e < self.lo as usize || e >= self.hi as usize {
+            return node.entry_ref(e);
+        }
+        unsafe { self.decode(e - self.lo as usize) }
+    }
+
+    #[inline]
+    fn wide_radix(&mut self, node: &Node, e: usize) -> u8 {
+        let bits = node.radix_bits();
+        let last = self.last_e as usize;
+        let r = if self.last_e != u16::MAX && e == last + 1 {
+            bits.next_from(self.last_radix as usize + 1)
+        } else if self.last_e != u16::MAX && e + 1 == last {
+            bits.prev_below(self.last_radix as usize)
+        } else {
+            bits.select(e)
+        };
+        (self.last_e, self.last_radix) = (e as u16, r as u16);
+        r as u8
+    }
+}
+
