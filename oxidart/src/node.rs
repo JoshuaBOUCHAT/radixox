@@ -1700,6 +1700,13 @@ impl Drop for Node {
 
 // ─── Curseur de parcours ─────────────────────────────────────────────────────
 
+/// Ce que l'anticipation d'un parcours doit précharger pour une entrée.
+pub(crate) enum Ahead<'a> {
+    Child(u32),
+    Sfx(&'a CompactPath),
+    Nothing,
+}
+
 /// Lecture par rangs pour les parcours ordonnés (KRANGE, SCAN). Le segment qui
 /// contient le rang courant est décodé une fois, masques sur 64 bits, au lieu
 /// de l'être à chaque entrée par [`Node::entry_ref`] (choix de la forme, vue du
@@ -1841,18 +1848,38 @@ impl Cursor {
         (radix, unsafe { self.decode(i) })
     }
 
-    /// Entrée du rang `e < node.len()` pour l'anticipation, sans toucher au
-    /// curseur : décodée dans le segment courant, sinon (autre segment,
-    /// `Wide256`) par le chemin complet.
+    /// Cible de préchargement du rang `e < node.len()`, sans construire
+    /// l'entrée complète : idx d'un enfant, suffixe long d'une feuille (une
+    /// feuille sans suffixe ne coûte aucun popcount). Hors du segment
+    /// décodé (page de débordement, `Wide256`) : chemin complet.
     ///
     /// # Safety
     /// Comme [`get`](Self::get).
     #[inline(always)]
-    pub(crate) unsafe fn peek<'a>(&self, node: &'a Node, e: usize) -> EntryRef<'a> {
+    pub(crate) unsafe fn ahead<'a>(&self, node: &'a Node, e: usize) -> Ahead<'a> {
         if self.wide256 || e < self.lo as usize || e >= self.hi as usize {
-            return node.entry_ref(e);
+            return match node.entry_ref(e) {
+                EntryRef::Child(c) => Ahead::Child(c),
+                EntryRef::Leaf { sfx: Some(sfx), .. } => Ahead::Sfx(sfx),
+                EntryRef::Leaf { .. } => Ahead::Nothing,
+            };
         }
-        unsafe { self.decode(e - self.lo as usize) }
+        let i = e - self.lo as usize;
+        let bit = 1u64 << i;
+        let below = bit - 1;
+        let kids = (self.c & below).count_ones() as usize;
+        unsafe {
+            if self.c & bit != 0 {
+                Ahead::Child((self.cells.add(4 * kids) as *const u32).read())
+            } else if self.s & bit != 0 {
+                let leaves = i - kids + (self.t & below).count_ones() as usize + (self.s & below).count_ones() as usize;
+                let end = self.cap as usize - 8 * leaves;
+                let has_ttl = self.t & bit != 0;
+                Ahead::Sfx(&*(self.cells.add(end - 8 * (2 + has_ttl as usize)) as *const CompactPath))
+            } else {
+                Ahead::Nothing
+            }
+        }
     }
 
     #[inline]

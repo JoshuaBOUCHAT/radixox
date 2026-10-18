@@ -17,7 +17,7 @@
 
 use radixox_lib::shared_byte::SharedByte;
 
-use crate::node::{Cursor, EntryRef};
+use crate::node::{Ahead, Cursor, EntryRef};
 use crate::value::{RedisType, Tag, ValUnion};
 use crate::{OxidArt, PrefixHit, expired};
 
@@ -160,7 +160,9 @@ struct Frame {
     /// négatif = fini).
     next: i32,
     /// Radix de l'entrée sur le chemin de `from` : elle seule reste bornée.
-    bound: Option<u8>,
+    /// `NO_BOUND` : aucune (u16 plutôt qu'`Option<u8>` : comparaison en une
+    /// instruction dans la boucle).
+    bound: u16,
     /// KREVRANGE : la valeur du nœud sort après ses entrées.
     self_pending: bool,
     /// Enfant préchargé à l'étage 1 au pas précédent (`NO_CHILD` sinon) :
@@ -169,6 +171,7 @@ struct Frame {
 }
 
 const NO_CHILD: u32 = u32::MAX;
+const NO_BOUND: u16 = 256;
 
 /// Nombre d'entrées regardées en avance pour précharger les nœuds enfants.
 const PREFETCH_AHEAD: i32 = 2;
@@ -312,7 +315,7 @@ impl<'a, S: Sink<'a>> Walker<'a, '_, S> {
         let n = node.len() as i32;
 
         let mut self_ok = true;
-        let mut bound = None;
+        let mut bound = NO_BOUND;
         // rangs à visiter : [first, n) en croissant, [0, first] en décroissant
         let mut first = if self.rev { n - 1 } else { 0 };
         if bounded {
@@ -326,7 +329,7 @@ impl<'a, S: Sink<'a>> Walker<'a, '_, S> {
                     first = if self.rev { -1 } else { 0 };
                 } else {
                     let b = f[key_len];
-                    bound = Some(b);
+                    bound = b as u16;
                     first = match node.search(b) {
                         Ok(e) => e as i32,
                         Err(e) if self.rev => e as i32 - 1,
@@ -397,21 +400,21 @@ impl<'a, S: Sink<'a>> Walker<'a, '_, S> {
                 let ahead = e + step * PREFETCH_AHEAD;
                 if (0..n).contains(&ahead) {
                     // SAFETY: l'arbre n'est pas modifié pendant le parcours (`&OxidArt`).
-                    match unsafe { cur.peek(node, ahead as usize) } {
-                        EntryRef::Child(c) => {
+                    match unsafe { cur.ahead(node, ahead as usize) } {
+                        Ahead::Child(c) => {
                             let child = art.node(c);
                             radixox_lib::prefetch::prefetch_l1(child as *const _ as *const u8);
                             child.prefetch_body();
                             staged = c;
                         }
-                        EntryRef::Leaf { sfx: Some(sfx), .. } => sfx.prefetch(),
-                        EntryRef::Leaf { .. } => {}
+                        Ahead::Sfx(sfx) => sfx.prefetch(),
+                        Ahead::Nothing => {}
                     }
                 }
                 // SAFETY: idem ; `cur` est le curseur de `node`.
                 let (r, entry) = unsafe { cur.get(node, e as usize) };
                 e += step;
-                let bounded = bound == Some(r);
+                let bounded = bound == r as u16;
                 match entry {
                     EntryRef::Child(c) => {
                         set_tail(&mut self.key, key_len, r, &[]);
