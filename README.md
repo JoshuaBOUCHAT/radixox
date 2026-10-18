@@ -15,15 +15,17 @@ OxidArt is also usable directly as an embedded Rust library.
 
 ## Highlights
 
-Measured on 2026-10-17, one core each, 1M keys (see [Benchmarks](#benchmarks) for the setup
-and caveats):
+One core each, 1M keys, measured on 2026-10-18 (memory on 2026-10-17); see
+[Benchmarks](#benchmarks) for the setup and caveats:
 
 | | RadixOx | Valkey 9.1.2 | |
 |---|---|---|---|
-| p99, no pipeline (80 conns) | **0.58 ms** | 0.89 ms | −34 % |
-| p99.9, no pipeline | **0.76 ms** | 1.17 ms | −35 % |
-| Throughput, no pipeline | **193 k ops/s** | 173 k ops/s | +11 % |
-| Throughput, pipeline 32 | **2.02 M ops/s** | 1.66 M ops/s | +22 % |
+| p99, no pipeline (80 conns) | **0.38 ms** | 0.74 ms | −48 % |
+| p99.9, no pipeline | **0.44 ms** | 0.76 ms | −42 % |
+| Throughput, no pipeline | **239 k ops/s** | 209 k ops/s | +14 % |
+| Throughput, pipeline 32 | **2.44 M ops/s** | 2.00 M ops/s | +22 % |
+| Operations per second of server CPU, no pipeline | **389 k** | 325 k | +20 % |
+| YCSB A, READ p99 (1M records) | **544 µs** | 1,040 µs | −48 % |
 | Memory, 1M keys × 100 B values (structured keys) | **131 MB** | 163 MB | −20 % |
 | Memory, 1M random UUID keys × 100 B | 209 MB | 205 MB | ≈ |
 | Memory, 1M one-field hashes (YCSB-like) | **233 MB** | 344 MB | −32 % |
@@ -70,45 +72,46 @@ Requirements: **Linux** with io_uring (developed on 6.12 LTS and 7.2), **Rust 20
 ### Setup
 
 - AMD Ryzen 5 7600X (6 cores / 12 threads), 30 GB RAM, Linux 7.2-zen, power profile
-  `performance`, loopback. Both servers measured in the same session (2026-10-17).
-- **One core each.** The server is pinned to CPU 0 with its SMT sibling idle. RadixOx runs
-  without SQ_POLL; Valkey 9.1.2 runs with `io-threads 1`, persistence off. memtier runs on
-  physical cores 2–5.
-- 1,000,000 keys (`key:1` … `key:1000000`), 100-byte values, uniform random access,
+  `performance`, loopback, idle machine. Measured on 2026-10-18.
+- **One core each.** Both servers run at the same time, pinned to CPU 0 (its SMT sibling stays
+  idle); only one is loaded at a time, and the order alternates every round so that drift on
+  the machine hits both. RadixOx runs without SQ_POLL; Valkey 9.1.2 runs with `io-threads 1`,
+  persistence off. Clients run on physical cores 2–5.
+- memtier: 1,000,000 keys (`key:1` … `key:1000000`), 100-byte values, uniform random access,
   `memtier_benchmark --threads 4 --clients 20 --distinct-client-seed --randomize`,
-  10-second runs, **single run per configuration**.
+  **3 rounds of 10 s per configuration, median reported** (min–max for throughput).
+- Server CPU is the user + kernel time of the server process (`/proc/<pid>/stat`) during the
+  run. On loopback, part of the network work is billed to the client side, so a server never
+  shows a full core.
+- Reproduce with [`scripts/bench_vs_valkey.sh`](scripts/bench_vs_valkey.sh) (about 3 minutes).
 
 ### Throughput and latency (1:4 SET:GET)
 
-| | Throughput | p50 | p99 | p99.9 |
-|---|---|---|---|---|
-| **No pipeline**, RadixOx | **192,623 ops/s** | **0.399 ms** | **0.583 ms** | **0.759 ms** |
-| No pipeline, Valkey | 173,130 ops/s | 0.439 ms | 0.887 ms | 1.167 ms |
-| **Pipeline 32**, RadixOx | **2,024,933 ops/s** | **1.127 ms** | **2.079 ms** | **2.431 ms** |
-| Pipeline 32, Valkey | 1,656,917 ops/s | 1.359 ms | 2.975 ms | 3.663 ms |
+| | Throughput (min–max) | p50 | p99 | p99.9 | p99.99 | Server CPU | Ops / CPU-second |
+|---|---|---|---|---|---|---|---|
+| **No pipeline**, RadixOx | **238,673** (236,636–263,541) | **0.343 ms** | **0.383 ms** | **0.439 ms** | **0.671 ms** | 0.62 core | **388,719** |
+| No pipeline, Valkey | 209,106 (208,654–209,180) | 0.375 ms | 0.743 ms | 0.759 ms | 0.807 ms | 0.64 core | 324,814 |
+| **Pipeline 32**, RadixOx | **2,436,822** (2,431,731–2,439,907) | **0.911 ms** | **1.527 ms** | **1.639 ms** | 2.367 ms | 0.86 core | **2,826,940** |
+| Pipeline 32, Valkey | 2,002,807 (1,999,635–2,020,254) | 1.063 ms | 1.943 ms | 2.079 ms | **2.191 ms** | 0.88 core | 2,268,185 |
 
-Without pipelining, both servers are bounded by the TCP stack and the client's round trips:
-the kernel takes most of the core. The tail is where RadixOx stands out: p99 and p99.9 are
-about 35 % lower.
-
-**Caveat on these throughput numbers**: another program (a game) was running on the
-machine during this session, which explains why both servers are slower than on 2026-10-12
-(Valkey 173 k vs 202 k ops/s without pipeline). Both servers ran back to back under the same
-conditions, so the comparison between rows holds, but the absolute values are pessimistic
-and the tail latencies noisier. A clean re-run is planned.
+Without pipelining, both servers are bounded by the TCP stack and the clients' round trips.
+The tail is where RadixOx stands out: p99 and p99.9 are about half of Valkey's. RadixOx also
+does about 20–25 % more work per second of CPU. With pipeline 32, Valkey's p99.99 is slightly
+lower.
 
 ### YCSB workload A
 
-5M records (one hash field of 100 B per record), 10M operations (50 % read / 50 % update),
-100 client threads, one server thread each, single run:
+1M records (one hash field of 100 B per record), 2M operations (50 % read / 50 % update),
+100 client threads, one server thread each, **single run** (2026-10-18):
 
-| | Load | Run | READ avg | READ p99 | READ p99.9 | READ p99.99 | Peak RSS |
-|---|---|---|---|---|---|---|---|
-| RadixOx | **76 k ops/s** | **174 k ops/s** | **574 µs** | **749 µs** | **811 µs** | **1,112 µs** | **2,014 MB** |
-| Valkey | 60 k ops/s | 148 k ops/s | 673 µs | 1,308 µs | 1,438 µs | 1,826 µs | 2,053 MB |
+| | Load | Run | READ avg | READ p50 | READ p99 | READ p99.9 | READ p99.99 | UPDATE p99 | Peak RSS |
+|---|---|---|---|---|---|---|---|---|---|
+| RadixOx | **108 k ops/s** | **219 k ops/s** | **454 µs** | **450 µs** | **544 µs** | **739 µs** | 4,579 µs | **545 µs** | **331 MB** |
+| Valkey | 86 k ops/s | 187 k ops/s | 532 µs | 520 µs | 1,040 µs | 1,117 µs | **3,799 µs** | 1,040 µs | 430 MB |
 
-Measured before small hashes were stored as compact blocks (see below): each one-field hash
-was then a full valart tree. Same caveat as above about the machine load.
+The p99.99 of a single run of 2M operations rests on about 100 samples per operation type:
+treat it as noise-level. On the previous run (5M records, 10M operations, 2026-10-17, busier
+machine), RadixOx was ahead on p99.99 too (1,112 µs against 1,826 µs).
 
 ### Memory
 
@@ -213,8 +216,8 @@ without `fork`.
 
 - Loopback only: the client's TCP receive path and netfilter are billed to the same machine.
   Real two-machine numbers are planned.
-- Single runs, short durations: treat the numbers as orders of magnitude, not as precise
-  ratios (run-to-run variation on this machine is around ±10 %).
+- Short runs: memtier results are the median of 3 rounds of 10 s, YCSB is a single run.
+  Treat the numbers as orders of magnitude, not as precise ratios.
 - Valkey can use more cores (`io-threads`); RadixOx is single-threaded by design. The
   comparison is per core.
 
