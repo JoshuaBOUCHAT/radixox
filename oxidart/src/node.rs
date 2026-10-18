@@ -694,6 +694,28 @@ impl Node {
         prefetch_l1(self.ptr.as_ptr());
     }
 
+    /// Préchargement de second étage, une fois le nœud arrivé en cache :
+    /// sa page, son préfixe long et les suffixes longs (sur le tas) des
+    /// feuilles de ses cellules. Ceux de la page attendent qu'elle arrive.
+    #[inline]
+    pub(crate) fn prefetch_leaves(&self) {
+        self.prefetch_page();
+        self.prefix.prefetch();
+        if !self.kind.is_small() {
+            return;
+        }
+        let seg = self.node_seg();
+        let mut m = (seg.s & !seg.c) as u32;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            // SAFETY: `i` < n_in (maps masquées par le segment), feuille à suffixe.
+            if let EntryRef::Leaf { sfx: Some(sfx), .. } = unsafe { seg.entry_ref(i) } {
+                sfx.prefetch();
+            }
+        }
+    }
+
     #[inline]
     fn block(&self) -> usize {
         self.pg_block8 as usize * 8

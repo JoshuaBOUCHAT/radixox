@@ -161,7 +161,12 @@ struct Frame {
     bound: Option<u8>,
     /// KREVRANGE : la valeur du nœud sort après ses entrées.
     self_pending: bool,
+    /// Enfant préchargé à l'étage 1 au pas précédent (`NO_CHILD` sinon) :
+    /// l'étage 2 le reprend sans redécoder l'entrée.
+    staged: u32,
 }
+
+const NO_CHILD: u32 = u32::MAX;
 
 /// Nombre d'entrées regardées en avance pour précharger les nœuds enfants.
 const PREFETCH_AHEAD: i32 = 2;
@@ -287,6 +292,7 @@ impl<'a, S: Sink<'a>> Walker<'a, '_, S> {
             next: first,
             bound,
             self_pending: self_ok && self.rev && node.has_val(),
+            staged: NO_CHILD,
         });
     }
 
@@ -310,16 +316,29 @@ impl<'a, S: Sink<'a>> Walker<'a, '_, S> {
             let step = if self.rev { -1 } else { 1 };
             f.next += step;
             let (key_len, bound) = (f.key_len as usize, f.bound);
+            // Préchargement en deux étages. Sur des clés aléatoires, les nœuds
+            // du dernier niveau n'ont que 2 ou 3 feuilles : anticiper dans le
+            // nœud courant ne couvre presque rien, et les suffixes d'un enfant
+            // ne sont connus qu'une fois l'enfant arrivé. Donc :
+            // - étage 1, entrée e + 2 : les deux lignes de l'enfant (adresses
+            //   connues par l'idx), ou le suffixe d'une feuille ;
+            // - étage 2, entrée e + 1 : l'enfant préchargé au pas précédent
+            //   (gardé dans `staged`) est là ; sa page et les suffixes de ses
+            //   feuilles partent, avec tout le sous-arbre de l'entrée e comme
+            //   avance.
+            let staged = std::mem::replace(&mut f.staged, NO_CHILD);
+            if staged != NO_CHILD {
+                art.node(staged).prefetch_leaves();
+            }
             let ahead = e + step * PREFETCH_AHEAD;
             if (0..n).contains(&ahead) {
                 match node.entry_ref(ahead as usize) {
                     EntryRef::Child(c) => {
                         let child = art.node(c);
                         radixox_lib::prefetch::prefetch_l1(child as *const _ as *const u8);
+                        child.prefetch_body();
+                        f.staged = c;
                     }
-                    // Suffixe > 7 octets : alloué à part, lu à la copie de la
-                    // clé (−5 à −10 % sur des clés de 32 octets ; plus d'avance
-                    // que 2 entrées est moins bon).
                     EntryRef::Leaf { sfx: Some(sfx), .. } => sfx.prefetch(),
                     EntryRef::Leaf { .. } => {}
                 }
@@ -806,6 +825,74 @@ mod tests {
         assert!(seen.windows(2).all(|w| w[0] < w[1]), "ordre strict, donc sans doublon");
         for k in initial.difference(&touched) {
             assert!(seen.binary_search(k).is_ok(), "clé stable manquante : {k:?}");
+        }
+    }
+    /// Fan-outs qui forcent les quatre formes de nœud (≤ 8, ≤ 16, ≤ 32,
+    /// jusqu'à 256 entrées) : pages dans les deux sens, `from` présent,
+    /// absent, entre deux clés, comparées à une BTreeMap. Couvre le suivi
+    /// pas à pas des radix des formes larges et le passage nœud → page.
+    #[test]
+    fn krange_all_node_shapes_match_btreemap() {
+        use crate::node::Kind;
+        let mut rnd = xorshift(0xA076_1D64_78BD_642F);
+        for fanout in [5usize, 12, 20, 30, 200, 256] {
+            let mut art = OxidArt::new();
+            let mut model = BTreeMap::new();
+            // 2 niveaux de fan-out `fanout` (octets étalés sur 0..=255) sous
+            // un préfixe, quelques clés plus longues, et une valeur sur un nœud.
+            let byte = |i: usize| (i * 255 / fanout.max(2).saturating_sub(1).max(1)).min(255) as u8;
+            for a in 0..fanout {
+                for b in 0..(fanout.min(40)) {
+                    if rnd() % 3 == 0 {
+                        continue;
+                    }
+                    let mut k = vec![b'p', byte(a), byte(b)];
+                    if rnd() % 5 == 0 {
+                        k.extend_from_slice(b"-suffixe-long-sur-le-tas");
+                    }
+                    let v = format!("{a}-{b}").into_bytes();
+                    art.set(SharedByte::from_slice(&k), Value::String(SharedByte::from_slice(&v)));
+                    model.insert(k, v);
+                }
+            }
+            let mut kinds = std::collections::BTreeSet::new();
+            let mut todo = vec![art.root_idx];
+            while let Some(idx) = todo.pop() {
+                let node = art.node(idx);
+                kinds.insert(node.kind() as u8);
+                todo.extend(node.iter().filter_map(|(_, e)| match e {
+                    crate::node::EntryRef::Child(c) => Some(c),
+                    _ => None,
+                }));
+            }
+            let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+            for t in 0..300 {
+                let count = [1, 3, 17, 64, 1000][t % 5];
+                let from: Vec<u8> = match t % 4 {
+                    0 => Vec::new(),
+                    1 => keys[rnd() as usize % keys.len()].clone(),
+                    2 => {
+                        let mut k = keys[rnd() as usize % keys.len()].clone();
+                        k.push(0);
+                        k
+                    }
+                    _ => vec![b'p', (rnd() % 256) as u8],
+                };
+                for rev in [false, true] {
+                    let got: Vec<(Vec<u8>, Vec<u8>)> =
+                        art.krange(b"p", &from, count, rev).iter().map(|(k, v)| (k.to_vec(), as_bytes(v))).collect();
+                    assert_eq!(got, expected(&model, b"p", &from, count, rev), "fanout {fanout}, from {from:?}, count {count}, rev {rev}");
+                }
+            }
+            if fanout >= 200 {
+                assert!(kinds.contains(&(Kind::Wide256 as u8)), "fanout {fanout} : formes {kinds:?}");
+            }
+            if fanout == 20 || fanout == 30 {
+                assert!(kinds.contains(&(Kind::Wide32 as u8)), "fanout {fanout} : formes {kinds:?}");
+            }
+            if fanout == 12 {
+                assert!(kinds.contains(&(Kind::Overflow8 as u8)), "fanout {fanout} : formes {kinds:?}");
+            }
         }
     }
 }
