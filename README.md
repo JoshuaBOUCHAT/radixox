@@ -281,7 +281,7 @@ own synchronization.
 
 | Category | Commands |
 |---|---|
-| Connection / server | `PING` `AUTH` `ECHO` `QUIT` `SELECT` `INFO` `DBSIZE` `FLUSHDB` `SAVE` `BGSAVE` |
+| Connection / server | `PING` `AUTH` `HELLO` (RESP2; `HELLO 3` → `-NOPROTO`) `CLIENT` (`SETNAME` `GETNAME` `ID` `SETINFO`) `COMMAND` `ECHO` `QUIT` `SELECT` `INFO` `DBSIZE` `FLUSHDB` `SAVE` `BGSAVE` |
 | Strings | `GET` `SET` (`EX` `PX` `NX` `XX`) `SETNX` `SETEX` `MGET` `MSET` |
 | Counters | `INCR` `DECR` `INCRBY` `DECRBY` |
 | Keys | `DEL` `UNLINK` `EXISTS` `TYPE` `KEYS` `SCAN` (`MATCH` `COUNT` `TYPE`) |
@@ -292,7 +292,7 @@ own synchronization.
 | Sorted set | `ZADD` `ZREM` `ZSCORE` `ZCARD` `ZRANGE` (`WITHSCORES`) `ZINCRBY` |
 | Pub/Sub | `SUBSCRIBE` `UNSUBSCRIBE` `PUBLISH` |
 
-Not yet: list commands, `MULTI`/`EXEC`, `CLIENT` / `CONFIG` / `HELLO`, Lua,
+Not yet: list commands, `MULTI`/`EXEC`, `CONFIG`, RESP3, Lua,
 replication, cluster.
 
 ---
@@ -389,7 +389,7 @@ across cores is meant to come from sharding by namespace, not from shared-state 
 - AOF and replication (sharing one stream of effects).
 - Lower memory per key on random keys: long suffixes stored inline on several cells (no
   separate allocation), a smaller node class for nodes with two or three entries.
-- Client compatibility commands (`HELLO`, `CLIENT`, `CONFIG`, `MULTI`/`EXEC`), lists.
+- Client compatibility: `MULTI`/`EXEC`, `CONFIG`, RESP3, lists.
 
 ---
 

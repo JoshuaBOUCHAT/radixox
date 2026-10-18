@@ -1,5 +1,6 @@
 pub(crate) mod auth;
 pub(crate) mod bgsave;
+pub(crate) mod client;
 pub(crate) mod shutdown;
 pub(crate) mod delayed;
 pub(crate) mod scan;

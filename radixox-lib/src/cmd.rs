@@ -60,6 +60,13 @@ pub enum Cmd<'a> {
     Info,
     /// AUTH password / AUTH username password
     Auth { user: Option<&'a [u8]>, pass: &'a [u8] },
+    /// HELLO [protover [AUTH user pass] [SETNAME name]] — arguments bruts,
+    /// validés par le serveur (messages d'erreur de Redis).
+    Hello(SmallVec<4, &'a [u8]>),
+    /// CLIENT subcommand [args…] — arguments bruts.
+    Client(SmallVec<4, &'a [u8]>),
+    /// COMMAND [subcommand …] — arguments bruts.
+    Command(SmallVec<4, &'a [u8]>),
 
     /// PING [message]
     Ping(Option<&'a [u8]>),
@@ -460,6 +467,10 @@ fn dispatch<'a>(raw: &[&'a [u8]]) -> Option<Cmd<'a>> {
             _ => None,
         },
 
+        // ── C : CLIENT COMMAND ────────────────────────────────────────────
+        b'c' if cmd.eq_ignore_ascii_case(b"client") => Some(Cmd::Client(multi_borrowed!(|v| v))),
+        b'c' if cmd.eq_ignore_ascii_case(b"command") => Some(Cmd::Command(multi_borrowed!(|v| v))),
+
         // ── B : BGSAVE ────────────────────────────────────────────────────
         b'b' => if cmd.eq_ignore_ascii_case(b"bgsave") { Some(Cmd::BgSave) } else { None },
 
@@ -486,6 +497,7 @@ fn dispatch<'a>(raw: &[&'a [u8]]) -> Option<Cmd<'a>> {
                 _ => None,
             },
             5 => match cmd[1] | 0x20 {
+                b'e' if cmd.eq_ignore_ascii_case(b"hello") => Some(Cmd::Hello(multi_borrowed!(|v| v))),
                 b'k' => { need!(1); Some(Cmd::HKeys(args[0])) }
                 b'v' => { need!(1); Some(Cmd::HVals(args[0])) }
                 b'm' => match cmd[2] | 0x20 {   // HM…

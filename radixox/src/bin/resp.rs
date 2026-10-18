@@ -35,6 +35,7 @@ use resp_cmd::{
     cmd_zadd, cmd_zcard, cmd_zincrby, cmd_zrange, cmd_zrem, cmd_zscore,
 };
 
+use crate::resp_cmd::client::Client;
 use crate::utils::{ConnState, SubRegistry};
 
 pub(crate) type IOResult<T> = std::io::Result<T>;
@@ -231,7 +232,7 @@ async fn handle_loop(
     let mut read_buf: Vec<u8> = Vec::with_capacity(BUFFER_SIZE);
     let mut io_buf: Vec<u8> = Vec::with_capacity(BUFFER_SIZE);
     let mut io_buf_offset = 0;
-    let mut authed = resp_cmd::auth::password().is_none();
+    let mut client = Client::new();
 
     loop {
         // Commande incomplète qui remplit tout le buffer (grosse valeur) : sans
@@ -249,7 +250,7 @@ async fn handle_loop(
         }
 
         let consume_byte_count =
-            handle_buffer(&mut read_buf, conn_state, registry, art, &mut authed).await?;
+            handle_buffer(&mut read_buf, conn_state, registry, art, &mut client).await?;
         io_buf_offset = read_buf.len() - consume_byte_count;
         io_buf.extend_from_slice(&read_buf[consume_byte_count..]);
         read_buf.clear();
@@ -263,14 +264,14 @@ async fn handle_buffer(
     conn_state: &mut ConnState,
     registry: &SharedRegistry,
     art: &SharedART,
-    authed: &mut bool,
+    client: &mut Client,
 ) -> IOResult<usize> {
     let window = prefetch_window();
     if window == 0 {
         let mut offset = 0;
         while let Some((cmd, n)) = Cmd::parse(&read_buf[offset..]) {
             offset += n;
-            dispatch(cmd, conn_state, registry, art, authed).await?;
+            dispatch(cmd, conn_state, registry, art, client).await?;
         }
         return Ok(offset);
     }
@@ -296,7 +297,7 @@ async fn handle_buffer(
         }
         keys.clear();
         for cmd in batch.drain(..) {
-            dispatch(cmd, conn_state, registry, art, authed).await?;
+            dispatch(cmd, conn_state, registry, art, client).await?;
         }
     }
 }
@@ -319,10 +320,10 @@ async fn dispatch(
     conn_state: &mut ConnState,
     registry: &SharedRegistry,
     art: &SharedART,
-    authed: &mut bool,
+    client: &mut Client,
 ) -> IOResult<()> {
     // Non authentifié : forcément en mode Normal (SUBSCRIBE est refusé).
-    if !*authed && !matches!(cmd, Cmd::Auth { .. } | Cmd::Quit) {
+    if !client.authed && !matches!(cmd, Cmd::Auth { .. } | Cmd::Hello(_) | Cmd::Quit) {
         conn_state.encode(resp_cmd::auth::noauth());
         return Ok(());
     }
@@ -360,8 +361,11 @@ async fn dispatch(
             }
             Cmd::Ping(msg) => conn_state.encode(resp_pong(msg)),
             Cmd::Auth { user, pass } => {
-                conn_state.encode(resp_cmd::auth::cmd_auth(user, pass, authed));
+                conn_state.encode(resp_cmd::auth::cmd_auth(user, pass, &mut client.authed));
             }
+            Cmd::Hello(args) => conn_state.encode(resp_cmd::client::cmd_hello(&args, client)),
+            Cmd::Client(args) => conn_state.encode(resp_cmd::client::cmd_client(&args, client)),
+            Cmd::Command(args) => conn_state.encode(resp_cmd::client::cmd_command(&args)),
             Cmd::Quit => {
                 // +OK (et les réponses pipelinées avant) partent avant la fermeture.
                 conn_state.encode(resp_ok());
@@ -537,6 +541,9 @@ fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         | Cmd::Save
         | Cmd::Info
         | Cmd::Auth { .. }
+        | Cmd::Hello(_)
+        | Cmd::Client(_)
+        | Cmd::Command(_)
         | Cmd::HMSet { .. }
         | Cmd::Unknown => unreachable!(),
     }

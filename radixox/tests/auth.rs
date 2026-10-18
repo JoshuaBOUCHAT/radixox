@@ -219,3 +219,30 @@ fn quit_is_allowed_before_auth() {
     let (mut s, mut r) = raw();
     assert_eq!(send(&mut s, &mut r, &["QUIT"]), "+OK");
 }
+
+const HELLO_NOAUTH: &str = "-NOAUTH HELLO must be called with the client already authenticated, otherwise the HELLO <proto> AUTH <user> <pass> option can be used to authenticate the client and select the RESP protocol version at the same time";
+
+/// HELLO avant AUTH : seul HELLO … AUTH bon_mot_de_passe authentifie ; une
+/// version refusée n'authentifie pas, même avec le bon mot de passe.
+#[test]
+fn hello_and_auth() {
+    let (mut s, mut r) = raw();
+    assert_eq!(send(&mut s, &mut r, &["HELLO"]), HELLO_NOAUTH);
+    assert_eq!(send(&mut s, &mut r, &["HELLO", "2"]), HELLO_NOAUTH);
+    assert_eq!(send(&mut s, &mut r, &["HELLO", "3", "AUTH", "default", PASS]), "-NOPROTO unsupported protocol version");
+    assert_eq!(send(&mut s, &mut r, &["HELLO", "2", "AUTH", "default", "nope"]), WRONGPASS);
+    assert_eq!(send(&mut s, &mut r, &["HELLO", "2", "AUTH", "alice", PASS]), WRONGPASS);
+    assert_eq!(send(&mut s, &mut r, &["HELLO", "2", "SETNAME", "x"]), HELLO_NOAUTH);
+    assert_eq!(send(&mut s, &mut r, &["PING"]), NOAUTH);
+    assert_eq!(send(&mut s, &mut r, &["CLIENT", "GETNAME"]), NOAUTH);
+    // tête de tableau, puis 14 éléments : 11 bulk (2 lignes), 2 entiers, `*0`
+    assert_eq!(send(&mut s, &mut r, &["HELLO", "2", "AUTH", "default", PASS, "SETNAME", "svc"]), "*14");
+    for _ in 0..11 * 2 + 2 {
+        line(&mut r);
+    }
+    assert_eq!(line(&mut r), "*0", "modules");
+    assert_eq!(send(&mut s, &mut r, &["PING"]), "+PONG");
+    assert_eq!(send(&mut s, &mut r, &["CLIENT", "GETNAME"]), "$3");
+    assert_eq!(line(&mut r), "svc");
+}
+
