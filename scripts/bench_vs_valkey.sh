@@ -3,14 +3,20 @@
 # pipeline et pipeline 32) puis YCSB workload A. Sert à la section
 # Benchmarks du README.
 #
-#   scripts/bench_vs_valkey.sh                 # ~6 min
+#   scripts/bench_vs_valkey.sh                 # ~3 min
 #   ROUNDS=1 TEST_TIME=5 scripts/bench_vs_valkey.sh   # essai rapide
+#   VK_IO_THREADS=4 VK_CPUS=0,1,6,7 SKIP_YCSB=1 SKIP_BGSAVE=1 scripts/bench_vs_valkey.sh
+#                                              # Valkey multi-thread sur 2 cœurs physiques
 #
-# - Les deux serveurs tournent en même temps, épinglés sur le CPU 0 (le
-#   jumeau SMT, CPU 6, reste libre) ; un seul est sollicité à la fois et
+# - Les deux serveurs tournent en même temps, thread principal épinglé sur
+#   le CPU 0 (le jumeau SMT, CPU 6, reste libre ; fils BGSAVE de Valkey sur
+#   le CPU 1) ; un seul est sollicité à la fois et
 #   l'ordre alterne à chaque round, pour répartir les dérives de la machine.
 # - memtier sur les cœurs physiques 2–5, --distinct-client-seed --randomize.
 # - CPU serveur (user + noyau) lu dans /proc pendant chaque run.
+# - Phase BGSAVE : un run memtier sans pipeline par serveur, BGSAVE lancé à
+#   t = 3 s ; durée du BGSAVE et latences du run (dump sur $OUT, tmpfs en
+#   général : coût du disque exclu).
 # - Résultats : médiane des rounds (et min–max) dans $OUT/summary.txt.
 set -euo pipefail
 
@@ -23,6 +29,17 @@ KEYS="${KEYS:-1000000}"
 YCSB_RECORDS="${YCSB_RECORDS:-1000000}"
 YCSB_OPS="${YCSB_OPS:-2000000}"
 SERVER_CPU=0
+VK_IO_THREADS="${VK_IO_THREADS:-1}"
+# Valkey mono-thread : thread principal seul sur le CPU 0 ; le fils du BGSAVE
+# et les threads d'arrière-plan (bio) sur le CPU 1, comme en production où le
+# fork ne prend pas le cœur du serveur. RadixOx fait son BGSAVE dans son
+# unique thread.
+if [ -z "${VK_CPUS:-}" ]; then
+  VK_CPUS="$SERVER_CPU,1"
+  VK_EXTRA=(--server-cpulist "$SERVER_CPU" --bio-cpulist 1 --bgsave-cpulist 1 --aof-rewrite-cpulist 1)
+else
+  VK_EXTRA=()
+fi
 CLIENT_CPUS=2-5
 RX_PORT=6501
 VK_PORT=6502
@@ -44,8 +61,8 @@ start_rx() {
 }
 start_vk() {
   systemd-run --user --scope -q -p MemoryMax=4G -p MemorySwapMax=0 \
-    taskset -c $SERVER_CPU valkey-server --port $VK_PORT --bind 127.0.0.1 --save "" \
-    --appendonly no --io-threads 1 --dir "$OUT" >"$OUT/vk.log" 2>&1 &
+    taskset -c "$VK_CPUS" valkey-server --port $VK_PORT --bind 127.0.0.1 --save "" \
+    --appendonly no --io-threads "$VK_IO_THREADS" --dir "$OUT" "${VK_EXTRA[@]}" >"$OUT/vk.log" 2>&1 &
   pids+=($!)
 }
 wait_port() {
@@ -95,9 +112,30 @@ for round in $(seq "$ROUNDS"); do
     done
   done
 done
+# ── Latence pendant un BGSAVE ────────────────────────────────────────────────
+now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
+if [ "${SKIP_BGSAVE:-0}" = 0 ]; then
+  for srv in rx vk; do
+    port=$([ $srv = rx ] && echo $RX_PORT || echo $VK_PORT)
+    log="$OUT/$srv.log"
+    done_re=$([ $srv = rx ] && echo 'écrits en' || echo 'Background saving terminated')
+    memtier "$port" 1 "$OUT/bgsave_$srv.json" --ratio 1:4 --key-pattern R:R --test-time "$TEST_TIME" &
+    mt=$!
+    sleep 3
+    t0=$(now_ms)
+    redis-cli -p "$port" BGSAVE >"$OUT/bgsave_reply_$srv.txt"
+    until grep -q "$done_re" "$log"; do sleep 0.005; done
+    echo $(( $(now_ms) - t0 )) >"$OUT/bgsave_ms_$srv.txt"
+    [ $srv = vk ] && redis-cli -p "$port" INFO stats | tr -d '\r' | awk -F: '/latest_fork_usec/ {print $2}' >"$OUT/bgsave_fork_us_vk.txt"
+    wait $mt
+    echo "  BGSAVE $srv fait ($(cat "$OUT/bgsave_ms_$srv.txt") ms)"
+  done
+fi
 for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
 pids=()
 sleep 0.5
+
+[ "${SKIP_YCSB:-0}" = 0 ] || { python3 "$ROOT/scripts/bench_vs_valkey_summary.py" "$OUT" "$ROUNDS" "$TEST_TIME" | tee "$OUT/summary.txt"; exit 0; }
 
 # ── YCSB workload A ──────────────────────────────────────────────────────────
 ycsb() {  # phase port out

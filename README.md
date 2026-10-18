@@ -1,51 +1,76 @@
 # RadixOx
 
-**An in-memory key-value store that speaks the Redis protocol (RESP2, a subset of the commands), built on an Adaptive Radix Tree, in Rust, on io_uring.**
+**An ordered in-memory key-value store that speaks the Redis protocol (RESP2, a subset of the commands). Rust, Adaptive Radix Tree, io_uring.**
 
-RadixOx speaks RESP2, so `redis-cli` and existing Redis client libraries work with it for the
-[supported commands](#supported-commands). Its
-storage engine, **OxidArt**, keeps keys in an ordered radix tree instead of a hash table. On a
-single core it beats Valkey on throughput, tail latency and, with structured keys, memory, and
-it makes ordered and prefix operations native: sorted pagination (`KRANGE`), prefix scans that
-only touch matching keys, and binary-safe keys.
+Keys live in a radix tree instead of a hash table, so they are always sorted. That makes
+things Redis cannot do natively cheap: sorted pagination under a prefix (`KRANGE`), `SCAN`
+and `KEYS` that only walk the matching subtree, a `SCAN` without duplicates. `redis-cli` and
+existing Redis client libraries work for the [supported commands](#supported-commands), and
+the engine, **OxidArt**, is also usable as an embedded Rust library.
 
-OxidArt is also usable directly as an embedded Rust library.
+It is single-threaded by design. On one core it has about half of Valkey's tail latency and
+13–20 % more throughput; a multi-threaded Valkey has more total throughput (see
+[Benchmarks](#benchmarks)).
 
 ---
 
+## Status
+
+RadixOx is **not a drop-in Redis replacement for production data yet**.
+
+Good fit today:
+- a cache or a pagination / prefix index whose data can be rebuilt;
+- OxidArt embedded in a Rust program (ordered map with TTL, prefix and range queries).
+
+Missing for primary data:
+- **no memory limit or eviction** (`maxmemory`, LRU/LFU): a growing dataset ends in OOM;
+- **durability is manual**: `SAVE` / `BGSAVE` and a save on SIGTERM, no AOF, no periodic
+  saves; a crash loses everything since the last save;
+- no replication, no cluster, no TLS, no ACLs (one password);
+- no lists, `MULTI`/`EXEC` or Lua, which queue and job libraries (Sidekiq, Celery, BullMQ)
+  rely on;
+- Linux only, and io_uring must be allowed (see [Deployment](#deployment)).
+
+The I/O layer will be rewritten (custom io_uring loop, see [Roadmap](#roadmap)).
+
+---
+
+## What Redis doesn't have
+
+- **`KRANGE` / `KREVRANGE`**: the next N keys under a prefix, in sorted order, after a cursor
+  key. Pagination for message threads, logs or feeds, without maintaining a sorted set. A
+  page of 64 entries costs about a third of 64 separate lookups (in-process: 5.2 µs vs
+  15.4 µs).
+- **Prefix queries that prune**: `SCAN MATCH user:*` and `KEYS user:*` walk only the `user:`
+  subtree; other `KEYS` globs are compiled to a DFA that skips whole subtrees.
+- **A stricter `SCAN`**: no duplicates, `COUNT` is exact, and every key present for the whole
+  scan is returned exactly once, even while the data changes.
+- **Binary-safe ordered keys**: any byte 0x00–0xFF at any position, ordered like `memcmp`.
+- **Snapshots without `fork`**: an application-level copy-on-write barrier gives a consistent
+  point-in-time dump while the server keeps serving, without a second process or memory
+  doubling.
+
 ## Highlights
 
-One core each, 1M keys, measured on 2026-10-18 (memory on 2026-10-17); see
-[Benchmarks](#benchmarks) for the setup and caveats:
+Measured on 2026-10-18 (memory on 2026-10-17), 1M keys, loopback; see
+[Benchmarks](#benchmarks) for the setup and caveats.
 
-| | RadixOx | Valkey 9.1.2 | |
+| | RadixOx (1 core) | Valkey 9.1.2 | |
 |---|---|---|---|
-| p99, no pipeline (80 conns) | **0.38 ms** | 0.74 ms | −48 % |
-| p99.9, no pipeline | **0.44 ms** | 0.76 ms | −42 % |
-| Throughput, no pipeline | **239 k ops/s** | 209 k ops/s | +14 % |
-| Throughput, pipeline 32 | **2.44 M ops/s** | 2.00 M ops/s | +22 % |
-| Operations per second of server CPU, no pipeline | **389 k** | 325 k | +20 % |
-| YCSB A, READ p99 (1M records) | **544 µs** | 1,040 µs | −48 % |
-| Memory, 1M keys × 100 B values (structured keys) | **131 MB** | 163 MB | −20 % |
+| Full `SCAN MATCH user:12*` (11K matches in 1M keys), server CPU | **< 10 ms**, 12 calls | 110 ms, 999 calls | ×10+ |
+| p99, no pipeline (80 connections) | **0.39 ms** | 0.74 ms (1 core) | −47 % |
+| p99.9, no pipeline | **0.46 ms** | 0.77 ms (1 core) | −40 % |
+| Throughput, no pipeline | 236 k ops/s | 208 k (1 core) · **454 k** (`io-threads 4`, 2 cores) | |
+| p99 of that multi-threaded Valkey | **0.42 ms** | 2.26 ms | |
+| Throughput, pipeline 32 | **2.39 M ops/s** | 1.98 M (1 core) · 2.37 M (`io-threads 4`) | |
+| Operations per second of server CPU, no pipeline | **381 k** | 323 k (1 core) · 142 k (`io-threads 4`) | |
+| YCSB A, READ p99 (1M records) | **544 µs** | 1,040 µs (1 core) | −48 % |
+| `BGSAVE` of 1M keys (to tmpfs) | **100 ms**, no extra core | 1,735 ms, on a second core | ×17 |
+| Restart with 1M keys | **~0.17 s** | ~0.53 s | ×3 |
+| Memory, 1M structured keys (`key:N`) × 100 B | **131 MB** | 163 MB | −20 % |
 | Memory, 1M random UUID keys × 100 B | 209 MB | 205 MB | ≈ |
 | Memory, 1M one-field hashes (YCSB-like) | **233 MB** | 344 MB | −32 % |
 | Memory, 1M two-field hashes (short values) | 161 MB | **129 MB** | Valkey −20 % |
-| `SAVE` of 1M keys | **84 ms** (raw) / 70 ms (zstd) | 1,810 ms | ×22–26 |
-| Restart with 1M keys | **~0.17 s** | ~0.53 s | ×3 |
-| `KEYS user:*` (1,000 matches in 1M keys, 2026-10-12) | **0.15 ms** | 21.4 ms | ×140 |
-| Full `SCAN MATCH user:12*` (11K matches in 1M keys, server CPU, 2026-10-18) | **< 10 ms**, 12 calls | 110 ms, 999 calls | ×10+ |
-
-Plus what Redis doesn't have:
-
-- **`KRANGE` / `KREVRANGE`**: the next N keys under a prefix, in sorted order, after a cursor
-  key. Pagination for message threads, logs or feeds, without maintaining a sorted set.
-- **Prefix and glob queries that prune**: `KEYS user:*` and `SCAN MATCH user:*` walk only the
-  `user:` subtree, and complex `KEYS` globs are compiled to a DFA that skips whole subtrees.
-- **A stricter `SCAN`**: no duplicates, `COUNT` is exact, and every key present for the whole
-  scan is returned exactly once, even while the data changes.
-- **Binary-safe keys**: any byte 0x00–0xFF at any position, ordered like `memcmp`.
-- **Snapshots without `fork`**: an application-level copy-on-write barrier gives a consistent
-  point-in-time dump while the server keeps serving.
 
 ---
 
@@ -73,31 +98,50 @@ Requirements: **Linux** with io_uring (developed on 6.12 LTS and 7.2), **Rust 20
 
 - AMD Ryzen 5 7600X (6 cores / 12 threads), 30 GB RAM, Linux 7.2-zen, power profile
   `performance`, loopback, idle machine. Measured on 2026-10-18.
-- **One core each.** Both servers run at the same time, pinned to CPU 0 (its SMT sibling stays
-  idle); only one is loaded at a time, and the order alternates every round so that drift on
-  the machine hits both. RadixOx runs without SQ_POLL; Valkey 9.1.2 runs with `io-threads 1`,
-  persistence off. Clients run on physical cores 2–5.
+- **One core each** unless stated: both servers run at the same time with their main thread
+  pinned to CPU 0 (its SMT sibling stays idle); only one is loaded at a time, and the order
+  alternates every round so that drift on the machine hits both. Valkey 9.1.2 runs with
+  `io-threads 1`, persistence off, and its background threads and `BGSAVE` child on CPU 1
+  (`bio-cpulist`, `bgsave-cpulist`), as in production where the fork does not take the
+  server's core. RadixOx runs without SQ_POLL. Clients run on physical cores 2–5.
 - memtier: 1,000,000 keys (`key:1` … `key:1000000`), 100-byte values, uniform random access,
   `memtier_benchmark --threads 4 --clients 20 --distinct-client-seed --randomize`,
   **3 rounds of 10 s per configuration, median reported** (min–max for throughput).
 - Server CPU is the user + kernel time of the server process (`/proc/<pid>/stat`) during the
-  run. On loopback, part of the network work is billed to the client side, so a server never
-  shows a full core.
-- Reproduce with [`scripts/bench_vs_valkey.sh`](scripts/bench_vs_valkey.sh) (about 3 minutes).
+  run. On loopback, part of the network work is billed to the client side, so a single-threaded
+  server never shows a full core.
+- Reproduce with [`scripts/bench_vs_valkey.sh`](scripts/bench_vs_valkey.sh) (about 3 minutes;
+  `VK_IO_THREADS=4 VK_CPUS=0,1,6,7` for the multi-threaded Valkey).
 
 ### Throughput and latency (1:4 SET:GET)
 
 | | Throughput (min–max) | p50 | p99 | p99.9 | p99.99 | Server CPU | Ops / CPU-second |
 |---|---|---|---|---|---|---|---|
-| **No pipeline**, RadixOx | **238,673** (236,636–263,541) | **0.343 ms** | **0.383 ms** | **0.439 ms** | **0.671 ms** | 0.62 core | **388,719** |
-| No pipeline, Valkey | 209,106 (208,654–209,180) | 0.375 ms | 0.743 ms | 0.759 ms | 0.807 ms | 0.64 core | 324,814 |
-| **Pipeline 32**, RadixOx | **2,436,822** (2,431,731–2,439,907) | **0.911 ms** | **1.527 ms** | **1.639 ms** | 2.367 ms | 0.86 core | **2,826,940** |
-| Pipeline 32, Valkey | 2,002,807 (1,999,635–2,020,254) | 1.063 ms | 1.943 ms | 2.079 ms | **2.191 ms** | 0.88 core | 2,268,185 |
+| **No pipeline**, RadixOx | **236,046** (235,886–236,234) | **0.343 ms** | **0.391 ms** | **0.463 ms** | **0.679 ms** | 0.62 core | **381,022** |
+| No pipeline, Valkey | 208,318 (207,672–210,111) | 0.375 ms | 0.743 ms | 0.767 ms | 0.871 ms | 0.65 core | 322,973 |
+| **Pipeline 32**, RadixOx | **2,385,531** (2,355,385–2,402,540) | **0.927 ms** | **1.575 ms** | **1.647 ms** | **1.799 ms** | 0.86 core | **2,757,840** |
+| Pipeline 32, Valkey | 1,981,735 (1,969,750–1,985,917) | 1.071 ms | 1.975 ms | 2.111 ms | 2.223 ms | 0.89 core | 2,239,249 |
 
 Without pipelining, both servers are bounded by the TCP stack and the clients' round trips.
-The tail is where RadixOx stands out: p99 and p99.9 are about half of Valkey's. RadixOx also
-does about 20–25 % more work per second of CPU. With pipeline 32, Valkey's p99.99 is slightly
-lower.
+The tail is where RadixOx stands out: p99 and p99.9 are about half of Valkey's, and it does
+about 20 % more work per second of CPU.
+
+### Against a multi-threaded Valkey
+
+Valkey with `io-threads 4` on two physical cores (CPUs 0, 1 and their SMT siblings 6, 7),
+RadixOx still on one core, same protocol (separate session, same day):
+
+| | Throughput | p50 | p99 | p99.9 | Server CPU | Ops / CPU-second |
+|---|---|---|---|---|---|---|
+| No pipeline, RadixOx | 227,242 | 0.351 ms | **0.415 ms** | **0.471 ms** | 0.61 core | **370,102** |
+| No pipeline, Valkey `io-threads 4` | **454,109** | **0.119 ms** | 2.255 ms | 2.911 ms | 3.25 cores | 141,632 |
+| Pipeline 32, RadixOx | 2,266,504 | **0.983 ms** | 1.983 ms | 2.319 ms | 0.86 core | **2,632,408** |
+| Pipeline 32, Valkey `io-threads 4` | **2,371,822** | 1.079 ms | **1.191 ms** | **1.455 ms** | 3.97 cores | 595,876 |
+
+With more cores, Valkey doubles RadixOx's throughput without pipelining and matches it with
+pipelining, at the cost of 4–5× more CPU and, without pipelining, a p99 five times higher.
+RadixOx's answer for more throughput is sharding by namespace, which does not exist yet. The
+clients share the machine, so the multi-threaded figures are a lower bound for Valkey.
 
 ### YCSB workload A
 
@@ -110,8 +154,7 @@ lower.
 | Valkey | 86 k ops/s | 187 k ops/s | 532 µs | 520 µs | 1,040 µs | 1,117 µs | **3,799 µs** | 1,040 µs | 430 MB |
 
 The p99.99 of a single run of 2M operations rests on about 100 samples per operation type:
-treat it as noise-level. On the previous run (5M records, 10M operations, 2026-10-17, busier
-machine), RadixOx was ahead on p99.99 too (1,112 µs against 1,826 µs).
+too few to rank the two servers on it.
 
 ### Memory
 
@@ -132,44 +175,28 @@ What drives these numbers:
   of its own. On structured keys (`key:1` … `key:1000000`, ten keys per node) the whole tree
   costs **16 B per key**; on random keys each node holds only two or three keys and the tree
   costs 60–100 B per key, which is about what Valkey's hash table and key strings cost: hence
-  the tie on UUIDs.
+  the tie on UUIDs. The −20 % above is the best case.
 - **Values**: a string is a separate allocation (100 B → 112 B in mimalloc); with large
   values both servers converge.
 - **Small hashes and sets** (up to 8 entries) are one compact block of field/value pointers
   instead of a tree. One-field hashes are much smaller than in Valkey; hashes with several
-  short fields are still larger, because each field and value stays a separately allocated
+  short fields are larger, because each field and value stays a separately allocated
   `SharedByte` (a deliberate trade-off: no copies on `HGET`/`HSET`).
 - **Connections**: each connection keeps three 64 KiB buffers while it is active (they grow
   for large commands). With many concurrent clients this adds a few MB.
-- Before 2026-10-17, `DBSIZE` built the whole key list to count it, which permanently
-  inflated RSS (+16 to +46 MB on 1M keys); it is now an O(1) counter. The figure published
-  earlier (253 MB, then 151 MB on 2026-10-17 with 80 connections) included this effect.
 
-What to expect on other key shapes, tree only (in-process, 1M keys, integer values):
+Tree cost per key on other key shapes (in-process, 1M keys, integer values):
 
-| Keys | Before | Now |
-|---|---|---|
-| sequential ids (`key:N`, `memtier-N`) | 72 B | **16 B** |
-| `user:{id}:{email,uuid,name,age}` | 83 B | **37 B** |
-| random UUIDs, binary (16 B) | 102 B | **64 B** |
-| YCSB (`user<hash>`) | 112 B | **77 B** |
-| random UUIDs as text, session tokens | 135 B | **100 B** |
-| `user:{n}` + `user:{n}:email` (two keys per id) | 64 B | 68 B |
-
-Dense or structured keys gain the most; random keys fan out only two or three ways at the
-deepest levels, so each node holds fewer keys.
+| Keys | Tree bytes per key |
+|---|---|
+| sequential ids (`key:N`, `memtier-N`) | **16 B** |
+| `user:{id}:{email,uuid,name,age}` | 37 B |
+| random UUIDs, binary (16 B) | 64 B |
+| YCSB (`user<hash>`) | 77 B |
+| random UUIDs as text, session tokens | 100 B |
+| `user:{n}` + `user:{n}:email` (two keys per id) | 68 B |
 
 ### Prefix queries
-
-`KEYS user:*` with 1,000 matching keys among 1,001,000, average of 50 calls, measured
-server-side (round trip subtracted):
-
-| RadixOx | Valkey |
-|---|---|
-| **0.15 ms** | 21.4 ms |
-
-Valkey has to scan the whole keyspace; RadixOx walks only the `user:` subtree. The gap grows
-with the size of the database.
 
 Full `SCAN` loops (cursor until 0) over 1M keys (500K `user:N`, 300K `session:<hex>`, 200K
 hashes), server CPU time read from `/proc` (2026-10-18, single run):
@@ -183,23 +210,32 @@ hashes), server CPU time read from `/proc` (2026-10-18, single run):
 | one `SCAN 0 MATCH *:99* COUNT 1000` call, latency (avg / p99) | **45 µs** / 71 µs | 78 µs / 135 µs |
 | `COUNT 10` | 750 ms (100K calls) | **620 ms** (84K calls) |
 
-With a small `COUNT`, Valkey wins: each RadixOx page descends again from the root to the
-resume key. Use a large `COUNT`.
+Valkey scans the whole keyspace and filters; RadixOx walks only the subtree of the pattern's
+literal prefix. The gap grows with the size of the database. With an explicit small `COUNT`,
+Valkey wins: each RadixOx page descends again from the root to the resume key (without
+`COUNT`, RadixOx uses pages of 1,000).
+
+`KEYS user:*` (1,000 matches among 1,001,000 keys, server-side, 2026-10-12): RadixOx
+0.15 ms, Valkey 21.4 ms. `KEYS` is rarely acceptable in production on Redis; the `SCAN`
+figures above are the fair comparison.
 
 ### Persistence (1M keys, 100-byte values)
 
-Dump written to tmpfs, same session (2026-10-17):
+`BGSAVE` triggered 3 s into a 10-second memtier run without pipeline, dump on tmpfs (disk
+cost excluded), same session as the main table (2026-10-18):
 
-| | `SAVE` | Dump size | Restart until all keys are back |
-|---|---|---|---|
-| RadixOx, raw dump | **84 ms** | 105 MB | **~0.17 s** |
-| RadixOx, zstd level 3 | **70 ms** | (see note) | **~0.16 s** |
-| Valkey (RDB, LZF) | 1,810 ms | 25 MB | ~0.53 s |
+| | `BGSAVE` duration | Throughput | p99 | p99.9 | p99.99 | max |
+|---|---|---|---|---|---|---|
+| RadixOx (slices in the server thread, zstd) | **100 ms** | 235,053 ops/s | **0.399 ms** | 0.943 ms | 1.567 ms | **2.19 ms** |
+| Valkey (`fork`, child on another core) | 1,735 ms (fork 1.9 ms) | 206,149 ops/s | 0.743 ms | **0.799 ms** | **0.991 ms** | 3.33 ms |
 
-memtier fills every value with the same bytes, so compression (zstd for the whole stream,
-LZF per value in Valkey) is unrealistically effective on this data; only RadixOx's raw size
-is meaningful here. `BGSAVE` runs the same snapshot in slices while the server keeps serving,
-without `fork`.
+RadixOx's snapshot is 17× shorter and needs no second core or memory headroom, but it runs in
+the server thread: its p99.9 doubles during those 100 ms (0.46 → 0.94 ms), while Valkey's
+tail barely moves because its child works on another core. The fork itself costs 1.9 ms here
+and grows with the heap (tens to hundreds of ms on tens of GB).
+
+Restart with 1M keys (dump on tmpfs, 2026-10-17): RadixOx ~0.17 s (105 MB raw dump), Valkey
+~0.53 s.
 
 ### Engine microbenchmarks (in-process, no network)
 
@@ -208,18 +244,18 @@ without `fork`.
 | Operation | Cost |
 |---|---|
 | `GET` of a random cold key | ~410 ns |
-| `MGET` of 64 random keys | **~105 ns per key** (was ~375 before interleaved lookups) |
+| `MGET` of 64 random keys | **~105 ns per key** |
 | `KRANGE` page of 64 entries | **5.2 µs** (~82 ns per entry; 64 separate GETs: 15.4 µs) |
 | `KRANGE` page of 1 entry | ~620 ns |
 
 ### Caveats
 
 - Loopback only: the client's TCP receive path and netfilter are billed to the same machine.
-  Real two-machine numbers are planned.
-- Short runs: memtier results are the median of 3 rounds of 10 s, YCSB is a single run.
-  Treat the numbers as orders of magnitude, not as precise ratios.
-- Valkey can use more cores (`io-threads`); RadixOx is single-threaded by design. The
-  comparison is per core.
+  Two-machine numbers are planned.
+- Short runs: memtier results are the median of 3 rounds of 10 s; YCSB and the `BGSAVE` run
+  are single runs. Treat the numbers as orders of magnitude, not as precise ratios.
+- These numbers move as the project changes (the tree was redesigned on 2026-10-17); the
+  script above regenerates them.
 
 ---
 
@@ -369,6 +405,47 @@ Environment variables:
 
 ---
 
+## Correctness
+
+A data store has to be right before it is fast. What is tested today:
+
+- **Differential fuzzing of the tree**: random operations (SET, DEL, TTL, prefix deletes,
+  hashes, sets) applied to the current tree and to the previous engine (`oxidart-legacy`,
+  kept as an oracle), with identical answers required and the whole structure checked after
+  every operation (canonical shape, counters, back-pointers).
+- **Snapshots under mutation**: a save is started, the tree is mutated between its slices,
+  and the dump must equal the state at the start of the save; dumps are reloaded across both
+  engines. A truncated or corrupted dump refuses to load (CRC footer).
+- **Model tests** against `BTreeMap` for ordered queries (`KRANGE`, `SCAN` pages with writes
+  between pages), and glob matching checked against a port of Redis's `stringmatchlen`.
+- **Unsafe code** (the slab, node layout, reference-counted buffers: a few hundred `unsafe`
+  blocks): the test suites have been run under AddressSanitizer, with the allocator switched
+  to malloc so that every block is visible. The procedure, including negative controls for
+  the copy-on-write tests, is in [`SAVE_DESIGN.md`](SAVE_DESIGN.md); it is not automated yet.
+- **Server integration tests** over TCP with the Rust `redis` client and raw RESP: every
+  command family, `AUTH` (refused commands have no effect, pipelines, near-miss passwords),
+  `HELLO`/`CLIENT`, `SCAN` cursors, `BGSAVE` and restart.
+
+About 300 engine and library tests plus about 130 server tests
+(`cargo test -p oxidart --features regex`, `-p valart`, `-p radixox-lib`, `-p radixox`).
+Not done yet: fuzzing of the RESP parser, Redis's own test suite, crash (kill -9) tests.
+
+---
+
+## Deployment
+
+- **Linux only**, with io_uring (tested on 6.12 LTS and 7.2; older kernels are untested).
+  There is no epoll fallback: if io_uring is unavailable, the server fails at startup.
+- **Containers**: the default seccomp profiles of recent Docker and containerd versions
+  block the io_uring system calls. Allow `io_uring_setup`, `io_uring_enter` and
+  `io_uring_register` in a custom profile (or run with `--security-opt seccomp=unconfined`
+  if that is acceptable). Some managed Kubernetes offerings disable io_uring entirely.
+- **Kernel setting** (Linux 6.6+): `/proc/sys/kernel/io_uring_disabled` must be `0` (or `1`
+  with the process in the allowed group).
+- Listens on `127.0.0.1` by default; see [Security](#security) before exposing it.
+
+---
+
 ## Architecture
 
 ```
@@ -413,6 +490,8 @@ across cores is meant to come from sharding by namespace, not from shared-state 
 
 ## Roadmap
 
+- **Production basics first**: periodic automatic saves, `maxmemory` with eviction,
+  `MULTI`/`EXEC`, lists, fuzzing of the RESP parser.
 - **Custom io_uring event loop** replacing monoio: no futures, no wakers, batches across all
   ready connections, network work delegated to the kernel —
   [`RUNTIME_ARCH.md`](RUNTIME_ARCH.md).
@@ -422,7 +501,8 @@ across cores is meant to come from sharding by namespace, not from shared-state 
 - AOF and replication (sharing one stream of effects).
 - Lower memory per key on random keys: long suffixes stored inline on several cells (no
   separate allocation), a smaller node class for nodes with two or three entries.
-- Client compatibility: `MULTI`/`EXEC`, `CONFIG`, RESP3, lists.
+- Client compatibility: `CONFIG`, RESP3.
+- Sharding by namespace for multi-core throughput.
 
 ---
 

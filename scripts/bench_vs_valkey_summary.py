@@ -39,6 +39,23 @@ for pipe in (1, 32):
     print()
 
 
+if (out / "bgsave_rx.json").exists():
+    print(f"## pendant un BGSAVE (run sans pipeline de {test_time:.0f} s, BGSAVE à t = 3 s)")
+    print(f"{'':8} {'ops/s':>10} {'p50':>7} {'p99':>7} {'p99.9':>7} {'p99.99':>7} {'max ms':>8} {'BGSAVE':>9}")
+    for srv in ("rx", "vk"):
+        t = json.loads((out / f"bgsave_{srv}.json").read_text())["ALL STATS"]["Totals"]
+        p = t["Percentile Latencies"]
+        ms = (out / f"bgsave_ms_{srv}.txt").read_text().strip()
+        fork = out / "bgsave_fork_us_vk.txt"
+        extra = f" (fork {int(fork.read_text())/1000:.1f} ms)" if srv == "vk" and fork.exists() else ""
+        print(f"{NAMES[srv]:8} {t['Ops/sec']:>10,.0f} {p['p50.00']:7.3f} {p['p99.00']:7.3f} {p['p99.90']:7.3f}"
+              f" {p['p99.99']:7.3f} {t['Max Latency']:8.3f} {ms:>6} ms{extra}")
+    print()
+
+if not (out / "ycsb_run_rx.txt").exists():
+    sys.exit(0)
+
+
 def ycsb(path):
     txt = path.read_text()
     def stat(section, name):
