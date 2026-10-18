@@ -1,6 +1,7 @@
 pub(crate) mod bgsave;
 pub(crate) mod shutdown;
 pub(crate) mod delayed;
+pub(crate) mod scan;
 mod hash;
 mod sset;
 pub(crate) mod string;

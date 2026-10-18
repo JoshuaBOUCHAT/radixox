@@ -198,6 +198,95 @@ pub fn glob_kind(glob: &[u8]) -> GlobKind<'_> {
     }
 }
 
+/// Literal bytes before the first special character (`*`, `?`, `[`, `\`):
+/// every key matching `glob` starts with them.
+pub fn glob_literal_prefix(glob: &[u8]) -> &[u8] {
+    let end = glob
+        .iter()
+        .position(|b| matches!(b, b'*' | b'?' | b'[' | b'\\'))
+        .unwrap_or(glob.len());
+    &glob[..end]
+}
+
+/// Does `key` match the Redis glob `pat`? Same semantics as
+/// [`glob_to_regex`], without building a DFA (SCAN MATCH tests one key at a
+/// time). Every token except `*` matches exactly one byte, so backtracking
+/// to the last `*` is enough.
+pub fn glob_match(pat: &[u8], key: &[u8]) -> bool {
+    let (mut p, mut i) = (0, 0);
+    // (pattern position after the last `*`, key position it was tried at)
+    let mut star: Option<(usize, usize)> = None;
+    loop {
+        if pat.get(p) == Some(&b'*') {
+            while pat.get(p) == Some(&b'*') {
+                p += 1;
+            }
+            if p == pat.len() {
+                return true;
+            }
+            star = Some((p, i));
+            continue;
+        }
+        if i == key.len() {
+            return p == pat.len();
+        }
+        if p < pat.len()
+            && let Some(next) = glob_token(pat, p, key[i])
+        {
+            p = next;
+            i += 1;
+            continue;
+        }
+        match star {
+            Some((sp, si)) => {
+                star = Some((sp, si + 1));
+                p = sp;
+                i = si + 1;
+            }
+            None => return false,
+        }
+    }
+}
+
+/// Matches the token at `pat[p]` (not `*`) against `c`; returns the position
+/// of the next token.
+fn glob_token(pat: &[u8], p: usize, c: u8) -> Option<usize> {
+    match pat[p] {
+        b'?' => Some(p + 1),
+        b'\\' if p + 1 < pat.len() => (pat[p + 1] == c).then_some(p + 2),
+        b'[' => {
+            let mut i = p + 1;
+            let negate = pat.get(i) == Some(&b'^');
+            if negate {
+                i += 1;
+            }
+            let mut matched = false;
+            while i < pat.len() && pat[i] != b']' {
+                let mut lo = pat[i];
+                if lo == b'\\' && i + 1 < pat.len() {
+                    i += 1;
+                    lo = pat[i];
+                }
+                if i + 2 < pat.len() && pat[i + 1] == b'-' && pat[i + 2] != b']' {
+                    let mut j = i + 2;
+                    if pat[j] == b'\\' && j + 1 < pat.len() {
+                        j += 1;
+                    }
+                    let hi = pat[j];
+                    let (a, b) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+                    matched |= (a..=b).contains(&c);
+                    i = j + 1;
+                    continue;
+                }
+                matched |= lo == c;
+                i += 1;
+            }
+            (matched != negate).then_some((i + 1).min(pat.len()))
+        }
+        lit => (lit == c).then_some(p + 1),
+    }
+}
+
 /// Converts a Redis glob into an anchored **byte-wise** regex for
 /// [`OxidArt::getn_regex`].
 ///
@@ -413,5 +502,35 @@ mod tests {
         let results = tree.getn_regex("user:.*:admin:.*").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.as_ref(), b"user:2:admin:y");
+    }
+
+    /// `glob_match` contre le chemin DFA (`getn_glob`), sur des clés et des
+    /// motifs aléatoires d'un petit alphabet (classes, plages, échappements,
+    /// classes non fermées compris).
+    #[test]
+    fn glob_match_agrees_with_dfa() {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(7);
+        const KEY_ALPHA: &[u8] = b"ab-]^\\*";
+        const PAT_ALPHA: &[u8] = b"ab-]^\\*?[";
+        let mut tree = OxidArt::new();
+        let mut keys = std::collections::BTreeSet::new();
+        for _ in 0..400 {
+            let len = rng.gen_range(1..7);
+            let k: Vec<u8> = (0..len).map(|_| KEY_ALPHA[rng.gen_range(0..KEY_ALPHA.len())]).collect();
+            tree.set(SharedByte::from_slice(&k), Value::String(SharedByte::from_str("v")));
+            keys.insert(k);
+        }
+        for _ in 0..3000 {
+            let len = rng.gen_range(0..7);
+            let pat: Vec<u8> = (0..len).map(|_| PAT_ALPHA[rng.gen_range(0..PAT_ALPHA.len())]).collect();
+            let mut dfa: Vec<Vec<u8>> =
+                tree.getn_glob(&pat).unwrap().into_iter().map(|(k, _)| k.to_vec()).collect();
+            dfa.sort();
+            let direct: Vec<Vec<u8>> = keys.iter().filter(|k| glob_match(&pat, k)).cloned().collect();
+            assert_eq!(direct, dfa, "motif {:?}", String::from_utf8_lossy(&pat));
+            let lit = glob_literal_prefix(&pat);
+            assert!(direct.iter().all(|k| k.starts_with(lit)));
+        }
     }
 }

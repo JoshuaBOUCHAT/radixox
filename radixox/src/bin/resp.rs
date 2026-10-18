@@ -336,10 +336,12 @@ async fn dispatch(
 
         ConnState::Normal(_, _) => match cmd {
             Cmd::Info => {
-                let info = SharedByte::from_slice(
-                    b"# Server\r\nredis_version:7.0.0\r\nradixox_version:0.5.0\r\n",
+                let info = format!(
+                    "# Server\r\nredis_version:7.0.0\r\nradixox_version:{}\r\n\r\n# Stats\r\nscan_cursors:{}\r\n",
+                    env!("CARGO_PKG_VERSION"),
+                    resp_cmd::scan::active_cursors()
                 );
-                conn_state.encode(Frame::BulkString(info));
+                conn_state.encode(Frame::BulkString(SharedByte::from_slice(info.as_bytes())));
             }
             Cmd::Ping(msg) => conn_state.encode(resp_pong(msg)),
             Cmd::Quit => {
@@ -422,6 +424,13 @@ async fn dispatch(
                 let range = art.krange(prefix, from, count, rev);
                 conn_state.encode_with(|buf| encode_krange(buf, &range));
             }
+            Cmd::Scan { cursor, pattern, count, ty } => {
+                let art = art.borrow();
+                match resp_cmd::scan::cmd_scan(&art, cursor, pattern, count, ty) {
+                    Ok((next, page)) => conn_state.encode_with(|buf| encode_scan(buf, next, &page)),
+                    Err(e) => conn_state.encode(e),
+                }
+            }
             Cmd::Unknown => {
                 conn_state.encode(Frame::Error("ERR unknown command".into()));
             }
@@ -501,6 +510,7 @@ fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         | Cmd::Publish { .. }
         | Cmd::Keys(_)
         | Cmd::KRange { .. }
+        | Cmd::Scan { .. }
         | Cmd::MGet(_)
         | Cmd::Unlink(_)
         | Cmd::BgSave
@@ -523,6 +533,17 @@ fn encode_krange(buf: &mut Vec<u8>, range: &oxidart::krange::RangeOut<'_>) {
             RangeVal::Bytes(b) => encode_bulk(buf, b.as_slice()),
             RangeVal::Int(n) => encode_int_bulk(buf, n),
         }
+    }
+}
+
+/// Réponse SCAN : [curseur, [clés…]], le curseur en bulk string décimale.
+fn encode_scan(buf: &mut Vec<u8>, cursor: u64, page: &oxidart::krange::ScanPage) {
+    use radixox_lib::shared_frame::{encode_array_len, encode_bulk};
+    encode_array_len(buf, 2);
+    encode_int_bulk(buf, cursor as i64);
+    encode_array_len(buf, page.len());
+    for key in page.iter() {
+        encode_bulk(buf, key);
     }
 }
 

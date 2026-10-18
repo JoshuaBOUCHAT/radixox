@@ -119,6 +119,10 @@ pub enum Cmd<'a> {
     /// `from` ("" = depuis le début / la fin). Réponse [k1, v1, k2, v2, …].
     KRange { prefix: &'a [u8], from: &'a [u8], count: usize, rev: bool },
 
+    /// SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]. Le curseur reste
+    /// brut : le serveur répond lui-même `ERR invalid cursor`.
+    Scan { cursor: &'a [u8], pattern: Option<&'a [u8]>, count: Option<usize>, ty: Option<&'a [u8]> },
+
     // --- TTL ---------------------------------------------------------
     /// TTL key  (retourne secondes)
     Ttl(&'a [u8]),
@@ -345,6 +349,26 @@ fn sb(s: &[u8]) -> SharedByte {
     SharedByte::from_slice(s)
 }
 
+/// SCAN : options par paires (la dernière l'emporte, comme Redis) ; COUNT ≥ 1.
+fn parse_scan<'a>(args: &[&'a [u8]]) -> Option<Cmd<'a>> {
+    let (mut pattern, mut count, mut ty) = (None, None, None);
+    let mut i = 1;
+    while i < args.len() {
+        let (opt, val) = (args[i], *args.get(i + 1)?);
+        if opt.eq_ignore_ascii_case(b"match") {
+            pattern = Some(val);
+        } else if opt.eq_ignore_ascii_case(b"count") {
+            count = Some(arg_u64(val).filter(|&n| n > 0)? as usize);
+        } else if opt.eq_ignore_ascii_case(b"type") {
+            ty = Some(val);
+        } else {
+            return None;
+        }
+        i += 2;
+    }
+    Some(Cmd::Scan { cursor: args[0], pattern, count, ty })
+}
+
 fn parse_set_opts(args: &[&[u8]]) -> Option<SetOpts> {
     let mut opts = SetOpts::default();
     let mut i = 0;
@@ -543,7 +567,7 @@ fn dispatch<'a>(raw: &[&'a [u8]]) -> Option<Cmd<'a>> {
         // ── Q : QUIT ──────────────────────────────────────────────────────
         b'q' => if cmd.len() == 4 { Some(Cmd::Quit) } else { None },
 
-        // ── S : SET SETNX SETEX SELECT SAVE SADD SREM SPOP SCARD SMEMBERS SISMEMBER SUBSCRIBE ──
+        // ── S : SET SETNX SETEX SELECT SAVE SADD SREM SPOP SCAN SCARD SMEMBERS SISMEMBER SUBSCRIBE ──
         b's' => match cmd.len() {
             3 => { // SET
                 need!(2);
@@ -555,6 +579,7 @@ fn dispatch<'a>(raw: &[&'a [u8]]) -> Option<Cmd<'a>> {
                 b'a' => { need!(2); let key = args[0]; Some(Cmd::SAdd { key, members: multi_owned_from!(1, |v| v) }) }
                 b'r' => { need!(2); let key = args[0]; Some(Cmd::SRem { key, members: multi_owned_from!(1, |v| v) }) }
                 b'p' => { need!(1); Some(Cmd::SPop { key: args[0], count: args.get(1).and_then(|s| arg_u64(s)) }) }
+                b'c' if cmd.eq_ignore_ascii_case(b"scan") => { need!(1); parse_scan(args) }
                 _ => None,
             },
             5 => match cmd[1] | 0x20 {

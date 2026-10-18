@@ -18,7 +18,7 @@
 use radixox_lib::shared_byte::SharedByte;
 
 use crate::node::EntryRef;
-use crate::value::{Tag, ValUnion};
+use crate::value::{RedisType, Tag, ValUnion};
 use crate::{OxidArt, PrefixHit, expired};
 
 /// Valeur d'une entrée de range, empruntée à l'arbre.
@@ -177,27 +177,53 @@ thread_local! {
     static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::default();
 }
 
-struct Walker<'a, 'f> {
-    art: &'a OxidArt,
-    from: &'f [u8],
-    rev: bool,
-    count: usize,
-    key: Vec<u8>,
-    stack: Vec<Frame>,
-    out: RangeOut<'a>,
+/// Ce que le parcours fait des clés rencontrées (KRANGE : strings avec
+/// valeur ; SCAN : clés de tout type, filtrées, avec budget).
+trait Sink<'a> {
+    /// Une clé avec valeur, du bon côté de `from` (vivante ou non).
+    fn emit(&mut self, key: &[u8], tag: Tag, val: &'a ValUnion, exp: Option<u64>, now: u64);
+    /// Le parcours s'arrête dès que c'est vrai (testé après chaque entrée).
+    fn full(&self) -> bool;
 }
 
-impl<'a> Walker<'a, '_> {
-    /// Ajoute la clé `self.key` si sa valeur est une string vivante.
-    fn emit(&mut self, tag: Tag, val: &'a ValUnion, exp: Option<u64>) {
-        let Some(v) = str_val(tag, val, exp, self.art.now) else {
+struct RangeSink<'a> {
+    out: RangeOut<'a>,
+    count: usize,
+}
+
+impl<'a> Sink<'a> for RangeSink<'a> {
+    /// Ajoute la clé si sa valeur est une string vivante.
+    #[inline]
+    fn emit(&mut self, key: &[u8], tag: Tag, val: &'a ValUnion, exp: Option<u64>, now: u64) {
+        let Some(v) = str_val(tag, val, exp, now) else {
             return;
         };
         if let RangeVal::Bytes(b) = v {
             b.prefetch();
         }
-        self.out.keys.extend_from_slice(&self.key);
+        self.out.keys.extend_from_slice(key);
         self.out.entries.push((self.out.keys.len() as u32, v));
+    }
+
+    #[inline]
+    fn full(&self) -> bool {
+        self.out.len() >= self.count
+    }
+}
+
+struct Walker<'a, 'f, S> {
+    art: &'a OxidArt,
+    from: &'f [u8],
+    rev: bool,
+    key: Vec<u8>,
+    stack: Vec<Frame>,
+    sink: S,
+}
+
+impl<'a, S: Sink<'a>> Walker<'a, '_, S> {
+    #[inline]
+    fn emit(&mut self, tag: Tag, val: &'a ValUnion, exp: Option<u64>) {
+        self.sink.emit(&self.key, tag, val, exp, self.art.now);
     }
 
     /// La clé `self.key` est-elle du bon côté (strict) de `from` ?
@@ -266,7 +292,7 @@ impl<'a> Walker<'a, '_> {
 
     fn run(&mut self) {
         let art = self.art;
-        while self.out.len() < self.count {
+        while !self.sink.full() {
             let Some(f) = self.stack.last_mut() else {
                 return;
             };
@@ -285,11 +311,18 @@ impl<'a> Walker<'a, '_> {
             f.next += step;
             let (key_len, bound) = (f.key_len as usize, f.bound);
             let ahead = e + step * PREFETCH_AHEAD;
-            if (0..n).contains(&ahead)
-                && let EntryRef::Child(c) = node.entry_ref(ahead as usize)
-            {
-                let child = art.node(c);
-                radixox_lib::prefetch::prefetch_l1(child as *const _ as *const u8);
+            if (0..n).contains(&ahead) {
+                match node.entry_ref(ahead as usize) {
+                    EntryRef::Child(c) => {
+                        let child = art.node(c);
+                        radixox_lib::prefetch::prefetch_l1(child as *const _ as *const u8);
+                    }
+                    // Suffixe > 7 octets : alloué à part, lu à la copie de la
+                    // clé (−5 à −10 % sur des clés de 32 octets ; plus d'avance
+                    // que 2 entrées est moins bon).
+                    EntryRef::Leaf { sfx: Some(sfx), .. } => sfx.prefetch(),
+                    EntryRef::Leaf { .. } => {}
+                }
             }
             self.key.truncate(key_len);
             let r = node.radix_at(e as usize);
@@ -319,20 +352,37 @@ impl OxidArt {
         if count == 0 {
             return RangeOut::default();
         }
-        let sc = SCRATCH.with(|s| std::mem::take(&mut *s.borrow_mut()));
         let cap = count.min(4096);
-        let mut w = Walker {
-            art: self,
-            from,
-            rev,
-            count,
-            key: sc.key,
-            stack: sc.stack,
+        let sink = RangeSink {
             out: RangeOut {
                 keys: Vec::with_capacity(cap * (prefix.len() + 16)),
                 entries: Vec::with_capacity(cap),
             },
+            count,
         };
+        self.range_walk(prefix, from, rev, sink, |_| ()).0.out
+    }
+
+    /// Comme [`krange`](Self::krange), mais rend un range possédé qui survit
+    /// à l'emprunt de l'arbre (valeurs à refcount +1, aucune allocation de plus).
+    pub fn krange_owned(&self, prefix: &[u8], from: &[u8], count: usize, rev: bool) -> OwnedRange {
+        self.krange(prefix, from, count, rev).into_owned()
+    }
+
+    /// Parcours commun à KRANGE et SCAN. `on_stop` reçoit la clé courante si
+    /// le parcours s'est arrêté sur `full()` avant la fin (c'est alors la
+    /// dernière clé passée au sink) ; le booléen rendu dit si tout le préfixe
+    /// a été parcouru.
+    fn range_walk<'a, S: Sink<'a>, R>(
+        &'a self,
+        prefix: &[u8],
+        from: &[u8],
+        rev: bool,
+        sink: S,
+        on_stop: impl FnOnce(&[u8]) -> R,
+    ) -> (S, Option<R>) {
+        let sc = SCRATCH.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        let mut w = Walker { art: self, from, rev, key: sc.key, stack: sc.stack, sink };
         match self.find_prefix(prefix, &mut w.key) {
             PrefixHit::None => {}
             PrefixHit::Node(idx) => {
@@ -347,17 +397,93 @@ impl OxidArt {
                 }
             }
         }
-        let Walker { mut key, mut stack, out, .. } = w;
+        // Pile vide : le préfixe est épuisé (sortie normale de `run`, ou
+        // préfixe absent / réduit à une feuille).
+        let stopped = (!w.stack.is_empty()).then(|| on_stop(&w.key));
+        let Walker { mut key, mut stack, sink, .. } = w;
         key.clear();
         stack.clear();
         SCRATCH.with(|s| *s.borrow_mut() = Scratch { key, stack });
-        out
+        (sink, stopped)
     }
 
-    /// Comme [`krange`](Self::krange), mais rend un range possédé qui survit
-    /// à l'emprunt de l'arbre (valeurs à refcount +1, aucune allocation de plus).
-    pub fn krange_owned(&self, prefix: &[u8], from: &[u8], count: usize, rev: bool) -> OwnedRange {
-        self.krange(prefix, from, count, rev).into_owned()
+    /// Une page de SCAN : clés de tout type sous `prefix`, en ordre croissant,
+    /// strictement après `from`, retenues par `keep(clé, type)`.
+    ///
+    /// S'arrête après `count` clés retenues ou `budget` clés examinées
+    /// (expirées et rejetées comprises : un MATCH qui ne retient presque rien
+    /// ne bloque pas le serveur). [`ScanPage::next`] est la clé de reprise
+    /// (la dernière examinée), `None` quand le préfixe est épuisé.
+    pub fn scan_keys(
+        &self,
+        prefix: &[u8],
+        from: &[u8],
+        count: usize,
+        budget: usize,
+        keep: impl FnMut(&[u8], RedisType) -> bool,
+    ) -> ScanPage {
+        let sink = ScanSink {
+            page: ScanPage::default(),
+            count: count.max(1),
+            budget: budget.max(1),
+            keep,
+        };
+        let (sink, next) = self.range_walk(prefix, from, false, sink, <[u8]>::to_vec);
+        let mut page = sink.page;
+        page.next = next;
+        page
+    }
+}
+
+/// Résultat de [`OxidArt::scan_keys`] : clés concaténées + fins.
+#[derive(Default, Debug)]
+pub struct ScanPage {
+    keys: Vec<u8>,
+    ends: Vec<u32>,
+    /// Clé après laquelle reprendre ; `None` : parcours terminé.
+    pub next: Option<Vec<u8>>,
+}
+
+impl ScanPage {
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &[u8]> + '_ {
+        let mut start = 0;
+        self.ends.iter().map(move |&end| {
+            let k = &self.keys[start..end as usize];
+            start = end as usize;
+            k
+        })
+    }
+}
+
+struct ScanSink<F> {
+    page: ScanPage,
+    count: usize,
+    budget: usize,
+    keep: F,
+}
+
+impl<'a, F: FnMut(&[u8], RedisType) -> bool> Sink<'a> for ScanSink<F> {
+    #[inline]
+    fn emit(&mut self, key: &[u8], tag: Tag, _val: &'a ValUnion, exp: Option<u64>, now: u64) {
+        self.budget -= 1;
+        if expired(exp, now) || !(self.keep)(key, tag.redis_type()) {
+            return;
+        }
+        self.page.keys.extend_from_slice(key);
+        self.page.ends.push(self.page.keys.len() as u32);
+    }
+
+    #[inline]
+    fn full(&self) -> bool {
+        self.page.ends.len() >= self.count || self.budget == 0
     }
 }
 
@@ -556,6 +682,130 @@ mod tests {
                 want.reverse();
             }
             assert_eq!(all, want);
+        }
+    }
+
+    fn xorshift(mut x: u64) -> impl FnMut() -> u64 {
+        move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        }
+    }
+
+    /// Scan complet page par page (reprise sur `next`) : toutes les clés du
+    /// préfixe retenues par `keep`, dans l'ordre, sans doublon, quels que
+    /// soient `count` et `budget` ; expirées jamais rendues.
+    #[test]
+    fn scan_pages_match_btreemap() {
+        use crate::value::RedisType;
+        let mut art = OxidArt::new();
+        art.set_now(1000);
+        let mut model: BTreeMap<Vec<u8>, RedisType> = BTreeMap::new();
+        let mut rnd = xorshift(0x9E37_79B9_7F4A_7C15);
+        let alphabet = b"ab:019z";
+        for i in 0..3000 {
+            let len = 1 + rnd() as usize % 7;
+            let mut k: Vec<u8> = (0..len).map(|_| alphabet[rnd() as usize % alphabet.len()]).collect();
+            if i % 3 == 0 {
+                k.splice(0..0, b"user:".iter().copied());
+            }
+            art.del(&k);
+            model.remove(&k);
+            match i % 7 {
+                0 => {
+                    let _ = art.cmd_hset(&k, &[(SharedByte::from_str("f"), SharedByte::from_str("v"))], None);
+                    model.insert(k, RedisType::Hash);
+                }
+                1 => {
+                    // expirée au moment du scan : jamais rendue
+                    art.set_ttl(SharedByte::from_slice(&k), std::time::Duration::from_secs(5), Value::Int(1));
+                }
+                2 => {
+                    art.set(SharedByte::from_slice(&k), Value::Int(i));
+                    model.insert(k, RedisType::String);
+                }
+                _ => {
+                    art.set(SharedByte::from_slice(&k), Value::String(SharedByte::from_str("v")));
+                    model.insert(k, RedisType::String);
+                }
+            }
+        }
+        art.set_now(2000);
+        let prefixes: [&[u8]; 5] = [b"", b"u", b"user:", b"user:1", b"zzzz"];
+        for prefix in prefixes {
+            for (count, budget) in [(1, 1), (10, 1000), (7, 3), (100, 50), (5000, 100_000)] {
+                for only_hash in [false, true] {
+                    let keep = |_: &[u8], t: RedisType| !only_hash || t == RedisType::Hash;
+                    let want: Vec<Vec<u8>> = model
+                        .iter()
+                        .filter(|(k, t)| k.starts_with(prefix) && keep(k, **t))
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    let mut got = Vec::new();
+                    let mut from = Vec::new();
+                    let mut pages = 0;
+                    loop {
+                        let page = art.scan_keys(prefix, &from, count, budget, keep);
+                        assert!(page.len() <= count);
+                        got.extend(page.iter().map(<[u8]>::to_vec));
+                        pages += 1;
+                        assert!(pages <= 2 * model.len() + 2, "le scan ne termine pas");
+                        match page.next {
+                            Some(n) => {
+                                assert!(n.as_slice() > from.as_slice(), "la reprise doit avancer");
+                                from = n;
+                            }
+                            None => break,
+                        }
+                    }
+                    assert_eq!(got, want, "préfixe {prefix:?}, count {count}, budget {budget}, hash {only_hash}");
+                }
+            }
+        }
+    }
+
+    /// Écritures entre les pages : une clé présente du début à la fin du scan
+    /// sort exactement une fois ; aucune clé ne sort deux fois.
+    #[test]
+    fn scan_survives_writes_between_pages() {
+        let mut art = OxidArt::new();
+        let mut rnd = xorshift(0xD1B5_4A32_D192_ED03);
+        let key = |rnd: &mut dyn FnMut() -> u64| -> Vec<u8> {
+            let len = 1 + rnd() as usize % 6;
+            (0..len).map(|_| b"abc:01"[rnd() as usize % 6]).collect()
+        };
+        let mut live = std::collections::BTreeSet::new();
+        for _ in 0..2000 {
+            let k = key(&mut rnd);
+            art.set(SharedByte::from_slice(&k), Value::String(SharedByte::from_str("v")));
+            live.insert(k);
+        }
+        let initial = live.clone();
+        let mut touched = std::collections::BTreeSet::new();
+        let mut seen = Vec::new();
+        let mut from = Vec::new();
+        loop {
+            let page = art.scan_keys(b"", &from, 13, 40, |_, _| true);
+            seen.extend(page.iter().map(<[u8]>::to_vec));
+            let Some(n) = page.next else { break };
+            from = n;
+            for _ in 0..20 {
+                let k = key(&mut rnd);
+                if rnd() % 2 == 0 {
+                    art.set(SharedByte::from_slice(&k), Value::String(SharedByte::from_str("w")));
+                    live.insert(k.clone());
+                } else {
+                    art.del(&k);
+                    live.remove(&k);
+                }
+                touched.insert(k);
+            }
+        }
+        assert!(seen.windows(2).all(|w| w[0] < w[1]), "ordre strict, donc sans doublon");
+        for k in initial.difference(&touched) {
+            assert!(seen.binary_search(k).is_ok(), "clé stable manquante : {k:?}");
         }
     }
 }

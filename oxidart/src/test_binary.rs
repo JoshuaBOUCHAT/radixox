@@ -348,6 +348,8 @@ fn glob_matches_redis_reference() {
         got.sort();
         let want: Vec<Vec<u8>> = keys.iter().filter(|k| redis_match(&pat, k)).cloned().collect();
         assert_eq!(got, want, "motif {:?} → regex {}", pat.escape_ascii().to_string(), glob_to_regex(&pat));
+        let direct: Vec<Vec<u8>> = keys.iter().filter(|k| crate::regex::glob_match(&pat, k)).cloned().collect();
+        assert_eq!(direct, want, "glob_match, motif {:?}", pat.escape_ascii().to_string());
         nonempty += !want.is_empty() as u32;
     }
     assert!(nonempty >= 100, "trop peu de motifs qui matchent quelque chose : {nonempty}/1000");

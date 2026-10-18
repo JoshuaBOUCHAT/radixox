@@ -229,6 +229,19 @@ Other prefix-aware operations: `KEYS prefix*` (subtree walk, no DFA), `KEYS` wit
 (compiled to a byte-wise DFA that prunes subtrees; pathological patterns are refused instead of
 freezing the server).
 
+`SCAN` uses the same ordered walk, with the position kept server-side (the client gets a small
+integer cursor):
+
+- no duplicates, and every key present for the whole scan is returned once, even if the data
+  changes between calls;
+- `COUNT` is exact: each call returns `COUNT` keys unless its examination budget
+  (`max(COUNT, 1000)` keys) runs out first. A large `COUNT` saves round trips;
+- `MATCH user:*` only walks the `user:` subtree; any other glob walks the subtree of its literal
+  prefix;
+- unlike Redis, an unknown, finished or reclaimed cursor gets `ERR invalid or expired cursor`.
+
+Design: [`SCAN_DESIGN.md`](SCAN_DESIGN.md).
+
 ---
 
 ## Embedded use (OxidArt)
@@ -271,7 +284,7 @@ own synchronization.
 | Connection / server | `PING` `ECHO` `QUIT` `SELECT` `INFO` `DBSIZE` `FLUSHDB` `SAVE` `BGSAVE` |
 | Strings | `GET` `SET` (`EX` `PX` `NX` `XX`) `SETNX` `SETEX` `MGET` `MSET` |
 | Counters | `INCR` `DECR` `INCRBY` `DECRBY` |
-| Keys | `DEL` `UNLINK` `EXISTS` `TYPE` `KEYS` |
+| Keys | `DEL` `UNLINK` `EXISTS` `TYPE` `KEYS` `SCAN` (`MATCH` `COUNT` `TYPE`) |
 | Ordered keys | `KRANGE` `KREVRANGE` |
 | Expiration | `EXPIRE` `PEXPIRE` `PERSIST` `TTL` `PTTL` |
 | Hash | `HSET` `HMSET` `HGET` `HMGET` `HGETALL` `HDEL` `HEXISTS` `HLEN` `HKEYS` `HVALS` `HINCRBY` |
@@ -279,7 +292,7 @@ own synchronization.
 | Sorted set | `ZADD` `ZREM` `ZSCORE` `ZCARD` `ZRANGE` (`WITHSCORES`) `ZINCRBY` |
 | Pub/Sub | `SUBSCRIBE` `UNSUBSCRIBE` `PUBLISH` |
 
-Not yet: list commands, `SCAN`, `MULTI`/`EXEC`, `CLIENT` / `CONFIG` / `HELLO`, Lua,
+Not yet: list commands, `MULTI`/`EXEC`, `CLIENT` / `CONFIG` / `HELLO`, Lua,
 replication, cluster.
 
 ---
@@ -314,6 +327,8 @@ Environment variables:
 | `RADIXOX_SAVE_SYNC_ZSTD` | raw | zstd level of `SAVE` and of the exit save |
 | `RADIXOX_SAVE_BACKLOG_MB` | `64` | compression backlog of `BGSAVE` |
 | `RADIXOX_SAVE_ON_EXIT` | off | save on SIGINT / SIGTERM |
+| `RADIXOX_SCAN_IDLE_SECS` | `60` | idle time after which a `SCAN` cursor can be reclaimed |
+| `RADIXOX_SCAN_MAX_CURSORS` | `65536` | active `SCAN` cursors at most; beyond, a new `SCAN` gets an error |
 | `SQ_POLL` | off | io_uring SQ polling (idle time in ms) |
 | `RADIXOX_SQ_POLL_PIN` | unset | CPU of the SQ polling kernel thread (**required** with `SQ_POLL` today) |
 
@@ -372,7 +387,7 @@ across cores is meant to come from sharding by namespace, not from shared-state 
 - AOF and replication (sharing one stream of effects).
 - Lower memory per key on random keys: long suffixes stored inline on several cells (no
   separate allocation), a smaller node class for nodes with two or three entries.
-- Client compatibility commands (`HELLO`, `CLIENT`, `CONFIG`, `MULTI`/`EXEC`), `SCAN`, lists.
+- Client compatibility commands (`HELLO`, `CLIENT`, `CONFIG`, `MULTI`/`EXEC`), lists.
 
 ---
 
