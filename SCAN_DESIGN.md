@@ -17,6 +17,9 @@ serveur ; la reprise se fait strictement après, dans l'ordre de l'arbre :
 
 - aucune clé rendue deux fois, toute clé présente du début à la fin du scan
   rendue une fois ;
+- sans `COUNT`, pages de 1000 (Redis : 10, une simple indication chez lui).
+  Chaque page redescend depuis la racine : à 10, un scan complet coûtait
+  ~15× plus de CPU serveur (redis-py `scan_iter` n'envoie pas COUNT) ;
 - `COUNT` exact : `COUNT` clés retenues par appel, sauf si le budget
   d'examen (`max(COUNT, 1000)` clés, expirées et rejetées comprises) est
   épuisé avant ;
@@ -46,6 +49,15 @@ tête → [libres…] [actifs, du moins au plus récemment utilisé] ← queue
 - expiration paresseuse : un scan inactif n'est évincé que si son slot est
   demandé ; son client peut reprendre d'ici là.
 - un scan fini en une page n'occupe aucun slot.
+- plafond par connexion (`RADIXOX_SCAN_MAX_CURSORS_PER_CLIENT`, 128) : un
+  curseur appartient à la connexion qui l'a ouvert, même repris depuis une
+  autre (pool, reconnexion). Une connexion à son plafond libère d'abord ses
+  propres curseurs inactifs : balayage depuis la tête (les inactifs y sont)
+  jusqu'au premier des siens, en libérant au passage les inactifs des autres
+  croisés en route (évinçables de toute façon, chacun n'est parcouru qu'une
+  fois). Sinon : `ERR max number of SCAN cursors for this connection
+  reached`. Protège contre un client bogué qui abandonne ses scans ; pas
+  contre un attaquant authentifié qui ouvre beaucoup de connexions.
 
 Curseur envoyé : `gen × max + idx + 1` (`max` fixé au démarrage). Il reste
 petit (peu de chiffres décimaux sur le réseau) tant que la table et les
@@ -63,6 +75,7 @@ curseur ; repartir de 0 ferait boucler un client lent indéfiniment.
 |---|---|---|
 | `RADIXOX_SCAN_IDLE_SECS` | `60` | inactivité après laquelle un curseur peut être repris |
 | `RADIXOX_SCAN_MAX_CURSORS` | `65536` | curseurs actifs au plus (1 ≤ n < 2³²) |
+| `RADIXOX_SCAN_MAX_CURSORS_PER_CLIENT` | `128` | curseurs actifs au plus par connexion |
 
 `INFO` expose `scan_cursors` (curseurs actifs).
 

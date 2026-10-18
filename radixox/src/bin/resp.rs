@@ -450,7 +450,7 @@ async fn dispatch(
             }
             Cmd::Scan { cursor, pattern, count, ty } => {
                 let art = art.borrow();
-                match resp_cmd::scan::cmd_scan(&art, cursor, pattern, count, ty) {
+                match resp_cmd::scan::cmd_scan(&art, client.id, cursor, pattern, count, ty) {
                     Ok((next, page)) => conn_state.encode_with(|buf| encode_scan(buf, next, &page)),
                     Err(e) => conn_state.encode(e),
                 }

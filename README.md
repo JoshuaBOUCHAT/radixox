@@ -256,6 +256,7 @@ integer cursor):
 
 - no duplicates, and every key present for the whole scan is returned once, even if the data
   changes between calls;
+- without `COUNT`, pages hold 1,000 keys (Redis uses 10, as a hint);
 - `COUNT` is exact: each call returns `COUNT` keys unless its examination budget
   (`max(COUNT, 1000)` keys) runs out first. A large `COUNT` saves round trips;
 - `MATCH user:*` only walks the `user:` subtree; any other glob walks the subtree of its literal
@@ -353,6 +354,7 @@ Environment variables:
 | `RADIXOX_SAVE_ON_EXIT` | off | save on SIGINT / SIGTERM |
 | `RADIXOX_SCAN_IDLE_SECS` | `60` | idle time after which a `SCAN` cursor can be reclaimed |
 | `RADIXOX_SCAN_MAX_CURSORS` | `65536` | active `SCAN` cursors at most; beyond, a new `SCAN` gets an error |
+| `RADIXOX_SCAN_MAX_CURSORS_PER_CLIENT` | `128` | active `SCAN` cursors at most per connection (its own idle cursors are reclaimed first) |
 | `SQ_POLL` | off | io_uring SQ polling (idle time in ms) |
 | `RADIXOX_SQ_POLL_PIN` | unset | CPU of the SQ polling kernel thread (**required** with `SQ_POLL` today) |
 

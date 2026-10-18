@@ -16,8 +16,14 @@
 //! `RADIXOX_SCAN_MAX_CURSORS` ; au-delà, le *nouveau* scan est refusé (ceux en
 //! cours continuent). Un curseur se lit `gen × max + idx + 1` : petit tant que
 //! la table et les générations le sont, jamais 0, toujours ≤ i64::MAX.
+//!
+//! Chaque curseur appartient à la connexion qui l'a ouvert (même s'il est
+//! repris depuis une autre) ; une connexion n'en garde au plus que
+//! `RADIXOX_SCAN_MAX_CURSORS_PER_CLIENT` actifs à la fois, pour qu'un client
+//! qui abandonne ses scans ne prive pas les autres.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use oxidart::OxidArt;
 use oxidart::krange::ScanPage;
@@ -29,8 +35,12 @@ use crate::Frame;
 const NIL: u32 = u32::MAX;
 const DEFAULT_IDLE_SECS: u64 = 60;
 const DEFAULT_MAX_CURSORS: u32 = 65536;
-/// COUNT par défaut, comme Redis.
-const DEFAULT_COUNT: usize = 10;
+const DEFAULT_MAX_PER_CLIENT: u32 = 128;
+/// Taille de page sans COUNT. Redis prend 10 (une indication chez lui) ; sans
+/// COUNT, aucune taille n'est promise, et chaque page redescend depuis la
+/// racine : 10 coûtait ~15× plus de CPU qu'une page de 1000 pour un scan
+/// complet (redis-py `scan_iter` n'envoie pas COUNT par défaut).
+const DEFAULT_COUNT: usize = 1000;
 
 /// Clés examinées au plus par appel (expirées et rejetées par MATCH/TYPE
 /// comprises) : borne la latence d'un appel quand le filtre retient peu.
@@ -48,6 +58,8 @@ struct Slot {
     last_used: u64,
     /// Clé après laquelle reprendre ; `None` : slot libre.
     from: Option<Vec<u8>>,
+    /// CLIENT ID de la connexion qui a ouvert le scan (slot actif seulement).
+    owner: u64,
 }
 
 struct Cursors {
@@ -59,6 +71,9 @@ struct Cursors {
     /// Génération maximale : `gen_limit × max + max ≤ i64::MAX`.
     gen_limit: u32,
     active: usize,
+    per_client: u32,
+    /// Curseurs actifs par propriétaire (entrées à 0 retirées).
+    owners: HashMap<u64, u32>,
     warned_full: bool,
 }
 
@@ -75,10 +90,12 @@ impl Cursors {
     fn from_env() -> Self {
         let idle_secs = env_or("RADIXOX_SCAN_IDLE_SECS", DEFAULT_IDLE_SECS, |_| true);
         let max = env_or("RADIXOX_SCAN_MAX_CURSORS", DEFAULT_MAX_CURSORS, |n| (1..NIL).contains(n));
-        Self::new(max, idle_secs)
+        let per_client = env_or("RADIXOX_SCAN_MAX_CURSORS_PER_CLIENT", DEFAULT_MAX_PER_CLIENT, |&n| n >= 1)
+            .min(max);
+        Self::new(max, idle_secs, per_client)
     }
 
-    fn new(max: u32, idle_secs: u64) -> Self {
+    fn new(max: u32, idle_secs: u64, per_client: u32) -> Self {
         let gen_limit = (i64::MAX as u64 / max as u64 - 1).min(u32::MAX as u64) as u32;
         Self {
             slots: Vec::new(),
@@ -88,8 +105,29 @@ impl Cursors {
             idle_secs,
             gen_limit,
             active: 0,
+            per_client,
+            owners: HashMap::new(),
             warned_full: false,
         }
+    }
+
+    /// Curseurs actifs de `owner`.
+    fn owned(&self, owner: u64) -> u32 {
+        self.owners.get(&owner).copied().unwrap_or(0)
+    }
+
+    /// Désactive `idx` (rend sa clé de reprise) ; compteurs à jour.
+    fn deactivate(&mut self, idx: u32) -> Option<Vec<u8>> {
+        let slot = &mut self.slots[idx as usize];
+        let from = slot.from.take()?;
+        let owner = slot.owner;
+        self.active -= 1;
+        let n = self.owners.get_mut(&owner).expect("propriétaire compté");
+        *n -= 1;
+        if *n == 0 {
+            self.owners.remove(&owner);
+        }
+        Some(from)
     }
 
     fn encode(&self, idx: u32) -> u64 {
@@ -105,6 +143,32 @@ impl Cursors {
         (slot.generation as u64 == generation && slot.from.is_some()).then_some(idx)
     }
 
+    /// `owner` est à son plafond : libère ses curseurs inactifs depuis
+    /// `idle_secs`. Les inactifs sont en tête (liste triée par dernier usage) ;
+    /// ceux des autres croisés en route sont libérés aussi (ils étaient
+    /// évinçables), donc chaque curseur n'est parcouru qu'une fois.
+    fn reclaim_idle(&mut self, owner: u64, now: u64) -> bool {
+        let mut i = self.head;
+        while i != NIL {
+            let slot = &self.slots[i as usize];
+            let next = slot.next;
+            if slot.from.is_some() {
+                if now.saturating_sub(slot.last_used) < self.idle_secs {
+                    return false; // la suite est plus récente
+                }
+                let mine = slot.owner == owner;
+                self.deactivate(i);
+                self.unlink(i);
+                self.push_front(i);
+                if mine {
+                    return true;
+                }
+            }
+            i = next;
+        }
+        false
+    }
+
     /// Un slot pour un nouveau scan, retiré de la liste ; `None` : plafond
     /// atteint et aucun slot libre ni inactif.
     fn alloc(&mut self, now: u64) -> Option<u32> {
@@ -116,39 +180,37 @@ impl Cursors {
                 Some(_) => now.saturating_sub(slot.last_used) >= self.idle_secs,
             };
             if reusable {
+                self.deactivate(h); // scan abandonné, évincé (sans effet si libre)
                 let slot = &mut self.slots[h as usize];
-                if slot.from.take().is_some() {
-                    self.active -= 1; // scan abandonné, évincé
-                }
                 slot.generation = if slot.generation >= self.gen_limit { 0 } else { slot.generation + 1 };
                 self.unlink(h);
                 return Some(h);
             }
         }
         if self.slots.len() < self.max as usize {
-            self.slots.push(Slot { generation: 0, prev: NIL, next: NIL, last_used: 0, from: None });
+            self.slots.push(Slot { generation: 0, prev: NIL, next: NIL, last_used: 0, from: None, owner: 0 });
             return Some(self.slots.len() as u32 - 1);
         }
         None
     }
 
-    /// Enregistre la reprise de `idx` et le place en queue (le plus récent).
-    /// `idx` doit être hors de la liste.
-    fn store(&mut self, idx: u32, from: Vec<u8>, now: u64) {
+    /// Active `idx` pour `owner` avec sa clé de reprise et le place en queue
+    /// (le plus récent). `idx` doit être hors de la liste et inactif.
+    fn store(&mut self, idx: u32, owner: u64, from: Vec<u8>, now: u64) {
         let slot = &mut self.slots[idx as usize];
+        debug_assert!(slot.from.is_none());
         slot.last_used = now;
-        if slot.from.replace(from).is_none() {
-            self.active += 1;
-        }
+        slot.from = Some(from);
+        slot.owner = owner;
+        self.active += 1;
+        *self.owners.entry(owner).or_insert(0) += 1;
         self.push_back(idx);
     }
 
     /// Libère `idx` (scan terminé) et le place en tête. `idx` doit être hors
     /// de la liste.
     fn release(&mut self, idx: u32) {
-        if self.slots[idx as usize].from.take().is_some() {
-            self.active -= 1;
-        }
+        self.deactivate(idx);
         self.push_front(idx);
     }
 
@@ -221,6 +283,7 @@ fn env_or<T: std::str::FromStr + std::fmt::Display + Copy>(
 /// renvoyer.
 pub(crate) fn cmd_scan(
     art: &OxidArt,
+    client_id: u64,
     cursor: &[u8],
     pattern: Option<&[u8]>,
     count: Option<usize>,
@@ -239,7 +302,8 @@ pub(crate) fn cmd_scan(
 
     CURSORS.with(|c| {
         let mut c = c.borrow_mut();
-        // Reprise : le slot sort de la liste le temps de l'appel.
+        // Reprise : le slot sort de la liste le temps de l'appel ; il garde
+        // son propriétaire, même repris depuis une autre connexion.
         let (slot, from) = if cursor == 0 {
             (None, Vec::new())
         } else {
@@ -247,23 +311,26 @@ pub(crate) fn cmd_scan(
                 .lookup(cursor)
                 .ok_or_else(|| Frame::Error("ERR invalid or expired cursor".into()))?;
             c.unlink(idx);
-            let from = c.slots[idx as usize].from.take().expect("slot actif");
-            c.active -= 1;
-            (Some(idx), from)
+            let owner = c.slots[idx as usize].owner;
+            let from = c.deactivate(idx).expect("slot actif");
+            (Some((idx, owner)), from)
         };
 
         let page = scan_page(art, &from, pattern, count, ty);
 
         let Some(next) = page.next.clone() else {
-            if let Some(idx) = slot {
+            if let Some((idx, _)) = slot {
                 c.release(idx);
             }
             return Ok((0, page));
         };
-        let idx = match slot {
-            Some(idx) => idx,
+        let (idx, owner) = match slot {
+            Some(s) => s,
+            None if c.owned(client_id) >= c.per_client && !c.reclaim_idle(client_id, now) => {
+                return Err(Frame::Error("ERR max number of SCAN cursors for this connection reached".into()));
+            }
             None => match c.alloc(now) {
-                Some(idx) => idx,
+                Some(idx) => (idx, client_id),
                 None => {
                     if !c.warned_full {
                         c.warned_full = true;
@@ -276,7 +343,7 @@ pub(crate) fn cmd_scan(
                 }
             },
         };
-        c.store(idx, next, now);
+        c.store(idx, owner, next, now);
         Ok((c.encode(idx), page))
     })
 }
@@ -334,9 +401,27 @@ mod tests {
     }
 
     fn open(c: &mut Cursors, now: u64) -> Option<u64> {
+        open_as(c, 1, now)
+    }
+
+    /// Ouverture comme `cmd_scan` : plafond par connexion, puis allocation.
+    fn open_as(c: &mut Cursors, owner: u64, now: u64) -> Option<u64> {
+        if c.owned(owner) >= c.per_client && !c.reclaim_idle(owner, now) {
+            return None;
+        }
         let idx = c.alloc(now)?;
-        c.store(idx, b"k".to_vec(), now);
+        c.store(idx, owner, b"k".to_vec(), now);
         Some(c.encode(idx))
+    }
+
+    /// Compteurs cohérents avec les slots.
+    fn check_counts(c: &Cursors) {
+        let mut want = std::collections::HashMap::new();
+        for s in c.slots.iter().filter(|s| s.from.is_some()) {
+            *want.entry(s.owner).or_insert(0u32) += 1;
+        }
+        assert_eq!(c.owners, want);
+        assert_eq!(c.active, want.values().sum::<u32>() as usize);
     }
 
     /// Reprise d'un curseur, comme `cmd_scan` : sort de la liste puis revient
@@ -344,15 +429,16 @@ mod tests {
     fn resume(c: &mut Cursors, cursor: u64, now: u64, done: bool) -> Option<()> {
         let idx = c.lookup(cursor)?;
         c.unlink(idx);
-        let from = c.slots[idx as usize].from.take().unwrap();
-        c.active -= 1;
-        if done { c.release(idx) } else { c.store(idx, from, now) }
+        let owner = c.slots[idx as usize].owner;
+        let from = c.deactivate(idx).unwrap();
+        if done { c.release(idx) } else { c.store(idx, owner, from, now) }
+        check_counts(c);
         Some(())
     }
 
     #[test]
     fn grows_while_cursors_are_recent_then_refuses() {
-        let mut c = Cursors::new(3, 60);
+        let mut c = Cursors::new(3, 60, 3);
         let a = open(&mut c, 0).unwrap();
         let b = open(&mut c, 1).unwrap();
         let d = open(&mut c, 2).unwrap();
@@ -366,7 +452,7 @@ mod tests {
 
     #[test]
     fn idle_head_is_evicted_and_its_cursor_dies() {
-        let mut c = Cursors::new(2, 60);
+        let mut c = Cursors::new(2, 60, 10);
         let a = open(&mut c, 0).unwrap();
         let b = open(&mut c, 10).unwrap();
         // a inactif depuis 61 s : repris, génération +1
@@ -383,7 +469,7 @@ mod tests {
 
     #[test]
     fn finished_scan_frees_its_slot_at_the_head() {
-        let mut c = Cursors::new(2, 60);
+        let mut c = Cursors::new(2, 60, 10);
         let a = open(&mut c, 0).unwrap();
         let b = open(&mut c, 0).unwrap();
         resume(&mut c, b, 1, true).unwrap();
@@ -398,7 +484,7 @@ mod tests {
 
     #[test]
     fn cursor_stays_below_i64_max_when_generation_wraps() {
-        let mut c = Cursors::new(u32::MAX - 1, 0);
+        let mut c = Cursors::new(u32::MAX - 1, 0, 1);
         assert!(c.gen_limit >= 1);
         open(&mut c, 0).unwrap();
         c.slots[0].generation = c.gen_limit;
@@ -409,4 +495,51 @@ mod tests {
         let idx = c.alloc(1).unwrap();
         assert_eq!((idx, c.slots[0].generation), (0, 0));
     }
+
+    #[test]
+    fn per_connection_limit() {
+        let mut c = Cursors::new(10, 60, 2);
+        let a1 = open_as(&mut c, 7, 0).unwrap();
+        let a2 = open_as(&mut c, 7, 0).unwrap();
+        assert_eq!(open_as(&mut c, 7, 0), None, "plafond de la connexion 7");
+        // les autres connexions ne sont pas touchées
+        let b = open_as(&mut c, 8, 0).unwrap();
+        check_counts(&c);
+        // reprise depuis une autre connexion : le curseur reste à 7
+        resume(&mut c, a1, 1, false).unwrap();
+        assert_eq!((c.owned(7), c.owned(8)), (2, 1));
+        // un scan terminé rend sa place
+        resume(&mut c, a2, 1, true).unwrap();
+        assert!(open_as(&mut c, 7, 1).is_some());
+        // un scan abandonné évincé rend aussi la place de son propriétaire
+        resume(&mut c, b, 1, true).unwrap();
+        let mut c = Cursors::new(1, 60, 1);
+        open_as(&mut c, 7, 0).unwrap();
+        assert_eq!(open_as(&mut c, 8, 30), None, "table pleine, tête récente");
+        open_as(&mut c, 8, 61).unwrap();
+        assert_eq!((c.owned(7), c.owned(8)), (0, 1));
+        check_counts(&c);
+    }
+
+    /// Un client à son plafond dont les curseurs sont abandonnés n'est pas
+    /// bloqué : le balayage depuis la tête libère les inactifs jusqu'au
+    /// premier des siens ; au-delà, rien n'est touché.
+    #[test]
+    fn capped_client_reclaims_its_idle_cursors() {
+        let mut c = Cursors::new(100, 60, 2);
+        let other_oldest = open_as(&mut c, 8, 0).unwrap();
+        let old = open_as(&mut c, 7, 1).unwrap();
+        let other_old = open_as(&mut c, 8, 5).unwrap();
+        let recent = open_as(&mut c, 7, 50).unwrap();
+        assert_eq!(open_as(&mut c, 7, 59), None, "rien d'inactif encore");
+        let fresh = open_as(&mut c, 7, 70).unwrap();
+        assert_eq!(c.lookup(other_oldest), None, "inactif croisé avant le sien : libéré");
+        assert_eq!(c.lookup(old), None, "son curseur abandonné est libéré");
+        assert!(c.lookup(other_old).is_some(), "après le sien : intact (expiration paresseuse)");
+        assert!(c.lookup(recent).is_some() && c.lookup(fresh).is_some());
+        assert_eq!((c.owned(7), c.owned(8)), (2, 1));
+        check_counts(&c);
+        order(&c);
+    }
 }
+
