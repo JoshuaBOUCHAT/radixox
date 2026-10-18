@@ -424,3 +424,19 @@ pied          u32 LE crc32 (IEEE, crc32fast) de tout ce qui précède | "RXDE"
 8bis. ✅ Vidage par tranches de la liste différée valart.
 9. ✅ Reload en flux (lecture par morceaux).
 10. ✅ Compression zstd par tranches (§5 « Compression ») ; reste : bench sur valeurs réalistes.
+
+## Plafond de CPU du BGSAVE (2026-10-18)
+
+Mesure : sans plafond, la save prenait ~60 % du thread pendant ~100 ms (1M
+clés) ; les tranches étaient courtes (≤ 62 µs) mais les clients faisaient la
+queue : p99.9 0,46 → 0,94 ms. `RADIXOX_SAVE_CPU_SHARE` (0,1 par défaut) : la
+tâche ne travaille que si temps de tranches + compression ≤ part × temps
+écoulé, sinon elle cède. Résultat : ~550–690 ms sous charge, p99.9 au niveau
+de la référence (0,46–0,74 ms selon le run, contre 0,79–0,86 pour Valkey).
+
+Signal d'inactivité : aucune lecture réseau depuis 1 ms (`note_read`, un
+compteur par lecture) → pas de plafond (~50 ms sur serveur inactif). Écarté :
+« le `yield` est revenu tout de suite » — des requêtes déjà arrivées dans le
+noyau attendent que la boucle les relève ; la save comblait ces trous et le
+p99.9 remontait à 0,87 ms.
+

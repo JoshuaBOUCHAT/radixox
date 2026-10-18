@@ -65,7 +65,7 @@ Measured on 2026-10-18 (memory on 2026-10-17), 1M keys, loopback; see
 | Throughput, pipeline 32 | **2.39 M ops/s** | 1.98 M (1 core) · 2.37 M (`io-threads 4`) | |
 | Operations per second of server CPU, no pipeline | **381 k** | 323 k (1 core) · 142 k (`io-threads 4`) | |
 | YCSB A, READ p99 (1M records) | **544 µs** | 1,040 µs (1 core) | −48 % |
-| `BGSAVE` of 1M keys (to tmpfs) | **100 ms**, no extra core | 1,735 ms, on a second core | ×17 |
+| `BGSAVE` of 1M keys under load (to tmpfs) | **~670 ms**, one core, tail near its reference | ~1,750 ms, on a second core | ×2.6 |
 | Restart with 1M keys | **~0.17 s** | ~0.53 s | ×3 |
 | Memory, 1M structured keys (`key:N`) × 100 B | **131 MB** | 163 MB | −20 % |
 | Memory, 1M random UUID keys × 100 B | 209 MB | 205 MB | ≈ |
@@ -222,17 +222,21 @@ figures above are the fair comparison.
 ### Persistence (1M keys, 100-byte values)
 
 `BGSAVE` triggered 3 s into a 10-second memtier run without pipeline, dump on tmpfs (disk
-cost excluded), same session as the main table (2026-10-18):
+cost excluded), two separate runs (2026-10-18):
 
 | | `BGSAVE` duration | Throughput | p99 | p99.9 | p99.99 | max |
 |---|---|---|---|---|---|---|
-| RadixOx (slices in the server thread, zstd) | **100 ms** | 235,053 ops/s | **0.399 ms** | 0.943 ms | 1.567 ms | **2.19 ms** |
-| Valkey (`fork`, child on another core) | 1,735 ms (fork 1.9 ms) | 206,149 ops/s | 0.743 ms | **0.799 ms** | **0.991 ms** | 3.33 ms |
+| RadixOx, no save (reference) | — | 236,398 ops/s | 0.407 ms | 0.511 ms | 0.703 ms | — |
+| RadixOx, during `BGSAVE` (runs 1 / 2) | **662 / 686 ms** | 234,630 / 233,568 | **0.415 / 0.415 ms** | **0.735 / 0.511 ms** | **0.927 / 0.719 ms** | **2.42 / 2.10 ms** |
+| Valkey, no save (reference) | — | 207,954 ops/s | 0.743 ms | 0.767 ms | 1.007 ms | — |
+| Valkey, during `BGSAVE` (runs 1 / 2) | 1,728 / 1,781 ms (fork 2.1 / 2.4 ms) | 185,512 / 206,334 | 0.751 / 0.743 ms | 0.855 / 0.791 ms | 1.175 / 0.927 ms | 3.74 / 4.06 ms |
 
-RadixOx's snapshot is 17× shorter and needs no second core or memory headroom, but it runs in
-the server thread: its p99.9 doubles during those 100 ms (0.46 → 0.94 ms), while Valkey's
-tail barely moves because its child works on another core. The fork itself costs 1.9 ms here
-and grows with the heap (tens to hundreds of ms on tens of GB).
+RadixOx snapshots in the server thread, in slices. While clients are active, the save takes
+at most 10 % of the thread (`RADIXOX_SAVE_CPU_SHARE`), so client latency stays at its
+reference level; on an idle server it runs at full speed (about 50 ms for these 1M keys).
+Without that cap, the save took about 60 % of the thread for 100 ms and doubled the p99.9.
+Valkey forks: its child works on a second core (`bgsave-cpulist`), and the fork itself costs
+about 2 ms here, growing with the heap (tens to hundreds of ms on tens of GB).
 
 Restart with 1M keys (dump on tmpfs, 2026-10-17): RadixOx ~0.17 s (105 MB raw dump), Valkey
 ~0.53 s.
@@ -252,8 +256,8 @@ Restart with 1M keys (dump on tmpfs, 2026-10-17): RadixOx ~0.17 s (105 MB raw du
 
 - Loopback only: the client's TCP receive path and netfilter are billed to the same machine.
   Two-machine numbers are planned.
-- Short runs: memtier results are the median of 3 rounds of 10 s; YCSB and the `BGSAVE` run
-  are single runs. Treat the numbers as orders of magnitude, not as precise ratios.
+- Short runs: memtier results are the median of 3 rounds of 10 s; YCSB is a single run and
+  the `BGSAVE` measurement two runs. Treat the numbers as orders of magnitude, not as precise ratios.
 - These numbers move as the project changes (the tree was redesigned on 2026-10-17); the
   script above regenerates them.
 
@@ -359,7 +363,9 @@ replication, cluster.
 ## Persistence
 
 - **`SAVE`** (blocking) and **`BGSAVE`** (incremental, in slices between client requests)
-  write `RADIXOX_DIR/dump.rxd`. The dump is reloaded at startup.
+  write `RADIXOX_DIR/dump.rxd`. The dump is reloaded at startup. While clients are active,
+  `BGSAVE` uses at most 10 % of the server thread (`RADIXOX_SAVE_CPU_SHARE`), so it does not
+  raise their tail latency.
 - Snapshots use an **application-level copy-on-write barrier** instead of `fork`: a node is
   copied only if it is modified before the snapshot reaches it. No memory doubling, no fork
   latency on a large heap.
@@ -388,6 +394,7 @@ Environment variables:
 | `RADIXOX_SAVE_SYNC_ZSTD` | raw | zstd level of `SAVE` and of the exit save |
 | `RADIXOX_SAVE_BACKLOG_MB` | `64` | compression backlog of `BGSAVE` |
 | `RADIXOX_SAVE_ON_EXIT` | off | save on SIGINT / SIGTERM |
+| `RADIXOX_SAVE_CPU_SHARE` | `0.1` | share of the server thread a `BGSAVE` may use while clients are active (no cap after 1 ms without network reads) |
 | `RADIXOX_SCAN_IDLE_SECS` | `60` | idle time after which a `SCAN` cursor can be reclaimed |
 | `RADIXOX_SCAN_MAX_CURSORS` | `65536` | active `SCAN` cursors at most; beyond, a new `SCAN` gets an error |
 | `RADIXOX_SCAN_MAX_CURSORS_PER_CLIENT` | `128` | active `SCAN` cursors at most per connection (its own idle cursors are reclaimed first) |

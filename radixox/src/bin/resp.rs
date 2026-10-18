@@ -12,7 +12,7 @@ use std::time::Duration;
 use monoio::buf::SliceMut;
 use monoio::io::Splitable;
 use monoio::net::tcp::TcpOwnedReadHalf;
-use monoio::net::{TcpListener, TcpStream};
+use monoio::net::{ListenerOpts, TcpListener, TcpStream};
 use monoio::time::TimeDriver;
 use monoio::{IoUringDriver, Runtime, RuntimeBuilder};
 
@@ -72,7 +72,11 @@ fn main() -> std::io::Result<()> {
         if resp_cmd::auth::password().is_none() && bind != "127.0.0.1" && bind != "::1" && bind != "localhost" {
             eprintln!("WARNING: listening on {bind} without RADIXOX_PASSWORD: anyone who can reach this port has full access");
         }
-        let listener = Rc::new(TcpListener::bind(&addr)?);
+        // monoio active SO_REUSEPORT par défaut : un second serveur lancé sur
+        // le même port démarrait sans erreur et le noyau lui envoyait une
+        // partie des connexions (données séparées). Ici, EADDRINUSE.
+        let opts = ListenerOpts::new().reuse_port(false);
+        let listener = Rc::new(TcpListener::bind_with_config(&addr, &opts)?);
         println!("RadixOx RESP Server listening on {addr}");
 
         let registry: SharedRegistry = Rc::new(RefCell::new(SubRegistry::default()));
@@ -248,6 +252,7 @@ async fn handle_loop(
         if n == 0 {
             return Ok(());
         }
+        resp_cmd::bgsave::note_read();
 
         let consume_byte_count =
             handle_buffer(&mut read_buf, conn_state, registry, art, &mut client).await?;

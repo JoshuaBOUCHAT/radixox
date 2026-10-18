@@ -34,6 +34,44 @@ const COMPRESS_SLICE: Duration = Duration::from_micros(150);
 /// Taille à partir de laquelle la tâche de save lance une écriture.
 const CHUNK: usize = 2 << 20;
 
+/// Part du thread serveur que le BGSAVE s'accorde (`RADIXOX_SAVE_CPU_SHARE`,
+/// entre 0 et 1). Sans plafond, la save prenait ~60 % du cœur pendant qu'elle
+/// tournait : les clients faisaient la queue et le p99.9 doublait. Au-delà
+/// de sa part (temps de tranches + compression rapporté au temps écoulé), la
+/// tâche cède sans travailler — sauf si aucune lecture réseau n'a abouti
+/// depuis `IDLE_AFTER` : pas de client actif, le thread est libre.
+///
+/// (Un `yield` qui revient tout de suite ne suffit pas comme signal : des
+/// requêtes déjà arrivées dans le noyau attendent que la boucle les relève, et
+/// la save qui comblait ces trous remettait le p99.9 au double.)
+fn save_cpu_share() -> f64 {
+    static SHARE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *SHARE.get_or_init(|| match std::env::var("RADIXOX_SAVE_CPU_SHARE") {
+        Err(_) => DEFAULT_SAVE_CPU_SHARE,
+        Ok(v) => match v.parse::<f64>() {
+            Ok(x) if x > 0.0 && x <= 1.0 => x,
+            _ => {
+                eprintln!("[bgsave] RADIXOX_SAVE_CPU_SHARE={v} invalide, {DEFAULT_SAVE_CPU_SHARE}");
+                DEFAULT_SAVE_CPU_SHARE
+            }
+        },
+    })
+}
+const DEFAULT_SAVE_CPU_SHARE: f64 = 0.1;
+/// Sans lecture réseau depuis ce délai, la save n'est plus plafonnée.
+const IDLE_AFTER: Duration = Duration::from_millis(1);
+
+thread_local! {
+    /// Lectures réseau abouties (toutes connexions) : signal d'activité.
+    static READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// À appeler à chaque lecture réseau non vide.
+#[inline]
+pub(crate) fn note_read() {
+    READS.with(|r| r.set(r.get().wrapping_add(1)));
+}
+
 const FILE_NAME: &str = "dump.rxd";
 const TMP_NAME: &str = "dump.rxd.tmp";
 
@@ -355,6 +393,8 @@ async fn bgsave_task(art: SharedART, dir: PathBuf, zstd: Option<ZstdConf>) {
         }
         None => art.borrow_mut().save_start(&mut sf.borrow_mut().fill),
     });
+    let share = save_cpu_share();
+    let (mut reads_seen, mut last_read) = (READS.with(|r| r.get()), Instant::now());
     let aborted = loop {
         if sf.borrow().err.is_some() {
             break true;
@@ -364,7 +404,16 @@ async fn bgsave_task(art: SharedART, dir: PathBuf, zstd: Option<ZstdConf>) {
             let s = sf.borrow();
             s.in_flight && s.fill.len() >= CHUNK
         };
-        if !blocked {
+        // Plafond de CPU : en avance sur sa part, la save cède sans travailler.
+        let reads = READS.with(|r| r.get());
+        if reads != reads_seen {
+            (reads_seen, last_read) = (reads, Instant::now());
+        }
+        let paced = share < 1.0 && last_read.elapsed() < IDLE_AFTER && {
+            let work = sf.borrow().stats.in_tranches + comp.as_ref().map_or(Duration::ZERO, |c| c.in_compress);
+            work.as_secs_f64() > share * start.elapsed().as_secs_f64()
+        };
+        if !blocked && !paced {
             // 1. Une tranche de DFS, si le brut en attente a de la place.
             if let Some(c_cur) = cur.as_mut()
                 && comp.as_ref().is_none_or(|c| c.pending() < c.backlog)
