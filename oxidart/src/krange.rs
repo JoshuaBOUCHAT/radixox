@@ -173,6 +173,62 @@ const NO_CHILD: u32 = u32::MAX;
 /// Nombre d'entrées regardées en avance pour précharger les nœuds enfants.
 const PREFETCH_AHEAD: i32 = 2;
 
+/// Copie de `s` à l'adresse `d` sans appel à `memcpy` pour les morceaux
+/// courts (≤ 32 octets) : copies chevauchantes de 16, 8 ou 4 octets.
+///
+/// # Safety
+/// `d` est valide en écriture sur `s.len()` octets et ne chevauche pas `s`.
+#[inline(always)]
+unsafe fn copy_short(d: *mut u8, s: &[u8]) {
+    let n = s.len();
+    let p = s.as_ptr();
+    unsafe {
+        if n > 32 {
+            std::ptr::copy_nonoverlapping(p, d, n);
+        } else if n >= 16 {
+            (d as *mut u128).write_unaligned((p as *const u128).read_unaligned());
+            (d.add(n - 16) as *mut u128).write_unaligned((p.add(n - 16) as *const u128).read_unaligned());
+        } else if n >= 8 {
+            (d as *mut u64).write_unaligned((p as *const u64).read_unaligned());
+            (d.add(n - 8) as *mut u64).write_unaligned((p.add(n - 8) as *const u64).read_unaligned());
+        } else if n >= 4 {
+            (d as *mut u32).write_unaligned((p as *const u32).read_unaligned());
+            (d.add(n - 4) as *mut u32).write_unaligned((p.add(n - 4) as *const u32).read_unaligned());
+        } else {
+            for i in 0..n {
+                *d.add(i) = *p.add(i);
+            }
+        }
+    }
+}
+
+/// `extend_from_slice` avec [`copy_short`] : une réservation, pas d'appel de
+/// bibliothèque pour les clés et suffixes courts (deux `memcpy` par entrée
+/// coûtaient ~1 600 instructions par page de 64).
+#[inline(always)]
+fn extend_short(v: &mut Vec<u8>, s: &[u8]) {
+    v.reserve(s.len());
+    // SAFETY: `s.len()` octets réservés après `len`.
+    unsafe {
+        copy_short(v.as_mut_ptr().add(v.len()), s);
+        v.set_len(v.len() + s.len());
+    }
+}
+
+/// Clé courante = `key[..key_len]` + `radix` + `sfx`, en une réservation.
+#[inline(always)]
+fn set_tail(key: &mut Vec<u8>, key_len: usize, radix: u8, sfx: &[u8]) {
+    key.truncate(key_len);
+    key.reserve(1 + sfx.len());
+    // SAFETY: `1 + sfx.len()` octets réservés après `key_len`.
+    unsafe {
+        let d = key.as_mut_ptr().add(key_len);
+        *d = radix;
+        copy_short(d.add(1), sfx);
+        key.set_len(key_len + 1 + sfx.len());
+    }
+}
+
 /// Buffers de travail réutilisés d'un appel à l'autre (par thread).
 #[derive(Default)]
 struct Scratch {
@@ -208,7 +264,7 @@ impl<'a> Sink<'a> for RangeSink<'a> {
         if let RangeVal::Bytes(b) = v {
             b.prefetch();
         }
-        self.out.keys.extend_from_slice(key);
+        extend_short(&mut self.out.keys, key);
         self.out.entries.push((self.out.keys.len() as u32, v));
     }
 
@@ -250,7 +306,7 @@ impl<'a, S: Sink<'a>> Walker<'a, '_, S> {
         let art = self.art;
         let node = art.node(idx);
         if !prefix_in_key {
-            self.key.extend_from_slice(&node.prefix);
+            extend_short(&mut self.key, &node.prefix);
         }
         let key_len = self.key.len();
         let n = node.len() as i32;
@@ -355,20 +411,17 @@ impl<'a, S: Sink<'a>> Walker<'a, '_, S> {
                 // SAFETY: idem ; `cur` est le curseur de `node`.
                 let (r, entry) = unsafe { cur.get(node, e as usize) };
                 e += step;
-                self.key.truncate(key_len);
-                self.key.push(r);
                 let bounded = bound == Some(r);
                 match entry {
                     EntryRef::Child(c) => {
+                        set_tail(&mut self.key, key_len, r, &[]);
                         let f = self.stack.last_mut().expect("non vide");
                         (f.next, f.staged) = (e, staged);
                         self.enter(c, bounded, false);
                         continue 'frames;
                     }
                     EntryRef::Leaf { tag, val, ttl, sfx } => {
-                        if let Some(sfx) = sfx {
-                            self.key.extend_from_slice(sfx);
-                        }
+                        set_tail(&mut self.key, key_len, r, sfx.map_or(&[], |s| s));
                         if !bounded || self.past_from() {
                             self.emit(tag, val, ttl);
                         }
@@ -396,7 +449,7 @@ impl OxidArt {
         let cap = count.min(4096);
         let sink = RangeSink {
             out: RangeOut {
-                keys: Vec::with_capacity(cap * (prefix.len() + 16)),
+                keys: Vec::with_capacity(cap * (prefix.len() + 32)),
                 entries: Vec::with_capacity(cap),
             },
             count,
@@ -525,7 +578,7 @@ impl<'a, F: FnMut(&[u8], RedisType) -> bool> Sink<'a> for ScanSink<F> {
         if expired(exp, now) || !(self.keep)(key, tag.redis_type()) {
             return;
         }
-        self.page.keys.extend_from_slice(key);
+        extend_short(&mut self.page.keys, key);
         self.page.ends.push(self.page.keys.len() as u32);
     }
 
