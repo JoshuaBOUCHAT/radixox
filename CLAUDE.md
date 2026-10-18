@@ -142,7 +142,8 @@ Client ──TCP──> io_buf ──extend──> read_buf ──decode_bytes_m
 **Shared state**: OxidArt tree is wrapped in `Rc<RefCell<>>` (single-threaded, no locks needed).
 
 **Supported RESP commands**:
-- **String/Keys**: PING, QUIT, ECHO, SELECT, GET, SET (with EX/PX/NX/XX), SETNX, SETEX, MGET, MSET, DEL, EXISTS, TYPE, KEYS, TTL, PTTL, EXPIRE, PEXPIRE, PERSIST, DBSIZE, FLUSHDB
+- **Connection**: PING, QUIT, ECHO, SELECT, AUTH, HELLO (RESP2 ; HELLO 3 → NOPROTO), CLIENT (SETNAME/GETNAME/ID/SETINFO), COMMAND
+- **String/Keys**: GET, SET (with EX/PX/NX/XX), SETNX, SETEX, MGET, MSET, DEL, UNLINK, EXISTS, TYPE, KEYS, SCAN (MATCH/COUNT/TYPE, voir `SCAN_DESIGN.md`), KRANGE/KREVRANGE, TTL, PTTL, EXPIRE, PEXPIRE, PERSIST, DBSIZE, FLUSHDB
 - **Counters**: INCR, DECR, INCRBY, DECRBY
 - **Hash**: HSET, HMSET, HGET, HGETALL, HDEL, HEXISTS, HLEN, HKEYS, HVALS, HMGET, HINCRBY
 - **Set**: SADD, SREM, SISMEMBER, SCARD, SMEMBERS, SPOP
@@ -401,7 +402,6 @@ Quand PUBLISH fait `join_all` sur les `WriteGate::write()` de tous les subscribe
 - [ ] ZSet: ZRANK, ZRANGEBYSCORE, BZPOPMIN, BZPOPMAX
 
 ### RESP Commands (not yet implemented)
-- [ ] `SCAN cursor [MATCH pattern] [COUNT count]` - Cursor-based iteration
 - [ ] `APPEND key value` - Append to string
 - [ ] `STRLEN key` - Get string length
 - [ ] `GETRANGE key start end` - Get substring

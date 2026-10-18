@@ -1,8 +1,9 @@
 # RadixOx
 
-**A Redis-compatible in-memory key-value store built on an Adaptive Radix Tree, in Rust, on io_uring.**
+**An in-memory key-value store that speaks the Redis protocol (RESP2, a subset of the commands), built on an Adaptive Radix Tree, in Rust, on io_uring.**
 
-RadixOx speaks RESP2, so `redis-cli` and existing Redis client libraries work with it. Its
+RadixOx speaks RESP2, so `redis-cli` and existing Redis client libraries work with it for the
+[supported commands](#supported-commands). Its
 storage engine, **OxidArt**, keeps keys in an ordered radix tree instead of a hash table. On a
 single core it beats Valkey on throughput, tail latency and, with structured keys, memory, and
 it makes ordered and prefix operations native: sorted pagination (`KRANGE`), prefix scans that
@@ -30,13 +31,16 @@ and caveats):
 | `SAVE` of 1M keys | **84 ms** (raw) / 70 ms (zstd) | 1,810 ms | ×22–26 |
 | Restart with 1M keys | **~0.17 s** | ~0.53 s | ×3 |
 | `KEYS user:*` (1,000 matches in 1M keys, 2026-10-12) | **0.15 ms** | 21.4 ms | ×140 |
+| Full `SCAN MATCH user:12*` (11K matches in 1M keys, server CPU, 2026-10-18) | **< 10 ms**, 12 calls | 110 ms, 999 calls | ×10+ |
 
 Plus what Redis doesn't have:
 
 - **`KRANGE` / `KREVRANGE`**: the next N keys under a prefix, in sorted order, after a cursor
   key. Pagination for message threads, logs or feeds, without maintaining a sorted set.
-- **Prefix and glob queries that prune**: `KEYS user:*` walks only the `user:` subtree, and
-  complex globs are compiled to a DFA that skips whole subtrees.
+- **Prefix and glob queries that prune**: `KEYS user:*` and `SCAN MATCH user:*` walk only the
+  `user:` subtree, and complex `KEYS` globs are compiled to a DFA that skips whole subtrees.
+- **A stricter `SCAN`**: no duplicates, `COUNT` is exact, and every key present for the whole
+  scan is returned exactly once, even while the data changes.
 - **Binary-safe keys**: any byte 0x00–0xFF at any position, ordered like `memcmp`.
 - **Snapshots without `fork`**: an application-level copy-on-write barrier gives a consistent
   point-in-time dump while the server keeps serving.
@@ -163,6 +167,21 @@ server-side (round trip subtracted):
 
 Valkey has to scan the whole keyspace; RadixOx walks only the `user:` subtree. The gap grows
 with the size of the database.
+
+Full `SCAN` loops (cursor until 0) over 1M keys (500K `user:N`, 300K `session:<hex>`, 200K
+hashes), server CPU time read from `/proc` (2026-10-18, single run):
+
+| | RadixOx | Valkey 9.1.2 |
+|---|---|---|
+| `COUNT 1000` | **50 ms** (1,001 calls) | 120 ms (999 calls) |
+| `COUNT 1000 MATCH user:12*` (11,111 keys) | **< 10 ms** (12 calls) | 110 ms (999 calls) |
+| `COUNT 1000 MATCH session:*` (300K keys) | **30 ms** (301 calls) | 110 ms (999 calls) |
+| `COUNT 1000 MATCH *:99*` (3,426 keys) | **50 ms** (1,001 calls) | 180 ms (999 calls) |
+| one `SCAN 0 MATCH *:99* COUNT 1000` call, latency (avg / p99) | **45 µs** / 71 µs | 78 µs / 135 µs |
+| `COUNT 10` | 750 ms (100K calls) | **620 ms** (84K calls) |
+
+With a small `COUNT`, Valkey wins: each RadixOx page descends again from the root to the
+resume key. Use a large `COUNT`.
 
 ### Persistence (1M keys, 100-byte values)
 
@@ -333,6 +352,15 @@ Environment variables:
 | `RADIXOX_SCAN_MAX_CURSORS` | `65536` | active `SCAN` cursors at most; beyond, a new `SCAN` gets an error |
 | `SQ_POLL` | off | io_uring SQ polling (idle time in ms) |
 | `RADIXOX_SQ_POLL_PIN` | unset | CPU of the SQ polling kernel thread (**required** with `SQ_POLL` today) |
+
+### Security
+
+- RadixOx listens on `127.0.0.1` unless `RADIXOX_BIND` says otherwise, and prints a warning if
+  it listens elsewhere without a password.
+- `RADIXOX_PASSWORD` works like Redis's `requirepass`: before `AUTH` (or `HELLO 2 AUTH …`),
+  every command except `AUTH`, `HELLO` and `QUIT` gets `-NOAUTH`. The comparison is in constant
+  time. Use a long random password (e.g. `openssl rand -hex 32`).
+- No ACLs (one `default` user) and no TLS yet: put a TLS proxy in front for remote clients.
 
 ---
 
