@@ -29,6 +29,7 @@ wait_for_server() {
     sleep 1
   done
   echo " FAILED — server unreachable"
+  echo "  (RadixOx écoute sur 127.0.0.1 par défaut : lancer le serveur distant avec RADIXOX_BIND=0.0.0.0)"
   exit 1
 }
 

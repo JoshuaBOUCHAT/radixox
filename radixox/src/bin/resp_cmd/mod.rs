@@ -1,3 +1,4 @@
+pub(crate) mod auth;
 pub(crate) mod bgsave;
 pub(crate) mod shutdown;
 pub(crate) mod delayed;

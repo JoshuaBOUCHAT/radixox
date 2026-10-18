@@ -47,7 +47,7 @@ Plus what Redis doesn't have:
 
 ```bash
 cargo install radixox                    # or: git clone … && cargo build --release --bin radixox
-radixox                                  # listens on 6379
+radixox                                  # listens on 127.0.0.1:6379 (RADIXOX_BIND to change)
 
 redis-cli SET user:10:message:1 hello
 redis-cli SET user:10:message:2 world
@@ -281,7 +281,7 @@ own synchronization.
 
 | Category | Commands |
 |---|---|
-| Connection / server | `PING` `ECHO` `QUIT` `SELECT` `INFO` `DBSIZE` `FLUSHDB` `SAVE` `BGSAVE` |
+| Connection / server | `PING` `AUTH` `ECHO` `QUIT` `SELECT` `INFO` `DBSIZE` `FLUSHDB` `SAVE` `BGSAVE` |
 | Strings | `GET` `SET` (`EX` `PX` `NX` `XX`) `SETNX` `SETEX` `MGET` `MSET` |
 | Counters | `INCR` `DECR` `INCRBY` `DECRBY` |
 | Keys | `DEL` `UNLINK` `EXISTS` `TYPE` `KEYS` `SCAN` (`MATCH` `COUNT` `TYPE`) |
@@ -320,6 +320,8 @@ Environment variables:
 | Variable | Default | Effect |
 |---|---|---|
 | `RADIXOX_PORT` | `6379` | listening port |
+| `RADIXOX_BIND` | `127.0.0.1` | listening address (`0.0.0.0` or `::` to accept remote clients; a warning is printed if no password is set) |
+| `RADIXOX_PASSWORD` | unset | require `AUTH <password>` (or `AUTH default <password>`) before any other command; use a long random value |
 | `RADIXOX_DIR` | `.` | directory of `dump.rxd` |
 | `RADIXOX_CPU_PIN` | unset | pin the server thread to this CPU |
 | `RADIXOX_PREFETCH` | `8` | pipelined commands whose key lookups are interleaved (`0` = off) |

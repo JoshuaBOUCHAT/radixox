@@ -64,7 +64,13 @@ fn main() -> std::io::Result<()> {
         resp_cmd::bgsave::load_at_startup(&shared_art)?;
         resp_cmd::shutdown::install(shared_art.clone());
 
-        let addr = format!("0.0.0.0:{port}");
+        // 127.0.0.1 par défaut : sans `RADIXOX_BIND`, le serveur n'est pas
+        // joignable depuis le réseau.
+        let bind = env::var("RADIXOX_BIND").unwrap_or_else(|_| "127.0.0.1".into());
+        let addr = if bind.contains(':') { format!("[{bind}]:{port}") } else { format!("{bind}:{port}") };
+        if resp_cmd::auth::password().is_none() && bind != "127.0.0.1" && bind != "::1" && bind != "localhost" {
+            eprintln!("WARNING: listening on {bind} without RADIXOX_PASSWORD: anyone who can reach this port has full access");
+        }
         let listener = Rc::new(TcpListener::bind(&addr)?);
         println!("RadixOx RESP Server listening on {addr}");
 
@@ -225,6 +231,7 @@ async fn handle_loop(
     let mut read_buf: Vec<u8> = Vec::with_capacity(BUFFER_SIZE);
     let mut io_buf: Vec<u8> = Vec::with_capacity(BUFFER_SIZE);
     let mut io_buf_offset = 0;
+    let mut authed = resp_cmd::auth::password().is_none();
 
     loop {
         // Commande incomplète qui remplit tout le buffer (grosse valeur) : sans
@@ -241,7 +248,8 @@ async fn handle_loop(
             return Ok(());
         }
 
-        let consume_byte_count = handle_buffer(&mut read_buf, conn_state, registry, art).await?;
+        let consume_byte_count =
+            handle_buffer(&mut read_buf, conn_state, registry, art, &mut authed).await?;
         io_buf_offset = read_buf.len() - consume_byte_count;
         io_buf.extend_from_slice(&read_buf[consume_byte_count..]);
         read_buf.clear();
@@ -255,13 +263,14 @@ async fn handle_buffer(
     conn_state: &mut ConnState,
     registry: &SharedRegistry,
     art: &SharedART,
+    authed: &mut bool,
 ) -> IOResult<usize> {
     let window = prefetch_window();
     if window == 0 {
         let mut offset = 0;
         while let Some((cmd, n)) = Cmd::parse(&read_buf[offset..]) {
             offset += n;
-            dispatch(cmd, conn_state, registry, art).await?;
+            dispatch(cmd, conn_state, registry, art, authed).await?;
         }
         return Ok(offset);
     }
@@ -287,7 +296,7 @@ async fn handle_buffer(
         }
         keys.clear();
         for cmd in batch.drain(..) {
-            dispatch(cmd, conn_state, registry, art).await?;
+            dispatch(cmd, conn_state, registry, art, authed).await?;
         }
     }
 }
@@ -310,7 +319,13 @@ async fn dispatch(
     conn_state: &mut ConnState,
     registry: &SharedRegistry,
     art: &SharedART,
+    authed: &mut bool,
 ) -> IOResult<()> {
+    // Non authentifié : forcément en mode Normal (SUBSCRIBE est refusé).
+    if !*authed && !matches!(cmd, Cmd::Auth { .. } | Cmd::Quit) {
+        conn_state.encode(resp_cmd::auth::noauth());
+        return Ok(());
+    }
     match conn_state {
         ConnState::PubSub(_) => match cmd {
             Cmd::Subscribe(channels) => cmd_subscribe(&channels, conn_state, registry).await?,
@@ -344,8 +359,13 @@ async fn dispatch(
                 conn_state.encode(Frame::BulkString(SharedByte::from_slice(info.as_bytes())));
             }
             Cmd::Ping(msg) => conn_state.encode(resp_pong(msg)),
+            Cmd::Auth { user, pass } => {
+                conn_state.encode(resp_cmd::auth::cmd_auth(user, pass, authed));
+            }
             Cmd::Quit => {
+                // +OK (et les réponses pipelinées avant) partent avant la fermeture.
                 conn_state.encode(resp_ok());
+                conn_state.flush().await?;
                 return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
             }
             Cmd::Echo(msg) => conn_state.encode(Frame::BulkString(SharedByte::from_slice(msg))),
@@ -516,6 +536,7 @@ fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         | Cmd::BgSave
         | Cmd::Save
         | Cmd::Info
+        | Cmd::Auth { .. }
         | Cmd::HMSet { .. }
         | Cmd::Unknown => unreachable!(),
     }

@@ -58,6 +58,8 @@ pub enum Cmd<'a> {
     Unknown,
     /// INFO [section] — retourne des infos serveur (réponse minimale)
     Info,
+    /// AUTH password / AUTH username password
+    Auth { user: Option<&'a [u8]>, pass: &'a [u8] },
 
     /// PING [message]
     Ping(Option<&'a [u8]>),
@@ -448,6 +450,13 @@ fn dispatch<'a>(raw: &[&'a [u8]]) -> Option<Cmd<'a>> {
                 b'p' => { need!(2); Some(Cmd::Expire { key: args[0], dur: Duration::from_secs(arg_u64(args[1])?) }) } // EXPIRE e-x-P
                 _ => None,
             },
+            _ => None,
+        },
+
+        // ── A : AUTH ──────────────────────────────────────────────────────
+        b'a' if cmd.eq_ignore_ascii_case(b"auth") => match *args {
+            [pass] => Some(Cmd::Auth { user: None, pass }),
+            [user, pass] => Some(Cmd::Auth { user: Some(user), pass }),
             _ => None,
         },
 

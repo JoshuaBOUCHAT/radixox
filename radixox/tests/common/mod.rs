@@ -8,6 +8,12 @@ use std::time::Duration;
 /// test run are killed first (via `fuser -k`), so each test binary always starts
 /// with a fresh server and clean state.
 pub fn start_server(port: u16) {
+    start_server_env(port, &[]);
+}
+
+/// [`start_server`] avec des variables d'environnement en plus.
+#[allow(dead_code)]
+pub fn start_server_env(port: u16, envs: &[(&str, &str)]) {
     // Kill any orphan from a previous run holding this port.
     let _ = Command::new("fuser")
         .args(["-k", &format!("{port}/tcp")])
@@ -19,6 +25,7 @@ pub fn start_server(port: u16) {
     let bin = env!("CARGO_BIN_EXE_radixox");
     let child = Command::new(bin)
         .env("RADIXOX_PORT", port.to_string())
+        .envs(envs.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
