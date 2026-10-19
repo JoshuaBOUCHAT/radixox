@@ -76,10 +76,9 @@ cmd_start() {
   case "$which" in
     radixox)
       local bin="$ROOT/target/release/radixox"
-      if [ ! -x "$bin" ]; then
-        echo "build de radixox (target-cpu=native)…"
-        (cd "$ROOT" && RUSTFLAGS="-C target-cpu=native" cargo build --release --bin radixox)
-      fi
+      # Toujours à jour avec le dépôt (rapide si rien n'a changé).
+      (cd "$ROOT" && RUSTFLAGS="-C target-cpu=native" cargo build --release --bin radixox -q) \
+        || die "build de radixox impossible"
       local env=(RADIXOX_BIND=0.0.0.0 RADIXOX_PORT="$PORT" RADIXOX_CPU_PIN="$main" RADIXOX_DIR="$STATE")
       if [ -n "$iowq" ]; then
         env+=(RADIXOX_SEND_ASYNC=1 RADIXOX_IOWQ_WORKERS=$((k - 1)) RADIXOX_IOWQ_CPUS="$iowq")
