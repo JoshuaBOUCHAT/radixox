@@ -10,7 +10,7 @@
 # services redis/valkey arrêtés, pare-feu ouvert à ce PC, build) → test de connexion →
 # YCSB A contre RadixOx puis Valkey pour chaque K → tableaux.
 #
-# Variables : REMOTE_DIR (radixox), PORT (6379), RECORDS (5M), OPS (10M), THREADS (100),
+# Variables : REMOTE_DIR (radixox), PORT (6379), RECORDS (1M), OPS (2M), THREADS (100),
 # HOST (adresse du serveur ; défaut : celle que ssh résout pour la cible), SKIP_SETUP=1.
 set -euo pipefail
 
@@ -20,8 +20,8 @@ KS=("$@")
 [ ${#KS[@]} -gt 0 ] || KS=(1 3)
 PORT="${PORT:-6379}"
 REMOTE_DIR="${REMOTE_DIR:-radixox}"
-RECORDS="${RECORDS:-5000000}"
-OPS="${OPS:-10000000}"
+RECORDS="${RECORDS:-1000000}"
+OPS="${OPS:-2000000}"
 THREADS="${THREADS:-100}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 YCSB_DIR="$ROOT/../ycsb-redis-binding-0.18.0-SNAPSHOT"
@@ -85,6 +85,11 @@ ycsb() { # phase fichier
     -p fieldcount=1 -p fieldnamekey=false -p fieldlength=100 \
     -p recordcount="$RECORDS" "${count[@]}" -threads "$THREADS" \
     -p percentiles=95,99,99.9,99.99 >"$out" 2>&1 || die "YCSB $phase a échoué (log : $out)"
+  # YCSB sort avec 0 même si toutes les opérations échouent : on vérifie.
+  grep -q 'Return=OK' "$out" || die "YCSB $phase : aucune opération réussie (log : $out)"
+  if grep -qE 'Return=(ERROR|NOT_FOUND)' "$out"; then
+    echo "    ⚠ erreurs YCSB : $(grep -E 'Return=(ERROR|NOT_FOUND)' "$out" | tr '\n' ' ')"
+  fi
 }
 stat() { grep -F "$2" "$1" 2>/dev/null | awk '{print $3}' | head -1 || true; }
 pct() { grep -oP "\[$2:[^\]]*\]" "$1" 2>/dev/null | tail -1 | grep -oP "$3=\K[0-9]+" || true; }
@@ -92,7 +97,10 @@ pct() { grep -oP "\[$2:[^\]]*\]" "$1" 2>/dev/null | tail -1 | grep -oP "$3=\K[0-
 declare -A R
 bench() { # serveur K
   local s=$1 k=$2 f="$OUT/${1}_k$2"
-  echo "  $s, $k cœur(s) : $(remote start "$s" "$k" | tail -1)"
+  local started
+  started=$(remote start "$s" "$k" 2>&1) || die "démarrage de $s ($k cœurs) impossible :
+$started"
+  echo "  $(echo "$started" | tail -1)"
   echo "    load de $RECORDS enregistrements…"
   ycsb load "${f}_load.txt"
   echo "    run de $OPS opérations sur les $RECORDS clés…"

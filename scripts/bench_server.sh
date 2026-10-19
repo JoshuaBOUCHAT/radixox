@@ -122,12 +122,16 @@ cmd_start() {
       ;;
     valkey)
       local bin; bin=$(ref_bin) || die "ni valkey-server ni redis-server"
-      # Redis 6/7 ne parallélise les lectures réseau qu'avec io-threads-do-reads.
-      local extra=()
-      [ "$bin" = redis-server ] && [ "$k" -gt 1 ] && extra=(--io-threads-do-reads yes)
+      # Redis 7.0 : `server_cpulist` (tiret bas) ; et ses io-threads ne lisent le
+      # réseau qu'avec io-threads-do-reads. Valkey accepte `server-cpulist`.
+      local extra=() cpulist_opt=--server-cpulist
+      if [ "$bin" = redis-server ]; then
+        cpulist_opt=--server_cpulist
+        [ "$k" -gt 1 ] && extra=(--io-threads-do-reads yes)
+      fi
       setsid taskset -c "$cpus" "$bin" --port "$PORT" --bind 0.0.0.0 --protected-mode no \
         --save "" --appendonly no --dir "$STATE" \
-        --io-threads "$k" --server-cpulist "$cpus" "${extra[@]}" </dev/null >"$STATE/server.log" 2>&1 &
+        --io-threads "$k" "$cpulist_opt" "$cpus" "${extra[@]}" </dev/null >"$STATE/server.log" 2>&1 &
       which="$(cmd_refname)"
       ;;
     *) die "start radixox|valkey [K]" ;;
