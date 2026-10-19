@@ -410,6 +410,8 @@ Environment variables:
 | `RADIXOX_TIMEOUT` | `0` | close a client idle for this many seconds (`0` = never), like Redis's `timeout` |
 | `RADIXOX_BATCH_CMDS` | `2048` | commands per slice of a loop turn; replies ready between slices are sent |
 | `RADIXOX_RING_BUFS` / `RADIXOX_RING_BUF_KB` | `64` / `32` | receive buffer ring shared by all connections |
+| `RADIXOX_SEND_ASYNC` | off | run sends on kernel io-wq workers (`IOSQE_ASYNC`): helps clients without pipelining when a second core is available |
+| `RADIXOX_IOWQ_WORKERS` / `RADIXOX_IOWQ_CPUS` | `1` / unset | io-wq network workers at most, and the CPUs they may run on (e.g. `1,7`) |
 
 ### Security
 

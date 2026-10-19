@@ -1137,6 +1137,24 @@ Leçons, contraires au design initial (§2.1, §2.3) :
 - Pic restant, commun aux deux binaires : `end_save` libère d'un coup les copies T0
   (~8 ms sur 1 M clés sous écriture) → à faire par tranches (oxidart).
 
+**Délégation des sends, version statique (2026-10-19, §6.4 étape 1).** `RADIXOX_SEND_ASYNC=1`,
+`RADIXOX_IOWQ_WORKERS`, `RADIXOX_IOWQ_CPUS`. Boucle sur CPU 0, workers sur le cœur
+physique 1 (CPU 1, et 7 son frère SMT), client sur 2-5,8-11 ; un run par point.
+
+| | sans (1 cœur) | 1 worker (CPU 1) | 2 workers (CPU 1+7) |
+|---|---|---|---|
+| p1 débit | 310 K | 289 K | **526 K (+70 %)** |
+| p1 moy. / p99 | 0,295 / 0,447 ms | 0,277 / 0,375 | **0,174 / 0,279 ms** |
+| p32 débit / p99 | 2,08–2,41 M / 1,46–1,55 | | 2,59 M / 1,54 |
+| p256 débit / p99 | 2,83 M / 9,5 | | 2,76 M / 12,2 |
+| occupation p1 (2 workers) | | | CPU 0 75 %, CPU 1 89 %, CPU 7 89 % |
+
+Lecture : sans pipeline, la pile TCP part sur les workers et le débit suit leur nombre ;
+un seul worker déplace le TCP sans le paralléliser (même constat que SQ_POLL, §12.3) ;
+en pipeline profond, déléguer ne rapporte rien (goulot = l'arbre) et peut coûter → le
+mode `auto` (déléguer quand le noyau sature notre cœur) a une raison d'être. Repère :
+Valkey 4 io-threads faisait ~500 K en p1 en mai, sur 4 cœurs.
+
 **Prochaine optimisation (idée de l'utilisateur, 2026-10-19) : préchargement anticipé.**
 Pendant qu'on exécute la fenêtre N, précharger déjà les octets des frames et les clés de
 la fenêtre N+1 (distance réglable, comme le préchargement des frères de KRANGE) : les

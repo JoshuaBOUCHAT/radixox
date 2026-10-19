@@ -113,6 +113,8 @@ struct Server {
     listener: TcpListener,
     ops: Vec<Op>,
     no_iowait: bool,
+    /// Sends délégués aux workers io-wq (`IOSQE_ASYNC`, RUNTIME_ARCH.md §6.4).
+    send_async: bool,
     /// `signalfd` de SIGINT / SIGTERM (`RADIXOX_SAVE_ON_EXIT`).
     signals: Option<Signals>,
 }
@@ -229,10 +231,13 @@ impl Server {
                 Op::Send { slot } => {
                     // Le tampon reste intact jusqu'au CQE (invariant du cœur).
                     let buf = self.core.pending_send(slot);
-                    opcode::Send::new(Fixed(slot), buf.as_ptr(), buf.len() as u32)
+                    let sqe = opcode::Send::new(Fixed(slot), buf.as_ptr(), buf.len() as u32)
                         .flags(libc::MSG_WAITALL | libc::MSG_NOSIGNAL)
                         .build()
-                        .user_data(ud(K_SEND, slot))
+                        .user_data(ud(K_SEND, slot));
+                    // Délégué : la pile TCP de l'envoi tourne sur un worker io-wq,
+                    // pas pendant notre `enter`.
+                    if self.send_async { sqe.flags(squeue::Flags::ASYNC) } else { sqe }
                 }
                 Op::CancelRecv { slot } => opcode::AsyncCancel::new(ud(K_RECV, slot))
                     .build()
@@ -461,6 +466,34 @@ fn raise_nofile(wanted: u32) -> u32 {
     }
 }
 
+/// Délégation des sends (RUNTIME_ARCH.md §6.4), version statique :
+/// `RADIXOX_SEND_ASYNC=1` active `IOSQE_ASYNC` ; `RADIXOX_IOWQ_WORKERS` fixe le
+/// plafond de workers réseau (1 par défaut : sans plafond, le noyau peut en
+/// créer des dizaines) ; `RADIXOX_IOWQ_CPUS` (« 1,7 ») les épingle.
+fn setup_iowq(ring: &IoUring) -> io::Result<bool> {
+    let on = std::env::var("RADIXOX_SEND_ASYNC")
+        .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+    if !on {
+        return Ok(false);
+    }
+    let workers: u32 = std::env::var("RADIXOX_IOWQ_WORKERS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    // [bounded (disque), unbounded (réseau)] ; 0 = inchangé.
+    let mut max = [0, workers.max(1)];
+    ring.submitter().register_iowq_max_workers(&mut max)?;
+    let mut msg = format!("sends délégués à io-wq : {} worker(s) réseau", workers.max(1));
+    if let Ok(cpus) = std::env::var("RADIXOX_IOWQ_CPUS") {
+        // SAFETY: cpu_set_t initialisé à zéro puis rempli.
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        for c in cpus.split(',').filter_map(|c| c.trim().parse::<usize>().ok()) {
+            unsafe { libc::CPU_SET(c, &mut set) };
+        }
+        ring.submitter().register_iowq_aff(&set)?;
+        msg += &format!(", CPU {cpus}");
+    }
+    println!("{msg}");
+    Ok(true)
+}
+
 fn build_ring() -> io::Result<IoUring> {
     IoUring::builder()
         .setup_single_issuer()
@@ -518,12 +551,13 @@ fn main() -> io::Result<()> {
     cfg.max_conn = raise_nofile(cfg.max_conn);
     ring.submitter().register_files_sparse(cfg.max_conn)?;
     let no_iowait = ring.params().is_feature_no_iowait();
+    let send_async = setup_iowq(&ring)?;
     let mut core = Core::new(cfg, art);
     let bufring = BufRing::new(&ring, &mut core)?;
     let listener = TcpListener::bind(&addr)?;
     println!("RadixOx RESP Server (io_uring loop) listening on {addr}");
 
     let signals = Signals::install()?;
-    let mut server = Server { ring, bufring, core, listener, ops: Vec::new(), no_iowait, signals };
+    let mut server = Server { ring, bufring, core, listener, ops: Vec::new(), no_iowait, send_async, signals };
     server.run()
 }
