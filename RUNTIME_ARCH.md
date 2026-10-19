@@ -1155,6 +1155,25 @@ en pipeline profond, déléguer ne rapporte rien (goulot = l'arbre) et peut coû
 mode `auto` (déléguer quand le noyau sature notre cœur) a une raison d'être. Repère :
 Valkey 4 io-threads faisait ~500 K en p1 en mai, sur 4 cœurs.
 
+**YCSB A à ressources égales, 3 cœurs physiques chacun** (`SERVER_CORES=3 bench_compare.sh`,
+un thread par cœur, frères SMT des cœurs serveur inactifs, YCSB sur les 3 autres cœurs ;
+RadixOx : boucle + 2 workers io-wq ; Valkey : io-threads=3 ; un run, 2026-10-19).
+
+| | RadixOx (3 cœurs) | Valkey (3 threads) |
+|---|---|---|
+| load | **223 K**, p99 816 µs | 182 K, p99 1 107 µs |
+| run | **411 K (+12 %)** | 366 K |
+| lecture moy. | **234 µs** | 271 µs |
+| lecture p95 / p99 / p99.9 | 329 / 484 / 727 µs | **319 / 440 / 702 µs** |
+| lecture p99.99 | **1 983 µs** | 2 283 µs |
+| RSS | **1 556 Mo** | 2 056 Mo |
+
+Débit, moyenne et mémoire pour RadixOx ; **queues p95–p99.9 un peu meilleures chez Valkey**
+(3 à 10 %), contrairement au cas à 1 cœur. Hypothèse : variance du passage de relais vers
+io-wq (mise en file, réveil d'un worker, complétion rendue au prochain `enter`), là où
+Valkey pilote ses propres io-threads. Pistes : mode `auto` et pilotage d'io-wq (§6.4),
+mesure du délai soumission → CQE des sends délégués.
+
 **Prochaine optimisation (idée de l'utilisateur, 2026-10-19) : préchargement anticipé.**
 Pendant qu'on exécute la fenêtre N, précharger déjà les octets des frames et les clés de
 la fenêtre N+1 (distance réglable, comme le préchargement des frères de KRANGE) : les
