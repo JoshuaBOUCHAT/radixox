@@ -1093,6 +1093,21 @@ Leçons : (1) parser au moment d'exécuter, par fenêtres (§5.4) ; (2) l'anneau
 petit et ses tampons rendus vite (§5.1) ; (3) les défauts L1 de l'arbre sont identiques
 entre les deux binaires : l'écart venait entièrement de la plomberie.
 
+**YCSB workload A** (`bench_compare.sh`, 5 M hashes de 100 o, 10 M ops 50/50, 100
+threads, RadixOx sur CPU 0-1, un run chacun, lancé par l'utilisateur le 2026-10-19).
+Les deux runs n'ont pas le même profil d'énergie : comparer l'écart à Valkey du même run.
+
+| | monoio vs Valkey (power-saver) | radixox-uring vs Valkey (performance) |
+|---|---|---|
+| load | 91 K vs 68 K (+34 %), p99 1 335 vs 2 841 µs | **115 K vs 76 K (+51 %)**, p99 1 216 vs 2 535 µs |
+| run | 204 K vs 173 K (+18 %) | **258 K vs 199 K (+30 %)** |
+| lecture moy. / p99 | 488 / 633 vs 574 / 1 121 µs | **386 / 570** vs 500 / 971 µs |
+| lecture p99.9 / p99.99 | 715 / 1 029 vs 1 235 / 1 382 µs | 660 / 1 007 vs 892 / 1 065 µs |
+| RSS | 1 555 vs 2 054 Mo | 1 557 vs 2 053 Mo |
+
+La boucle creuse l'écart en débit et en latence moyenne ; les queues extrêmes restent
+devant Valkey avec moins de marge qu'avec monoio (un run : à surveiller).
+
 **Prochaine optimisation (idée de l'utilisateur, 2026-10-19) : préchargement anticipé.**
 Pendant qu'on exécute la fenêtre N, précharger déjà les octets des frames et les clés de
 la fenêtre N+1 (distance réglable, comme le préchargement des frères de KRANGE) : les
