@@ -42,7 +42,10 @@ The I/O layer will be rewritten (custom io_uring loop, see [Roadmap](#roadmap)).
   page of 64 entries costs about a third of 64 separate lookups (in-process: 5.2 µs vs
   15.4 µs).
 - **Prefix queries that prune**: `SCAN MATCH user:*` and `KEYS user:*` walk only the `user:`
-  subtree; other `KEYS` globs are compiled to a DFA that skips whole subtrees.
+  subtree; other globs walk only the subtree of their literal prefix (`user:*:email` →
+  `user:`).
+- **`UNLINK user:*`**: deletes a whole namespace; its keys disappear at once, the memory is
+  freed in the background.
 - **A stricter `SCAN`**: no duplicates, `COUNT` is exact, and every key present for the whole
   scan is returned exactly once, even while the data changes.
 - **Binary-safe ordered keys**: any byte 0x00–0xFF at any position, ordered like `memcmp`.
@@ -354,6 +357,12 @@ own synchronization.
 | Set | `SADD` `SREM` `SISMEMBER` `SCARD` `SMEMBERS` `SPOP` |
 | Sorted set | `ZADD` `ZREM` `ZSCORE` `ZCARD` `ZRANGE` (`WITHSCORES`) `ZINCRBY` |
 | Pub/Sub | `SUBSCRIBE` `UNSUBSCRIBE` `PUBLISH` |
+
+- `UNLINK key` deletes that key only; `UNLINK prefix*` deletes every key under `prefix`.
+- `KEYS`, `UNLINK prefix*` and `FLUSHDB` never block other clients: the work is done in
+  slices between other commands. `FLUSHDB` replies at once (`DBSIZE` is 0 right after) and
+  frees the memory in the background.
+- Commands can also be sent inline, as with Redis (`SET k "a b"` from telnet or `nc`).
 
 Not yet: list commands, `MULTI`/`EXEC`, `CONFIG`, RESP3, Lua,
 replication, cluster.

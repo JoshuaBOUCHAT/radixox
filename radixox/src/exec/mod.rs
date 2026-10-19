@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod client;
+pub mod jobs;
 mod hash;
 pub mod scan;
 mod sset;
@@ -25,7 +26,7 @@ use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::shared_frame::SharedFrame as Frame;
 
 use string::{
-    cmd_dbsize, cmd_decr, cmd_decrby, cmd_del, cmd_exists, cmd_expire, cmd_flushdb, cmd_get,
+    cmd_dbsize, cmd_decr, cmd_decrby, cmd_del, cmd_exists, cmd_expire, cmd_get,
     cmd_incr, cmd_incrby, cmd_mset, cmd_persist, cmd_pttl, cmd_set, cmd_setnx, cmd_ttl,
     cmd_type,
 };
@@ -54,7 +55,6 @@ pub fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         Cmd::DecrBy { key, delta } => cmd_decrby(art, key, delta),
         // ── Server ───────────────────────────────────────────────────────────
         Cmd::DbSize => cmd_dbsize(art),
-        Cmd::FlushDb => cmd_flushdb(art),
         // ── Hash ─────────────────────────────────────────────────────────────
         Cmd::HSet { key, fields } => cmd_hset(art, key, &fields),
         Cmd::HGet { key, field } => cmd_hget(art, key, field),
@@ -86,7 +86,8 @@ pub fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         Cmd::ZRem { key, members } => cmd_zrem(art, key, &members),
         Cmd::ZIncrBy { key, delta, member } => cmd_zincrby(art, key, delta, member),
         // ── Should not reach here (handled in dispatch) ───────────────────
-        Cmd::Ping(_)
+        Cmd::FlushDb
+        | Cmd::Ping(_)
         | Cmd::Quit
         | Cmd::Echo(_)
         | Cmd::Select(_)

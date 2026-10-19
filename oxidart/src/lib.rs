@@ -339,15 +339,11 @@ impl OxidArt {
         while !self.drain_deferred(u32::MAX) {}
     }
 
-    /// Ferme la barrière (images libérées, UNLINK en attente réveillés) sans
-    /// vider la liste différée valart.
+    /// Ferme la barrière (images libérées) sans vider la liste différée valart.
     pub fn end_save(&mut self) {
         self.save.barrier.finish();
         self.save.clear_images();
         valart().end_save();
-        for waker in self.save.waiters.drain(..) {
-            waker.wake();
-        }
     }
 
     /// Une tranche du vidage de la liste différée valart (suppressions faites
@@ -1043,7 +1039,40 @@ impl OxidArt {
     /// is empty). Returns the number of deleted live (non-expired) values.
     pub fn deln(&mut self, prefix: &[u8]) -> usize {
         let (mut stack, count) = self.cut_prefix(prefix);
-        count + self.free_subtrees(&mut stack, usize::MAX)
+        count + self.free_subtrees(&mut stack, usize::MAX, true)
+    }
+
+    /// Détache tout ce qui commence par `prefix` (tout si vide) : les clés
+    /// disparaissent tout de suite, la mémoire est rendue ensuite par
+    /// [`free_detached`](Self::free_detached), par tranches.
+    pub fn detach_prefix(&mut self, prefix: &[u8], into: &mut Detached) {
+        let (stack, count) = self.cut_prefix(prefix);
+        into.stack.extend(stack);
+        into.freed += count;
+    }
+
+    /// Détache toute la base : comme `detach_prefix(b"")`, mais le compte de
+    /// clés tombe à 0 tout de suite (FLUSHDB : `DBSIZE` juste après vaut 0).
+    pub fn detach_all(&mut self, into: &mut Detached) {
+        let (stack, count) = self.cut_prefix(b"");
+        into.stack.extend(stack);
+        into.freed += count;
+        into.uncounted = true;
+        self.key_count = 0;
+    }
+
+    /// Libère au plus `budget` nœuds détachés. `true` quand tout est libéré.
+    /// Pendant une save, ne fait rien (le sous-arbre détaché reste dans la
+    /// vue T0, SAVE_DESIGN.md §2.F) et rend `false`.
+    pub fn free_detached(&mut self, d: &mut Detached, budget: usize) -> bool {
+        if d.stack.is_empty() {
+            return true;
+        }
+        if self.is_saving() {
+            return false;
+        }
+        d.freed += self.free_subtrees(&mut d.stack, budget, !d.uncounted);
+        d.stack.is_empty()
     }
 
     /// Détache tout ce qui commence par `prefix` : renvoie les sous-arbres à
@@ -1097,8 +1126,9 @@ impl OxidArt {
     }
 
     /// Libère au plus `budget` nœuds des sous-arbres détachés de `stack` ;
-    /// renvoie le nombre de valeurs vivantes libérées.
-    pub(crate) fn free_subtrees(&mut self, stack: &mut Vec<u32>, budget: usize) -> usize {
+    /// renvoie le nombre de valeurs vivantes libérées. `counted` : leurs clés
+    /// sont encore dans `key_count` (faux après [`detach_all`](Self::detach_all)).
+    pub(crate) fn free_subtrees(&mut self, stack: &mut Vec<u32>, budget: usize, counted: bool) -> usize {
         let now = self.now;
         let mut count = 0;
         let mut done = 0;
@@ -1118,7 +1148,9 @@ impl OxidArt {
                     }
                 }
             }
-            self.key_count -= removed;
+            if counted {
+                self.key_count -= removed;
+            }
             // le Drop du nœud libère ses feuilles, sa page et sa self-val
             drop(self.remove_node(idx));
             done += 1;
@@ -1278,5 +1310,24 @@ impl ExpAndRadix {
         Self {
             inner: ((parent_radix as u64) << Self::EXP_LENGTH) | exp,
         }
+    }
+}
+
+/// Sous-arbres détachés de l'arbre (UNLINK `prefix*`, FLUSHDB), en attente de
+/// libération : plus accessibles depuis la racine, ils n'appartiennent qu'à
+/// ce curseur, donc leurs idx restent valides d'une tranche à l'autre.
+#[derive(Default, Debug)]
+pub struct Detached {
+    stack: Vec<u32>,
+    /// Valeurs vivantes (non expirées) retirées jusqu'ici.
+    pub freed: usize,
+    /// Clés déjà retirées de `key_count` (FLUSHDB).
+    uncounted: bool,
+}
+
+impl Detached {
+    /// Plus rien à libérer.
+    pub fn is_done(&self) -> bool {
+        self.stack.is_empty()
     }
 }

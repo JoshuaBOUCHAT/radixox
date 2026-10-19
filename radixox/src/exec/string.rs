@@ -148,8 +148,3 @@ pub fn cmd_dbsize(art: &mut OxidArt) -> Frame {
     let count = art.len() as i64;
     Frame::Integer(count)
 }
-
-pub fn cmd_flushdb(art: &mut OxidArt) -> Frame {
-    art.deln(b"");
-    Frame::SimpleString(SharedByte::from_slice(b"OK"))
-}

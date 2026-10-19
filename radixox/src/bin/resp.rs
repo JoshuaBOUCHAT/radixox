@@ -17,12 +17,11 @@ use monoio::time::TimeDriver;
 use monoio::{IoUringDriver, Runtime, RuntimeBuilder};
 
 use oxidart::OxidArt;
-use oxidart::async_command::OxidArtAsync;
 use radixox_lib::cmd::{Cmd, Parse};
 use radixox_lib::shared_byte::SharedByte;
 pub(crate) use radixox_lib::shared_frame::SharedFrame as Frame;
 
-use resp_cmd::delayed::{cmd_keys, cmd_unlink};
+use resp_cmd::delayed::{cmd_flushdb, cmd_keys, cmd_unlink};
 use resp_cmd::pub_sub::{cmd_publish, cmd_subscribe, cmd_unsubscribe};
 use radixox::exec::{
     encode_krange, encode_mget, encode_scan, execute_sync, resp_ok, resp_pong,
@@ -408,8 +407,8 @@ async fn dispatch(
                 conn_state.encode(frame);
             }
             Cmd::Keys(pattern) => {
-                let frame = cmd_keys(pattern, art.clone()).await;
-                conn_state.encode(frame);
+                let resp = cmd_keys(pattern, art).await;
+                conn_state.encode_with(|buf| buf.extend_from_slice(&resp));
             }
             Cmd::BgSave => {
                 let frame = if resp_cmd::bgsave::start_bgsave(&art) {
@@ -435,16 +434,15 @@ async fn dispatch(
                 };
                 conn_state.encode(frame);
             }
-            Cmd::FlushDb if art.borrow().is_saving() => {
-                // Pendant une save : libération par tranches après la save
-                // (sinon tout l'arbre serait capturé).
-                art.deln_async(SharedByte::from_slice(b"")).await;
-                conn_state.encode(Frame::SimpleString(SharedByte::from_slice(b"OK")));
+            Cmd::FlushDb => {
+                // Base détachée tout de suite ; libération en fond (après la
+                // save si une save tourne : sinon tout l'arbre serait capturé).
+                cmd_flushdb(art);
+                conn_state.encode(resp_ok());
             }
             Cmd::Unlink(keys) => {
-                let v: Vec<SharedByte> = keys.into_iter().collect();
-                let frame = cmd_unlink(v, art.clone()).await;
-                conn_state.encode(frame);
+                let count = cmd_unlink(&keys, art).await;
+                conn_state.encode(Frame::Integer(count));
             }
             Cmd::MGet(keys) => {
                 // Descentes entrelacées + valeurs par référence, encodées

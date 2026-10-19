@@ -138,8 +138,6 @@ pub(crate) struct OxidSave {
     pub(crate) leaves: Vec<ImgLeaf>,
     /// `now` au begin : une clé expirée à T0 n'est pas écrite.
     pub(crate) t0: u64,
-    /// Tâches (UNLINK) en attente de la fin de la save.
-    pub(crate) waiters: Vec<std::task::Waker>,
 }
 
 impl OxidSave {
