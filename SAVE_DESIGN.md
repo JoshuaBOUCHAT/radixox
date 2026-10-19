@@ -424,6 +424,16 @@ pied          u32 LE crc32 (IEEE, crc32fast) de tout ce qui précède | "RXDE"
 9. ✅ Reload en flux (lecture par morceaux).
 10. ✅ Compression zstd par tranches (§5 « Compression ») ; reste : bench sur valeurs réalistes.
 
+## Fin de save sans pic : feuilles des images libérées par tranches (2026-10-19)
+
+À la fin du DFS, toutes les images ont été consommées (`take`), mais le tableau aplati de
+leurs feuilles (`OxidSave::leaves`, une copie de valeur par feuille) restait entier :
+`end_save` le libérait d'un bloc (8,8 ms pour ~480 000 feuilles, 1 M clés sous écriture,
+p99.99 du serveur à 10 ms pendant une save). Désormais `end_save` le déplace dans
+`OxidSave::leftover`, et `OxidArt::drain_deferred(budget)` le libère par tranches avant la
+liste différée valart (le BGSAVE l'appelle déjà tranche par tranche). `finish_save` et
+`begin_save` vident le reste d'un coup. Test : `image_leaves_are_freed_by_slices`.
+
 ## Plafond de CPU du BGSAVE (2026-10-18)
 
 Mesure : sans plafond, la save prenait ~60 % du thread pendant ~100 ms (1M

@@ -134,16 +134,33 @@ pub(crate) struct OxidSave {
     pub(crate) barrier: SaveBarrier<NodeImage>,
     /// Enfants des images, aplatis. Vidé à `finish` (capacité gardée).
     pub(crate) childs: Vec<(u8, u32)>,
-    /// Feuilles des images, aplaties. Vidé à `finish`.
+    /// Feuilles des images, aplaties. Déplacées dans `leftover` à `end_save`.
     pub(crate) leaves: Vec<ImgLeaf>,
+    /// Feuilles de la save terminée, libérées par tranches (`drain_deferred`) :
+    /// chacune tient une copie de valeur ; les libérer d'un bloc prenait ~9 ms
+    /// pour ~480 000 feuilles (1 M clés sous écriture).
+    pub(crate) leftover: Vec<ImgLeaf>,
     /// `now` au begin : une clé expirée à T0 n'est pas écrite.
     pub(crate) t0: u64,
 }
 
 impl OxidSave {
+    /// Fin de save : les enfants (sans destructeur) sont vidés tout de suite,
+    /// les feuilles mises de côté pour une libération par tranches.
     pub(crate) fn clear_images(&mut self) {
         self.childs.clear();
-        self.leaves.clear();
+        if self.leftover.is_empty() {
+            std::mem::swap(&mut self.leaves, &mut self.leftover);
+        } else {
+            self.leftover.append(&mut self.leaves);
+        }
+    }
+
+    /// Libère au plus `budget` feuilles mises de côté ; rend le budget restant.
+    pub(crate) fn drain_leftover(&mut self, budget: u32) -> u32 {
+        let n = (budget as usize).min(self.leftover.len());
+        self.leftover.truncate(self.leftover.len() - n);
+        budget - n as u32
     }
 }
 

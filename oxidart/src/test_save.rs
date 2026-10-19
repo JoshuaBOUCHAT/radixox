@@ -522,3 +522,34 @@ fn reload_compressed_file() {
         assert!(OxidArt::new().load_file(&extra[..]).is_err());
     }
 }
+
+/// Fin de save : les feuilles des images (une copie de valeur chacune) ne sont
+/// pas libérées d'un bloc par `end_save` mais mises de côté et libérées par
+/// tranches dans `drain_deferred` (pic de ~9 ms sur 1 M clés sinon).
+#[test]
+fn image_leaves_are_freed_by_slices() {
+    let mut art = OxidArt::new();
+    for i in 0..2000 {
+        art.set(sb(&format!("k:{i:04}")), Value::from_str("v"));
+    }
+    let expect = expected(&art);
+    let mut out = Vec::new();
+    let mut cur = art.save_start(&mut out);
+    // Écrasées avant le parcours : leurs nœuds sont capturés avec leurs feuilles.
+    for i in 0..2000 {
+        art.set(sb(&format!("k:{i:04}")), Value::from_str("w"));
+    }
+    while !art.save_step(&mut cur, &mut out, 64) {}
+    drop(cur);
+    art.end_save();
+    let pending = art.save.leftover.len();
+    assert!(pending > 1000, "feuilles mises de côté : {pending}");
+    let mut slices = 0;
+    while !art.drain_deferred(100) {
+        slices += 1;
+    }
+    assert!(slices >= pending / 100 - 1, "libérées par tranches ({slices})");
+    assert!(art.save.leftover.is_empty());
+    assert_eq!(decoded(&out), expect, "vue T0 intacte");
+    assert_eq!(art.get(b"k:0007"), Some(Value::from_str("w")));
+}

@@ -1134,8 +1134,12 @@ Leçons, contraires au design initial (§2.1, §2.3) :
 - **la tranche de save passe après l'envoi des réponses**, peut se répéter dans un tour
   jusqu'à sa part de CPU (une seule par tour : save deux fois plus longue, plus de copies
   T0 à libérer), et l'`enter` en plus n'a lieu que si une tranche s'exécute.
-- Pic restant, commun aux deux binaires : `end_save` libère d'un coup les copies T0
-  (~8 ms sur 1 M clés sous écriture) → à faire par tranches (oxidart).
+- ~~Pic restant, commun aux deux binaires : `end_save` libère d'un coup les copies T0~~
+  **Résolu (2026-10-19)** : mesuré, ce n'étaient pas les images (toutes consommées par le
+  DFS) mais leurs **feuilles** (~480 000 sur 1 M clés sous écriture, une copie de valeur
+  chacune, 8,8 ms d'un bloc). `end_save` les met de côté, `drain_deferred` les libère par
+  tranches : p32 + BGSAVE, p99.99 10,2 → **3,25 ms** (le niveau sans save), tranche max
+  9 ms → 318 µs.
 
 **Délégation des sends, version statique (2026-10-19, §6.4 étape 1).** `RADIXOX_SEND_ASYNC=1`,
 `RADIXOX_IOWQ_WORKERS`, `RADIXOX_IOWQ_CPUS`. Boucle sur CPU 0, workers sur le cœur

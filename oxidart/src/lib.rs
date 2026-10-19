@@ -333,6 +333,8 @@ impl OxidArt {
     /// Démarre une save : fige la vue T0 (bitmap de présence d'oxidart et
     /// de valart).
     pub fn begin_save(&mut self) {
+        // Reliquat d'une save précédente pas encore vidé : d'un coup (rare).
+        self.save.leftover.clear();
         let map = &self.map;
         self.save.barrier.begin_with(|buf| {
             map.copy_occupancy(buf);
@@ -357,11 +359,16 @@ impl OxidArt {
         valart().end_save();
     }
 
-    /// Une tranche du vidage de la liste différée valart (suppressions faites
-    /// pendant la save). `true` quand elle est vide. Voir
-    /// `ValTrees::drain_deferred`.
+    /// Une tranche de ce que la save laisse à libérer : feuilles des images
+    /// oxidart, puis liste différée valart (suppressions faites pendant la
+    /// save). `budget` : feuilles + coût valart (`ValTrees::drain_deferred`).
+    /// `true` quand tout est libéré.
     pub fn drain_deferred(&mut self, budget: u32) -> bool {
-        valart().drain_deferred(budget)
+        let rest = self.save.drain_leftover(budget);
+        if !self.save.leftover.is_empty() {
+            return false;
+        }
+        valart().drain_deferred(rest)
     }
 
     /// Nombre de nœuds qui ont une page de débordement.
