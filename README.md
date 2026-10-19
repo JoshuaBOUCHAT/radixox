@@ -407,8 +407,9 @@ Environment variables:
 | `RADIXOX_SCAN_IDLE_SECS` | `60` | idle time after which a `SCAN` cursor can be reclaimed |
 | `RADIXOX_SCAN_MAX_CURSORS` | `65536` | active `SCAN` cursors at most; beyond, a new `SCAN` gets an error |
 | `RADIXOX_SCAN_MAX_CURSORS_PER_CLIENT` | `128` | active `SCAN` cursors at most per connection (its own idle cursors are reclaimed first) |
-| `SQ_POLL` | off | io_uring SQ polling (idle time in ms) |
-| `RADIXOX_SQ_POLL_PIN` | unset | CPU of the SQ polling kernel thread (**required** with `SQ_POLL` today) |
+| `RADIXOX_TIMEOUT` | `0` | close a client idle for this many seconds (`0` = never), like Redis's `timeout` |
+| `RADIXOX_BATCH_CMDS` | `2048` | commands per slice of a loop turn; replies ready between slices are sent |
+| `RADIXOX_RING_BUFS` / `RADIXOX_RING_BUF_KB` | `64` / `32` | receive buffer ring shared by all connections |
 
 ### Security
 
@@ -465,12 +466,20 @@ Not done yet: fuzzing of the RESP parser, Redis's own test suite, crash (kill -9
 ## Architecture
 
 ```
-TCP ──io_uring (monoio)──▶ RESP parser ──▶ batch of commands ──▶ interleaved key lookups
-                              (borrows the                        (prefetch, misses overlap)
-                               read buffer)                                │
-                                                                           ▼
-      client ◀── one write per batch ◀── RESP encoder ◀── OxidArt (values by reference)
+TCP ──io_uring──▶ shared buffer ring ──▶ windows of K commands ──▶ interleaved key lookups
+     (multishot recv,   (parsed in place,      (across connections)      (prefetch, misses overlap)
+      no runtime)        right before use)                                       │
+                                                                                 ▼
+      client ◀── one send per connection ◀── RESP encoder ◀── OxidArt (values by reference)
 ```
+
+**The event loop** ([`RUNTIME_ARCH.md`](RUNTIME_ARCH.md)): a hand-written io_uring loop, no
+async runtime, no futures, no wakers. Each turn harvests completions (multishot accept and
+receive into a shared ring of small buffers), runs the ready connections' commands in
+windows (parse, prefetch, execute), sends one reply buffer per connection, then advances
+background jobs (`KEYS`, `UNLINK prefix*`, `FLUSHDB`, `BGSAVE`) by one slice. A long command
+parks only its own connection. The connection logic is a pure state machine tested against
+a simulated kernel.
 
 **OxidArt, the radix tree**
 - **128-byte nodes with inline leaves** in a slab (HiSlab) backed by anonymous `mmap` with
@@ -508,9 +517,9 @@ across cores is meant to come from sharding by namespace, not from shared-state 
 
 - **Production basics first**: periodic automatic saves, `maxmemory` with eviction,
   `MULTI`/`EXEC`, lists, fuzzing of the RESP parser.
-- **Custom io_uring event loop** replacing monoio: no futures, no wakers, batches across all
-  ready connections, network work delegated to the kernel —
-  [`RUNTIME_ARCH.md`](RUNTIME_ARCH.md).
+- **Event loop next steps** ([`RUNTIME_ARCH.md`](RUNTIME_ARCH.md)): prefetch ahead (next
+  window's data while the current one runs), sends delegated to kernel workers
+  (`IOSQE_ASYNC`), `SEND_ZC` for large replies.
 - **Atomic conditional transactions**: `MULTI ATOMIC` where an empty read aborts the whole
   block, `DELPREFIX` (delete a whole namespace in O(prefix length)), durable commits —
   [`TX_DESIGN.md`](TX_DESIGN.md).
@@ -546,8 +555,7 @@ Tests: `cargo test -p oxidart --features regex`, `cargo test -p radixox-lib`,
 
 MIT
 
-Built with [monoio](https://github.com/bytedance/monoio),
-[io-uring](https://github.com/tokio-rs/io-uring),
+Built with [io-uring](https://github.com/tokio-rs/io-uring),
 [mimalloc](https://github.com/microsoft/mimalloc),
 [regex-automata](https://github.com/rust-lang/regex) and
 [hislab](https://github.com/JoshuaBOUCHAT/hislab). Benchmarked against

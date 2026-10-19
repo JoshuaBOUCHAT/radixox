@@ -1,11 +1,11 @@
-//! `radixox-uring` : serveur RESP sur la boucle io_uring maison, sans runtime
+//! `radixox` : serveur RESP sur la boucle io_uring maison, sans runtime
 //! (RUNTIME_ARCH.md). La logique vit dans le cœur sans I/O
 //! (`radixox::uring::Core`) ; ce fichier ne fait que la traduction :
 //! `Op` → SQE, CQE → `Completion`, plus l'attente.
 //!
-//! Étapes 2–3 (§13) : accept, recv multishot sur anneau incrémental, send,
-//! commandes sync, SAVE, timers (évicteur, inactivité), arrêt sur signal avec
-//! save (`signalfd`), parquage (KEYS, UNLINK), BGSAVE. Pas encore : Pub/Sub.
+//! Accept, recv multishot sur anneau incrémental, send, toutes les commandes,
+//! parquage (KEYS, UNLINK), BGSAVE et SAVE, Pub/Sub, timers (évicteur,
+//! inactivité), arrêt sur signal avec save (`signalfd`).
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("RadixOx requires Linux to run (io_uring).");
@@ -18,7 +18,6 @@ use std::time::{Duration, Instant};
 
 use io_uring::types::{BufRingEntry, Fd, Fixed, IOU_PBUF_RING_INC, SubmitArgs, Timespec};
 use io_uring::{EnterFlags, IoUring, cqueue, opcode, squeue};
-use io_uring_07 as io_uring;
 use oxidart::OxidArt;
 use radixox::uring::{Bid, Completion, Config, Core, Op, Slot};
 
@@ -120,7 +119,7 @@ struct Server {
 
 /// Arrêt propre sur signal : la `signalfd` est lue par io_uring ; à réception,
 /// SAVE bloquante puis sortie. Un second signal pendant la save sort tout de
-/// suite (comme `resp_cmd/shutdown.rs` sous monoio).
+/// suite.
 struct Signals {
     fd: RawFd,
     buf: Box<libc::signalfd_siginfo>,

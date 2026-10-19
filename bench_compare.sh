@@ -22,7 +22,6 @@ OPS=10000000
 THREADS=100
 FIELDLENGTH=100
 
-# RADIXOX_BIN=target/release/radixox-uring pour la boucle io_uring maison.
 RADIXOX_BIN="${RADIXOX_BIN:-$SCRIPT_DIR/target/release/radixox}"
 VALKEY_IO_THREADS="${VALKEY_IO_THREADS:-1}"   # override: VALKEY_IO_THREADS=4 ./bench_compare.sh
 CURRENT_LOG=""

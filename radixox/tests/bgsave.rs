@@ -123,8 +123,7 @@ fn bgsave_failure_releases_the_save_slot() {
         .unwrap();
     redis::cmd("SET").arg("a").arg("b").query::<()>(&mut c).unwrap();
 
-    // monoio répond « started » puis échoue en fond (comme Redis après fork) ;
-    // la boucle io_uring ouvre le fichier tout de suite et répond l'erreur.
+    // Le fichier est ouvert tout de suite : l'échec est répondu directement.
     match redis::cmd("BGSAVE").query::<String>(&mut c) {
         Ok(r) => assert_eq!(r, "Background saving started"),
         Err(e) => assert!(e.to_string().contains("No such file"), "{e}"),

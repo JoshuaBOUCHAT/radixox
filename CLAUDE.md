@@ -14,8 +14,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Projet
 
 RadixOx : base clé-valeur en mémoire qui parle RESP2 (sous-ensemble des commandes Redis),
-bâtie sur OxidArt, un radix tree adaptatif. Mono-thread, io_uring (monoio aujourd'hui,
-boucle maison demain), Linux uniquement, Rust 2024.
+bâtie sur OxidArt, un radix tree adaptatif. Mono-thread, boucle io_uring maison sans
+runtime (noyau ≥ 6.12), Linux uniquement, Rust 2024.
 
 ## Workspace
 
@@ -24,8 +24,9 @@ oxidart/        arbre des clés : TTL, préfixe / glob / range, descentes entrel
 oxidart-legacy/ ancien arbre (nœuds 64 o), oracle des tests différentiels, non publié
 valart/         radix compacts pour les valeurs Hash et Set
 radixox-lib/    SharedByte, parseur RESP (cmd.rs) et encodeur, barrière de save
-radixox/        lib `radixox::exec` (commandes, encodage, jobs) + binaire `radixox`
-                (src/bin/resp.rs, monoio) + tests d'intégration
+radixox/        lib : `exec` (commandes, encodage, jobs, BGSAVE), `uring` (cœur sans I/O
+                de la boucle + faux noyau) ; binaire `radixox` (src/bin/uringloop.rs,
+                couche io_uring) ; tests d'intégration
 scripts/        bench_vs_valkey.sh (référence du README), stress_save.sh
 ```
 

@@ -126,7 +126,7 @@ pub enum Op {
 /// Une fenêtre de préchargement, sur la pile (pas d'allocation par fenêtre).
 type Window<T> = SmallVec<[T; 16]>;
 
-/// Évicteur TTL : une passe d'échantillonnage par seconde, comme sous monoio
+/// Évicteur TTL : une passe d'échantillonnage par seconde, comme l'ancien serveur monoio
 /// (l'évicteur à curseur est un chantier d'oxidart à part).
 const EVICT_EVERY: Duration = Duration::from_secs(1);
 /// Balayage d'inactivité : une tranche de connexions toutes les 100 ms.
@@ -641,7 +641,7 @@ impl Core {
     /// morceaux.
     ///
     /// On reste sur une connexion tant qu'elle a des frames : son lot finit tôt
-    /// et sa réponse peut partir entre deux tranches, comme monoio qui traitait
+    /// et sa réponse peut partir entre deux tranches, comme l'ancien serveur monoio qui traitait
     /// un pipeline d'un bloc (entrelacer 8 par 8 faisait finir tous les lots en
     /// même temps, à la fin du tour : p99 +40 % en p256, mesuré). Chaque fenêtre
     /// garde une place par autre connexion prête (une frame chacune) : un client
@@ -656,7 +656,7 @@ impl Core {
             return false;
         }
         // Ordre d'arrivée (liste prête), sans rotation : chaque connexion garde sa
-        // place d'un tour à l'autre, comme la file FIFO de monoio. Une rotation
+        // place d'un tour à l'autre, comme la file FIFO de l'ancien serveur monoio. Une rotation
         // pouvait faire passer une connexion première puis dernière (presque
         // deux tours d'attente) ; l'équité vient des tranches, qui servent toutes
         // les connexions prêtes à chaque tour.

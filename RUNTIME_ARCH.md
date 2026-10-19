@@ -1253,9 +1253,8 @@ binaire (`RADIXOX_TEST_BIN`) pour faire tourner la même suite sur les deux.
 `radixox/src/bin/uringloop.rs` (io-uring 0.7.15), qui remplace `resp.rs` une fois
 stabilisée.
 
-**État (2026-10-19) : étapes 0 à 5 faites** — détail plus bas, mesures §12.4.
-Prochaine : étape 6 (critères de bascule, puis suppression de monoio — décision de
-l'utilisateur).
+**État (2026-10-19) : étapes 0 à 6 faites — monoio est retiré**, le binaire `radixox` est
+la boucle maison. Mesures §12.4. Suite : étape 7+ (optimisations, chacune mesurée).
 
 | # | Étape | Terminé quand |
 |---|---|---|
@@ -1265,7 +1264,7 @@ l'utilisateur).
 | 3 ✅ | Horloges, timers, `signalfd`, ~~évicteur à curseur~~ (reporté), balayage d'inactivité | horloge vivante au repos, arrêt propre avec et sans save |
 | 4 ✅ | Parquage + jobs branchés sur `ready`, port de BGSAVE, ~~SAVE = BGSAVE + parquage~~ (SAVE reste bloquante, §8.1 plus tard), save d'arrêt | p99.99 sous BGSAVE en pipeline 32 ≤ monoio |
 | 5 ✅ | Pub/Sub avec limite d'`out` | abonné lent → `Draining`, pas d'OOM |
-| 6 | Bascule par défaut, suppression de monoio (`oxidart/monoio.rs`, `async_command.rs`, `#[monoio::test]`, `resp.rs`, `utils/mod.rs`) | critères de bascule (§15) atteints |
+| 6 ✅ | Bascule par défaut, suppression de monoio (`oxidart/monoio.rs`, `async_command.rs`, `#[monoio::test]`, `resp.rs`, `utils/mod.rs`) | critères de bascule (§15) atteints |
 | 7+ | Une optimisation à la fois, chacune mesurée : préchargement entre connexions + idx + époque (§17), GET par référence, `IOSQE_ASYNC` off/on puis auto (§6.4), jamais bloquant (§8.1), cas 3 du parseur, saves auto + AOF, pool enregistré + `SEND_ZC`, allocateur bump, GC, listes puis BLPOP | |
 
 ---

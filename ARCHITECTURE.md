@@ -17,7 +17,7 @@
 |---|---|---|
 | **ARCHITECTURE.md** (ici) | vue d'ensemble, invariants, checklist de revue | à jour |
 | [`README.md`](README.md) | présentation, commandes supportées, configuration (`RADIXOX_*`), benchs de référence, layout du dépôt | à jour (public, en anglais) |
-| [`RUNTIME_ARCH.md`](RUNTIME_ARCH.md) | boucle io_uring maison qui remplacera monoio : connexions, réception, émission, lot, équité, jobs, jamais bloquant, déploiement, migration | conception validée (revue 2026-10-19), **rien d'implémenté** |
+| [`RUNTIME_ARCH.md`](RUNTIME_ARCH.md) | boucle io_uring maison : connexions, réception, émission, lot, équité, jobs, jamais bloquant, déploiement, migration, mesures | **implémentée** (étapes 0–6, 2026-10-19) ; reste l'étape 7+ (optimisations) |
 | [`SAVE_DESIGN.md`](SAVE_DESIGN.md) | save progressive : COW applicatif par nœud, format du dump, BGSAVE / SAVE / reload | **implémenté** (étapes 1–8) ; restent saves auto + AOF, reportés à la boucle maison |
 | [`SCAN_DESIGN.md`](SCAN_DESIGN.md) | SCAN à curseur côté serveur (table de curseurs, LRU, COUNT exact) | **implémenté** |
 | [`TX_DESIGN.md`](TX_DESIGN.md) | transactions atomiques à conditions (`MULTI ATOMIC`, `DELPREFIX`, `EXEC DURABLE`) | conception, rien d'implémenté ; dépend de la boucle maison |
@@ -38,41 +38,42 @@ plusieurs processus (sharding par namespace, qui préserve les scans par préfix
 par des threads qui partagent l'état. `SELECT n ≠ 0` n'a pas de sens (à transformer en
 erreur, RUNTIME_ARCH §16).
 
-**Aujourd'hui (monoio)** — `radixox/src/bin/resp.rs` :
-- une tâche par connexion, arbre partagé en `Rc<RefCell<OxidArt>>` ;
-- lecture double tampon, `read_and_flush` (écriture et lecture soumises ensemble) ;
-- parse par fenêtres de 8 commandes, clés préchargées ensemble (`RADIXOX_PREFETCH`) ;
-- commandes sync exécutées d'un tenant (atomiques), dans la bibliothèque
-  (`radixox::exec`), partagée avec la future boucle ;
-- KEYS, UNLINK `prefix*`, FLUSHDB : jobs à curseur synchrones (`radixox::exec::jobs`)
-  pilotés tranche par tranche avec `oxidart::async_command::yield_now` ; BGSAVE de même ;
-- Pub/Sub : writer task + `SubRegistry` (`radixox/src/bin/utils/mod.rs`).
-
-**Demain (boucle maison)** — RUNTIME_ARCH.md : plus de futures ni de tâches ; files de
-frames par connexion, tirage par tours, jobs à curseur, connexions parquées.
+**La boucle io_uring maison** (RUNTIME_ARCH.md ; monoio a été retiré le 2026-10-19) :
+- `radixox::uring::Core` : cœur **sans I/O** (reçoit des `Completion`, émet des `Op`),
+  testé contre un faux noyau ; `src/bin/uringloop.rs` : traduction en SQE / CQE ;
+- l'arbre appartient au cœur (`&mut OxidArt`, plus de `Rc<RefCell<>>`) ;
+- réception multishot dans un anneau partagé de petits tampons ; les morceaux reçus
+  attendent tels quels dans la file de leur connexion ;
+- lot par fenêtres de K commandes (parse en place, préchargement, exécution), une
+  connexion servie d'un bloc, réponses envoyées entre tranches de 2048 commandes ;
+- KEYS, UNLINK `prefix*`, FLUSHDB, BGSAVE : jobs à curseur synchrones avancés d'une
+  tranche par tour ; une commande longue parque seulement sa connexion ;
+- Pub/Sub : registre canal → abonnés dans le cœur, limites de sortie des abonnés.
 
 ### 1.1 Règle d'or
 
 > **Rien de daté ne survit à un point de rendu de main sans être re-résolu.**
 
 « Daté » = un borrow (`Ref`/`RefMut`), un **idx de slab**, un pointeur, un curseur de
-parcours, une hypothèse (« X existe »). Le point de rendu de main est un `.await` sous
-monoio, **la fin d'un tour de boucle** dans la boucle maison.
+parcours, une hypothèse (« X existe »). Le point de rendu de main est **la fin d'une
+tranche de job ou d'un tour de boucle**.
 
 Conséquences :
 - un job ou une continuation garde une **clé** re-résolvable, jamais un idx de slab
   (exception : la save, protégée par sa barrière COW) ;
 - un curseur de SCAN est rattaché à une clé, jamais à un idx ;
-- aucun borrow de l'arbre n'est tenu à travers un `.await` ;
-- dans la boucle maison, aucune référence vers l'anneau de réception ne survit au tour
-  autrement que par une `FrameRef` comptée (RUNTIME_ARCH §5.4).
+- un job ne garde entre deux tranches que des clés ou des sous-arbres détachés qui
+  n'appartiennent qu'à lui ;
+- aucune référence vers l'anneau de réception ne survit au tour autrement que par un
+  morceau (span) compté (RUNTIME_ARCH §5.4).
 
 ### 1.2 Jamais bloquant
 
 Toute commande peut prendre du temps, aucune ne bloque les autres : les travaux longs
-(KEYS, UNLINK, save, libérations lourdes) sont découpés en tranches. Aujourd'hui par
-`yield_now` ; demain par des jobs à curseur, avec seuil « devient un job » et verrou de
-lecture par clé pour l'atomicité (RUNTIME_ARCH §8.1).
+(KEYS, UNLINK, save, libérations lourdes) sont des jobs à curseur avancés d'une tranche
+par tour ; la connexion qui attend est parquée, les autres continuent. Plus tard : seuil
+« devient un job » pour toute commande lourde, et verrou de lecture par clé pour
+l'atomicité (RUNTIME_ARCH §8.1).
 
 ---
 
@@ -182,8 +183,8 @@ complet.
 
 Avant de valider du code :
 - [ ] Aucun lock, atomique de synchronisation, `Arc`, thread partagé ni `fork()`.
-- [ ] Rien de daté (borrow, idx de slab, pointeur, référence vers l'anneau) ne survit à un
-      `.await` ou à la fin d'un tour sans re-résolution (§1.1).
+- [ ] Rien de daté (borrow, idx de slab, pointeur, référence vers l'anneau) ne survit à
+      une tranche de job ou à la fin d'un tour sans re-résolution (§1.1).
 - [ ] Les curseurs (SCAN, jobs) sont des clés, jamais des idx.
 - [ ] Toute mutation ou libération d'un nœud oxidart / valart passe par son point de
       passage (barrière de save, SAVE_DESIGN §3) ; aucune libération pendant une save hors

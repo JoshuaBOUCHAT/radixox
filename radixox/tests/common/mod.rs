@@ -34,13 +34,9 @@ pub fn start_server_env(port: u16, envs: &[(&str, &str)]) {
     wait_for_port(port);
 }
 
-/// Binaire testé : `RADIXOX_TEST_BIN=uring` fait tourner la même suite contre
-/// la boucle io_uring maison (`radixox-uring`).
+/// Binaire du serveur testé.
 pub fn server_bin() -> &'static str {
-    match std::env::var("RADIXOX_TEST_BIN").as_deref() {
-        Ok("uring") => env!("CARGO_BIN_EXE_radixox-uring"),
-        _ => env!("CARGO_BIN_EXE_radixox"),
-    }
+    env!("CARGO_BIN_EXE_radixox")
 }
 
 /// Open a fresh synchronous Redis connection to `port`.

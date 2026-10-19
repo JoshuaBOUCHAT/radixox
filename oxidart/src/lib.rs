@@ -45,7 +45,6 @@
 //! Ordered operations (`krange`, prefix scans) use unsigned byte order (`memcmp`), like Redis.
 
 
-pub mod async_command;
 pub mod compact_path;
 pub mod compress;
 pub mod error;
@@ -64,7 +63,6 @@ pub mod value;
 pub mod zcommand;
 pub mod zset_inner;
 
-pub mod monoio;
 
 pub mod counter;
 
@@ -88,6 +86,9 @@ mod test_node;
 
 #[cfg(test)]
 mod test_diff;
+
+#[cfg(test)]
+mod test_detached;
 
 use hislab::TaggedHiSlab;
 use radixox_lib::shared_byte::SharedByte;
@@ -310,6 +311,16 @@ impl OxidArt {
     #[inline]
     pub fn set_now(&mut self, now: u64) {
         self.now = now;
+    }
+
+    /// Met l'horloge du TTL à l'heure murale (secondes depuis l'époque Unix).
+    /// La boucle du serveur l'appelle une fois par tour.
+    #[inline]
+    pub fn tick(&mut self) {
+        self.now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before UNIX epoch")
+            .as_secs();
     }
 
     /// Indique si une save est en cours. Pendant une save, les lectures ne

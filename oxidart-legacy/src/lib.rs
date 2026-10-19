@@ -44,7 +44,6 @@
 //! Keys are arbitrary bytes (binary-safe): every byte value 0x00–0xFF, `\0` included.
 //! Ordered operations (`krange`, prefix scans) use unsigned byte order (`memcmp`), like Redis.
 
-pub mod async_command;
 pub mod compact_path;
 pub mod compress;
 pub mod error;
@@ -61,7 +60,6 @@ pub mod value;
 pub mod zcommand;
 pub mod zset_inner;
 
-pub mod monoio;
 
 pub mod counter;
 

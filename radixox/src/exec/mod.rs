@@ -1,8 +1,7 @@
 //! Exécution des commandes, indépendante du runtime réseau : commandes sync
 //! sur l'arbre, encodage des réponses construites sans `Frame`, état d'une
-//! connexion cliente (AUTH, CLIENT, HELLO), curseurs SCAN. Partagé par le
-//! serveur monoio (`bin/resp.rs`) et la future boucle io_uring
-//! (RUNTIME_ARCH.md §13).
+//! connexion cliente (AUTH, CLIENT, HELLO), curseurs SCAN, jobs, persistance.
+//! Utilisé par le cœur de la boucle io_uring (`radixox::uring`).
 
 pub mod auth;
 pub mod bgsave;

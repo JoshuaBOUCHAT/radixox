@@ -2,8 +2,8 @@
 //! UNLINK `prefix*`, libération de FLUSHDB.
 //!
 //! Un job est un curseur synchrone : [`Job::step`] avance d'une tranche et dit
-//! s'il reste du travail. N'importe quelle boucle peut le piloter (une tâche
-//! monoio aujourd'hui, la boucle io_uring demain). Entre deux tranches, il ne
+//! s'il reste du travail. N'importe quelle boucle peut le piloter (la boucle
+//! io_uring, les tests). Entre deux tranches, il ne
 //! garde rien de daté : une **clé** de reprise (KEYS) ou des sous-arbres
 //! détachés qui n'appartiennent qu'à lui (UNLINK, FLUSHDB).
 //!
