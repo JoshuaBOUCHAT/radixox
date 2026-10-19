@@ -353,58 +353,66 @@ fn header(d: &[u8], pos: &mut usize) -> Header {
     if neg { Header::Neg } else { Header::Num(n) }
 }
 
-/// Découpe une commande RESP qui commence à `d[pos] == b'*'`.
-fn parse_multibulk<'a>(d: &'a [u8], mut pos: usize) -> Parse<'a> {
+/// Parcours d'une frame : `Ok(fin)` (octets consommés depuis le début de `d`),
+/// chaque argument remis à `arg`. `Ok` sans argument : rien à exécuter.
+type Walk = Result<usize, Stop>;
+
+/// Fin de parcours sans frame complète.
+#[derive(Clone, Copy)]
+enum Stop {
+    Incomplete,
+    Invalid(&'static str),
+}
+
+/// Commande RESP qui commence à `d[pos] == b'*'`.
+fn walk_multibulk<'a>(d: &'a [u8], mut pos: usize, mut arg: impl FnMut(&'a [u8])) -> Walk {
     pos += 1;
     let n = match header(d, &mut pos) {
-        Header::Num(0) | Header::Neg => return Parse::Done(Cmd::Empty, pos),
+        Header::Num(0) | Header::Neg => return Ok(pos),
         Header::Num(n) if n <= MAX_MULTIBULK_LEN => n,
-        Header::Num(_) | Header::Invalid => return Parse::Invalid("invalid multibulk length"),
-        Header::Incomplete => return Parse::Incomplete,
+        Header::Num(_) | Header::Invalid => return Err(Stop::Invalid("invalid multibulk length")),
+        Header::Incomplete => return Err(Stop::Incomplete),
     };
-    let mut raw: SmallVec<8, &[u8]> = SmallVec::new();
     for _ in 0..n {
         match d.get(pos) {
-            None => return Parse::Incomplete,
+            None => return Err(Stop::Incomplete),
             Some(b'$') => pos += 1,
-            Some(_) => return Parse::Invalid("expected '$'"),
+            Some(_) => return Err(Stop::Invalid("expected '$'")),
         }
         let len = match header(d, &mut pos) {
             Header::Num(len) if len <= MAX_BULK_LEN => len,
             Header::Num(_) | Header::Neg | Header::Invalid => {
-                return Parse::Invalid("invalid bulk length");
+                return Err(Stop::Invalid("invalid bulk length"));
             }
-            Header::Incomplete => return Parse::Incomplete,
+            Header::Incomplete => return Err(Stop::Incomplete),
         };
         // `pos <= d.len()` (crlf lu juste avant) : pas de débordement possible.
         if d.len() - pos < len + 2 {
-            return Parse::Incomplete;
+            return Err(Stop::Incomplete);
         }
         if &d[pos + len..pos + len + 2] != b"\r\n" {
-            return Parse::Invalid("expected CRLF after bulk string");
+            return Err(Stop::Invalid("expected CRLF after bulk string"));
         }
-        raw.push(&d[pos..pos + len]);
+        arg(&d[pos..pos + len]);
         pos += len + 2;
     }
-    Parse::Done(dispatch(&raw), pos)
+    Ok(pos)
 }
 
 /// Commande inline (`SET k v\r\n` tapé dans telnet ou `nc`), comme Redis :
 /// arguments séparés par des espaces, `"…"` ou `'…'` pour un argument qui en
 /// contient. Les arguments empruntent la ligne : un échappement (`\n`, `\x41`…)
 /// à l'intérieur de guillemets est refusé.
-fn parse_inline<'a>(d: &'a [u8], pos: usize) -> Parse<'a> {
+fn walk_inline<'a>(d: &'a [u8], pos: usize, mut arg: impl FnMut(&'a [u8])) -> Walk {
     let rest = &d[pos..];
     let Some(nl) = rest.iter().take(MAX_INLINE_LEN + 1).position(|&b| b == b'\n') else {
-        return if rest.len() > MAX_INLINE_LEN {
-            Parse::Invalid("too big inline request")
+        return Err(if rest.len() > MAX_INLINE_LEN {
+            Stop::Invalid("too big inline request")
         } else {
-            Parse::Incomplete
-        };
+            Stop::Incomplete
+        });
     };
     let line = rest[..nl].strip_suffix(b"\r").unwrap_or(&rest[..nl]);
-    let consumed = pos + nl + 1;
-    let mut raw: SmallVec<8, &[u8]> = SmallVec::new();
     let mut i = 0;
     loop {
         while i < line.len() && line[i].is_ascii_whitespace() {
@@ -417,31 +425,60 @@ fn parse_inline<'a>(d: &'a [u8], pos: usize) -> Parse<'a> {
         if q == b'"' || q == b'\'' {
             let start = i + 1;
             let Some(len) = line[start..].iter().position(|&b| b == q) else {
-                return Parse::Invalid("unbalanced quotes in request");
+                return Err(Stop::Invalid("unbalanced quotes in request"));
             };
-            let arg = &line[start..start + len];
-            if arg.contains(&b'\\') {
-                return Parse::Invalid("escapes are not supported in inline requests");
+            let a = &line[start..start + len];
+            if a.contains(&b'\\') {
+                return Err(Stop::Invalid("escapes are not supported in inline requests"));
             }
             i = start + len + 1;
             // Un argument entre guillemets doit être suivi d'un espace (Redis).
             if i < line.len() && !line[i].is_ascii_whitespace() {
-                return Parse::Invalid("unbalanced quotes in request");
+                return Err(Stop::Invalid("unbalanced quotes in request"));
             }
-            raw.push(arg);
+            arg(a);
         } else {
             let start = i;
             while i < line.len() && !line[i].is_ascii_whitespace() {
                 i += 1;
             }
-            raw.push(&line[start..i]);
+            arg(&line[start..i]);
         }
     }
-    if raw.is_empty() {
-        // Ligne vide : ignorée, comme Redis (`redis-cli --pipe` envoie `\r\n`).
-        return Parse::Done(Cmd::Empty, consumed);
+    Ok(pos + nl + 1)
+}
+
+/// Une frame au début de `d` (lignes vides de tête sautées).
+fn walk<'a>(d: &'a [u8], arg: impl FnMut(&'a [u8])) -> Walk {
+    let mut pos = 0;
+    // Lignes vides ignorées, comme Redis : `redis-cli --pipe` envoie `\r\n`
+    // avant son `ECHO` final.
+    while d[pos..].starts_with(b"\r\n") {
+        pos += 2;
     }
-    Parse::Done(dispatch(&raw), consumed)
+    match d.get(pos) {
+        None => Err(Stop::Incomplete),
+        Some(b'*') => walk_multibulk(d, pos, arg),
+        Some(_) => walk_inline(d, pos, arg),
+    }
+}
+
+/// Longueur de la frame au début de `d`, sans la décoder (pas d'allocation) :
+/// sert à découper le flux à l'arrivée ; la commande est parsée plus tard,
+/// à son exécution.
+pub enum FrameLen {
+    /// Frame complète de `n` octets (peut ne rien contenir à exécuter).
+    Done(usize),
+    Incomplete,
+    Invalid(&'static str),
+}
+
+pub fn frame_len(d: &[u8]) -> FrameLen {
+    match walk(d, |_| {}) {
+        Ok(n) => FrameLen::Done(n),
+        Err(Stop::Incomplete) => FrameLen::Incomplete,
+        Err(Stop::Invalid(msg)) => FrameLen::Invalid(msg),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -816,16 +853,13 @@ impl CmdError {
 impl<'a> Cmd<'a> {
     /// Découpe une commande au début de `d` (RESP ou inline).
     pub fn parse(d: &'a [u8]) -> Parse<'a> {
-        let mut pos = 0;
-        // Lignes vides ignorées, comme Redis : `redis-cli --pipe` envoie `\r\n`
-        // avant son `ECHO` final.
-        while d[pos..].starts_with(b"\r\n") {
-            pos += 2;
-        }
-        match d.get(pos) {
-            None => Parse::Incomplete,
-            Some(b'*') => parse_multibulk(d, pos),
-            Some(_) => parse_inline(d, pos),
+        let mut raw: SmallVec<8, &'a [u8]> = SmallVec::new();
+        match walk(d, |a| raw.push(a)) {
+            // Ligne vide, `*0` : consommés, rien à exécuter (comme Redis).
+            Ok(n) if raw.is_empty() => Parse::Done(Cmd::Empty, n),
+            Ok(n) => Parse::Done(dispatch(&raw), n),
+            Err(Stop::Incomplete) => Parse::Incomplete,
+            Err(Stop::Invalid(msg)) => Parse::Invalid(msg),
         }
     }
 
@@ -926,7 +960,7 @@ impl<'a> Cmd<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cmd, CmdError, Parse};
+    use super::{Cmd, CmdError, FrameLen, Parse, frame_len};
 
     fn done(d: &[u8]) -> (Cmd<'_>, usize) {
         match Cmd::parse(d) {
@@ -1053,5 +1087,30 @@ mod tests {
         assert_eq!(err(b"SET k v FOO\r\n"), "ERR syntax error");
         assert_eq!(err(b"ZRANGE z 0 1 REV\r\n"), "ERR syntax error");
         assert_eq!(err(b"FooBar\r\n"), "ERR unknown command 'foobar'");
+    }
+
+    /// `frame_len` (découpage à l'arrivée) et `parse` (à l'exécution) voient
+    /// exactement les mêmes frontières, sur tous les préfixes.
+    #[test]
+    fn frame_len_agrees_with_parse() {
+        let streams: [&[u8]; 6] = [
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\nhello\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+            b"\r\n\r\nPING\r\nSET k \"a b\"\r\n*0\r\nGET k\n",
+            b"*1\r\n$-1\r\n",
+            b"ECHO \"abc\r\n",
+            b"*2\r\n$3\r\nGET\r\n$9223372036854775807\r\nk\r\n",
+            b"DUMP k\r\nFOO\r\n*1\r\n$4\r\nPING\r\n",
+        ];
+        for d in streams {
+            for cut in 0..=d.len() {
+                let part = &d[..cut];
+                match (frame_len(part), Cmd::parse(part)) {
+                    (FrameLen::Done(a), Parse::Done(_, b)) => assert_eq!(a, b),
+                    (FrameLen::Incomplete, Parse::Incomplete) => {}
+                    (FrameLen::Invalid(a), Parse::Invalid(b)) => assert_eq!(a, b),
+                    _ => panic!("désaccord sur {:?}", part.escape_ascii().to_string()),
+                }
+            }
+        }
     }
 }

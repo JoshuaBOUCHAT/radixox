@@ -23,10 +23,7 @@ pub(crate) use radixox_lib::shared_frame::SharedFrame as Frame;
 
 use resp_cmd::delayed::{cmd_flushdb, cmd_keys, cmd_unlink};
 use resp_cmd::pub_sub::{cmd_publish, cmd_subscribe, cmd_unsubscribe};
-use radixox::exec::{
-    encode_krange, encode_mget, encode_scan, execute_sync, resp_ok, resp_pong,
-};
-use radixox::exec::cmd_hset;
+use radixox::exec::{Executed, execute_into, resp_ok, resp_pong};
 use crate::resp_cmd::client::Client;
 use crate::utils::{ConnState, SubRegistry};
 
@@ -368,116 +365,68 @@ async fn dispatch(
             }
         },
 
-        ConnState::Normal(_, _) => match cmd {
-            Cmd::Info => {
-                let info = format!(
-                    "# Server\r\nredis_version:7.0.0\r\nradixox_version:{}\r\n\r\n# Stats\r\nscan_cursors:{}\r\n",
-                    env!("CARGO_PKG_VERSION"),
-                    resp_cmd::scan::active_cursors()
-                );
-                conn_state.encode(Frame::BulkString(SharedByte::from_slice(info.as_bytes())));
-            }
-            Cmd::Ping(msg) => conn_state.encode(resp_pong(msg)),
-            Cmd::Auth { user, pass } => {
-                conn_state.encode(resp_cmd::auth::cmd_auth(user, pass, &mut client.authed));
-            }
-            Cmd::Hello(args) => conn_state.encode(resp_cmd::client::cmd_hello(&args, client)),
-            Cmd::Client(args) => conn_state.encode(resp_cmd::client::cmd_client(&args, client)),
-            Cmd::Command(args) => conn_state.encode(resp_cmd::client::cmd_command(&args)),
-            Cmd::Quit => {
-                // +OK (et les réponses pipelinées avant) partent avant la fermeture.
-                conn_state.encode(resp_ok());
-                conn_state.flush().await?;
-                return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
-            }
-            Cmd::Echo(msg) => conn_state.encode(Frame::BulkString(SharedByte::from_slice(msg))),
-            Cmd::Select(_) => conn_state.encode(resp_ok()),
-            Cmd::Subscribe(channels) => cmd_subscribe(&channels, conn_state, registry).await?,
-            Cmd::Publish { channel, message } => {
-                let a = [channel, message];
-                cmd_publish(&a, conn_state, registry).await?;
-            }
-            Cmd::HMSet { key, fields } => {
-                // HMSET doit répondre +OK (jedis attend un status, pas un entier)
-                let result = cmd_hset(&mut art.borrow_mut(), key, &fields);
-                let frame = match result {
-                    Frame::Error(_) => result,
-                    _ => resp_ok(),
-                };
-                conn_state.encode(frame);
-            }
-            Cmd::Keys(pattern) => {
-                let resp = cmd_keys(pattern, art).await;
-                conn_state.encode_with(|buf| buf.extend_from_slice(&resp));
-            }
-            Cmd::BgSave => {
-                let frame = if resp_cmd::bgsave::start_bgsave(&art) {
-                    Frame::SimpleString(SharedByte::from_slice(b"Background saving started"))
-                } else {
-                    Frame::Error("ERR Background save already in progress".into())
-                };
-                conn_state.encode(frame);
-            }
-            Cmd::Save => {
-                let frame = match resp_cmd::bgsave::save_sync(&art, resp_cmd::bgsave::sync_level()) {
-                    Ok(st) => {
-                        eprintln!(
-                            "[save] {:.1} MB ({:.1} MB bruts) en {:.2?} (DFS {:.2?})",
-                            st.written as f64 / 1e6,
-                            st.raw as f64 / 1e6,
-                            st.total,
-                            st.walk
-                        );
-                        resp_ok()
-                    }
-                    Err(e) => Frame::Error(format!("ERR {e}").into()),
-                };
-                conn_state.encode(frame);
-            }
-            Cmd::FlushDb => {
-                // Base détachée tout de suite ; libération en fond (après la
-                // save si une save tourne : sinon tout l'arbre serait capturé).
-                cmd_flushdb(art);
-                conn_state.encode(resp_ok());
-            }
-            Cmd::Unlink(keys) => {
-                let count = cmd_unlink(&keys, art).await;
-                conn_state.encode(Frame::Integer(count));
-            }
-            Cmd::MGet(keys) => {
-                // Descentes entrelacées + valeurs par référence, encodées
-                // pendant l'emprunt (ni clone ni Vec<Frame>).
-                let mut expired = Vec::new();
-                {
-                    let art = art.borrow();
-                    let vals = art.mget_ref(&keys, &mut expired);
-                    conn_state.encode_with(|buf| encode_mget(buf, &vals));
+        ConnState::Normal(_, _) => {
+            let executed =
+                conn_state.encode_with(|buf| execute_into(cmd, &mut art.borrow_mut(), client, buf));
+            let Executed::Runtime(cmd) = executed else {
+                return Ok(());
+            };
+            match cmd {
+                Cmd::Quit => {
+                    // +OK (et les réponses pipelinées avant) partent avant la fermeture.
+                    conn_state.encode(resp_ok());
+                    conn_state.flush().await?;
+                    return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
                 }
-                // Suppression à la volée des expirées croisées, après l'encodage.
-                if !expired.is_empty() {
-                    art.borrow_mut().purge_expired(&keys, &expired);
+                Cmd::Subscribe(channels) => cmd_subscribe(&channels, conn_state, registry).await?,
+                Cmd::Unsubscribe(channels) => {
+                    cmd_unsubscribe(&channels, conn_state, registry).await?
                 }
-            }
-            Cmd::KRange { prefix, from, count, rev } => {
-                // Encodé pendant l'emprunt de l'arbre : les valeurs sont des
-                // références (pas de clone/refcount), préchargées au parcours.
-                let art = art.borrow();
-                let range = art.krange(prefix, from, count, rev);
-                conn_state.encode_with(|buf| encode_krange(buf, &range));
-            }
-            Cmd::Scan { cursor, pattern, count, ty } => {
-                let art = art.borrow();
-                match resp_cmd::scan::cmd_scan(&art, client.id, cursor, pattern, count, ty) {
-                    Ok((next, page)) => conn_state.encode_with(|buf| encode_scan(buf, next, &page)),
-                    Err(e) => conn_state.encode(e),
+                Cmd::Publish { channel, message } => {
+                    let a = [channel, message];
+                    cmd_publish(&a, conn_state, registry).await?;
                 }
+                Cmd::Keys(pattern) => {
+                    let resp = cmd_keys(pattern, art).await;
+                    conn_state.encode_with(|buf| buf.extend_from_slice(&resp));
+                }
+                Cmd::BgSave => {
+                    let frame = if resp_cmd::bgsave::start_bgsave(art) {
+                        Frame::SimpleString(SharedByte::from_slice(b"Background saving started"))
+                    } else {
+                        Frame::Error("ERR Background save already in progress".into())
+                    };
+                    conn_state.encode(frame);
+                }
+                Cmd::Save => {
+                    let frame = match resp_cmd::bgsave::save_sync(art, resp_cmd::bgsave::sync_level()) {
+                        Ok(st) => {
+                            eprintln!(
+                                "[save] {:.1} MB ({:.1} MB bruts) en {:.2?} (DFS {:.2?})",
+                                st.written as f64 / 1e6,
+                                st.raw as f64 / 1e6,
+                                st.total,
+                                st.walk
+                            );
+                            resp_ok()
+                        }
+                        Err(e) => Frame::Error(format!("ERR {e}")),
+                    };
+                    conn_state.encode(frame);
+                }
+                Cmd::FlushDb => {
+                    // Base détachée tout de suite ; libération en fond (après la
+                    // save si une save tourne : sinon tout l'arbre serait capturé).
+                    cmd_flushdb(art);
+                    conn_state.encode(resp_ok());
+                }
+                Cmd::Unlink(keys) => {
+                    let count = cmd_unlink(&keys, art).await;
+                    conn_state.encode(Frame::Integer(count));
+                }
+                _ => unreachable!("commande sans dépendance au runtime"),
             }
-            Cmd::Invalid { name, err } => conn_state.encode(Frame::Error(err.message(name).into())),
-            cmd => {
-                let frame = execute_sync(cmd, &mut art.borrow_mut());
-                conn_state.encode(frame);
-            }
-        },
+        }
 
         _ => {}
     }

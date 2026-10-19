@@ -31,6 +31,98 @@ use string::{
     cmd_type,
 };
 
+// ── Exécution vers le tampon de sortie ──────────────────────────────────────
+
+/// Commande dont l'exécution dépend du runtime réseau (fermeture, Pub/Sub,
+/// jobs, fichiers) : rendue à l'appelant par [`execute_into`].
+pub enum Executed<'a> {
+    Done,
+    Runtime(Cmd<'a>),
+}
+
+/// Exécute `cmd` et écrit sa réponse dans `out`, ou la rend à l'appelant si
+/// elle dépend du runtime (`QUIT`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`,
+/// `KEYS`, `UNLINK`, `FLUSHDB`, `BGSAVE`, `SAVE`). Contrôle d'AUTH compris.
+pub fn execute_into<'a>(
+    cmd: Cmd<'a>,
+    art: &mut OxidArt,
+    client: &mut client::Client,
+    out: &mut Vec<u8>,
+) -> Executed<'a> {
+    use radixox_lib::shared_frame::extend_encode;
+    if matches!(cmd, Cmd::Empty) {
+        return Executed::Done;
+    }
+    if !client.authed && !cmd.allowed_unauthenticated() {
+        extend_encode(out, &auth::noauth());
+        return Executed::Done;
+    }
+    let frame = match cmd {
+        Cmd::Quit
+        | Cmd::Subscribe(_)
+        | Cmd::Unsubscribe(_)
+        | Cmd::Publish { .. }
+        | Cmd::Keys(_)
+        | Cmd::Unlink(_)
+        | Cmd::FlushDb
+        | Cmd::BgSave
+        | Cmd::Save => return Executed::Runtime(cmd),
+        Cmd::Info => {
+            let info = format!(
+                "# Server\r\nredis_version:7.0.0\r\nradixox_version:{}\r\n\r\n# Stats\r\nscan_cursors:{}\r\n",
+                env!("CARGO_PKG_VERSION"),
+                scan::active_cursors()
+            );
+            Frame::BulkString(SharedByte::from_slice(info.as_bytes()))
+        }
+        Cmd::Ping(msg) => resp_pong(msg),
+        Cmd::Auth { user, pass } => auth::cmd_auth(user, pass, &mut client.authed),
+        Cmd::Hello(args) => client::cmd_hello(&args, client),
+        Cmd::Client(args) => client::cmd_client(&args, client),
+        Cmd::Command(args) => client::cmd_command(&args),
+        Cmd::Echo(msg) => Frame::BulkString(SharedByte::from_slice(msg)),
+        // Un processus = une base (ARCHITECTURE.md §1) : comme Redis avec
+        // `databases 1`.
+        Cmd::Select(0) => resp_ok(),
+        Cmd::Select(_) => Frame::Error("ERR DB index is out of range".into()),
+        Cmd::HMSet { key, fields } => match cmd_hset(art, key, &fields) {
+            // HMSET répond +OK (jedis attend un status, pas un entier).
+            err @ Frame::Error(_) => err,
+            _ => resp_ok(),
+        },
+        Cmd::MGet(keys) => {
+            // Descentes entrelacées + valeurs par référence, encodées pendant
+            // l'emprunt (ni clone ni Vec<Frame>) ; expirées croisées purgées après.
+            let mut expired = Vec::new();
+            {
+                let vals = art.mget_ref(&keys, &mut expired);
+                encode_mget(out, &vals);
+            }
+            if !expired.is_empty() {
+                art.purge_expired(&keys, &expired);
+            }
+            return Executed::Done;
+        }
+        Cmd::KRange { prefix, from, count, rev } => {
+            // Valeurs par référence (pas de clone/refcount), préchargées au parcours.
+            let range = art.krange(prefix, from, count, rev);
+            encode_krange(out, &range);
+            return Executed::Done;
+        }
+        Cmd::Scan { cursor, pattern, count, ty } => {
+            match scan::cmd_scan(art, client.id, cursor, pattern, count, ty) {
+                Ok((next, page)) => encode_scan(out, next, &page),
+                Err(e) => extend_encode(out, &e),
+            }
+            return Executed::Done;
+        }
+        Cmd::Invalid { name, err } => Frame::Error(err.message(name)),
+        cmd => execute_sync(cmd, art),
+    };
+    extend_encode(out, &frame);
+    Executed::Done
+}
+
 // ── Command execution ─────────────────────────────────────────────────────────
 
 pub fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
