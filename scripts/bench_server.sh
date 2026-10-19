@@ -80,9 +80,10 @@ cmd_start() {
   main=${cpus%%,*}
   iowq=${cpus#"$main"}; iowq=${iowq#,}
   cmd_stop >/dev/null
-  local other; other=$(port_owner)
-  if [ -n "$other" ]; then
-    die "port $PORT déjà pris par : $(ps -o pid=,comm= -p "$other" 2>/dev/null || echo "pid $other") — service système ? (sudo systemctl disable --now redis-server / valkey-server)"
+  # Occupation du port testée sans le PID : `ss -p` ne montre pas les processus
+  # d'un autre utilisateur (un service redis/valkey système, par exemple).
+  if [ -n "$(ss -ltnH "sport = :$PORT" 2>/dev/null)" ]; then
+    die "port $PORT déjà pris ($(ss -ltnH "sport = :$PORT" | awk '{print $4}' | paste -sd' ')) — service système ? (sudo systemctl disable --now redis-server ou valkey-server)"
   fi
   rm -f "$STATE"/dump.rxd*
   ulimit -n 65536 2>/dev/null || true
