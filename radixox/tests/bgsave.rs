@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use oxidart::{Value, check_footer, parse_dump};
 
+mod common;
+
 const PORT: u16 = 6412;
 const PORT_ERR: u16 = 6413;
 
@@ -35,7 +37,7 @@ fn start_with(port: u16, dir: &PathBuf, env: &[(&str, &str)]) -> Server {
         .stderr(Stdio::null())
         .status();
     std::thread::sleep(Duration::from_millis(150));
-    let child = Command::new(env!("CARGO_BIN_EXE_radixox"))
+    let child = Command::new(common::server_bin())
         .env("RADIXOX_PORT", port.to_string())
         .env("RADIXOX_DIR", dir)
         .envs(env.iter().copied())
@@ -200,7 +202,7 @@ fn corrupted_dump_prevents_startup() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("dump.rxd"), b"RXDB pas un dump").unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_radixox"))
+    let mut child = Command::new(common::server_bin())
         .env("RADIXOX_PORT", "6415")
         .env("RADIXOX_DIR", &dir)
         .stdout(Stdio::null())

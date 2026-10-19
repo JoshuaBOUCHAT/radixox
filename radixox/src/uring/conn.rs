@@ -3,6 +3,7 @@
 //! [`ConnOut`] (réponses, envoi, mode, mutables pendant l'exécution).
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use crate::exec::client::Client;
 
@@ -77,6 +78,8 @@ pub struct ConnOut {
     pub ready: bool,
     /// Tour de lot où la connexion a exécuté une barrière (§2.1).
     pub stop_turn: u64,
+    /// Dernière réception (balayage d'inactivité).
+    pub last_active: Instant,
 }
 
 impl ConnOut {
@@ -96,6 +99,7 @@ impl ConnOut {
             dirty: false,
             ready: false,
             stop_turn: u64::MAX,
+            last_active: Instant::now(),
         }
     }
 

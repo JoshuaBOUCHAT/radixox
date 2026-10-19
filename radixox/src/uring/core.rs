@@ -12,6 +12,10 @@
 //! 4. [`Core::flush`] : un send par connexion sale, fermetures terminées ;
 //! 5. [`Core::take_ops`] → SQE, puis `enter`.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+use std::time::{Duration, Instant};
+
 use oxidart::OxidArt;
 use smallvec::SmallVec;
 use radixox_lib::cmd::{Cmd, FrameLen, Parse, frame_len};
@@ -19,6 +23,7 @@ use radixox_lib::shared_frame::{SharedFrame as Frame, extend_encode};
 
 use crate::exec::client::Client;
 use crate::exec::jobs::{FREE_BUDGET, FlushJob, KeysJob, Step, UnlinkJob};
+use crate::exec::persist::{save_sync, sync_level};
 use crate::exec::{Executed, execute_into, resp_ok};
 
 use super::bufs::{Bid, BufPool};
@@ -48,8 +53,11 @@ pub struct Config {
     /// tirée (backpressure, §6.2).
     pub out_backpressure: usize,
     /// Commandes dont les clés sont préchargées ensemble (`RADIXOX_PREFETCH`,
-    /// 1 = pas de préchargement). Au plus une par connexion par fenêtre.
+    /// 1 = pas de préchargement).
     pub prefetch: usize,
+    /// Connexion sans rien reçu depuis cette durée : fermée (`timeout` de
+    /// Redis ; `RADIXOX_TIMEOUT`, désactivé par défaut).
+    pub idle_timeout: Option<Duration>,
 }
 
 impl Default for Config {
@@ -67,6 +75,7 @@ impl Default for Config {
             flush_early: 64 << 10,
             out_backpressure: 1 << 20,
             prefetch: 8,
+            idle_timeout: None,
         }
     }
 }
@@ -104,6 +113,20 @@ pub enum Op {
 /// Une fenêtre de préchargement, sur la pile (pas d'allocation par fenêtre).
 type Window<T> = SmallVec<[T; 16]>;
 
+/// Évicteur TTL : une passe d'échantillonnage par seconde, comme sous monoio
+/// (l'évicteur à curseur est un chantier d'oxidart à part).
+const EVICT_EVERY: Duration = Duration::from_secs(1);
+/// Balayage d'inactivité : une tranche de connexions toutes les 100 ms.
+const SWEEP_EVERY: Duration = Duration::from_millis(100);
+const SWEEP_SLOTS: usize = 1024;
+
+/// Échéances du tas de timers (RUNTIME_ARCH.md §9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Timer {
+    Evict,
+    Sweep,
+}
+
 /// Suite à donner après l'exécution d'une frame.
 enum After {
     Continue,
@@ -131,11 +154,22 @@ pub struct Core {
     jobs: std::collections::VecDeque<FlushJob>,
     turn: u64,
     rr: usize,
+    /// Horloge monotone du tour (`set_now`) ; le TTL suit l'horloge murale
+    /// d'oxidart (`art.tick`).
+    now: Instant,
+    timers: BinaryHeap<Reverse<(Instant, Timer)>>,
+    sweep_pos: usize,
 }
 
 impl Core {
     pub fn new(cfg: Config, art: OxidArt) -> Self {
         let n = cfg.max_conn as usize;
+        let now = Instant::now();
+        let mut timers = BinaryHeap::new();
+        timers.push(Reverse((now + EVICT_EVERY, Timer::Evict)));
+        if cfg.idle_timeout.is_some() {
+            timers.push(Reverse((now + SWEEP_EVERY, Timer::Sweep)));
+        }
         Self {
             art,
             ins: (0..n).map(|_| ConnIn::default()).collect(),
@@ -151,7 +185,61 @@ impl Core {
             jobs: Default::default(),
             turn: 0,
             rr: 0,
+            now,
+            timers,
+            sweep_pos: 0,
             cfg,
+        }
+    }
+
+    // ── Temps ────────────────────────────────────────────────────────────
+
+    /// Horloge monotone du tour.
+    pub fn set_now(&mut self, now: Instant) {
+        self.now = now;
+    }
+
+    /// Prochaine échéance : borne l'attente dans `enter` (sinon l'horloge et
+    /// l'évicteur gèleraient au repos).
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.timers.peek().map(|Reverse((t, _))| *t)
+    }
+
+    /// Déclenche les échéances passées.
+    pub fn fire_timers(&mut self) {
+        while let Some(&Reverse((t, timer))) = self.timers.peek()
+            && t <= self.now
+        {
+            self.timers.pop();
+            match timer {
+                Timer::Evict => {
+                    // Pendant une save, l'évicteur est en pause (SAVE_DESIGN.md §2.C).
+                    if !self.art.is_saving() {
+                        self.art.evict_expired();
+                    }
+                    self.timers.push(Reverse((self.now + EVICT_EVERY, Timer::Evict)));
+                }
+                Timer::Sweep => {
+                    self.sweep_idle();
+                    self.timers.push(Reverse((self.now + SWEEP_EVERY, Timer::Sweep)));
+                }
+            }
+        }
+    }
+
+    /// Ferme, par tranches, les connexions qui n'ont rien envoyé depuis
+    /// `idle_timeout` (y compris une frame partielle qui n'avance plus).
+    /// Pas un timer par connexion : un balayage, comme le `clientsCron` de Redis.
+    fn sweep_idle(&mut self) {
+        let Some(limit) = self.cfg.idle_timeout else { return };
+        let n = self.outs.len();
+        for _ in 0..SWEEP_SLOTS.min(n) {
+            let slot = self.sweep_pos as Slot;
+            self.sweep_pos = (self.sweep_pos + 1) % n;
+            let o = &self.outs[slot as usize];
+            if o.mode == Mode::Normal && self.now.saturating_duration_since(o.last_active) > limit {
+                self.drain(slot);
+            }
         }
     }
 
@@ -235,6 +323,7 @@ impl Core {
         o.sending.clear();
         o.sent = 0;
         o.client = Client::new();
+        o.last_active = self.now;
         o.dirty = false;
         o.ready = false;
         o.stop_turn = u64::MAX;
@@ -254,6 +343,7 @@ impl Core {
             n if n > 0 => {
                 let bid = bid.expect("recv avec données sans tampon");
                 let off = self.bufs.chunk(bid, n as u32, buf_more);
+                self.outs[s].last_active = self.now;
                 if self.outs[s].mode == Mode::Normal && !self.ins[s].broken {
                     self.push_span(slot, Span { bid, off, len: n as u32 });
                 }
@@ -835,7 +925,25 @@ fn runtime(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut) -> After {
             extend_encode(&mut o.out, &resp_ok());
             After::Background(job)
         }
-        Cmd::Subscribe(_) | Cmd::Unsubscribe(_) | Cmd::Publish { .. } | Cmd::BgSave | Cmd::Save => {
+        Cmd::Save => {
+            // Bloquante, comme celle de Redis (BGSAVE : étape 4).
+            let frame = match save_sync(art, sync_level()) {
+                Ok(st) => {
+                    eprintln!(
+                        "[save] {:.1} MB ({:.1} MB bruts) en {:.2?} (DFS {:.2?})",
+                        st.written as f64 / 1e6,
+                        st.raw as f64 / 1e6,
+                        st.total,
+                        st.walk
+                    );
+                    resp_ok()
+                }
+                Err(e) => Frame::Error(format!("ERR {e}")),
+            };
+            extend_encode(&mut o.out, &frame);
+            After::Continue
+        }
+        Cmd::Subscribe(_) | Cmd::Unsubscribe(_) | Cmd::Publish { .. } | Cmd::BgSave => {
             extend_encode(&mut o.out, &Frame::Error("ERR not supported yet by radixox-uring".into()));
             After::Continue
         }

@@ -3,8 +3,9 @@
 //! (`radixox::uring::Core`) ; ce fichier ne fait que la traduction :
 //! `Op` → SQE, CQE → `Completion`, plus l'attente.
 //!
-//! Étape 2 (§13) : accept, recv multishot sur anneau incrémental, send, toutes
-//! les commandes sync. Pas encore : timers, signalfd, parquage, BGSAVE, Pub/Sub.
+//! Étapes 2–3 (§13) : accept, recv multishot sur anneau incrémental, send,
+//! commandes sync, SAVE, timers (évicteur, inactivité), arrêt sur signal avec
+//! save (`signalfd`). Pas encore : parquage, BGSAVE, Pub/Sub.
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("RadixOx requires Linux to run (io_uring).");
@@ -25,10 +26,6 @@ use radixox::uring::{Bid, Completion, Config, Core, Op, Slot};
 const BGID: u16 = 0;
 const SQ_ENTRIES: u32 = 4096;
 const CQ_ENTRIES: u32 = 16384;
-/// Attente maximale dans `enter` quand il n'y a rien à faire : l'horloge et
-/// l'évicteur avancent quand même (timers : étape 3).
-const IDLE_WAIT: Duration = Duration::from_millis(100);
-const EVICT_EVERY: Duration = Duration::from_secs(1);
 
 // ── user_data : kind << 32 | slot (RUNTIME_ARCH.md §3) ──────────────────────
 
@@ -37,6 +34,7 @@ const K_RECV: u64 = 2;
 const K_SEND: u64 = 3;
 const K_CANCEL: u64 = 4;
 const K_CLOSE: u64 = 5;
+const K_SIGNAL: u64 = 6;
 
 fn ud(kind: u64, slot: Slot) -> u64 {
     kind << 32 | slot as u64
@@ -113,6 +111,83 @@ struct Server {
     listener: TcpListener,
     ops: Vec<Op>,
     no_iowait: bool,
+    /// `signalfd` de SIGINT / SIGTERM (`RADIXOX_SAVE_ON_EXIT`).
+    signals: Option<Signals>,
+}
+
+/// Arrêt propre sur signal : la `signalfd` est lue par io_uring ; à réception,
+/// SAVE bloquante puis sortie. Un second signal pendant la save sort tout de
+/// suite (comme `resp_cmd/shutdown.rs` sous monoio).
+struct Signals {
+    fd: RawFd,
+    buf: Box<libc::signalfd_siginfo>,
+}
+
+impl Signals {
+    fn install() -> io::Result<Option<Self>> {
+        let on = std::env::var("RADIXOX_SAVE_ON_EXIT")
+            .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+        if !on {
+            return Ok(None);
+        }
+        // SAFETY: masque initialisé, appels libc sur le thread principal.
+        let fd = unsafe {
+            let mut mask: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut mask);
+            libc::sigaddset(&mut mask, libc::SIGINT);
+            libc::sigaddset(&mut mask, libc::SIGTERM);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
+            libc::signalfd(-1, &mask, libc::SFD_CLOEXEC)
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: structure C, tout à zéro est valide.
+        Ok(Some(Self { fd, buf: Box::new(unsafe { std::mem::zeroed() }) }))
+    }
+
+    fn read_sqe(&mut self) -> squeue::Entry {
+        opcode::Read::new(Fd(self.fd), (&mut *self.buf as *mut libc::signalfd_siginfo).cast(), size_of::<libc::signalfd_siginfo>() as u32)
+            .build()
+            .user_data(ud(K_SIGNAL, 0))
+    }
+}
+
+extern "C" fn exit_now(_sig: i32) {
+    // SAFETY: `_exit` est sûr dans un gestionnaire de signal.
+    unsafe { libc::_exit(130) }
+}
+
+/// Signal reçu : save puis sortie (second signal : sortie immédiate).
+fn shutdown(art: &mut OxidArt) -> ! {
+    eprintln!("[shutdown] signal reçu : save puis sortie (second signal : sortie immédiate)");
+    // La boucle ne lira plus la signalfd pendant la save : gestionnaire classique.
+    // SAFETY: gestionnaire réduit à `_exit` ; masque initialisé.
+    unsafe {
+        libc::signal(libc::SIGINT, exit_now as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, exit_now as *const () as libc::sighandler_t);
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        libc::sigaddset(&mut mask, libc::SIGINT);
+        libc::sigaddset(&mut mask, libc::SIGTERM);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut());
+    }
+    match radixox::exec::persist::save_sync(art, radixox::exec::persist::sync_level()) {
+        Ok(st) => {
+            eprintln!(
+                "[shutdown] {:.1} MB ({:.1} MB bruts) en {:.2?} (DFS {:.2?})",
+                st.written as f64 / 1e6,
+                st.raw as f64 / 1e6,
+                st.total,
+                st.walk
+            );
+            std::process::exit(0)
+        }
+        Err(e) => {
+            eprintln!("[shutdown] échec de la save : {e}");
+            std::process::exit(1)
+        }
+    }
 }
 
 impl Server {
@@ -212,6 +287,7 @@ impl Server {
                     more: cqueue::more(flags),
                 },
                 K_SEND => Completion::Send { slot, res },
+                K_SIGNAL => shutdown(&mut self.core.art),
                 // Annulation d'une op déjà finie, close d'un slot : rien à faire.
                 K_CANCEL | K_CLOSE => {
                     if res < 0 && res != -libc::ENOENT && res != -libc::EALREADY {
@@ -227,17 +303,19 @@ impl Server {
     }
 
     fn run(&mut self) -> io::Result<()> {
-        let mut last_evict = Instant::now();
+        if let Some(sig) = self.signals.as_mut() {
+            let sqe = sig.read_sqe();
+            self.push_sqe(&sqe)?;
+        }
         loop {
+            // Deux horloges par tour : murale pour le TTL, monotone pour les timers.
             self.core.art.tick();
+            self.core.set_now(Instant::now());
             self.harvest();
+            self.core.fire_timers();
             self.core.run_batch();
             self.core.run_jobs();
             self.core.flush();
-            if last_evict.elapsed() >= EVICT_EVERY {
-                self.core.art.evict_expired();
-                last_evict = Instant::now();
-            }
             self.submit_ops()?;
             let res = if self.core.idle() {
                 self.wait()
@@ -254,9 +332,14 @@ impl Server {
         }
     }
 
-    /// Soumet et attend au moins une complétion (ou le timeout).
+    /// Soumet et attend au moins une complétion, au plus jusqu'à la prochaine
+    /// échéance de timer.
     fn wait(&mut self) -> io::Result<usize> {
-        let ts = Timespec::from(IDLE_WAIT);
+        let timeout = self
+            .core
+            .next_deadline()
+            .map_or(Duration::from_secs(1), |t| t.saturating_duration_since(Instant::now()));
+        let ts = Timespec::from(timeout);
         let args = SubmitArgs::new().timespec(&ts);
         let mut flags = EnterFlags::GETEVENTS | EnterFlags::EXT_ARG;
         if self.no_iowait {
@@ -360,6 +443,10 @@ fn main() -> io::Result<()> {
     if let Some(kb) = std::env::var("RADIXOX_RING_BUF_KB").ok().and_then(|v| v.parse::<u32>().ok()) {
         cfg.buf_size = kb.max(4) << 10;
     }
+    // `timeout` de Redis : 0 ou absent = jamais.
+    if let Some(secs) = std::env::var("RADIXOX_TIMEOUT").ok().and_then(|v| v.parse::<u64>().ok()) {
+        cfg.idle_timeout = (secs > 0).then(|| Duration::from_secs(secs));
+    }
     ring.submitter().register_files_sparse(cfg.max_conn)?;
     let no_iowait = ring.params().is_feature_no_iowait();
     let mut core = Core::new(cfg, art);
@@ -367,6 +454,7 @@ fn main() -> io::Result<()> {
     let listener = TcpListener::bind(&addr)?;
     println!("RadixOx RESP Server (io_uring loop) listening on {addr}");
 
-    let mut server = Server { ring, bufring, core, listener, ops: Vec::new(), no_iowait };
+    let signals = Signals::install()?;
+    let mut server = Server { ring, bufring, core, listener, ops: Vec::new(), no_iowait, signals };
     server.run()
 }

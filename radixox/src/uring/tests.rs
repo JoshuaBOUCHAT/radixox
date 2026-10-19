@@ -2,6 +2,7 @@
 //! séquences de complétions fabriquées, invariants vérifiés à chaque tour.
 
 use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use oxidart::OxidArt;
 
@@ -418,6 +419,25 @@ fn flushdb_frees_in_background() {
     f.settle();
     assert_eq!(f.take(c), "+OK\r\n:0\r\n");
     assert_eq!(f.core.art.len(), 0);
+}
+
+/// Balayage d'inactivité : une connexion muette au-delà du délai est fermée,
+/// une connexion active reste ouverte (horloge pilotée par le test).
+#[test]
+fn idle_connections_are_closed() {
+    let mut f = Fake::new(Config { max_conn: 8, idle_timeout: Some(Duration::from_secs(5)), ..Config::default() });
+    let t0 = Instant::now();
+    let idle = f.connect();
+    let busy = f.connect();
+    f.core.set_now(t0 + Duration::from_secs(3));
+    f.send(busy, b"PING\r\n");
+    f.settle();
+    f.core.set_now(t0 + Duration::from_secs(7));
+    f.core.fire_timers();
+    f.settle();
+    assert!(f.closed_with(idle).is_some(), "connexion muette fermée");
+    assert_eq!(f.core.mode(busy), Mode::Normal);
+    assert_eq!(f.take(busy), "+PONG\r\n");
 }
 
 // ── Aléatoire contre un oracle ───────────────────────────────────────────────

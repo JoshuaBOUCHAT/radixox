@@ -1152,6 +1152,22 @@ données reçues reviennent en cache juste avant leur parse.
 - Gardé par sécurité : le champ `sent` (renvoi du reste si un send rend moins que demandé
   malgré `MSG_WAITALL`).
 
+**Étape 3, ce qui a été fait :**
+- Cœur : horloge monotone par tour (`set_now`), tas de timers (`next_deadline`,
+  `fire_timers`) : évicteur TTL (l'échantillonnage actuel, une passe par seconde, en pause
+  pendant une save) et balayage d'inactivité (`RADIXOX_TIMEOUT`, 1024 slots toutes les
+  100 ms, `last_active` par connexion). Le binaire attend dans `enter` au plus jusqu'à la
+  prochaine échéance.
+- Arrêt : avec `RADIXOX_SAVE_ON_EXIT`, SIGINT / SIGTERM bloqués et lus par une `signalfd`
+  via io_uring ; à réception, gestionnaire `_exit` réinstallé (second signal = sortie
+  immédiate), SAVE bloquante, sortie.
+- `SAVE` bloquante dans la lib (`exec::persist::save_sync`), servie par les deux binaires.
+- **Reporté** : l'évicteur à curseur (scan du bitmap tagué) est un chantier d'oxidart,
+  indépendant de la boucle.
+- Tests : `bgsave.rs` choisit aussi son binaire ; sur `radixox-uring`, SAVE, la save
+  d'arrêt et le refus d'un dump corrompu passent ; les 4 tests BGSAVE attendent l'étape 4.
+  (`cargo test --no-fail-fast` pour voir toutes les suites malgré un échec.)
+
 **Organisation du code :** le code commun aux deux serveurs (dispatch, `execute_sync`,
 encodage, jobs, table des commandes) vit dans la bibliothèque `radixox/src/lib.rs` ; second
 binaire `radixox-uring` (`src/bin/uringloop.rs`) ; les tests d'intégration choisissent leur
@@ -1162,15 +1178,15 @@ binaire (`RADIXOX_TEST_BIN`) pour faire tourner la même suite sur les deux.
 `radixox/src/bin/uringloop.rs` (io-uring 0.7.15), qui remplace `resp.rs` une fois
 stabilisée.
 
-**État (2026-10-19) : étapes 0, 1 et 2 faites** — détail plus bas, mesures §12.4.
-Prochaine : étape 3 (horloges, timers, signalfd, évicteur à curseur).
+**État (2026-10-19) : étapes 0 à 3 faites** — détail plus bas, mesures §12.4.
+Prochaine : étape 4 (parquage, jobs, BGSAVE).
 
 | # | Étape | Terminé quand |
 |---|---|---|
 | 0 ✅ | **Sous monoio, sans risque** : sortir dispatch + `execute_sync` dans un module indépendant du runtime ; table des commandes (§2.2) ; découpage à trois issues + limites (§5.3) ; KEYS / UNLINK / FLUSHDB en jobs à curseur qui encodent leur réponse en octets (§8) ; retirer les Waker d'oxidart | tests actuels verts ; monoio ne fait plus qu'appeler `step` + `yield_now` |
 | 1 ✅ | **Cœur sans I/O** (§1.2) : files de `FrameRef` + refcount des tampons (§5.4), tirage par tours + barrières (§2.1), `Closing` / `Draining`, `epoch`, `check_invariants` | tests sur faux anneau, scénarios et séquences aléatoires : envoi qui traîne, EOF avec pipeline en cours, `ENOBUFS`, multishot terminé, annulation croisée avec une complétion, frame coupée octet par octet |
 | 2 ✅ | **`uringloop.rs`** : accept classique + `FilesUpdate` (§4.1), recv sur anneau incrémental, send `MSG_WAITALL`, toutes les commandes sync, préchargement à l'intérieur d'une connexion comme aujourd'hui | `test_resp.sh` + intégration verts ; A/B court contre monoio en pipeline 1 / 32 / 256 ; mesurés : nombre et taille des tampons, `ENOBUFS`, adjacence, fixed file utile ou non, `MSG_WAITALL` |
-| 3 | Horloges, timers, `signalfd`, évicteur à curseur, balayage d'inactivité | horloge vivante au repos, arrêt propre avec et sans save |
+| 3 ✅ | Horloges, timers, `signalfd`, ~~évicteur à curseur~~ (reporté), balayage d'inactivité | horloge vivante au repos, arrêt propre avec et sans save |
 | 4 | Parquage + jobs branchés sur `ready`, port de BGSAVE, SAVE = BGSAVE + parquage, save d'arrêt | p99.99 sous BGSAVE en pipeline 32 ≤ monoio |
 | 5 | Pub/Sub avec limite d'`out` | abonné lent → `Draining`, pas d'OOM |
 | 6 | Bascule par défaut, suppression de monoio (`oxidart/monoio.rs`, `async_command.rs`, `#[monoio::test]`, `resp.rs`, `utils/mod.rs`) | critères de bascule (§15) atteints |

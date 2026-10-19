@@ -22,11 +22,7 @@ pub fn start_server_env(port: u16, envs: &[(&str, &str)]) {
     // Give the OS a moment to release the port.
     std::thread::sleep(Duration::from_millis(150));
 
-    // `RADIXOX_TEST_BIN=uring` : même suite contre la boucle io_uring maison.
-    let bin = match std::env::var("RADIXOX_TEST_BIN").as_deref() {
-        Ok("uring") => env!("CARGO_BIN_EXE_radixox-uring"),
-        _ => env!("CARGO_BIN_EXE_radixox"),
-    };
+    let bin = server_bin();
     let child = Command::new(bin)
         .env("RADIXOX_PORT", port.to_string())
         .envs(envs.iter().copied())
@@ -36,6 +32,15 @@ pub fn start_server_env(port: u16, envs: &[(&str, &str)]) {
         .unwrap_or_else(|e| panic!("failed to spawn radixox on port {port}: {e}"));
     std::mem::forget(child);
     wait_for_port(port);
+}
+
+/// Binaire testé : `RADIXOX_TEST_BIN=uring` fait tourner la même suite contre
+/// la boucle io_uring maison (`radixox-uring`).
+pub fn server_bin() -> &'static str {
+    match std::env::var("RADIXOX_TEST_BIN").as_deref() {
+        Ok("uring") => env!("CARGO_BIN_EXE_radixox-uring"),
+        _ => env!("CARGO_BIN_EXE_radixox"),
+    }
 }
 
 /// Open a fresh synchronous Redis connection to `port`.
