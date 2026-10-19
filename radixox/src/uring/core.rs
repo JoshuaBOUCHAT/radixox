@@ -12,6 +12,7 @@
 //! 5. [`Core::take_ops`] → SQE, puis `enter`.
 
 use oxidart::OxidArt;
+use smallvec::SmallVec;
 use radixox_lib::cmd::{Cmd, FrameLen, Parse, frame_len};
 use radixox_lib::shared_frame::{SharedFrame as Frame, extend_encode};
 
@@ -95,6 +96,9 @@ pub enum Op {
     /// Rendre le tampon à l'anneau.
     ProvideBuf { bid: Bid },
 }
+
+/// Une fenêtre de préchargement, sur la pile (pas d'allocation par fenêtre).
+type Window<T> = SmallVec<[T; 16]>;
 
 /// Suite à donner après l'exécution d'une frame.
 enum After {
@@ -385,10 +389,12 @@ impl Core {
 
     // ── Lot ──────────────────────────────────────────────────────────────
 
-    /// Tirage par tours (§2.1) : la 1re frame de chaque connexion, puis la 2e…
-    /// jusqu'au budget. Ordre gardé à l'intérieur d'une connexion. Les frames
-    /// tirées forment des fenêtres de `prefetch` commandes de connexions
-    /// différentes, dont les clés sont préchargées ensemble (§8bis).
+    /// Tirage par tours (§2.1), par fenêtres de `prefetch` commandes dont les
+    /// clés sont préchargées ensemble (§8bis). Une fenêtre prend d'abord des
+    /// frames consécutives d'une même connexion (son état reste chaud en cache,
+    /// comme quand monoio traitait un pipeline d'un bloc), puis complète avec
+    /// les connexions suivantes : un client sans pipeline donne une frame, un
+    /// pipeline au plus `prefetch` par passage. Ordre gardé par connexion.
     pub fn run_batch(&mut self) {
         self.turn += 1;
         let n = self.ready.len();
@@ -397,22 +403,27 @@ impl Core {
         }
         let mut pos = self.rr % n;
         self.rr = self.rr.wrapping_add(1);
-        let width = self.cfg.prefetch.clamp(1, n.min(oxidart::PREFETCH_BATCH));
+        let width = self.cfg.prefetch.clamp(1, oxidart::PREFETCH_BATCH);
         let mut budget = self.cfg.batch_cmds;
-        let mut window: Vec<(Slot, Item)> = Vec::with_capacity(width);
+        let mut window: Window<(Slot, Item)> = SmallVec::new();
         while budget > 0 {
-            // Une fenêtre : au plus une frame par connexion (une barrière ne
-            // laisse donc jamais passer la frame suivante de sa connexion).
             let mut tried = 0;
             while window.len() < width.min(budget) && tried < n {
                 let slot = self.ready[pos % n];
                 pos += 1;
                 tried += 1;
-                if window.iter().any(|&(s, _)| s == slot) || !self.drawable(slot) {
+                if !self.drawable(slot) {
                     continue;
                 }
-                if let Some(item) = self.ins[slot as usize].queue.pop_front() {
+                let room = width.min(budget) - window.len();
+                let queue = &mut self.ins[slot as usize].queue;
+                let before = window.len();
+                while window.len() - before < room
+                    && let Some(item) = queue.pop_front()
+                {
                     window.push((slot, item));
+                }
+                if window.len() > before {
                     tried = 0;
                 }
             }
@@ -432,7 +443,7 @@ impl Core {
         });
     }
 
-    /// La connexion peut donner une frame à ce tour-ci.
+    /// La connexion peut donner des frames à ce tour-ci.
     fn drawable(&self, slot: Slot) -> bool {
         let o = &self.outs[slot as usize];
         o.stop_turn != self.turn
@@ -441,45 +452,75 @@ impl Core {
     }
 
     /// Parse les frames de la fenêtre, précharge leurs clés, les exécute dans
-    /// l'ordre, puis rend les tampons et applique les suites.
+    /// l'ordre, puis rend les tampons et applique les suites. Les frames d'une
+    /// connexion qui suivent une barrière dans la fenêtre ne sont pas exécutées :
+    /// elles retournent en tête de sa file (§2.1).
     fn exec_window(&mut self, window: &[(Slot, Item)]) {
-        let mut afters: Vec<After> = Vec::with_capacity(window.len());
+        let mut afters: Window<Option<After>> = SmallVec::new();
         {
             let Core { art, ins, outs, bufs, .. } = self;
-            let cmds: Vec<Option<Cmd<'_>>> = window
+            let mut barrier_at: Option<Slot> = None;
+            let cmds: Window<Option<Cmd<'_>>> = window
                 .iter()
                 .map(|&(slot, item)| {
+                    // Fenêtre : les frames d'une connexion y sont contiguës.
+                    if barrier_at == Some(slot) {
+                        return None;
+                    }
                     let bytes = match item {
-                        Item::ProtoErr(_) => return None,
+                        Item::ProtoErr(_) => {
+                            barrier_at = Some(slot);
+                            return None;
+                        }
                         Item::Ring { bid, off, len } => bufs.slice(bid, off, len),
                         Item::Local { off, len } => &ins[slot as usize].rx[off as usize..(off + len) as usize],
                     };
                     let Parse::Done(cmd, _) = Cmd::parse(bytes) else {
                         unreachable!("frame découpée à l'arrivée : toujours complète");
                     };
+                    if cmd.is_barrier() {
+                        barrier_at = Some(slot);
+                    }
                     Some(cmd)
                 })
                 .collect();
             if window.len() > 1 {
-                let keys: Vec<&[u8]> = cmds.iter().flatten().filter_map(Cmd::main_key).collect();
+                let keys: Window<&[u8]> = cmds.iter().flatten().filter_map(Cmd::main_key).collect();
                 if keys.len() > 1 {
                     art.prefetch_keys(&keys);
                 }
             }
+            let mut skipped: Option<Slot> = None;
             for (&(slot, item), cmd) in window.iter().zip(cmds) {
                 let o = &mut outs[slot as usize];
                 afters.push(match (item, cmd) {
-                    (Item::ProtoErr(msg), _) => {
+                    (Item::ProtoErr(msg), _) if skipped != Some(slot) => {
                         extend_encode(&mut o.out, &Frame::Error(format!("ERR Protocol error: {msg}")));
-                        After::Close
+                        skipped = Some(slot);
+                        Some(After::Close)
                     }
-                    (_, Some(cmd)) => run_cmd(cmd, art, o),
-                    (_, None) => unreachable!(),
+                    (_, Some(cmd)) => {
+                        let after = run_cmd(cmd, art, o);
+                        if matches!(after, After::Barrier | After::Close) {
+                            skipped = Some(slot);
+                        }
+                        Some(after)
+                    }
+                    // Après une barrière de sa connexion : pas exécutée.
+                    _ => None,
                 });
             }
         }
+        // Frames non exécutées : remises en tête de leur file, dans l'ordre.
+        for (&(slot, item), after) in window.iter().zip(&afters).rev() {
+            if after.is_none() {
+                self.ins[slot as usize].queue.push_front(item);
+            }
+        }
         for (&(slot, item), after) in window.iter().zip(afters) {
-            self.finish_item(slot, item, after);
+            if let Some(after) = after {
+                self.finish_item(slot, item, after);
+            }
         }
     }
 

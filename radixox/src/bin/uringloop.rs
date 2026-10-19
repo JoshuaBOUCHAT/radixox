@@ -353,6 +353,13 @@ fn main() -> io::Result<()> {
     if let Some(w) = std::env::var("RADIXOX_PREFETCH").ok().and_then(|v| v.parse::<usize>().ok()) {
         cfg.prefetch = w.max(1);
     }
+    // Anneau de réception (RUNTIME_ARCH.md §5.1) : nombre et taille des tampons.
+    if let Some(n) = std::env::var("RADIXOX_RING_BUFS").ok().and_then(|v| v.parse::<u16>().ok()) {
+        cfg.bufs = n.max(1);
+    }
+    if let Some(kb) = std::env::var("RADIXOX_RING_BUF_KB").ok().and_then(|v| v.parse::<u32>().ok()) {
+        cfg.buf_size = kb.max(4) << 10;
+    }
     ring.submitter().register_files_sparse(cfg.max_conn)?;
     let no_iowait = ring.params().is_feature_no_iowait();
     let mut core = Core::new(cfg, art);
