@@ -24,7 +24,8 @@ oxidart/        arbre des clés : TTL, préfixe / glob / range, descentes entrel
 oxidart-legacy/ ancien arbre (nœuds 64 o), oracle des tests différentiels, non publié
 valart/         radix compacts pour les valeurs Hash et Set
 radixox-lib/    SharedByte, parseur RESP (cmd.rs) et encodeur, barrière de save
-radixox/        binaire serveur `radixox` (src/bin/resp.rs) + tests d'intégration
+radixox/        lib `radixox::exec` (commandes, encodage, jobs) + binaire `radixox`
+                (src/bin/resp.rs, monoio) + tests d'intégration
 scripts/        bench_vs_valkey.sh (référence du README), stress_save.sh
 ```
 

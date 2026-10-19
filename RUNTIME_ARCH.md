@@ -1073,6 +1073,23 @@ Client à 76 % inactif dans les deux cas. Lecture :
 | jobs | tourniquet simple (§8) |
 | configuration | variables `RADIXOX_*` (fichier de config plus tard) |
 
+**Étape 0, ce qui a été fait :**
+- `Cmd::parse` → `Parse::{Done, Incomplete, Invalid}`, limites du §5.3 (frame), inline,
+  `*0` sauté (`Cmd::Empty`) ; dispatch sur le **nom complet** (elle ne regardait que la
+  1re lettre et la longueur : `DUMP k` exécutait `DECR k`) ; erreurs typées
+  (`Cmd::Invalid` + `CmdError`) ; métadonnées `is_barrier`, `allowed_unauthenticated`,
+  `allowed_in_pubsub`, `is_write` (§2.2, sous forme de méthodes plutôt que de table).
+- `radixox::exec` (lib) : commandes sync, `execute_sync`, encodeurs, client/AUTH, SCAN.
+- `radixox::exec::jobs` : `KeysJob` (reprise sur clé via `scan_keys`, réponse encodée en
+  octets, en-tête réservé), `UnlinkJob` (clé exacte supprimée tout de suite, `prefix*`
+  détaché d'un coup), `FlushJob` (base détachée, réponse immédiate, `DBSIZE` à 0 aussitôt,
+  libération en fond). oxidart : `Detached` remplace `deln_async` / `getn_async` /
+  `SaveDone` ; plus de `Waker` dans oxidart.
+- Écarts assumés : pendant un `UNLINK prefix*`, `DBSIZE` compte encore les clés pas encore
+  libérées ; les globs de KEYS parcourent le sous-arbre de leur préfixe littéral (comme
+  SCAN) au lieu du DFA de `getn_glob`. Limite globale d'accumulation : avec la boucle
+  maison (monoio : 1 Go par connexion seulement).
+
 **Organisation du code :** le code commun aux deux serveurs (dispatch, `execute_sync`,
 encodage, jobs, table des commandes) vit dans la bibliothèque `radixox/src/lib.rs` ; second
 binaire `radixox-uring` (`src/bin/uringloop.rs`) ; les tests d'intégration choisissent leur
@@ -1083,9 +1100,12 @@ binaire (`RADIXOX_TEST_BIN`) pour faire tourner la même suite sur les deux.
 `radixox/src/bin/uringloop.rs` (io-uring 0.7.15), qui remplace `resp.rs` une fois
 stabilisée.
 
+**État (2026-10-19) : étape 0 faite** (commits `29d329b`, `7e5b5fc`, `64fa7a3`) — détail
+plus bas. Prochaine : étape 1.
+
 | # | Étape | Terminé quand |
 |---|---|---|
-| 0 | **Sous monoio, sans risque** : sortir dispatch + `execute_sync` dans un module indépendant du runtime ; table des commandes (§2.2) ; découpage à trois issues + limites (§5.3) ; KEYS / UNLINK / FLUSHDB en jobs à curseur qui encodent leur réponse en octets (§8) ; retirer les Waker d'oxidart | tests actuels verts ; monoio ne fait plus qu'appeler `step` + `yield_now` |
+| 0 ✅ | **Sous monoio, sans risque** : sortir dispatch + `execute_sync` dans un module indépendant du runtime ; table des commandes (§2.2) ; découpage à trois issues + limites (§5.3) ; KEYS / UNLINK / FLUSHDB en jobs à curseur qui encodent leur réponse en octets (§8) ; retirer les Waker d'oxidart | tests actuels verts ; monoio ne fait plus qu'appeler `step` + `yield_now` |
 | 1 | **Cœur sans I/O** (§1.2) : files de `FrameRef` + refcount des tampons (§5.4), tirage par tours + barrières (§2.1), `Closing` / `Draining`, `epoch`, `check_invariants` | tests sur faux anneau, scénarios et séquences aléatoires : envoi qui traîne, EOF avec pipeline en cours, `ENOBUFS`, multishot terminé, annulation croisée avec une complétion, frame coupée octet par octet |
 | 2 | **`uringloop.rs`** : accept classique + `FilesUpdate` (§4.1), recv sur anneau incrémental, send `MSG_WAITALL`, toutes les commandes sync, préchargement à l'intérieur d'une connexion comme aujourd'hui | `test_resp.sh` + intégration verts ; A/B court contre monoio en pipeline 1 / 32 / 256 ; mesurés : nombre et taille des tampons, `ENOBUFS`, adjacence, fixed file utile ou non, `MSG_WAITALL` |
 | 3 | Horloges, timers, `signalfd`, évicteur à curseur, balayage d'inactivité | horloge vivante au repos, arrêt propre avec et sans save |

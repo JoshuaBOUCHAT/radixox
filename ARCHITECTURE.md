@@ -42,8 +42,10 @@ erreur, RUNTIME_ARCH §16).
 - une tâche par connexion, arbre partagé en `Rc<RefCell<OxidArt>>` ;
 - lecture double tampon, `read_and_flush` (écriture et lecture soumises ensemble) ;
 - parse par fenêtres de 8 commandes, clés préchargées ensemble (`RADIXOX_PREFETCH`) ;
-- commandes sync exécutées d'un tenant (atomiques) ; KEYS, UNLINK, FLUSHDB-pendant-save
-  et BGSAVE découpés en tranches avec `oxidart::async_command::yield_now` ;
+- commandes sync exécutées d'un tenant (atomiques), dans la bibliothèque
+  (`radixox::exec`), partagée avec la future boucle ;
+- KEYS, UNLINK `prefix*`, FLUSHDB : jobs à curseur synchrones (`radixox::exec::jobs`)
+  pilotés tranche par tranche avec `oxidart::async_command::yield_now` ; BGSAVE de même ;
 - Pub/Sub : writer task + `SubRegistry` (`radixox/src/bin/utils/mod.rs`).
 
 **Demain (boucle maison)** — RUNTIME_ARCH.md : plus de futures ni de tâches ; files de
@@ -116,8 +118,9 @@ naturel, même mécanique de save que l'arbre principal (ANALYSE_ART_UNIFIE §10
 
 `Cmd<'a>` : les clés empruntent le tampon de lecture (zéro allocation), les données
 stockées durablement (valeurs, membres, arguments de commandes longues) sont des
-`SharedByte` possédés. `Cmd::parse` = une passe, sans retour arrière. Limites et
-découpage à trois issues (complet / incomplet / invalide) : à faire (RUNTIME_ARCH §5.3).
+`SharedByte` possédés. `Cmd::parse` = une passe, sans retour arrière, à trois issues
+(`Done` / `Incomplete` / `Invalid` → erreur de protocole et fermeture), limites de Redis,
+commandes inline acceptées ; dispatch sur le nom complet, erreurs d'arguments typées.
 
 ---
 
