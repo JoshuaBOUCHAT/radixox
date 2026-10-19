@@ -413,6 +413,38 @@ fn pin_cpu() {
     }
 }
 
+/// La table des fichiers enregistrés est bornée par `RLIMIT_NOFILE` (souvent
+/// 1024 en limite souple) : on remonte la limite souple jusqu'à la dure, et si
+/// ça ne suffit pas on réduit le nombre de connexions, comme Redis pour
+/// `maxclients`. Rend le nombre de slots utilisables.
+fn raise_nofile(wanted: u32) -> u32 {
+    // Marge pour les autres fd du processus (écoute, signalfd, dump, anneau…).
+    const SPARE: u64 = 32;
+    // SAFETY: structure initialisée, appels libc simples.
+    unsafe {
+        let mut lim: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return wanted;
+        }
+        let need = wanted as u64 + SPARE;
+        if lim.rlim_cur < need {
+            lim.rlim_cur = need.min(lim.rlim_max);
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim);
+            }
+        }
+        let max = lim.rlim_cur.saturating_sub(SPARE).min(wanted as u64) as u32;
+        if max < wanted {
+            eprintln!(
+                "WARNING: RLIMIT_NOFILE = {} : connexions limitées à {max} au lieu de {wanted} \
+                 (ulimit -n ou LimitNOFILE= pour en avoir plus)",
+                lim.rlim_cur
+            );
+        }
+        max
+    }
+}
+
 fn build_ring() -> io::Result<IoUring> {
     IoUring::builder()
         .setup_single_issuer()
@@ -463,6 +495,7 @@ fn main() -> io::Result<()> {
     if let Some(secs) = std::env::var("RADIXOX_TIMEOUT").ok().and_then(|v| v.parse::<u64>().ok()) {
         cfg.idle_timeout = (secs > 0).then(|| Duration::from_secs(secs));
     }
+    cfg.max_conn = raise_nofile(cfg.max_conn);
     ring.submitter().register_files_sparse(cfg.max_conn)?;
     let no_iowait = ring.params().is_feature_no_iowait();
     let mut core = Core::new(cfg, art);
