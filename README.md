@@ -8,9 +8,12 @@ and `KEYS` that only walk the matching subtree, a `SCAN` without duplicates. `re
 existing Redis client libraries work for the [supported commands](#supported-commands), and
 the engine, **OxidArt**, is also usable as an embedded Rust library.
 
-It is single-threaded by design. On one core it has about half of Valkey's tail latency and
-13–20 % more throughput; a multi-threaded Valkey has more total throughput (see
-[Benchmarks](#benchmarks)).
+The data path is **single-threaded by design**: one thread owns the data, with no locks and
+no shared state. The network work runs in the kernel through a hand-written io_uring loop
+(no async runtime), and can be spread over more cores by the kernel's io_uring workers. On
+YCSB workload A (5M records), against Valkey 9.1.2 with the same resources: **+30 %
+throughput on one core**, **+12 % on three physical cores each**, with lower average latency
+and about a quarter less memory (see [Benchmarks](#benchmarks)).
 
 ---
 
@@ -31,7 +34,6 @@ Missing for primary data:
   rely on;
 - Linux only, and io_uring must be allowed (see [Deployment](#deployment)).
 
-The I/O layer will be rewritten (custom io_uring loop, see [Roadmap](#roadmap)).
 
 ---
 
@@ -55,8 +57,22 @@ The I/O layer will be rewritten (custom io_uring loop, see [Roadmap](#roadmap)).
 
 ## Highlights
 
-Measured on 2026-10-18 (memory on 2026-10-17), 1M keys, loopback; see
-[Benchmarks](#benchmarks) for the setup and caveats.
+With the custom io_uring loop (2026-10-19, loopback, **single runs**; see
+[Custom io_uring loop](#custom-io_uring-loop-2026-10-19)):
+
+| | RadixOx | Valkey 9.1.2 | |
+|---|---|---|---|
+| YCSB A, 5M records, **1 core** each: throughput | **258 k ops/s** | 199 k | **+30 %** |
+| same, READ avg / p99 | **386 µs / 570 µs** | 500 µs / 971 µs | −23 % / −41 % |
+| YCSB A, 5M records, **3 physical cores** each: throughput | **411 k ops/s** | 366 k | **+12 %** |
+| same, READ avg / p99 | **234 µs** / 484 µs | 271 µs / **440 µs** | −14 % / +10 % |
+| same, peak RSS | **1,556 MB** | 2,056 MB | −24 % |
+
+During a `BGSAVE` under load (pipeline 32, 1M keys), RadixOx's p99.99 stays at **3.25 ms**,
+its level without a save: the snapshot does not show in the tail.
+
+Earlier measurements (2026-10-18, memory on 2026-10-17, **previous I/O layer**, 1M keys,
+loopback; to be re-run with the new loop):
 
 | | RadixOx (1 core) | Valkey 9.1.2 | |
 |---|---|---|---|
@@ -90,14 +106,50 @@ redis-cli KEYS "user:10:*"
 redis-cli BGSAVE                         # snapshot to ./dump.rxd, reloaded at next start
 ```
 
-Requirements: **Linux** with io_uring (developed on 6.12 LTS and 7.2), **Rust 2024 edition**
+Requirements: **Linux 6.12 or newer** with io_uring (developed on 6.12 LTS and 7.2), **Rust 2024 edition**
 (stable).
 
 ---
 
 ## Benchmarks
 
-### Setup
+### Custom io_uring loop (2026-10-19)
+
+The server now runs on a hand-written io_uring loop (no async runtime): see
+[`RUNTIME_ARCH.md`](RUNTIME_ARCH.md). Same machine as below, power profile `performance`,
+loopback, **single runs**.
+
+**YCSB workload A** ([`bench_compare.sh`](bench_compare.sh)): 5M records (one hash field of
+100 B), 10M operations (50 % read / 50 % update), 100 client threads. `SERVER_CORES=K` gives
+each server K physical cores, **one thread per core, the same CPUs for both**, and leaves
+the SMT siblings of those cores idle; YCSB runs on the other cores. RadixOx: event loop on
+the first core, sends delegated to io_uring kernel workers (`IOSQE_ASYNC`) pinned on the
+others. Valkey: `io-threads K` on the same CPUs.
+
+| | Load | Run | READ avg | READ p95 | READ p99 | READ p99.9 | READ p99.99 | Peak RSS |
+|---|---|---|---|---|---|---|---|---|
+| RadixOx, 1 core | **115 k** | **258 k** | **386 µs** | **504 µs** | **570 µs** | **660 µs** | **1,007 µs** | **1,557 MB** |
+| Valkey, 1 core | 76 k | 199 k | 500 µs | 602 µs | 971 µs | 892 µs | 1,065 µs | 2,053 MB |
+| RadixOx, 3 cores | **223 k** | **411 k** | **234 µs** | 329 µs | 484 µs | 727 µs | **1,983 µs** | **1,556 MB** |
+| Valkey, 3 cores (`io-threads 3`) | 182 k | 366 k | 271 µs | **319 µs** | **440 µs** | **702 µs** | 2,283 µs | 2,056 MB |
+
+On three cores, Valkey has a slightly better p95–p99.9 (3–10 %): handing sends to the
+kernel's workers adds some variance, which a planned adaptive mode should reduce.
+
+**memtier**, 1M keys, 100 B values, 1:4 SET:GET, 80 connections (8 threads × 10), RadixOx
+alone (no Valkey run in this series):
+
+| | Throughput | avg | p99 |
+|---|---|---|---|
+| No pipeline, 1 core | 310 k ops/s | 0.295 ms | 0.447 ms |
+| No pipeline, 1 core + 2 io_uring send workers on a second physical core | **526 k ops/s** | **0.174 ms** | **0.279 ms** |
+| Pipeline 32, 1 core | 2.08–2.41 M ops/s | 1.06–1.09 ms | 1.46–1.55 ms |
+| Pipeline 32, 1 core, `BGSAVE` at t = 3 s | 1.91 M ops/s | — | 2.22 ms (p99.99 **3.25 ms**) |
+
+The previous I/O layer had a p99.99 of ~10 ms during the same `BGSAVE`; freeing the
+snapshot's copies in slices removed that spike.
+
+### Setup (sections below: previous I/O layer, 2026-10-18)
 
 - AMD Ryzen 5 7600X (6 cores / 12 threads), 30 GB RAM, Linux 7.2-zen, power profile
   `performance`, loopback, idle machine. Measured on 2026-10-18.
@@ -185,8 +237,9 @@ What drives these numbers:
   instead of a tree. One-field hashes are much smaller than in Valkey; hashes with several
   short fields are larger, because each field and value stays a separately allocated
   `SharedByte` (a deliberate trade-off: no copies on `HGET`/`HSET`).
-- **Connections**: each connection keeps three 64 KiB buffers while it is active (they grow
-  for large commands). With many concurrent clients this adds a few MB.
+- **Connections** (measured with the previous I/O layer, which kept three 64 KiB buffers per
+  connection): the new loop receives into one 2 MB ring shared by all connections, and keeps
+  per connection only its pending replies and the fragment of a split command.
 
 Tree cost per key on other key shapes (in-process, 1M keys, integer values):
 
@@ -453,8 +506,11 @@ Not done yet: fuzzing of the RESP parser, Redis's own test suite, crash (kill -9
 
 ## Deployment
 
-- **Linux only**, with io_uring (tested on 6.12 LTS and 7.2; older kernels are untested).
-  There is no epoll fallback: if io_uring is unavailable, the server fails at startup.
+- **Linux 6.12 or newer**, with io_uring (incremental buffer rings; tested on 6.12 LTS and
+  7.2). There is no epoll fallback: if io_uring is unavailable, the server fails at startup
+  with an explanation.
+- **Open files**: the server raises its soft `RLIMIT_NOFILE` to the hard limit at startup;
+  if that stays below 10,000 it accepts fewer connections and prints a warning.
 - **Containers**: the default seccomp profiles of recent Docker and containerd versions
   block the io_uring system calls. Allow `io_uring_setup`, `io_uring_enter` and
   `io_uring_register` in a custom profile (or run with `--security-opt seccomp=unconfined`
