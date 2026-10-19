@@ -1108,6 +1108,35 @@ Les deux runs n'ont pas le même profil d'énergie : comparer l'écart à Valkey
 La boucle creuse l'écart en débit et en latence moyenne ; les queues extrêmes restent
 devant Valkey avec moins de marge qu'avec monoio (un run : à surveiller).
 
+**Avant bascule : queues de latence et BGSAVE (2026-10-19, p32 / p256, 1 cœur).**
+Mesures du critère « p99.99 sous BGSAVE » ; chaque ligne corrige un défaut trouvé.
+
+| | p32 sans save : débit, p99, p99.9 | p32 + BGSAVE : p99, p99.9, p99.99 | p256 : débit, p99 |
+|---|---|---|---|
+| monoio | 2,06 M, 1,94, 2,22 ms | 2,06–2,10, 2,53–2,58, 10,8–10,9 ms | 2,54 M, 8,8 ms |
+| uring, tours de 1024 cmd, tranche de save après l'`enter` | 2,47 M, 2,37, 3,01 | 3,18, 5,12, 14,0 | 2,84 M, 10,7 |
+| + envois du tour avant la tranche de fond | | 2,46, 3,15, 15,9 | |
+| + pas d'`enter` en plus quand la tranche est plafonnée | | 2,40, 3,14, 12,4 | |
+| + tours de 4096 cmd | 2,20 M, 1,62, 1,87 | 2,03, 2,38, 14,1 | 2,79 M, 12,3 |
+| + plusieurs tranches de save par tour (jusqu'à sa part) | | 1,78, 2,11, 9,8 | |
+| + une connexion à la fois, envois entre tranches de 2048 | 2,41 M, 1,55 | 1,69, 2,22, 9,0 | 2,58 M, 13,1 |
+| **+ ordre d'arrivée, sans rotation** | **2,08 M, 1,46** | (1,69, 2,22, 9,0) | **2,83 M, 9,5** |
+
+Leçons, contraires au design initial (§2.1, §2.3) :
+- **des tours courts allongent la queue** : toutes les réponses d'un tour partent ensemble,
+  une connexion servie au tour suivant attend un tour de plus. Le tour sert toutes les
+  connexions prêtes, par tranches de 2048 commandes entre lesquelles les réponses prêtes
+  partent ;
+- **servir une connexion d'un bloc** (fenêtres de 8, une place par autre connexion prête)
+  plutôt qu'entrelacer 8 par 8 : sinon tous les lots finissent en même temps ;
+- **pas de rotation du point de départ** : l'ordre d'arrivée garde à chaque connexion sa
+  place d'un tour à l'autre (comme la file FIFO de monoio) ;
+- **la tranche de save passe après l'envoi des réponses**, peut se répéter dans un tour
+  jusqu'à sa part de CPU (une seule par tour : save deux fois plus longue, plus de copies
+  T0 à libérer), et l'`enter` en plus n'a lieu que si une tranche s'exécute.
+- Pic restant, commun aux deux binaires : `end_save` libère d'un coup les copies T0
+  (~8 ms sur 1 M clés sous écriture) → à faire par tranches (oxidart).
+
 **Prochaine optimisation (idée de l'utilisateur, 2026-10-19) : préchargement anticipé.**
 Pendant qu'on exécute la fenêtre N, précharger déjà les octets des frames et les clés de
 la fenêtre N+1 (distance réglable, comme le préchargement des frères de KRANGE) : les

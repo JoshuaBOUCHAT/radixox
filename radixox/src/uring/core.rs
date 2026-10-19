@@ -75,7 +75,9 @@ impl Default for Config {
             bufs: 64,
             buf_size: 32 << 10,
             query_limit: 1 << 30,
-            batch_cmds: 1024,
+            // Taille d'une tranche de tour : entre deux tranches, les réponses des
+            // connexions qui ont fini partent (la boucle rappelle `run_batch`).
+            batch_cmds: 2048,
             flush_early: 64 << 10,
             out_backpressure: 1 << 20,
             prefetch: 8,
@@ -228,7 +230,6 @@ pub struct Core {
     /// Jobs des connexions parquées, avec l'époque de leur parquage.
     conn_jobs: std::collections::VecDeque<(Slot, u32, ConnJob)>,
     turn: u64,
-    rr: usize,
     /// Horloge monotone du tour (`set_now`) ; le TTL suit l'horloge murale
     /// d'oxidart (`art.tick`).
     now: Instant,
@@ -268,7 +269,6 @@ impl Core {
             jobs: Default::default(),
             conn_jobs: Default::default(),
             turn: 0,
-            rr: 0,
             now,
             timers,
             sweep_pos: 0,
@@ -460,14 +460,18 @@ impl Core {
     /// Une tranche de BGSAVE, sous le plafond de CPU quand des clients sont
     /// actifs (SAVE_DESIGN.md, « Plafond de CPU du BGSAVE »).
     fn bgsave_slice(&mut self) {
-        let Some(bg) = self.bgsave.as_mut() else { return };
-        if bg.wants_slice() {
-            let active = self.now.saturating_duration_since(self.last_rx) < Duration::from_millis(1);
-            let elapsed = self.now.saturating_duration_since(bg.started()).as_secs_f64();
-            let paced = self.save_share < 1.0 && active && bg.work().as_secs_f64() > self.save_share * elapsed;
-            if !paced {
-                bg.slice(&mut self.art);
+        // Plusieurs tranches par tour jusqu'à sa part de CPU (une seule par tour
+        // ne lui en donnait que ~6 % avec des tours longs : save deux fois plus
+        // longue, plus de copies T0 à libérer à la fin), 250 µs au plus.
+        let t = Instant::now();
+        while self.bgsave_slice_due() && t.elapsed() < Duration::from_micros(250) {
+            self.bgsave.as_mut().unwrap().slice(&mut self.art);
+            let bg = self.bgsave.as_ref().unwrap();
+            if bg.in_flight() || !bg.wants_slice() {
+                break;
             }
+            // Le temps passé compte dans `work` : la part se recalcule à `now`.
+            self.now = Instant::now();
         }
         self.bgsave_next();
     }
@@ -631,45 +635,66 @@ impl Core {
 
     // ── Lot ──────────────────────────────────────────────────────────────
 
-    /// Tirage par tours (§2.1), par fenêtres de `prefetch` frames : parse (une
-    /// seule passe, directement dans les morceaux reçus), préchargement des clés
-    /// (§8bis), exécution, puis on avance dans les morceaux. Une fenêtre prend
-    /// d'abord des frames consécutives d'une connexion, puis complète avec les
-    /// suivantes : un client sans pipeline donne une frame, un pipeline au plus
-    /// `prefetch` par passage. Ordre gardé par connexion.
-    pub fn run_batch(&mut self) {
+    /// Une tranche de tour (au plus `batch_cmds` commandes), par fenêtres de
+    /// `prefetch` frames : parse (une seule passe, directement dans les morceaux
+    /// reçus), préchargement des clés (§8bis), exécution, puis on avance dans les
+    /// morceaux.
+    ///
+    /// On reste sur une connexion tant qu'elle a des frames : son lot finit tôt
+    /// et sa réponse peut partir entre deux tranches, comme monoio qui traitait
+    /// un pipeline d'un bloc (entrelacer 8 par 8 faisait finir tous les lots en
+    /// même temps, à la fin du tour : p99 +40 % en p256, mesuré). Chaque fenêtre
+    /// garde une place par autre connexion prête (une frame chacune) : un client
+    /// sans pipeline n'attend pas la fin d'un gros pipeline.
+    ///
+    /// Rend `true` si le budget est épuisé alors qu'il reste du travail : la
+    /// boucle envoie les réponses prêtes puis rappelle (§2.3).
+    pub fn run_batch(&mut self) -> bool {
         self.turn += 1;
         let n = self.ready.len();
         if n == 0 {
-            return;
+            return false;
         }
-        let mut pos = self.rr % n;
-        self.rr = self.rr.wrapping_add(1);
+        // Ordre d'arrivée (liste prête), sans rotation : chaque connexion garde sa
+        // place d'un tour à l'autre, comme la file FIFO de monoio. Une rotation
+        // pouvait faire passer une connexion première puis dernière (presque
+        // deux tours d'attente) ; l'équité vient des tranches, qui servent toutes
+        // les connexions prêtes à chaque tour.
+        let mut pos = 0;
         let width = self.cfg.prefetch.clamp(1, oxidart::PREFETCH_BATCH);
         let mut budget = self.cfg.batch_cmds;
         let mut picked: Window<Slot> = SmallVec::new();
-        while budget > 0 {
-            // Connexions candidates de la fenêtre (au plus `width`) ; les frames
-            // qui coupent deux morceaux sont reconstituées avant le parse.
-            picked.clear();
-            let mut tried = 0;
-            while picked.len() < width && tried < n {
-                let slot = self.ready[pos % n];
+        let mut idle_run = 0;
+        while budget > 0 && idle_run < n {
+            let first = self.ready[pos % n];
+            if !(self.drawable(first) && self.prepare(first)) {
                 pos += 1;
-                tried += 1;
+                idle_run += 1;
+                continue;
+            }
+            picked.clear();
+            picked.push(first);
+            let mut k = 1;
+            while picked.len() < width && k < n {
+                let slot = self.ready[(pos + k) % n];
+                k += 1;
                 if self.drawable(slot) && self.prepare(slot) {
                     picked.push(slot);
                 }
             }
-            if picked.is_empty() {
-                break;
-            }
             let done = self.exec_window(&picked, width.min(budget));
             if done == 0 {
-                break;
+                pos += 1;
+                idle_run += 1;
+                continue;
             }
+            idle_run = 0;
             budget = budget.saturating_sub(done);
+            if !(self.ins[first as usize].has_work() && self.drawable(first)) {
+                pos += 1;
+            }
         }
+        let more = budget == 0;
         let (ins, outs) = (&self.ins, &mut self.outs);
         self.ready.retain(|&slot| {
             let s = slot as usize;
@@ -679,6 +704,7 @@ impl Core {
             outs[s].ready = keep;
             keep
         });
+        more && !self.ready.is_empty()
     }
 
     /// La connexion peut donner des frames à ce tour-ci.
@@ -792,10 +818,14 @@ impl Core {
             let job_budget = self.cfg.job_budget;
             let Core { art, ins, outs, bufs, .. } = self;
             let mut frames: Window<(Slot, Cmd<'_>)> = SmallVec::new();
-            for &slot in picked {
+            for (rank, &slot) in picked.iter().enumerate() {
                 if frames.len() >= width {
                     break;
                 }
+                // La première connexion prend la fenêtre moins une place par autre
+                // connexion prête ; les autres, une frame chacune.
+                let quota = if rank == 0 { width.saturating_sub(picked.len() - 1).max(1) } else { 1 };
+                let stop_at = (frames.len() + quota).min(width);
                 let i = &ins[slot as usize];
                 let mut plan = Plan { slot, from_rx: false, consumed: 0, tail: false, err: None, first: frames.len() };
                 let mut barrier = false;
@@ -816,7 +846,7 @@ impl Core {
                 {
                     let data = bufs.slice(front.bid, front.off, front.len);
                     let mut pos = 0;
-                    while frames.len() < width && pos < data.len() {
+                    while frames.len() < stop_at && pos < data.len() {
                         match Cmd::parse(&data[pos..]) {
                             Parse::Done(cmd, n) => {
                                 pos += n;
@@ -1057,6 +1087,25 @@ impl Core {
             self.drain(slot);
         }
         sent
+    }
+
+    /// Du travail de fond attend une tranche (job de connexion parquée,
+    /// libération, BGSAVE) : la boucle doit envoyer les réponses du tour avant
+    /// de la faire (RUNTIME_ARCH.md §2).
+    pub fn has_jobs(&self) -> bool {
+        !self.conn_jobs.is_empty() || !self.jobs.is_empty() || self.bgsave_slice_due()
+    }
+
+    /// Une tranche de BGSAVE est à faire à ce tour-ci (pas de tranche à
+    /// faire, ou plafond de CPU atteint pendant que des clients sont actifs).
+    fn bgsave_slice_due(&self) -> bool {
+        let Some(bg) = self.bgsave.as_ref() else { return false };
+        if !bg.wants_slice() {
+            return false;
+        }
+        let active = self.now.saturating_duration_since(self.last_rx) < Duration::from_millis(1);
+        let elapsed = self.now.saturating_duration_since(bg.started()).as_secs_f64();
+        !(self.save_share < 1.0 && active && bg.work().as_secs_f64() > self.save_share * elapsed)
     }
 
     /// Parque la connexion : son job répondra. Ses morceaux en attente sont

@@ -131,11 +131,16 @@ pub struct BgSave {
     start: Instant,
     walk: Duration,
     writes: u64,
+    /// Durées notables (diagnostic : pics de latence pendant une save).
+    max_slice: Duration,
+    start_took: Duration,
+    finalize_took: Duration,
 }
 
 impl BgSave {
     /// Ouvre `dump.rxd.tmp` et la barrière de save.
     pub fn start(art: &mut OxidArt, zstd: Option<ZstdConf>) -> io::Result<Self> {
+        let t0 = Instant::now();
         let dir = save_dir();
         let file = std::fs::File::create(dir.join(TMP_NAME))?;
         let mut comp = zstd.map(|c| Compress {
@@ -155,6 +160,7 @@ impl BgSave {
             }
             None => art.save_start(&mut fill),
         };
+        let start_took = t0.elapsed();
         Ok(Self {
             dir,
             file,
@@ -172,6 +178,9 @@ impl BgSave {
             start: Instant::now(),
             walk: Duration::ZERO,
             writes: 0,
+            max_slice: Duration::ZERO,
+            start_took,
+            finalize_took: Duration::ZERO,
         })
     }
 
@@ -239,7 +248,9 @@ impl BgSave {
             Phase::Flush => self.compress_slice(),
             Phase::Sync | Phase::Done => {}
         }
-        self.work += t.elapsed();
+        let el = t.elapsed();
+        self.work += el;
+        self.max_slice = self.max_slice.max(el);
     }
 
     fn compress_slice(&mut self) {
@@ -333,8 +344,10 @@ impl BgSave {
             self.err = Some(io::Error::from_raw_os_error(-res));
             return;
         }
+        let t = Instant::now();
         let r = std::fs::rename(self.dir.join(TMP_NAME), self.dir.join(FILE_NAME))
             .and_then(|_| std::fs::File::open(&self.dir)?.sync_all());
+        self.finalize_took = t.elapsed();
         if let Err(e) = r {
             self.err = Some(e);
         }
@@ -348,12 +361,16 @@ impl BgSave {
         }
         (self.phase == Phase::Done).then(|| {
             eprintln!(
-                "[bgsave] {:.1} MB écrits en {:.2?} (DFS {:.2?}) ; {} écritures, CPU {:.2?}",
+                "[bgsave] {:.1} MB écrits en {:.2?} (DFS {:.2?}) ; {} écritures, CPU {:.2?} ; \
+                 démarrage {:.2?}, tranche max {:.2?}, rename+fsync dossier {:.2?}",
                 self.pos as f64 / 1e6,
                 self.start.elapsed(),
                 self.walk,
                 self.writes,
-                self.work
+                self.work,
+                self.start_took,
+                self.max_slice,
+                self.finalize_took
             );
             Ok(())
         })

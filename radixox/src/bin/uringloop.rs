@@ -26,6 +26,8 @@ use radixox::uring::{Bid, Completion, Config, Core, Op, Slot};
 const BGID: u16 = 0;
 const SQ_ENTRIES: u32 = 4096;
 const CQ_ENTRIES: u32 = 16384;
+/// Tranches de lot par tour au plus (une tranche = `Config::batch_cmds`).
+const MAX_SLICES: u32 = 32;
 
 // ── user_data : kind << 32 | slot (RUNTIME_ARCH.md §3) ──────────────────────
 
@@ -329,8 +331,23 @@ impl Server {
             self.core.set_now(Instant::now());
             self.harvest();
             self.core.fire_timers();
-            self.core.run_batch();
-            self.core.run_jobs();
+            // Par tranches : les réponses des connexions qui ont fini partent
+            // entre deux tranches au lieu d'attendre la fin du tour.
+            let mut slices = 0;
+            while self.core.run_batch() && slices < MAX_SLICES {
+                self.core.flush();
+                self.submit_ops()?;
+                self.ring.submit()?;
+                slices += 1;
+            }
+            if self.core.has_jobs() {
+                // Les réponses du tour partent avant la tranche de fond : sinon
+                // chacune attendrait la tranche (p99 sous BGSAVE ×1,6 mesuré).
+                self.core.flush();
+                self.submit_ops()?;
+                self.ring.submit()?;
+                self.core.run_jobs();
+            }
             self.core.flush();
             self.submit_ops()?;
             let res = if self.core.idle() {
@@ -490,6 +507,10 @@ fn main() -> io::Result<()> {
     }
     if let Some(kb) = std::env::var("RADIXOX_RING_BUF_KB").ok().and_then(|v| v.parse::<u32>().ok()) {
         cfg.buf_size = kb.max(4) << 10;
+    }
+    // Commandes par tour au plus (RUNTIME_ARCH.md §2.1, §2.3).
+    if let Some(n) = std::env::var("RADIXOX_BATCH_CMDS").ok().and_then(|v| v.parse::<usize>().ok()) {
+        cfg.batch_cmds = n.max(1);
     }
     // `timeout` de Redis : 0 ou absent = jamais.
     if let Some(secs) = std::env::var("RADIXOX_TIMEOUT").ok().and_then(|v| v.parse::<u64>().ok()) {
