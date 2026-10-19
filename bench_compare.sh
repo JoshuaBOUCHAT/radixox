@@ -3,6 +3,10 @@ set -euo pipefail
 
 # Usage:
 #   ./bench_compare.sh                    # RadixOx vs Valkey (starts/stops both, as before)
+#   SERVER_CORES=2 ./bench_compare.sh     # K physical cores for each server, the rest for YCSB:
+#                                         #   RadixOx: event loop on the first CPU, sends on io-wq
+#                                         #   workers (one per CPU of the other K-1 cores);
+#                                         #   Valkey: io-threads on the same CPUs.
 #   ./bench_compare.sh --running [label]  # bench whatever server is ALREADY running on $PORT
 #                                          # (any Redis-compatible service). Does not start or
 #                                          # kill anything. label defaults to "Service".
@@ -23,13 +27,43 @@ THREADS=100
 FIELDLENGTH=100
 
 RADIXOX_BIN="${RADIXOX_BIN:-$SCRIPT_DIR/target/release/radixox}"
-VALKEY_IO_THREADS="${VALKEY_IO_THREADS:-1}"   # override: VALKEY_IO_THREADS=4 ./bench_compare.sh
 CURRENT_LOG=""
 
-NPROC=$(nproc)
-# Valkey MT gets the top N+1 cores (N io-threads + 1 main), away from YCSB (2-5) and RadixOx (0-1)
-VALKEY_MT_FIRST=$(( NPROC - VALKEY_IO_THREADS - 1 ))
-VALKEY_MT_LAST=$(( NPROC - 1 ))
+# ── Répartition des cœurs (SERVER_CORES = cœurs physiques par serveur) ──────
+SERVER_CORES="${SERVER_CORES:-1}"
+# cœur physique -> CPU logiques (frères SMT), dans l'ordre des cœurs
+declare -A CORE_CPUS=()
+CORE_IDS=()
+while IFS=, read -r cpu core; do
+  [[ "$cpu" =~ ^# ]] && continue
+  [ -z "${CORE_CPUS[$core]:-}" ] && CORE_IDS+=("$core")
+  CORE_CPUS[$core]="${CORE_CPUS[$core]:+${CORE_CPUS[$core]},}$cpu"
+done < <(lscpu -p=CPU,CORE)
+NCORES=${#CORE_IDS[@]}
+if [ "$SERVER_CORES" -lt 1 ] || [ "$SERVER_CORES" -ge "$NCORES" ]; then
+  echo "SERVER_CORES=$SERVER_CORES : entre 1 et $((NCORES - 1)) ($NCORES cœurs physiques)" >&2
+  exit 1
+fi
+join() { local IFS=,; echo "$*"; }
+SERVER_SET=(); IOWQ_SET=(); CLIENT_SET=()
+for i in "${!CORE_IDS[@]}"; do
+  cpus="${CORE_CPUS[${CORE_IDS[$i]}]}"
+  if [ "$i" -lt "$SERVER_CORES" ]; then
+    SERVER_SET+=("$cpus")
+    [ "$i" -gt 0 ] && IOWQ_SET+=("$cpus")
+  else
+    CLIENT_SET+=("$cpus")
+  fi
+done
+SERVER_CPUS=$(join "${SERVER_SET[@]}")
+MAIN_CPU="${CORE_CPUS[${CORE_IDS[0]}]%%,*}"
+IOWQ_CPUS=$(join "${IOWQ_SET[@]+"${IOWQ_SET[@]}"}")
+CLIENT_CPUS=$(join "${CLIENT_SET[@]}")
+IOWQ_WORKERS=0
+[ -n "$IOWQ_CPUS" ] && IOWQ_WORKERS=$(echo "$IOWQ_CPUS" | tr ',' '\n' | wc -l)
+# Valkey : boucle principale + un io-thread par CPU de délégation (mêmes CPU que RadixOx)
+VALKEY_IO_THREADS="${VALKEY_IO_THREADS:-$((1 + IOWQ_WORKERS))}"
+VALKEY_CPUS="$MAIN_CPU${IOWQ_CPUS:+,$IOWQ_CPUS}"
 
 # ============================================
 # Helpers
@@ -90,7 +124,7 @@ run_ycsb() {
   local extra_args="${3:-}"
 
   if [ "$phase" = "load" ]; then
-    taskset -c 2-5 "$YCSB_DIR/bin/ycsb.sh" load redis -s -P "$YCSB_DIR/$WORKLOAD" \
+    taskset -c "$CLIENT_CPUS" "$YCSB_DIR/bin/ycsb.sh" load redis -s -P "$YCSB_DIR/$WORKLOAD" \
       -p redis.host=127.0.0.1 -p redis.port="$PORT" \
       -p fieldcount=1 -p fieldnamekey=false \
       -p fieldlength="$FIELDLENGTH" \
@@ -100,7 +134,7 @@ run_ycsb() {
       $extra_args \
       >"$outfile" 2>&1
   else
-    taskset -c 2-5 "$YCSB_DIR/bin/ycsb.sh" run redis -s -P "$YCSB_DIR/$WORKLOAD" \
+    taskset -c "$CLIENT_CPUS" "$YCSB_DIR/bin/ycsb.sh" run redis -s -P "$YCSB_DIR/$WORKLOAD" \
       -p redis.host=127.0.0.1 -p redis.port="$PORT" \
       -p fieldcount=1 -p fieldnamekey=false \
       -p fieldlength="$FIELDLENGTH" \
@@ -202,9 +236,8 @@ echo "  YCSB Benchmark: RadixOx vs Valkey"
 echo "  Workload A: 50% read / 50% update"
 echo "  Records: $RECORDS | Ops: $OPS | Threads: $THREADS"
 echo "  Field length: $FIELDLENGTH bytes"
-if [ "$VALKEY_IO_THREADS" -gt 1 ]; then
-  echo "  Valkey io-threads: $VALKEY_IO_THREADS (cores ${VALKEY_MT_FIRST}-${VALKEY_MT_LAST})"
-fi
+echo "  Server: $SERVER_CORES core(s), CPUs $SERVER_CPUS (event loop on $MAIN_CPU${IOWQ_CPUS:+, io-wq / io-threads on $IOWQ_CPUS}) | YCSB: CPUs $CLIENT_CPUS"
+echo "  Valkey io-threads: $VALKEY_IO_THREADS (CPUs $VALKEY_CPUS)"
 echo "═══════════════════════════════════════════════════"
 echo ""
 echo "[0/4] Building RadixOx (release)..."
@@ -218,7 +251,11 @@ echo ""
 # ============================================
 echo "[1/4] Starting RadixOx on :$PORT..."
 kill_port || true
-taskset -c 0-1 "$RADIXOX_BIN" &
+RADIXOX_ENV=(RADIXOX_CPU_PIN="$MAIN_CPU")
+if [ "$IOWQ_WORKERS" -gt 0 ]; then
+  RADIXOX_ENV+=(RADIXOX_SEND_ASYNC=1 RADIXOX_IOWQ_WORKERS="$IOWQ_WORKERS" RADIXOX_IOWQ_CPUS="$IOWQ_CPUS")
+fi
+taskset -c "$SERVER_CPUS" env "${RADIXOX_ENV[@]}" "$RADIXOX_BIN" &
 RADIXOX_PID=$!
 wait_for_server
 
@@ -252,15 +289,10 @@ kill_port
 # ============================================
 # Valkey Benchmark
 # ============================================
-if [ "$VALKEY_IO_THREADS" -gt 1 ]; then
-  echo "[3/4] Starting Valkey MT (io-threads=$VALKEY_IO_THREADS, cores ${VALKEY_MT_FIRST}-${VALKEY_MT_LAST}) on :$PORT..."
-  taskset -c "${VALKEY_MT_FIRST}-${VALKEY_MT_LAST}" valkey-server \
-    --port "$PORT" --daemonize no --save "" --appendonly no --dir /tmp \
-    --io-threads "$VALKEY_IO_THREADS" &
-else
-  echo "[3/4] Starting Valkey (single-thread) on :$PORT..."
-  taskset -c 0-1 valkey-server --port "$PORT" --daemonize no --save "" --appendonly no --dir /tmp &
-fi
+echo "[3/4] Starting Valkey (io-threads=$VALKEY_IO_THREADS, CPUs $VALKEY_CPUS) on :$PORT..."
+taskset -c "$SERVER_CPUS" valkey-server \
+  --port "$PORT" --daemonize no --save "" --appendonly no --dir /tmp \
+  --io-threads "$VALKEY_IO_THREADS" --server-cpulist "$VALKEY_CPUS" &
 VALKEY_PID=$!
 wait_for_server
 
@@ -308,12 +340,13 @@ winner() {
 }
 
 VALKEY_LABEL="Valkey"
-[ "$VALKEY_IO_THREADS" -gt 1 ] && VALKEY_LABEL="Valkey MT(${VALKEY_IO_THREADS}t)"
+[ "$VALKEY_IO_THREADS" -gt 1 ] && VALKEY_LABEL="Valkey(${VALKEY_IO_THREADS}t)"
+RADIXOX_LABEL="RadixOx(${SERVER_CORES}c)"
 
 echo "═══════════════════════════════════════════════════"
 echo "  RESULTS COMPARISON"
 echo "═══════════════════════════════════════════════════"
-printf "%-28s %12s %12s %10s\n" "Metric" "RadixOx(1t)" "$VALKEY_LABEL" "Winner"
+printf "%-28s %12s %12s %10s\n" "Metric" "$RADIXOX_LABEL" "$VALKEY_LABEL" "Winner"
 echo "-----------------------------------------------------------"
 printf "%-28s %12s %12s %10s\n" "Load throughput (ops/sec)" \
   "$RADIXOX_LOAD_OPS" "$VALKEY_LOAD_OPS" \
