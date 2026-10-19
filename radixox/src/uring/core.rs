@@ -345,6 +345,12 @@ impl Core {
         }
         o.sending.clear();
         o.sent = 0;
+        // Rien n'attend : on écrira dans le tampon qui vient d'être envoyé,
+        // encore chaud en cache, plutôt que dans l'autre (+1,4 défaut L1 par
+        // commande mesuré avec l'alternance).
+        if o.out.is_empty() {
+            std::mem::swap(&mut o.out, &mut o.sending);
+        }
         if !o.out.is_empty() && !o.dirty {
             o.dirty = true;
             self.dirty.push(slot);
