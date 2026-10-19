@@ -1,5 +1,5 @@
 #!/bin/bash
-# Bench RadixOx contre Valkey sur deux machines : ce PC fait le client (YCSB), la cible
+# Bench RadixOx contre Valkey (ou Redis, selon ce qui est installé) sur deux machines : ce PC fait le client (YCSB), la cible
 # ssh fait le serveur. Tout est orchestré d'ici :
 #
 #   scripts/bench_2pc.sh server            # 1 cœur puis 3 cœurs physiques par serveur
@@ -73,6 +73,8 @@ if ! redis-cli -h "$HOST" -p "$PORT" PING 2>&1 | grep -q PONG; then
 fi
 remote stop >/dev/null
 ok "$HOST:$PORT répond depuis ce PC"
+REF=$(remote refname)
+ok "référence : $REF"
 
 # ── 5. Benchs ───────────────────────────────────────────────────────────────
 ycsb() { # phase fichier
@@ -110,7 +112,7 @@ bench() { # serveur K
 
 row() { # k libellé clé plus_grand_gagne
   local a=${R[radixox,$1,$3]:-} b=${R[valkey,$1,$3]:-} w
-  w=$(awk -v a="$a" -v b="$b" -v h="$4" 'BEGIN { if (a=="" || b=="") print "N/A"; else if ((h && a+0>b+0) || (!h && a+0<b+0)) print "RadixOx"; else print "Valkey" }')
+  w=$(awk -v a="$a" -v b="$b" -v h="$4" -v ref="${REF%% *}" 'BEGIN { if (a=="" || b=="") print "N/A"; else if ((h && a+0>b+0) || (!h && a+0<b+0)) print "RadixOx"; else print ref }')
   printf "  %-24s %14.0f %14.0f %9s\n" "$2" "${a:-0}" "${b:-0}" "$w"
 }
 
@@ -120,9 +122,9 @@ for k in "${KS[@]}"; do
   bench valkey "$k"
 done
 
-step "Résultats — $RECORDS enregistrements, $OPS opérations, $THREADS threads, serveur $TARGET ($HOST), commit $REMOTE_REV"
+step "Résultats — RadixOx contre $REF — $RECORDS enregistrements, $OPS opérations, $THREADS threads, serveur $TARGET ($HOST), commit $REMOTE_REV"
 for k in "${KS[@]}"; do
-  printf "\n  %-24s %14s %14s %9s\n" "" "RadixOx(${k}c)" "Valkey(${k}t)" "gagnant"
+  printf "\n  %-24s %14s %14s %9s\n" "" "RadixOx(${k}c)" "${REF%% *}(${k}t)" "gagnant"
   row "$k" "Load (ops/s)" load 1
   row "$k" "Load p99 (µs)" loadp99 0
   row "$k" "Run (ops/s)" run 1

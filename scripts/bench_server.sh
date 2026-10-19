@@ -4,8 +4,10 @@
 #   scripts/bench_server.sh setup <ip_client>         # prep + libère le port + pare-feu (sudo)
 #   scripts/bench_server.sh prep                      # réglages système (sudo), une fois par démarrage
 #   scripts/bench_server.sh start radixox [K]         # RadixOx sur K cœurs physiques (défaut 1)
-#   scripts/bench_server.sh start valkey  [K]         # Valkey sur les mêmes K cœurs
+#   scripts/bench_server.sh start valkey  [K]         # la référence sur les mêmes K cœurs :
+#                                                     # valkey-server, ou redis-server s'il n'y en a pas
 #   scripts/bench_server.sh stop | status | rss       # arrêt, état, pic de RSS (Mo)
+#   scripts/bench_server.sh refname                   # nom et version de la référence
 #
 # Équité : un thread par cœur physique, les mêmes CPU pour les deux serveurs (les K
 # premiers cœurs), les autres cœurs laissés au système et aux interruptions réseau.
@@ -26,6 +28,20 @@ PIDFILE="$STATE/server.pid"
 mkdir -p "$STATE"
 
 die() { echo "bench_server: $*" >&2; exit 1; }
+
+# Serveur de référence : Valkey s'il est installé, sinon Redis (mêmes options).
+ref_bin() {
+  if command -v valkey-server >/dev/null; then echo valkey-server
+  elif command -v redis-server >/dev/null; then echo redis-server
+  else return 1
+  fi
+}
+
+cmd_refname() {
+  local bin; bin=$(ref_bin) || die "ni valkey-server ni redis-server"
+  local v; v=$("$bin" --version | grep -oP 'v=\K[0-9.]+' || true)
+  case "$bin" in valkey-server) echo "Valkey $v" ;; *) echo "Redis $v" ;; esac
+}
 
 # Premier CPU de chacun des K premiers cœurs physiques, séparés par des virgules.
 server_cpus() {
@@ -105,10 +121,14 @@ cmd_start() {
       setsid taskset -c "$cpus" env "${env[@]}" "$bin" </dev/null >"$STATE/server.log" 2>&1 &
       ;;
     valkey)
-      command -v valkey-server >/dev/null || die "valkey-server introuvable"
-      setsid taskset -c "$cpus" valkey-server --port "$PORT" --bind 0.0.0.0 --protected-mode no \
+      local bin; bin=$(ref_bin) || die "ni valkey-server ni redis-server"
+      # Redis 6/7 ne parallélise les lectures réseau qu'avec io-threads-do-reads.
+      local extra=()
+      [ "$bin" = redis-server ] && [ "$k" -gt 1 ] && extra=(--io-threads-do-reads yes)
+      setsid taskset -c "$cpus" "$bin" --port "$PORT" --bind 0.0.0.0 --protected-mode no \
         --save "" --appendonly no --dir "$STATE" \
-        --io-threads "$k" --server-cpulist "$cpus" </dev/null >"$STATE/server.log" 2>&1 &
+        --io-threads "$k" --server-cpulist "$cpus" "${extra[@]}" </dev/null >"$STATE/server.log" 2>&1 &
+      which="$(cmd_refname)"
       ;;
     *) die "start radixox|valkey [K]" ;;
   esac
@@ -179,9 +199,9 @@ cmd_setup() {
     sudo ufw allow from "$client" to any port "$PORT" proto tcp >/dev/null
     echo "pare-feu : port $PORT ouvert pour $client"
   fi
-  command -v valkey-server >/dev/null || die "valkey-server absent (sudo apt install valkey-server)"
+  ref_bin >/dev/null || die "ni valkey-server ni redis-server (sudo apt install valkey-server ou redis-server)"
   command -v cargo >/dev/null || die "cargo absent (https://rustup.rs)"
-  echo "valkey : $(valkey-server --version | awk '{print $3}')"
+  echo "référence : $(cmd_refname)"
   echo "build de radixox…"
   (cd "$ROOT" && RUSTFLAGS="-C target-cpu=native" cargo build --release --bin radixox -q) || die "build impossible"
   echo "serveur prêt (commit $(cd "$ROOT" && git rev-parse --short HEAD))"
@@ -194,5 +214,6 @@ case "${1:-}" in
   stop) cmd_stop ;;
   status) cmd_status ;;
   rss) cmd_rss ;;
+  refname) cmd_refname ;;
   *) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
