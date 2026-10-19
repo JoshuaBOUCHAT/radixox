@@ -1,6 +1,7 @@
 #!/bin/bash
 # Côté serveur d'un bench réseau (à lancer sur la machine serveur, dans le dépôt).
 #
+#   scripts/bench_server.sh setup <ip_client>         # prep + libère le port + pare-feu (sudo)
 #   scripts/bench_server.sh prep                      # réglages système (sudo), une fois par démarrage
 #   scripts/bench_server.sh start radixox [K]         # RadixOx sur K cœurs physiques (défaut 1)
 #   scripts/bench_server.sh start valkey  [K]         # Valkey sur les mêmes K cœurs
@@ -14,6 +15,9 @@
 # Les deux écoutent sur 0.0.0.0:$PORT sans mot de passe et sans persistance :
 # n'ouvrir le port qu'à la machine cliente.
 set -euo pipefail
+
+# Session ssh non interactive : cargo n'est pas forcément dans le PATH.
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PORT="${PORT:-6379}"
@@ -156,7 +160,35 @@ cmd_prep() {
   fi
 }
 
+# Tout ce qui demande sudo, en une fois : réglages, port libéré, pare-feu ouvert au client.
+cmd_setup() {
+  local client=${1:?setup <ip_client>}
+  cmd_prep
+  # Services redis / valkey du système qui prendraient le port.
+  local svc
+  for svc in $(systemctl list-units --type=service --state=active --no-legend 2>/dev/null \
+                 | awk '{print $1}' | grep -Ei '^(redis|valkey)' || true); do
+    echo "service système $svc arrêté et désactivé (il occupe le port des benchs)"
+    sudo systemctl disable --now "$svc"
+  done
+  cmd_stop >/dev/null
+  if [ -n "$(ss -ltnH "sport = :$PORT" 2>/dev/null)" ]; then
+    die "port $PORT toujours pris : $(ss -ltnH "sport = :$PORT" | awk '{print $4}' | paste -sd' ')"
+  fi
+  if command -v ufw >/dev/null && sudo ufw status | grep -q '^Status: active'; then
+    sudo ufw allow from "$client" to any port "$PORT" proto tcp >/dev/null
+    echo "pare-feu : port $PORT ouvert pour $client"
+  fi
+  command -v valkey-server >/dev/null || die "valkey-server absent (sudo apt install valkey-server)"
+  command -v cargo >/dev/null || die "cargo absent (https://rustup.rs)"
+  echo "valkey : $(valkey-server --version | awk '{print $3}')"
+  echo "build de radixox…"
+  (cd "$ROOT" && RUSTFLAGS="-C target-cpu=native" cargo build --release --bin radixox -q) || die "build impossible"
+  echo "serveur prêt (commit $(cd "$ROOT" && git rev-parse --short HEAD))"
+}
+
 case "${1:-}" in
+  setup) shift; cmd_setup "$@" ;;
   prep) cmd_prep ;;
   start) shift; cmd_start "$@" ;;
   stop) cmd_stop ;;
