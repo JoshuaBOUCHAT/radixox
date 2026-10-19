@@ -18,7 +18,7 @@ use monoio::{IoUringDriver, Runtime, RuntimeBuilder};
 
 use oxidart::OxidArt;
 use oxidart::async_command::OxidArtAsync;
-use radixox_lib::cmd::Cmd;
+use radixox_lib::cmd::{Cmd, Parse};
 use radixox_lib::shared_byte::SharedByte;
 pub(crate) use radixox_lib::shared_frame::SharedFrame as Frame;
 
@@ -46,7 +46,9 @@ pub(crate) type SharedRegistry = Rc<RefCell<SubRegistry>>;
 /// grandissent au besoin (grosse valeur, gros pipeline). À 512 Kio, 80
 /// connexions memtier gardaient ~48 Mo de pages écrites en RSS.
 const BUFFER_SIZE: usize = 64 * 1024;
-static ERR_EMPTY_CMD: &str = "ERR empty command";
+/// Taille maximale du tampon d'entrée d'une connexion (frame en cours de
+/// réception), comme `client-query-buffer-limit` de Redis. Au-delà : fermeture.
+const QUERY_BUFFER_LIMIT: usize = 1 << 30;
 const NB_ACCEPTOR: usize = 16;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -242,7 +244,10 @@ async fn handle_loop(
         // Commande incomplète qui remplit tout le buffer (grosse valeur) : sans
         // place libre, la lecture rendrait 0 et la connexion serait fermée.
         if io_buf_offset == io_buf.capacity() {
-            io_buf.reserve(io_buf.capacity());
+            if io_buf_offset >= QUERY_BUFFER_LIMIT {
+                return Err(std::io::Error::other("query buffer limit reached"));
+            }
+            io_buf.reserve(io_buf.capacity().min(QUERY_BUFFER_LIMIT - io_buf_offset));
         }
         let io_buf_cap = io_buf.capacity();
         let slice = SliceMut::new(io_buf, io_buf_offset, io_buf_cap);
@@ -271,31 +276,31 @@ async fn handle_buffer(
     art: &SharedART,
     client: &mut Client,
 ) -> IOResult<usize> {
-    let window = prefetch_window();
-    if window == 0 {
-        let mut offset = 0;
-        while let Some((cmd, n)) = Cmd::parse(&read_buf[offset..]) {
-            offset += n;
-            dispatch(cmd, conn_state, registry, art, client).await?;
-        }
-        return Ok(offset);
-    }
+    let window = prefetch_window().max(1);
     // Par fenêtres : parse jusqu'à `window` commandes, précharge leurs clés
     // ensemble (miss superposés), puis exécution dans l'ordre, inchangée.
     let read_buf = &*read_buf;
     let mut offset = 0;
     let mut batch: Vec<Cmd<'_>> = Vec::with_capacity(window);
     let mut keys: Vec<&[u8]> = Vec::with_capacity(window);
+    let mut invalid = None;
     loop {
-        while batch.len() < window
-            && let Some((cmd, n)) = Cmd::parse(&read_buf[offset..])
-        {
-            offset += n;
-            keys.extend(cmd.main_key());
-            batch.push(cmd);
+        while batch.len() < window {
+            match Cmd::parse(&read_buf[offset..]) {
+                Parse::Done(cmd, n) => {
+                    offset += n;
+                    keys.extend(cmd.main_key());
+                    batch.push(cmd);
+                }
+                Parse::Incomplete => break,
+                Parse::Invalid(msg) => {
+                    invalid = Some(msg);
+                    break;
+                }
+            }
         }
         if batch.is_empty() {
-            return Ok(offset);
+            break;
         }
         if keys.len() > 1 {
             art.borrow().prefetch_keys(&keys);
@@ -303,6 +308,19 @@ async fn handle_buffer(
         keys.clear();
         for cmd in batch.drain(..) {
             dispatch(cmd, conn_state, registry, art, client).await?;
+        }
+        if invalid.is_some() {
+            break;
+        }
+    }
+    match invalid {
+        None => Ok(offset),
+        // Flux invalide : les commandes valides d'avant ont répondu ; erreur
+        // puis fermeture, comme Redis.
+        Some(msg) => {
+            let err = Frame::Error(format!("ERR Protocol error: {msg}").into());
+            conn_state.send(err, registry).await?;
+            Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
         }
     }
 }
@@ -328,7 +346,10 @@ async fn dispatch(
     client: &mut Client,
 ) -> IOResult<()> {
     // Non authentifié : forcément en mode Normal (SUBSCRIBE est refusé).
-    if !client.authed && !matches!(cmd, Cmd::Auth { .. } | Cmd::Hello(_) | Cmd::Quit) {
+    if matches!(cmd, Cmd::Empty) {
+        return Ok(());
+    }
+    if !client.authed && !cmd.allowed_unauthenticated() {
         conn_state.encode(resp_cmd::auth::noauth());
         return Ok(());
     }
@@ -460,9 +481,7 @@ async fn dispatch(
                     Err(e) => conn_state.encode(e),
                 }
             }
-            Cmd::Unknown => {
-                conn_state.encode(Frame::Error("ERR unknown command".into()));
-            }
+            Cmd::Invalid { name, err } => conn_state.encode(Frame::Error(err.message(name).into())),
             cmd => {
                 let frame = execute_sync(cmd, &mut art.borrow_mut());
                 conn_state.encode(frame);
@@ -550,7 +569,8 @@ fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         | Cmd::Client(_)
         | Cmd::Command(_)
         | Cmd::HMSet { .. }
-        | Cmd::Unknown => unreachable!(),
+        | Cmd::Empty
+        | Cmd::Invalid { .. } => unreachable!(),
     }
 }
 

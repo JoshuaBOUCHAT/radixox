@@ -2,7 +2,7 @@ use std::mem::MaybeUninit;
 
 use crate::shared_byte::SharedByte;
 use crate::small_vec::{SmallVec, SmallVecIterator};
-use crate::cmd::{Cmd, SetCondition};
+use crate::cmd::{Cmd, CmdError, SetCondition};
 
 #[test]
 fn test_str() {
@@ -505,19 +505,21 @@ fn cmd_subscribe_multi() {
 
 #[test]
 fn cmd_invalid_returns_none() {
-    // RESP incomplet/malformé : None (attend plus d'octets, ne peut pas avancer le curseur).
+    // Incomplet : None (attend plus d'octets, ne peut pas avancer le curseur).
     assert!(Cmd::from_slice(b"").is_none());
-    assert!(Cmd::from_slice(b"PING\r\n").is_none()); // pas un array RESP
+    assert!(Cmd::from_slice(b"*1\r\n$4\r\nPI").is_none());
+    // Inline : accepté, comme Redis.
+    assert!(matches!(Cmd::from_slice(b"PING\r\n"), Some(Cmd::Ping(None))));
 
-    // RESP syntaxiquement complet mais commande non reconnue/arité invalide :
-    // Some(Cmd::Unknown) — le curseur doit avancer (répond ERR) sinon la
-    // connexion reste bloquée à vie sur une commande qui ne deviendra jamais valide.
+    // RESP complet mais commande non reconnue / arité invalide : Some(Cmd::Invalid)
+    // — le curseur avance (le serveur répond ERR), sinon la connexion resterait
+    // bloquée à vie sur une commande qui ne deviendra jamais valide.
     let r = resp(&[b"SET", b"k"]); // SET sans valeur
-    assert!(matches!(Cmd::from_slice(&r), Some(Cmd::Unknown)));
+    assert!(matches!(Cmd::from_slice(&r), Some(Cmd::Invalid { err: CmdError::Arity, .. })));
     let r = resp(&[b"HSET", b"h", b"f1"]); // nombre de champs impair
-    assert!(matches!(Cmd::from_slice(&r), Some(Cmd::Unknown)));
+    assert!(matches!(Cmd::from_slice(&r), Some(Cmd::Invalid { err: CmdError::Arity, .. })));
     let r = resp(&[b"FOOBAR"]); // commande inconnue
-    assert!(matches!(Cmd::from_slice(&r), Some(Cmd::Unknown)));
+    assert!(matches!(Cmd::from_slice(&r), Some(Cmd::Invalid { err: CmdError::Unknown, .. })));
 }
 
 /// Au-delà de u16::MAX clones, le compteur sature : plus de libération
