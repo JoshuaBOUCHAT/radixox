@@ -124,7 +124,7 @@ loop {
 
     srv.harvest(BUDGET_CQE);                // 1. CQE → frames dans les files (§5.4)
                                             //    au plus BUDGET_CQE : le reste attend dans la CQ
-    srv.run_batch(BUDGET_CMD);              // 2-4. tirage par tours, parse, exécution (§2.1)
+    srv.run_batch(BUDGET_TOUR);             // 2-4. tirage par tours, parse, exécution (§2.1)
     srv.release_frames();                   // 5. refcount des tampons, restitution à l'anneau
     srv.timers.fire(now.mono, &mut srv);    //    échéances (BLPOP, autosave, balayage, fsync AOF)
     srv.inject_ready();                     //    réponses de jobs finis, connexions à rejouer
@@ -148,7 +148,7 @@ n'est plus une option (§14).
 **Budget de tour.** Les réponses ne partent qu'en fin de tour : un tour trop long retarde
 tout le monde. On ne vide pas toute la CQ : au plus `BUDGET_CQE` CQE par tour, le reste
 attend dans la CQ et ses données restent dans l'anneau (pas encore rendu). Aucune copie.
-Le lot a son propre budget en commandes (§2.1).
+Le lot a son propre budget, en temps (§2.1).
 
 **Envoi avant la tranche de job.** Les SQE ne partent qu'à un `enter`. Sans l'`enter` de
 soumission avant `run_slice`, les réponses du tour attendraient la tranche. Coût : 2
@@ -164,7 +164,7 @@ copie des données reçues) ne sont exécutées que pendant un `io_uring_enter` 
 le bug de yield monoio).
 
 **Réglages à mesurer :** `SubmitArgs::min_wait_usec` (regrouper les complétions à faible
-charge), `BUDGET_CQE`, `BUDGET_CMD`, `BUDGET_JOB`.
+charge), `BUDGET_CQE`, `BUDGET_TOUR`, `BUDGET_JOB` (valeurs de départ : §13.1).
 
 ### 2.1 Le lot : tirage par tours entre connexions (2026-10-19)
 
@@ -173,7 +173,7 @@ Chaque connexion a une file de frames prêtes (§5.4). Le lot pioche dedans **pa
 ```
 tour 0 : la 1re frame de chaque connexion qui en a une
 tour 1 : la 2e frame des connexions qui en ont encore
-…        jusqu'à BUDGET_CMD commandes ; le point de départ tourne à chaque tour de boucle
+…        jusqu'à épuiser BUDGET_TOUR ; le point de départ tourne à chaque tour de boucle
 ```
 
 - **Les connexions sans pipeline passent toutes au tour 0.** Ce sont des allers-retours :
@@ -189,9 +189,12 @@ tour 1 : la 2e frame des connexions qui en ont encore
   AUTH, HELLO, SUBSCRIBE, UNSUBSCRIBE, QUIT, toute commande qui parque, plus tard MULTI)
   est la **dernière** exécutée pour sa connexion dans ce tour de boucle. Sinon
   `[GET a, KEYS *, GET b]` exécuterait `GET b` avant la réponse de KEYS.
-- **Budget** en commandes, avec un garde-fou en octets de sortie : un MGET ou un HGETALL
-  volumineux compte plus d'une commande. Les commandes lourdes ne coûtent presque rien
-  au lot : elles deviennent des jobs (§8.1), qui ont leur propre part du CPU.
+- **Budget en temps** (2026-10-19) : ~200 µs d'exécution par tour, mesurés au TSC, avec
+  1024 commandes et un plafond d'octets de sortie comme garde-fous. Un budget en nombre
+  de commandes ne borne rien sans pipeline : là, le coût d'un tour, ce sont les sends
+  payés dans notre `enter` (~3 µs chacun en loopback), pas les commandes. Les commandes
+  lourdes ne coûtent presque rien au lot : elles deviennent des jobs (§8.1), qui ont leur
+  propre part du CPU.
 - **Connexion tuée pendant le lot** (limite d'`out`, plus tard CLIENT KILL) : son mode est
   testé avant chaque exécution, ses frames restantes sont relâchées.
 - Plus tard (§8bis, §17) : préchargement par fenêtres **entre connexions** d'un même tour
@@ -213,6 +216,34 @@ d'informations dispersées entre `main_key` et le `match` du dispatch :
 
 Elle donne un chemin clair pour chaque cas particulier (frame à moitié reçue, barrière,
 commande lourde) et sert aussi `COMMAND`, plus tard les ACL et les transactions.
+
+### 2.3 Ce que les budgets font au p99 (2026-10-19)
+
+**Sous saturation, la latence est imposée par la loi de Little**, pas par la boucle :
+`latence moyenne = requêtes en vol / débit = connexions × profondeur de pipeline / débit`.
+80 connexions à 280 K ops/s → 0,29 ms (mesuré : 0,29–0,32 ms). 10 000 connexions actives
+sans pipeline → ~36 ms quoi qu'on fasse. Seul le débit la baisse (délégation TCP, lots,
+pipeline côté client). Les budgets décident **qui** attend et l'écart entre moyenne et p99.
+
+**Hors saturation**, une requête attend au pire ~2 tours (la fin du tour en cours, puis le
+sien). `T ≈ commandes × coût user + sends × coût noyau + tranche de job` :
+
+| Régime | Commandes | Sends | T | p99 ajouté (~2 T) |
+|---|---|---|---|---|
+| pipeline (peu de conns, gros lots) | 1024 × ~0,25 µs ≈ 250 µs | quelques-uns | ~300–400 µs | ~0,6–0,8 ms |
+| sans pipeline, 80 conns | 80 × 0,3 µs ≈ 25 µs | 80 × ~3 µs ≈ 240 µs | ~300 µs | ~0,6 ms (0,41 mesuré sous monoio) |
+| sans pipeline, ≥ 1024 conns | ~300 µs | 1024 × ~3 µs ≈ 3 ms | ~3,5 ms | ~7 ms, mais Little impose déjà ≥ 3,6 ms |
+
+- La tranche de job (~50 µs) ajoute au plus ~10 % à un p99 de ~400 µs, seulement pendant
+  qu'un job tourne, et ne retarde pas l'envoi des réponses (`enter` avant la tranche).
+- Le levier sur un tour long sans pipeline reste la **délégation des sends** (§6.4) : sortis
+  de notre `enter`, les 3 ms de la dernière ligne redeviennent du calcul user.
+- L'équité protège les petits clients : au tour 0 du tirage, chaque connexion sans
+  pipeline passe à chaque tour ; 10 conns × 256 commandes s'étalent sur ~3 tours (~1,2 ms
+  pour le lot complet).
+- Ordres de grandeur tirés des mesures du 2026-10-19 (3,6 µs de CPU serveur par requête
+  sans pipeline, 8 % de user) : à vérifier avec l'histogramme de durée des tours exposé
+  dans `INFO` dès l'étape 2.
 
 ---
 
@@ -414,11 +445,32 @@ rend `None` à la fois pour « incomplet » et « invalide » : une frame mal fo
 laisse la connexion attendre indéfiniment pendant que `rx` grossit. `Invalid` →
 `-ERR Protocol error`, puis `Draining`.
 
-**Limites, comme Redis :** bulk string ≤ 512 Mo (`proto-max-bulk-len`), nombre
-d'arguments borné (~1 M), taille de `rx` bornée. Tous les entiers d'en-tête lus avec
-`checked_mul` / `checked_add` : aujourd'hui `parse_uint` déborde en release, et
-`$18446744073709551615` fait passer le test de longueur puis paniquer le découpage
-(crash à distance avant AUTH, serveur monoio compris). À corriger sans attendre la boucle.
+**Commandes inline acceptées** (2026-10-19), comme Redis : une frame qui ne commence pas
+par `*` est une ligne découpée sur les espaces, avec guillemets (`SET k "a b"`) et
+échappements. Telnet, `nc` et les scripts shell marchent ; coût nul pour le chemin RESP
+(un test sur le premier octet).
+
+**Limites à trois niveaux (2026-10-19).** Une limite par connexion seule ne tient pas :
+1 Go × 10 000 connexions = 10 To en théorie.
+
+| Niveau | Limite | Dépassement |
+|---|---|---|
+| frame | bulk string ≤ 512 Mo (`proto-max-bulk-len`), ≤ 1 048 576 arguments, ligne inline ≤ 64 Ko | `-ERR Protocol error`, `Draining` |
+| connexion | reliquat `rx` + valeur en remplissage ≤ 1 Go (`client-query-buffer-limit`) | `Draining` |
+| **global** | **budget d'accumulation** : `rx` + valeurs partielles + files recopiées, toutes connexions (1 Go par défaut, plus tard une part de `maxmemory`) | **pas de fermeture** : backpressure sur les plus gros consommateurs (recv suspendu, §7.1), reprise quand le budget redescend |
+
+- Tenu par un compteur mis à jour à chaque copie ou libération dans `rx` : rien sur le
+  chemin chaud, qui ne copie pas.
+- Cas 3 : la taille annoncée `$N` est **réservée dans le budget avant** d'allouer, et la
+  valeur grossit avec les données reçues : un client qui annonce 500 Mo sans les envoyer
+  ne prend pas 500 Mo.
+- Même logique en sortie : **budget global d'`out`** en plus des limites par connexion
+  (§10, §13.1).
+- `INFO` expose les deux compteurs et le nombre de connexions suspendues.
+
+Entiers d'en-tête lus avec `checked_mul` / `checked_add` : corrigé le 2026-10-19
+(`b975c9d`) ; `$18446744073709551615` faisait passer le test de longueur puis paniquer le
+découpage (crash à distance avant AUTH).
 
 ### 5.4 Files de frames et refcount des tampons (2026-10-19)
 
@@ -525,6 +577,34 @@ et compte dans `RLIMIT_MEMLOCK` (défaut systemd : 8 Mo) : rester en dessous ou 
 `LimitMEMLOCK`.
 
 ### 6.4 Délégation des envois (`IOSQE_ASYNC`)
+
+**Cadrage (2026-10-19) : io-wq est un chemin de secours détourné.** Il sert normalement
+aux opérations qui ne savent pas se faire sans bloquer (fichiers bufferisés…) ; pour un
+socket, io_uring ne l'utilise jamais (poll interne + relance sur notre thread). Avec
+`IOSQE_ASYNC`, on le détourne en pool de calcul pour la pile TCP. Sa règle de création
+(un worker dès qu'une op attend, sous le plafond) est bonne pour le disque, où un worker
+attend sans CPU ; pour nous, un worker brûle du CPU du début à la fin et n'aide que s'il
+y a un cœur libre. Plafond par défaut ≈ `RLIMIT_NPROC` : **un plafond fixe est
+obligatoire**. Le noyau ne connaît ni notre quota, ni SMT, ni le coût de l'éclatement, ni
+notre goulot. Plafond et affinité se changent à chaud (`register_iowq_max_workers`,
+`register_iowq_aff`) ; on ne peut ni imposer un minimum ni pré-créer les workers ; en
+baissant le plafond, le worker en trop s'arrête au plus tard après ~5 s d'inactivité.
+
+**Modèle de gain : un pipeline, pas Amdahl.** Thread principal et workers tournent en
+même temps ; `débit max ∝ 1 / max(part série, part parallélisable / N)`. Part série réelle
+≈ 25–30 % (code RadixOx ~8 % sans pipeline, recv dans notre `task_work`, gestion io_uring,
+passage de relais) :
+
+| Workers TCP | Étage limitant | Gain théorique |
+|---|---|---|
+| 1 (≈ SQ_POLL) | TCP, 0,75 | ×1,33 |
+| 2 | TCP, 0,375 | ×2,7 |
+| 3 | série = TCP, 0,25 | ×4 (plafond) |
+
+Réaliste : ×2–3 avec 2–3 workers (le passage d'un cœur à l'autre a un coût, cf. SQ_POLL
+§12.3 ; Valkey io-threads, même modèle : ~200 K → ~500 K sur 4 threads). La pile TCP se
+parallélise bien entre connexions (verrou par socket). En pipeline, la part user monte à
+70–80 % : la délégation rapporte peu, les lots (§8bis, §17) prennent le relais.
 
 Par défaut, le noyau exécute le send sur notre thread pendant `enter`. `IOSQE_ASYNC`
 l'envoie aux workers io-wq. Justification chiffrée (§12) : sans pipeline, le noyau prend
@@ -705,7 +785,17 @@ enum Job {
 }
 ```
 
-- `step(&mut Server, budget) -> Done | More`. Une tranche par tour, round-robin.
+- `step(&mut Server, budget) -> Done | More`. Une tranche par tour, **tourniquet simple
+  en v1** (décision 2026-10-19).
+- Plus tard, si les mesures le justifient : **file à rétroaction multi-niveaux** (idée de
+  l'utilisateur, 2026-10-19). Un job commence « léger » (ou dans la classe donnée par son
+  coût estimé, §8.1), descend en « semi-lourd » au-delà de ~0,5 ms consommée, en « lourd »
+  au-delà de ~5 ms ; tourniquet pondéré 4:2:1 entre classes. Approxime « servir d'abord
+  ce qui a le moins consommé » : les jobs courts (KEYS sur un petit préfixe) finissent
+  vite, les longs ne sont jamais affamés. Avec : classe à part pour le travail de fond
+  (save, évicteur, libérations, GC : plafond de CPU, part minimale garantie pour la save),
+  héritage de priorité quand des écrivains attendent un verrou de lecture (§8.1), et
+  attente par classe dans `INFO`.
 - Budget minimal par tour même sous charge (sinon un serveur toujours occupé ne nettoie
   jamais), budget large quand il n'y a ni CQE ni send en attente.
 - À réécrire en curseurs sync : `deln_async` / `getn_async` / `SaveDone` d'oxidart
@@ -848,7 +938,8 @@ parse par fenêtres de K commandes, précharge `Cmd::main_key`, exécute dans l'
 - PUBLISH encode le message une fois, l'ajoute à l'`out` de chaque abonné et le marque
   sale. Pas de writer task, de channel ni de `CancelationFutur`.
 - **Limite d'`out` par abonné** → `Draining` (équivalent de `client-output-buffer-limit
-  pubsub`). Règle le TODO OOM sur abonné lent.
+  pubsub` : 32 Mo dur, 8 Mo pendant 60 s). Règle le TODO OOM sur abonné lent. Le budget
+  global d'`out` (§5.3) s'applique aussi.
 - Plus tard : un bloc partagé par refcount + `sendmsg` multi-iovec, au lieu de N memcpy.
 
 ---
@@ -944,9 +1035,49 @@ dans la même zone.
 Points faibles : mémoire (~333 contre ~258 o/clé), pipeline court. Points forts : pipeline
 profond, persistance. Écart sans pipeline / pipeline 64 : ×7,4.
 
+### 12.3 SQ_POLL sans pipeline (2026-10-19, monoio, loopback)
+
+80 conns (memtier 8 threads × 10 sur CPU 2-5,8-11), 1:4, 1 M clés, 10 s par run, deux
+passes, profil `performance`. Serveur `RADIXOX_CPU_PIN=0` ; SQ_POLL épinglé sur le CPU 1.
+Occupation par CPU lue dans `/proc/stat` (softirq compris, non compté dans le processus).
+
+| | ops/s | latence moy. | p99 | CPU 0 (serveur) | CPU 1 |
+|---|---|---|---|---|---|
+| sans SQ_POLL | 281 K / 278 K | 0,316–0,319 ms | 0,41–0,43 ms | 91 % : user 8, noyau 50, softirq 33 | libre |
+| SQ_POLL | 277 K / 280 K | 0,286–0,289 ms | 0,375–0,391 ms | 16 % (user 13) | 100 % : noyau 61, softirq 39 |
+
+Client à 76 % inactif dans les deux cas. Lecture :
+- Le partage est **~90:10** noyau/user une fois le softirq compté, pas 80:20.
+- SQ_POLL **déplace** tout le TCP sur un seul thread noyau, il ne le **partage** pas : le
+  débit plafonne au même niveau, le thread principal attend (84 % inactif). Seul gain :
+  −10 % de latence moyenne, −13 % au p99, au prix d'un cœur qui tourne en boucle (son
+  100 % inclut de l'attente active).
+- Conclusion : pour gagner du débit sans pipeline, il faut **paralléliser** le TCP
+  (io-wq ≥ 2 workers, §6.4) ; confirme l'abandon de SQ_POLL (§14).
+
 ---
 
 ## 13. Migration
+
+### 13.1 Valeurs par défaut du prototype (2026-10-19)
+
+| Réglage | Valeur |
+|---|---|
+| connexions max | 10 000 (`maxclients` de Redis), quelques slots réservés pour l'erreur « max clients » |
+| sortie par connexion | clients normaux sans limite propre (comme Redis), abonnés 32 Mo dur / 8 Mo 60 s ; budget global d'`out` pour tous |
+| entrée | limites à trois niveaux du §5.3 (frame, connexion 1 Go, budget global 1 Go) |
+| timeouts | inactivité désactivée (comme Redis), `TCP_USER_TIMEOUT` 60 s, keepalive 300 s |
+| anneau de réception | 32 × 256 Ko au départ, à mesurer contre 4 × 2 Mo |
+| budgets | `BUDGET_TOUR` ~200 µs (garde-fous : 1024 commandes, octets de sortie), `BUDGET_CQE` 4096, SQ 4096 / CQ 16384, tranche de job ~50 µs |
+| préchargement | fenêtre 8 (comme aujourd'hui), 32 à tester à l'étape 7 |
+| jobs | tourniquet simple (§8) |
+| configuration | variables `RADIXOX_*` (fichier de config plus tard) |
+
+**Organisation du code :** le code commun aux deux serveurs (dispatch, `execute_sync`,
+encodage, jobs, table des commandes) vit dans la bibliothèque `radixox/src/lib.rs` ; second
+binaire `radixox-uring` (`src/bin/uringloop.rs`) ; les tests d'intégration choisissent leur
+binaire (`RADIXOX_TEST_BIN`) pour faire tourner la même suite sur les deux.
+
 
 *Make it work, make it fast, make it adaptable.* Une seule boucle dans
 `radixox/src/bin/uringloop.rs` (io-uring 0.7.15), qui remplace `resp.rs` une fois
@@ -1006,9 +1137,10 @@ abandonné ; noyau ≥ 6.12.
 - Fixed file : gain réel sur le flux (§4.1).
 - `IOSQE_ASYNC` : où tournent les relances après `EAGAIN` (§6.4, piège 3).
 
-**Critères de bascule par défaut (étape 6) :** à définir avant l'étape 2 — bench
-(`scripts/bench_vs_valkey.sh`, base 10 M), profondeurs de pipeline (1, 32, 256), tolérance
-de régression, tests (unitaires, intégration, faux anneau, banc réseau hostile §16).
+**Critères de bascule par défaut (étape 6), décidés le 2026-10-19 :** toute la suite de
+tests verte sur les deux binaires ; `scripts/bench_vs_valkey.sh` : débit ≥ monoio − 2 % et
+p99 pas pire, sans pipeline et en pipeline 32 ; un run BGSAVE sous charge avec un p99.99
+pas pire.
 
 ---
 
