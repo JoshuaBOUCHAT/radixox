@@ -1,5 +1,9 @@
 # Analyse — "Tout dans l'ART" et TTL par valeur (Hash/Set/ZSet fields)
 
+> ⚠️ Journal : les renvois à `ARCHITECTURE.md` visent sa version d'avant le 2026-10-19
+> (`git log -- ARCHITECTURE.md`), réécrite depuis. Ce qui reste actif ici : §11–12 (valart),
+> §13 (design ZSet).
+>
 > Contre-analyse de `ARCHITECTURE.md` (produit par un IA sans accès au code) confronté
 > à l'état réel du code sur la branche `custom_parser`, + étude de faisabilité du
 > corollaire discuté : éliminer HashMap/BTreeMap/BTreeSet/VecDeque des conteneurs et

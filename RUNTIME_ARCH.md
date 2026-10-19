@@ -4,32 +4,39 @@
 > sans waker, sans tâche**. Les CQE sont dispatchés directement vers des
 > machines à états explicites.
 >
-> Décisions prises en session le 2026-10-10 et le 2026-10-11. La version
-> précédente de ce fichier (runtime à futures : `RawTask`, `fn_poll`,
-> `syscall_nb`, SQ_POLL) est **écartée**, voir §14. Historique : `git log -- RUNTIME_ARCH.md`.
+> Décisions prises en session le 2026-10-10, le 2026-10-11 et le 2026-10-19 (revue
+> complète : modèle par files de frames, équité, accept classique, jamais bloquant,
+> déploiement). La version précédente de ce fichier (runtime à futures : `RawTask`,
+> `fn_poll`, `syscall_nb`) est **écartée**, voir §14. Historique : `git log -- RUNTIME_ARCH.md`.
 >
-> Base logicielle : **io-uring 0.7.15** (anneau incrémental, bundles, `SetSockOpt`,
-> zcrx, NAPI). monoio garde sa 0.6.4 jusqu'à sa suppression (§13, étape 5) : les
-> deux versions coexistent dans le workspace.
+> Base logicielle : **io-uring 0.7.15**, **noyau ≥ 6.12** (§11). monoio garde sa 0.6.4
+> jusqu'à sa suppression (§13) : les deux versions coexistent dans le workspace.
+>
+> Démarche : *make it work, make it fast, make it adaptable*. Une seule boucle dans
+> `radixox/src/bin/uringloop.rs`, qui remplace `resp.rs` une fois stabilisée.
 
 ---
 
 ## 0. Résumé
 
 ```
-conns: Vec<Conn>       index = slot de fixed file, choisi par le noyau à l'accept
-user_data              kind << 32 | slot           (pas de génération)
-fin de connexion       Draining → refs == 0 → CLOSE_DIRECT
-lecture                recv multishot + anneau incrémental de quelques gros tampons
-                       aucune référence vers l'anneau ne survit au handler du CQE
-écriture               au plus un send en vol par connexion, flush en fin de tour,
-                       flush anticipé au-delà d'un seuil d'octets, backpressure
-travaux longs          jobs à curseur, une tranche par tour (save, KEYS, UNLINK, évicteur, GC)
-commandes « lentes »   la connexion est parquée ; celui qui termine répond et la reprend
-lots de recherches     clés de toutes les connexions du tour préchargées par fenêtres de 8
-délégation            sends en IOSQE_ASYNC quand IORING_SQ_TASKRUN reste levé ; plafond io-wq piloté
+un processus           une boucle, une base (pas de multi-boucle, pas de SELECT n ≠ 0)
+connexions             slot pris dans notre free list ; accept classique + FilesUpdate (§4.1)
+                       ConnIn (rx, file de frames) / ConnOut (out, envoi, mode) séparés
+user_data              kind << 32 | slot ; registres userland marqués (slot, epoch) (§4.3)
+fin de connexion       Closing (flush puis fermeture) ou Draining (erreur) → refs == 0 → CLOSE_DIRECT
+lecture                recv multishot + anneau incrémental ; frames complètes → FrameRef
+                       dans la file de la conn, refcount par tampon ; frame coupée → rx
+lot                    tirage par tours entre connexions (1 commande par conn d'abord),
+                       ordre gardé par connexion, barrières, budget de tour (§2.1)
+écriture               réponses écrites directement dans out ; un send MSG_WAITALL en vol
+                       par connexion ; flush en fin de tour ; backpressure par octets
+jamais bloquant        commande lourde → job qui encode sa réponse en octets ; connexion
+                       parquée ; verrou de lecture par clé pour l'atomicité (§8.1)
+cœur sans I/O          les machines émettent des Op ; une couche mince fait les SQE (§1.2)
+délégation             sends en IOSQE_ASYNC : off/on d'abord, auto ensuite (§6.4)
 cible finale           thread principal = calcul pur sur des lots, réseau entier au noyau (§17)
-attente                enter(GETEVENTS) ; timeout = prochaine échéance de timer
+attente                enter(GETEVENTS | NO_IOWAIT) ; timeout = prochaine échéance de timer
 ```
 
 ---
@@ -38,7 +45,7 @@ attente                enter(GETEVENTS) ; timeout = prochaine échéance de time
 
 - **Un seul propriétaire.** `struct Server { ring, art, conns, bufs, pubsub, blockers, jobs, timers }`
   est passé en `&mut` aux handlers. Plus de `Rc<RefCell<OxidArt>>`, plus de borrow à l'exécution.
-- **Pas de `.await`.** L'invariant d'`ARCHITECTURE.md` §1 (« rien de daté ne traverse un
+- **Pas de `.await`.** L'invariant d'`ARCHITECTURE.md` §1.1 (« rien de daté ne traverse un
   `.await` ») devient : **rien de daté ne survit d'un tour de boucle à l'autre**. Un job
   conserve un curseur re-résolvable (clé), jamais un idx de slab ni un pointeur (sauf la
   save, qui a sa barrière COW, cf. `SAVE_DESIGN.md`).
@@ -48,11 +55,17 @@ attente                enter(GETEVENTS) ; timeout = prochaine échéance de time
 
 | Machine | États |
 |---|---|
-| Connexion | `Normal` · `Parked` · `Draining` |
-| Réception | armée · affamée (`ENOBUFS`) · terminée |
+| Connexion | `Normal` · `Parked` · `Closing` · `Draining` |
+| Réception | armée · affamée (`ENOBUFS`) · suspendue (backpressure) · terminée |
 | Envoi | libre · en vol |
-| Parseur | frame entière · remplissage de valeur |
+| Découpage | frame complète · incomplète (reliquat dans `rx`) · invalide · remplissage de valeur |
 | Job | curseur + `step(&mut Server, budget) -> Done \| More` |
+
+- **Une connexion n'a pas de machine à états pendant l'exécution** : elle a une file de
+  frames à exécuter (§5.4) et un tampon de sortie. Le lot (§2.1) pioche dans les files ;
+  l'exécution écrit dans `out`. Pas d'interior mutability : l'anneau et `inbound` sont
+  empruntés en lecture, `art` et `outbound` en écriture, ce sont des champs disjoints de
+  `Server`.
 
 ### 1.1 Garder la complexité sous contrôle (2026-10-12)
 
@@ -66,12 +79,11 @@ tenir ces cinq règles :
    passage de la save. Le compilateur force à traiter chaque état : aucun cas oublié.
 2. **Un vérificateur d'invariants du serveur** (`Server::check_invariants`), appelé en debug
    à la fin de chaque tour, comme `assert_canonical` pour l'arbre :
-   - `refs` d'une connexion = ce qui la référence vraiment (recv armé, send en vol,
-     inscriptions en file d'attente, jobs) ;
-   - une connexion parquée est dans exactement les files qu'elle déclare, avec son
-     `park_seq` ;
-   - au plus un send en vol par connexion ;
-   - aucun tampon de l'anneau retenu après le tour.
+   - `refs` d'une connexion = ce qui peut encore produire un CQE pour elle (recv armé,
+     send en vol, jobs) ;
+   - une connexion parquée a une file de frames vide (tout est dans `rx`) ;
+   - au plus un send en vol par connexion, tampon en vol inchangé ;
+   - `Σ refs_buf` = nombre de `FrameRef::Ring` dans toutes les files (§5.4).
    Une incohérence explose tout de suite, au bon endroit.
 3. **Tests déterministes sur un faux anneau** (§16) : séquences de CQE fabriquées (envoi
    partiel, connexion qui meurt en plein BLPOP, LPUSH et timeout dans le même tour,
@@ -81,12 +93,25 @@ tenir ces cinq règles :
    Aucune logique métier dans la boucle ; les commandes restent dans `execute_sync`, inchangé.
 5. **Pas d'optimisation prématurée — le mot important est « prématurée ».** On optimise
    tard, pas jamais. Le premier prototype vise un squelette **correct et mesuré** : pas de
-   lot sur tout le tour, pas de délégation des envois, pas de modes extrêmes (§17). Mais le
+   préchargement entre connexions, pas de délégation des envois, pas de modes extrêmes
+   (§17). Le tirage par tours (§2.1) n'est pas une optimisation mais la structure même de
+   la boucle : il est dans le prototype. Mais le
    design leur garde leur place dès le départ (idx de slot stables, `out` par connexion,
    dispatch par lots possible), pour que les optimiser plus tard ne demande pas de tout
    réécrire. Chaque optimisation arrive ensuite **avec sa mesure avant/après**, comme les
    chantiers de l'arbre (SWAR, prefetch des frères, multi-clés : chaque gain chiffré avant
    commit).
+
+### 1.2 Cœur sans I/O
+
+Les machines à états ne soumettent jamais de SQE elles-mêmes. Elles poussent des `Op`
+(`Recv{slot}`, `Send{slot}`, `CancelRecv{slot}`, `CancelSend{slot}`, `Close{slot}`,
+`FileWrite{job}`…) dans une file ; une couche mince les traduit en SQE au moment de
+l'`enter`. Dans l'autre sens, la couche anneau traduit chaque CQE en `Completion` typée.
+
+Les tests du faux anneau (§16) injectent des `Completion` fabriquées et lisent les `Op`
+produites : aucun io_uring à simuler. Les résultats « lents » suivent la même logique
+proactive : un job construit sa réponse de son côté et l'injecte à la fin (§8).
 
 ---
 
@@ -94,36 +119,43 @@ tenir ces cinq règles :
 
 ```rust
 loop {
-    let now = clock();                    // une lecture par tour ; remplace la tâche ticker
-    srv.art.set_now(now);
+    let now = clocks();                     // murale (TTL) + monotone (timers), §9
+    srv.art.set_now(now.wall);
 
-    for cqe in srv.ring.completion() {     // 1. récolte
-        dispatch(&mut srv, cqe);
+    srv.harvest(BUDGET_CQE);                // 1. CQE → frames dans les files (§5.4)
+                                            //    au plus BUDGET_CQE : le reste attend dans la CQ
+    srv.run_batch(BUDGET_CMD);              // 2-4. tirage par tours, parse, exécution (§2.1)
+    srv.release_frames();                   // 5. refcount des tampons, restitution à l'anneau
+    srv.timers.fire(now.mono, &mut srv);    //    échéances (BLPOP, autosave, balayage, fsync AOF)
+    srv.inject_ready();                     //    réponses de jobs finis, connexions à rejouer
+    srv.flush_dirty();                      // 6. un send par connexion sale (§6)
+    if let Some(job) = srv.jobs.next() {    // 7. une tranche de travail de fond
+        enter(to_submit, 0, 0);             //    les réponses du tour partent AVANT la tranche
+        srv.run_slice(job, BUDGET_JOB);
     }
-    srv.timers.fire(now, &mut srv);        // 2. échéances (BLPOP, autosave, fsync AOF)
-    srv.flush_dirty();                     // 3. un send par connexion sale (§6)
-    if let Some(job) = srv.jobs.front() {  // 4. une tranche de travail de fond
-        srv.run_slice(job, BUDGET);
-    }
-    // 5. soumission + attente
-    if srv.jobs.is_empty() && cq_vide {
-        enter(to_submit, 1, GETEVENTS | EXT_ARG, timeout = srv.timers.next())
+    if srv.idle() {                         // 8. soumission + attente
+        enter(to_submit, 1, GETEVENTS | EXT_ARG | NO_IOWAIT, timeout = srv.timers.next())
     } else {
-        enter(to_submit, 0, GETEVENTS)     // on continue de tourner
+        enter(to_submit, 0, GETEVENTS)      // on continue de tourner
     }
 }
 ```
 
-**Setup de l'anneau (mode A, défaut).** `SINGLE_ISSUER` + `DEFER_TASKRUN` +
-`TASKRUN_FLAG` (§6.4), `register_ring_fd`, CQ dimensionnée large (`setup_cqsize`).
+**Setup de l'anneau.** `SINGLE_ISSUER` + `DEFER_TASKRUN` + `TASKRUN_FLAG` (§6.4),
+`register_ring_fd`, CQ au moins 4× la SQ (`setup_cqsize`, ex. SQ 4096 / CQ 16384). SQ_POLL
+n'est plus une option (§14).
 
-**Mode B (option de démarrage, à mesurer).** SQ_POLL épinglé sur un cœur réservé, à la
-place de `DEFER_TASKRUN` (les deux sont incompatibles). Un seul thread noyau exécute
-toutes les SQE, sends compris : il sort le travail TCP de notre cœur sans passage de
-relais, mais tourne en continu et n'a aucun parallélisme. Nos meilleurs YCSB de mai
-venaient de SQ_POLL **sur un autre cœur** ; sur notre propre cœur il dégradait. À
-comparer au mode A + io-wq à budget égal (2 cœurs). Attendu, non vérifié : SQ_POLL
-meilleur en latence à charge moyenne, io-wq meilleur quand il faut plus d'un cœur de TCP.
+**Budget de tour.** Les réponses ne partent qu'en fin de tour : un tour trop long retarde
+tout le monde. On ne vide pas toute la CQ : au plus `BUDGET_CQE` CQE par tour, le reste
+attend dans la CQ et ses données restent dans l'anneau (pas encore rendu). Aucune copie.
+Le lot a son propre budget en commandes (§2.1).
+
+**Envoi avant la tranche de job.** Les SQE ne partent qu'à un `enter`. Sans l'`enter` de
+soumission avant `run_slice`, les réponses du tour attendraient la tranche. Coût : 2
+syscalls par tour, seulement quand un job tourne.
+
+**`NO_IOWAIT` (6.15, utilisé si le noyau l'annonce).** Sans lui, l'attente dans `enter` est comptée en iowait et gonfle
+`/proc/pressure/io` : alertes de monitoring trompeuses en prod.
 
 **⚠️ `GETEVENTS` obligatoire.** Avec `DEFER_TASKRUN`, les complétions (y compris la
 copie des données reçues) ne sont exécutées que pendant un `io_uring_enter` avec
@@ -132,7 +164,55 @@ copie des données reçues) ne sont exécutées que pendant un `io_uring_enter` 
 le bug de yield monoio).
 
 **Réglages à mesurer :** `SubmitArgs::min_wait_usec` (regrouper les complétions à faible
-charge), `BUDGET` d'une tranche de job.
+charge), `BUDGET_CQE`, `BUDGET_CMD`, `BUDGET_JOB`.
+
+### 2.1 Le lot : tirage par tours entre connexions (2026-10-19)
+
+Chaque connexion a une file de frames prêtes (§5.4). Le lot pioche dedans **par tours** :
+
+```
+tour 0 : la 1re frame de chaque connexion qui en a une
+tour 1 : la 2e frame des connexions qui en ont encore
+…        jusqu'à BUDGET_CMD commandes ; le point de départ tourne à chaque tour de boucle
+```
+
+- **Les connexions sans pipeline passent toutes au tour 0.** Ce sont des allers-retours :
+  le client attend chaque réponse, il faut les servir vite. Les pipelines se partagent le
+  budget restant ; leur reste attend le tour de boucle suivant, où il sera traité en masse
+  (et plus tard délégué en `IOSQE_ASYNC`, §6.4).
+- **Ordre gardé à l'intérieur d'une connexion, libre entre connexions.** Réordonner les
+  commandes d'un même client casse la causalité vue par les autres : `SET a` puis `SET b`
+  exécutés à l'envers, un tiers du même lot peut voir `b` sans `a`. Entre connexions, tout
+  ordre est linéarisable (un seul thread). Comme l'ordre par connexion est gardé, les
+  réponses vont **directement dans `out`**, sans phase de remise en ordre.
+- **Barrières.** Une commande qui change l'interprétation des suivantes (table §2.2 :
+  AUTH, HELLO, SUBSCRIBE, UNSUBSCRIBE, QUIT, toute commande qui parque, plus tard MULTI)
+  est la **dernière** exécutée pour sa connexion dans ce tour de boucle. Sinon
+  `[GET a, KEYS *, GET b]` exécuterait `GET b` avant la réponse de KEYS.
+- **Budget** en commandes, avec un garde-fou en octets de sortie : un MGET ou un HGETALL
+  volumineux compte plus d'une commande. Les commandes lourdes ne coûtent presque rien
+  au lot : elles deviennent des jobs (§8.1), qui ont leur propre part du CPU.
+- **Connexion tuée pendant le lot** (limite d'`out`, plus tard CLIENT KILL) : son mode est
+  testé avant chaque exécution, ses frames restantes sont relâchées.
+- Plus tard (§8bis, §17) : préchargement par fenêtres **entre connexions** d'un même tour
+  de tirage, réutilisation des idx, fusion des lectures identiques.
+
+### 2.2 Table des commandes
+
+Une table de métadonnées par commande, comme la table de commandes de Redis, au lieu
+d'informations dispersées entre `main_key` et le `match` du dispatch :
+
+| Champ | Sert à |
+|---|---|
+| arité (min, max) | rejet au parse |
+| barrière | §2.1 |
+| écriture / lecture | collecteur d'effets (§18), verrous de lecture (§8.1), WATCH plus tard |
+| clé(s) principale(s) | préchargement, verrous |
+| coût estimable | seuil « devient un job » (§8.1) |
+| autorisée non authentifiée / en Pub/Sub | contrôle d'accès, mode abonné |
+
+Elle donne un chemin clair pour chaque cas particulier (frame à moitié reçue, barrière,
+commande lourde) et sert aussi `COMMAND`, plus tard les ACL et les transactions.
 
 ---
 
@@ -144,44 +224,53 @@ u64 = [ kind : 32 ][ slot : 32 ]
 
 | kind | slot | Remarque |
 |---|---|---|
-| `Accept` | — | multishot, un seul SQE pour toute la vie du serveur |
+| `Accept` | listener | multishot, un seul SQE par listener pour toute la vie du serveur |
+| `Install` | conn | `FilesUpdate` du socket accepté dans son slot (§4.1) |
 | `Recv` | conn | multishot |
 | `Send` | conn | au plus un en vol par conn |
-| `Cancel` | conn | annulation du recv au passage en `Draining` |
-| `Close` | conn | ne touche pas la table (le slot peut déjà être redonné) |
+| `Cancel` | conn | `IOSQE_CQE_SKIP_SUCCESS` ; en cas d'erreur, log seulement |
+| `Close` | conn | `IOSQE_CQE_SKIP_SUCCESS` ; ne touche jamais la table (le slot peut déjà être redonné) |
 | `File` | job | écritures et fsync du dump / de l'AOF |
 | `Signal` | — | lecture de la `signalfd` |
 | `Timeout` | — | si un timer passe par io_uring plutôt que par le timeout d'`enter` |
 
-**Pas de génération.** Une CQE ne peut jamais viser une connexion qui a été remplacée
-(§4.2), donc aucun test d'obsolescence dans le dispatch.
+**Pas de génération dans `user_data`.** Une CQE ne peut jamais viser une connexion qui a
+été remplacée (`refs`, §4.2), donc aucun test d'obsolescence dans le dispatch. La
+génération existe, mais pour les registres userland seulement (`epoch`, §4.3).
 
 ---
 
 ## 4. Connexions
 
-### 4.1 L'index = le slot de fixed file
+### 4.1 Accept classique, slot choisi par nous (2026-10-19)
 
-- `register_files_sparse(MAX_CONN)` à l'init.
-- `AcceptMulti` avec `allocate_file_index(true)` (ACCEPT_DIRECT) : le CQE renvoie l'index
-  choisi par le noyau, qui sert directement d'index dans `conns: Vec<Conn>` (préallouée).
-- Le noyau ne redonne pas un index tant qu'on n'a pas fait `CLOSE_DIRECT` sur ce slot.
-- Il n'alloue pas forcément le plus bas index libre : il avance avec un curseur et repart
-  au début en bout de table. Toute la table finit par servir, donc dimensionner `MAX_CONN`
-  au besoin réel (64 K conns × ~128 o = 8 Mo).
-- Pas de `fget`/`fput` par op.
-- Revers : les connexions sont invisibles pour `lsof`, `ss` et `/proc/pid/fd` → les
-  exposer dans `INFO clients`.
+On optimise le flux, pas l'ouverture : un client sérieux ouvre un pool au démarrage et le
+garde des heures, et même une connexion courte paie surtout la poignée de main TCP. Donc :
 
-**`TCP_NODELAY`.** Un socket direct n'a pas de fd, donc pas de `setsockopt` classique.
-Deux pistes à tester dans le prototype : l'opcode `SetSockOpt` sur le fixed file, ou
-l'héritage du flag posé sur le socket d'écoute (probable sous Linux, non vérifié). Il est
-indispensable : il avait corrigé les p99.99 de 43 ms en pipeline.
+1. `AcceptMulti` **sans** `allocate_file_index` : le CQE rend un **fd normal**.
+2. Dans le handler : `getpeername` (adresse pour `CLIENT LIST`, logs, futur filtrage par
+   IP), `TCP_NODELAY` (indispensable : il avait corrigé les p99.99 de 43 ms en pipeline),
+   `TCP_USER_TIMEOUT` (§4.2).
+3. Slot pris dans **notre** free list (LIFO : table dense, slots chauds en cache).
+4. `FilesUpdate` (opcode, pas de syscall en plus) installe le socket dans ce slot, chaîné
+   par `IOSQE_IO_LINK` au premier `RecvMulti` ; `close` du fd au CQE de l'installation.
 
-### 4.2 Fin de connexion : le compteur `refs`
+- `register_files_sparse(MAX_CONN)` à l'init ; le chemin chaud (recv, send) reste en
+  fixed file, sans `fget`/`fput` par op. Si la mesure de l'étape 2 (§13) montre que le
+  fixed file ne gagne rien, on le retire aussi : fd normal partout.
+- Coût : 2–3 syscalls par connexion, payés une fois.
+- **Max clients** : quelques slots gardés en réserve. Sous la réserve, la connexion reçoit
+  `-ERR max number of clients reached` puis est fermée, comme Redis.
+- `ss` voit les sockets (sock_diag) ; seuls `ss -p` et `lsof` ne les rattachent pas au
+  processus → les exposer dans `INFO clients`.
+- Plusieurs listeners (TCP, socket Unix, plus tard TLS) : `slot` de `user_data` = id du
+  listener. kTLS (§16) demande un fd pendant la poignée de main : un argument de plus
+  pour l'accept classique.
 
-**Règle unique : `refs` compte tout ce qui peut encore désigner le slot. `CLOSE_DIRECT`
-seulement à `refs == 0`.**
+### 4.2 Fin de connexion : `Closing`, `Draining` et le compteur `refs`
+
+**Règle unique : `refs` compte tout ce qui peut encore produire un CQE pour le slot.
+`CLOSE_DIRECT` seulement à `refs == 0`.**
 
 | Source | +1 | −1 |
 |---|---|---|
@@ -189,32 +278,57 @@ seulement à `refs == 0`.**
 | send en vol | soumission | CQE du send |
 | job qui vise la conn (KEYS, UNLINK…) | création | fin du job |
 
-Passage en `Draining` (EOF, erreur, QUIT, dépassement de limite) :
-1. On ne soumet plus rien pour la connexion.
-2. On annule le recv (`AsyncCancel` sur son `user_data`). Le send en vol se termine ou
-   échoue tout seul.
-3. On la retire **tout de suite** des registres pub/sub et blockers (elle connaît ses
-   canaux et ses clés). Ces registres ne comptent pas dans `refs` : aucune entrée ne doit
-   pointer vers le slot quand le noyau le redonnera.
-4. Chaque CQE restant fait `refs -= 1`. À 0 : `CLOSE_DIRECT`.
+Les registres userland (pub/sub, blockers, timers) ne comptent pas dans `refs` : ils sont
+marqués `(slot, epoch)` (§4.3).
 
-### 4.3 Structure
+**Deux façons de finir :**
+- **`Closing`** — QUIT, ou EOF du client (un client qui ferme son côté écriture après son
+  pipeline : `nc`, scripts, `--pipe` attend quand même ses réponses). Le recv est annulé ;
+  les frames déjà reçues sont exécutées ; `out` est envoyé ; puis `Draining`.
+- **`Draining`** — erreur, reset, dépassement de limite, protocole invalide (après
+  `-ERR Protocol error` envoyé au mieux), timeout. Rien n'est plus exécuté ni soumis.
+
+Passage en `Draining` :
+1. On ne soumet plus rien pour la connexion ; ses `FrameRef` sont relâchées tout de suite
+   (sinon elles retiennent des tampons de l'anneau).
+2. On annule le recv **et le send en vol**. Un send ne finit pas forcément tout seul : un
+   client qui arrête de lire sans fermer (process figé, réseau coupé sans RST) remplit la
+   fenêtre TCP et le send reste en vol indéfiniment, donc `refs` ne tomberait jamais à 0.
+   Filet de sécurité côté noyau : `TCP_USER_TIMEOUT` (ex. 30 s) à l'accept.
+3. On la retire tout de suite de Pub/Sub (mémoire, et compte exact renvoyé par PUBLISH).
+   Les autres registres (blockers, timers) sont nettoyés paresseusement grâce à l'`epoch`.
+4. Chaque CQE restant fait `refs -= 1`. À 0 : `CLOSE_DIRECT`, slot rendu à la free list.
+
+### 4.3 Structure et `epoch`
 
 ```rust
-struct Conn {
-    mode: Mode,                       // Normal | Parked(Reason) | Draining
+struct ConnIn {                       // emprunté en lecture pendant le lot
+    queue: VecDeque<FrameRef>,        // frames complètes prêtes à exécuter (§5.4)
+    rx: Vec<u8>,                      // reliquat de frame coupée, frames recopiées (§5.4)
+    partial: Option<Box<Partial>>,    // remplissage de grosse valeur (§5.3)
+}
+struct ConnOut {                      // mutable pendant le lot
+    mode: Mode,                       // Normal | Parked(Reason) | Closing | Draining
+    epoch: u32,                       // monotone à travers les réutilisations du slot
     refs: u8,
-    rx: Vec<u8>,                      // reliquat de frame coupée (§5.3), vide en général
-    partial: Option<Box<Partial>>,    // frame en cours de remplissage de valeur (§5.3)
     out: Vec<u8>,                     // réponses en cours d'accumulation
     sending: Option<Vec<u8>>,         // tampon en vol (None = pas de send en vol)
-    sent: u32,                        // reprise sur envoi partiel
-    channels / blocked_keys …         // pour le retrait immédiat des registres
+    last_active: u32,                 // secondes, pour le balayage d'inactivité (§9)
+    client: ClientInfo,               // id global (≠ slot), nom, adresse, authed…
+    channels …                        // pour le retrait immédiat de Pub/Sub
 }
 ```
 
-Le prototype garde des `Vec` pour `out`/`sending`. Le pool enregistré arrive avec
-`SEND_ZC` (§6.3).
+- **`epoch`** est incrémenté à chaque accept et à chaque parquage, **jamais remis à zéro**
+  quand le slot est redonné. Timers et inscriptions BLPOP portent `(slot, epoch)` ; une
+  entrée dont l'epoch ne correspond plus est ignorée. Remplace `park_seq`, et dispense les
+  registres de prendre des `refs`.
+- `client.id` reste un compteur global (les curseurs SCAN sont rattachés à lui), jamais le
+  slot, qui est réutilisé.
+- `sending` : le noyau lit ce tampon par pointeur jusqu'au CQE. Jamais redimensionné ni
+  échangé pendant un envoi (vérifié par `check_invariants`).
+- Le prototype garde des `Vec` pour `out`/`sending`. Le pool enregistré arrive avec
+  `SEND_ZC` (§6.3).
 
 ---
 
@@ -235,10 +349,15 @@ Le prototype garde des `Vec` pour `out`/`sending`. Le pool enregistré arrive av
   du mécanisme, à confirmer par un test dans le prototype. On ne compte donc pas sur la
   contiguïté entre deux morceaux d'une même connexion.
 
-Pourquoi si peu de tampons suffisent : avec `DEFER_TASKRUN`, le noyau n'écrit dans
-l'anneau que pendant notre `enter`. Pour tomber à court, il faudrait recevoir plus que
-l'espace libre pendant un seul appel. Vérifier dans le prototype qu'`ENOBUFS` n'arrive
-jamais.
+**`ENOBUFS` est un cas normal, pas une anomalie.** Avec `DEFER_TASKRUN`, le noyau n'écrit
+dans l'anneau que pendant notre `enter`, mais dans un seul `enter` il peut vider le tampon
+de réception de chaque socket (plusieurs Mo avec l'autotuning) : 80 connexions pipelinées
+dépassent vite 8 Mo, et les frames en attente (§5.4) retiennent aussi des tampons. Donc :
+liste « affamées », réarmées quand des tampons reviennent, compteur dans `INFO`. Nombre
+et taille des tampons à mesurer (4 × 2 Mo contre 32 × 256 Ko : un tampon retenu par une
+seule frame bloque un quart de l'anneau dans le premier cas). À vérifier sur 7.2 : le
+plafond de relances du multishot par invocation, et si `len` sur `RecvMulti` borne le
+volume reçu par invocation (équité entre une connexion bavarde et les autres).
 
 ### 5.2 Handler
 
@@ -249,21 +368,18 @@ Kind::Recv => {
     match res {
         n if n > 0 => {
             let bid = cqueue::buffer_select(flags).unwrap();
-            on_data(conn, bufs.chunk(bid, n));   // parse + exécution (§5.3)
-            bufs.release_if_done(bid, cqueue::buffer_more(flags));
-            if !more { rearm(conn) }
+            frame_chunk(conn_in, bufs.chunk(bid, n)); // découpage en frames (§5.4), pas d'exécution
+            bufs.mark_done_if(bid, !cqueue::buffer_more(flags));
+            if !more { rearm.push(slot) }
         }
-        0 => conn.drain(),                       // EOF
+        0 => conn.close_gracefully(),            // EOF → Closing (§4.2)
         e if e == -ENOBUFS => starved.push(slot),// réarmé quand des tampons reviennent
         _ => conn.drain(),
     }
 }
 ```
 
-**Invariant : aucune référence vers un tampon de l'anneau ne survit au handler de son
-CQE.** Tout ce qui n'est pas consommé est copié avant de sortir, y compris les commandes
-mises en attente par une connexion parquée. Un tampon est donc rendable dès que le noyau
-l'a fini, sans compteur par tampon.
+Le handler ne fait que découper : l'exécution a lieu dans le lot (§2.1).
 
 ### 5.3 Parse : trois cas
 
@@ -291,8 +407,56 @@ on_data(conn, morceau):
   besoin d'un `rx` de 100 Mo), et une limite de taille de requête facile à appliquer.
 - Ordre : le prototype fait les cas 1 et 2, le cas 3 vient avec le chantier des grosses
   valeurs.
-- Écarté : le parseur reprenable à n'importe quel octet (un état par élément du protocole)
-  et la détection d'adjacence entre morceaux (compteurs par tampon).
+- Écarté : le parseur reprenable à n'importe quel octet (un état par élément du protocole).
+
+**Découpage à trois issues : `Complete(n) | Incomplete | Invalid`.** Le `Cmd::parse` actuel
+rend `None` à la fois pour « incomplet » et « invalide » : une frame mal formée (ou `*0`)
+laisse la connexion attendre indéfiniment pendant que `rx` grossit. `Invalid` →
+`-ERR Protocol error`, puis `Draining`.
+
+**Limites, comme Redis :** bulk string ≤ 512 Mo (`proto-max-bulk-len`), nombre
+d'arguments borné (~1 M), taille de `rx` bornée. Tous les entiers d'en-tête lus avec
+`checked_mul` / `checked_add` : aujourd'hui `parse_uint` déborde en release, et
+`$18446744073709551615` fait passer le test de longueur puis paniquer le découpage
+(crash à distance avant AUTH, serveur monoio compris). À corriger sans attendre la boucle.
+
+### 5.4 Files de frames et refcount des tampons (2026-10-19)
+
+Le handler du recv découpe ; il n'exécute pas. Chaque frame complète devient une
+`FrameRef` dans la file de sa connexion :
+
+```rust
+enum FrameRef {
+    Ring { buf: u16, off: u32, len: u32 },   // dans l'anneau ; refs_buf[buf] += 1
+    Local { off: u32, len: u32 },            // dans conn.rx
+}
+```
+
+- **Le parse a lieu à l'entrée dans le lot** : `FrameRef` → `Cmd<'tour>`, qui emprunte
+  l'anneau (ou `rx`) pour la durée du tour seulement. Aucun `unsafe` de durée de vie. Une
+  frame qui attend plusieurs tours est découpée une fois et parsée une fois, à son
+  exécution.
+- **Refcount par tampon** : `refs_buf[buf]` = nombre de `FrameRef::Ring` qui le visent.
+  Un tampon est rendu à l'anneau quand `refs_buf == 0` **et** que son dernier morceau ne
+  porte plus `F_BUF_MORE` (le noyau a fini d'y écrire).
+- **Frame coupée en bout de morceau** → recopiée dans `conn.rx` (`Local`). Si le morceau
+  suivant de la même connexion est **adjacent** dans le même tampon (même `bid`, `off` =
+  fin du précédent), on étend sans copie ; sinon on copie. Un test gratuit, en
+  optimisation de secours.
+- `rx` est en ajout seul tant que la file contient des `Local` ; compacté quand elle est
+  vide.
+- **Ce qui vit longtemps possède ses données** : clés et arguments des jobs et des
+  inscriptions BLPOP sont des `SharedByte`, jamais des `FrameRef`.
+- **Ne pas retenir l'anneau longtemps** :
+  - connexion parquée : au parquage, sa file est recopiée dans `rx`, et ce qu'elle reçoit
+    ensuite y va directement (un `BLPOP 0` ne retient jamais l'anneau) ;
+  - connexion en backpressure (§6.2) : même chose si le blocage dure plus de quelques
+    tours, puis recv annulé ;
+  - seuil bas : si l'anneau libre passe sous X %, les frames qui retiennent le tampon le
+    plus ancien sont recopiées dans leur `rx`.
+- Connexion qui meurt : ses `FrameRef` sont relâchées tout de suite.
+- Invariant (`check_invariants`) : `Σ refs_buf` = nombre de `FrameRef::Ring` dans toutes
+  les files.
 
 ---
 
@@ -302,11 +466,17 @@ on_data(conn, morceau):
 
 - **Au plus un send en vol par connexion.** C'est l'ordre des octets, et c'est requis par
   la délégation io-wq, qui ne sérialise pas les envois sur un socket.
-- **Flush en fin de récolte.** Les connexions qui ont produit des réponses pendant le tour
-  vont dans une liste « sales ». En fin de récolte : un send par connexion sale. Toutes les
+- **Flush en fin de tour.** Les connexions qui ont produit des réponses pendant le tour
+  vont dans une liste « sales ». En fin de tour : un send par connexion sale. Toutes les
   réponses d'un tour sont regroupées, et `read_and_flush` disparaît (le recv reste armé).
-- **Envoi partiel** : on resoumet le reste (`sent`).
+- **Le noyau fait les relances.** `EAGAIN` n'apparaît jamais dans un CQE : io_uring arme un
+  poll interne et réessaie quand le socket redevient écrivable. Avec **`MSG_WAITALL`**, il
+  enchaîne aussi les envois partiels et ne poste qu'un CQE, une fois tout envoyé ou en
+  erreur : plus de champ `sent` ni de reprise chez nous (à vérifier sur 7.2 avec un client
+  qui lit lentement). `MSG_NOSIGNAL` en plus, par sécurité.
 - Au CQE du send : si `out` n'est pas vide, on échange les tampons et on renvoie.
+- Note : avec `DEFER_TASKRUN`, ces relances tournent quand même sur **notre** thread,
+  pendant notre `enter`. Pour qu'elles tournent ailleurs : §6.4.
 
 ### 6.2 Flush anticipé et backpressure
 
@@ -324,11 +494,20 @@ après chaque commande :
   noyau, une commande ~0,1 µs (§12). Le découpage ne paie que pour une grosse sortie ou
   quand le send est délégué.
 - La limite donne de la backpressure : un client qui pipeline plus vite qu'il ne lit
-  arrête d'être parsé. Ça règle le TODO « buffers bornés » pour toutes les connexions.
+  sort du tirage (§2.1). Ça règle le TODO « buffers bornés » pour toutes les connexions.
+  Si ça dure : file recopiée dans `rx` et recv annulé (§5.4, §7.1).
 - L'autocorking TCP du noyau fusionne de petits sends rapprochés : un seuil un peu bas
   coûte moins cher que prévu.
 
 ### 6.3 Ce qui est zero-copy, et ce qui ne l'est pas
+
+« Fixed » désigne trois mécanismes différents dans io_uring :
+
+| Mécanisme | Ce que c'est | Pour nous |
+|---|---|---|
+| **Fixed files** (fichiers enregistrés) | un slot dans une table au lieu d'un fd : pas de `fget`/`fput` par op | oui, sur tout le flux (§4.1) |
+| **Provided buffers** (anneau de tampons) | le noyau choisit où écrire chaque réception | oui, indispensable au recv multishot (§5.1) |
+| **Registered buffers** (`register_buffers`, `*_FIXED`) | mémoire épinglée une fois, lue par le noyau sans copie | plus tard : `SEND_ZC` et dump en `O_DIRECT`. Rien à gagner pour un send qui copie, et ça interdirait les `Vec` qui grandissent |
 
 | Op | Copie noyau | Remarque |
 |---|---|---|
@@ -376,27 +555,63 @@ revalider sur un vrai réseau.
 3. **Où** : `register_iowq_aff(cpuset)`, commun à tous les workers. Ça ne réserve pas
    les cœurs : pour une vraie réservation, `cpuset` cgroup ou `isolcpus`.
 
-**Règle de bascule.** Signal de saturation gratuit : le drapeau `IORING_SQ_TASKRUN`
+**Ce que coûte la délégation, de notre côté :**
+- sous charge : une mise en file (quelques centaines de ns), le worker est déjà réveillé ;
+  on économise les ~2–3 µs de pile TCP du send ;
+- à faible charge : réveil d'un worker endormi (1–2 µs) et passage de cache d'un cœur à
+  l'autre. Mais à faible charge, on a du CPU libre.
+
+Le coût suit donc la charge dans le bon sens : argument pour une règle simple.
+
+**Pièges (2026-10-19), du plus important au moins important :**
+1. **Quota du conteneur.** Les workers io-wq sont des threads de notre processus : leur
+   CPU compte dans notre cgroup. Avec une limite à 1 CPU, déléguer ne libère rien et
+   déclenche du throttling. Au démarrage, lire `cpu.max` et le cpuset : **en dessous de 2
+   CPU de quota, ASYNC désactivé**.
+2. **SMT en cloud.** 2 vCPU = souvent les deux threads SMT d'un seul cœur physique : le
+   worker partage nos unités d'exécution, gain réel ~+30 %, pas ×2. Le bench cloud doit
+   dire quels vCPU sont frères (`lscpu -e`).
+3. **Où tournent les relances.** Sur `EAGAIN` (fenêtre du client pleine), la relance passe
+   par un poll. Probable : le drapeau ASYNC est conservé (`REQ_F_FORCE_ASYNC`) et la
+   relance repart sur io-wq. **À vérifier dans le source 7.2** : sinon les clients lents
+   ramènent leur coût sur notre cœur.
+4. **Verrou du socket.** Le worker qui envoie sur X et notre thread qui reçoit sur X
+   (multishot) prennent le même `lock_sock`. Contention brève, à surveiller au profil.
+5. **Effet sur les lots.** Déléguer raccourcit nos tours → moins de commandes par lot →
+   préchargement moins efficace (§17). Les deux se mesurent ensemble.
+6. **Limites d'environnement.** `pids.max` serré : un worker peut ne pas naître, le travail
+   attend un worker existant (sans gravité avec un plafond de 1–2). L'affinité io-wq doit
+   rester dans le cpuset du conteneur.
+
+**Ce qui reste en direct :** le recv. Le multishot tourne dans notre `task_work` ; sur une
+vraie carte, le gros de la réception (softirq) tourne sur le cœur de l'interruption, pas
+forcément le nôtre (§16, IRQ).
+
+**Ordre de mise en place, sans optimisation prématurée :**
+1. `RADIXOX_SEND_ASYNC=off|on`, statique. Mesures à charge faible, moyenne et saturée,
+   sur 2 vCPU, en loopback puis en cloud.
+2. Seulement si les courbes se croisent vraiment : mode `auto`, règle ci-dessous.
+3. Raffinements, chacun mesuré : seuil de taille (ne déléguer que les gros sends),
+   plafond io-wq piloté à chaud.
+
+**Règle `auto` (étape 2).** Signal de saturation gratuit : le drapeau `IORING_SQ_TASKRUN`
 (option `TASKRUN_FLAG`), levé par le noyau quand des complétions attendent qu'on entre.
 Avec `DEFER_TASKRUN`, regarder la CQ ne sert à rien (rien n'y est publié entre deux
 `enter`).
 
 ```
 fin de tour :
-  si sq.taskrun()   → tours_charges += 1, tours_libres = 0 ; enter(n, 0, GETEVENTS)
-  sinon             → tours_libres += 1, tours_charges = 0 ; enter(n, 1, GETEVENTS, timeout)
+  si sq.taskrun()   → tours_charges += 1, tours_libres = 0
+  sinon             → tours_libres += 1, tours_charges = 0
 sends en ASYNC  si tours_charges ≥ 4  ou travail de fond en attente (save, GC, compression)
 sends en direct si tours_libres  ≥ 16 et pas de travail de fond
 plafond io-wq   : 1 par défaut ; +1 si on reste saturé alors que les sends sont délégués
                   et que leur délai soumission → CQE monte ; −1 quand ça retombe
 ```
 
-- Saturé, un send en direct retarde la récolte des CQE suivants (il tourne pendant
-  `enter`). Délégué, il libère notre cœur ; le passage de relais (quelques µs) est payé
-  ailleurs.
 - Seuils asymétriques (4 / 16, à régler) : on bascule vite, on revient lentement.
 - Config de départ : 1 worker unbounded épinglé sur un cœur physique réservé (pas le
-  frère SMT du nôtre).
+  frère SMT du nôtre) quand la machine le permet.
 - Alternative écartée : notre propre thread d'envoi alimenté par `IORING_OP_MSG_RING`
   (contrôle total, mais un deuxième thread userland, contraire au mono-thread).
 
@@ -413,12 +628,12 @@ plafond io-wq   : 1 par défaut ; +1 si on reste saturé alors que les sends son
 | Occupation | Noyau | Cmd/recv | Diagnostic | Action |
 |---|---|---|---|---|
 | faible | — | — | tranquille | sends en direct |
-| ~100 % | ≥ 60 % | ~1 | clients sans pipeline, limite = TCP | délégation io-wq, ou mode B ; conseiller l'auto-pipelining côté client |
+| ~100 % | ≥ 60 % | ~1 | clients sans pipeline, limite = TCP | délégation io-wq ; conseiller l'auto-pipelining côté client |
 | ~100 % | faible | élevé | pipeline, limite = ART + mémoire | préchargement par lots (§8bis) ; déléguer ne sert presque à rien |
 | ~100 % | élevé | élevé | les deux | délégation + préchargement |
 
 Le serveur peut écrire ce diagnostic dans ses logs (« le noyau prend 80 % du cœur, clients
-sans pipeline : activer l'auto-pipelining côté client ou le mode SQ_POLL »).
+sans pipeline : activer l'auto-pipelining côté client ou la délégation des envois »).
 
 ---
 
@@ -427,17 +642,20 @@ sans pipeline : activer l'auto-pipelining côté client ou le mode SQ_POLL »).
 Un mécanisme unique pour KEYS, UNLINK, FLUSHDB pendant une save, et BLPOP / BRPOP plus
 tard.
 
-- La connexion passe en `Mode::Parked(reason)`.
+- La connexion passe en `Mode::Parked(reason)`, `epoch += 1`. Sa file de frames est
+  recopiée dans `rx` (§5.4) : un parquage ne retient jamais l'anneau.
 - Le recv reste armé : on détecte le FIN, et les commandes suivantes sont **copiées** dans
-  `rx` sans être exécutées (même sémantique que Redis, et invariant §5.2).
-- Celui qui termine écrit la réponse dans `out`, repasse la connexion en `Normal` et
-  rejoue `rx` : le job à la fin de sa dernière tranche, LPUSH pour BLPOP, le timer pour un
-  timeout.
+  `rx` sans être exécutées (même sémantique que Redis : un QUIT envoyé pendant un BLPOP
+  attend le réveil).
+- Celui qui termine écrit la réponse (ou la pousse dans `ready`, §8), repasse la connexion
+  en `Normal` et la met dans la liste des connexions **à rejouer au tour suivant** — jamais
+  dans le handler : une commande rejouée peut reparquer la connexion. Le job à la fin de
+  sa dernière tranche, LPUSH pour BLPOP, le timer pour un timeout.
 - Si la connexion meurt pendant le parquage : `Draining`. Un job qui la vise garde sa
   référence (`refs`) jusqu'à sa fin et n'écrit rien.
 
-Remplace dans `CONN_DESIGN.md` le « transfert complet + respawn de task » pour BLPOP, et
-les commandes async de `delayed.rs`. Même esprit (proactif, sans waker, sans oneshot),
+Remplace le « transfert complet + respawn de task » pour BLPOP de l'ancien `CONN_DESIGN.md`
+(supprimé le 2026-10-19, voir git), et les commandes async de `delayed.rs`. Même esprit (proactif, sans waker, sans oneshot),
 sans aucune tâche.
 
 ### 7.1 Multishot et parquage : pas de `select!` (2026-10-12)
@@ -463,15 +681,14 @@ en vol), les machines à états la moitié userland.
    réarmer quand elle repart. Ne jamais compter sur `ENOBUFS` pour freiner : l'anneau est
    partagé, ce serait affamer toutes les connexions. Même règle pour la backpressure §6.2 :
    « arrêter de parser » ne suffit pas tant que le recv reste armé.
-2. **Slot réutilisé** : une inscription dans une file d'attente BLPOP prend une référence
-   (`refs += 1`, §4.2) ; le slot ne peut pas être redonné tant qu'elle existe. Le LPUSH ou
-   le timer qui retire l'inscription rend la référence. Connexion en `Draining` trouvée dans
-   une file : sautée.
-3. **Événement d'un parquage précédent** : `park_seq` par connexion, incrémenté à chaque
-   parquage ; timers et inscriptions portent `(slot, park_seq)`, un événement dont le numéro
-   ne correspond plus est ignoré. Règle aussi BLPOP multi-clés : inscrit dans plusieurs
-   files, le premier réveil gagne, les autres inscriptions deviennent obsolètes et sont
-   retirées paresseusement.
+2. **Slot réutilisé** et 3. **événement d'un parquage précédent** : réglés par la même
+   règle (2026-10-19). Timers et inscriptions portent `(slot, epoch)` ; l'epoch du slot est
+   monotone à travers les réutilisations (§4.3), donc une entrée qui ne correspond plus
+   est ignorée, que le slot ait été redonné ou que la connexion ait été reparquée. Les
+   inscriptions ne prennent pas de `refs`. Règle aussi BLPOP multi-clés : inscrit dans
+   plusieurs files, le premier réveil gagne, les autres inscriptions deviennent obsolètes
+   et sont retirées paresseusement. Le tas de timers est compacté quand plus de la moitié
+   de ses entrées sont obsolètes.
 
 ---
 
@@ -497,6 +714,46 @@ enum Job {
   job), `Fsync` à la fin. Le double tampon de `bgsave.rs` (`fill` / `spare` / `in_flight`)
   se garde tel quel.
 - Une chose à la fois : pas de GC pendant une save (règle existante).
+- `save.waiters: Vec<Waker>` d'oxidart (`SaveDone`) disparaît : le job UNLINK teste
+  `is_saving()` à chaque `step`. oxidart ne dépend plus des Waker.
+- Le plafond de CPU de BGSAVE (`RADIXOX_SAVE_CPU_SHARE`) garde sa règle, mais le signal
+  d'activité devient exact : un tour sans CQE ni connexion sale = repos (remplace le
+  compteur `READS` + 1 ms sans lecture).
+
+**Résultat produit au fil de l'eau, en octets (2026-10-19).** Un job encode sa réponse
+dans son propre `Vec<u8>` pendant le parcours, pas dans un `Vec<SharedByte>` reconstitué
+à la fin : le memcpy se superpose aux miss du parcours suivant, et on n'écrit pas de
+refcount dans des lignes froides.
+- **En-tête RESP inconnu** (`*N\r\n` de KEYS) : 23 octets réservés au début, en-tête écrit
+  calé à droite à la fin, envoi à partir de l'offset. Pas de recopie. RESP2 n'a pas de
+  tableau en flux : `acc` de KEYS reste non borné (comme Redis), ou limite configurable.
+- **Injection** : au `Done`, le job pousse `(slot, epoch, buf)` dans `ready`. Traité après
+  le lot : si l'`out` de la connexion est vide, échange direct des tampons (cas courant :
+  une connexion parquée ne produit rien d'autre) ; sinon ajout à la suite. Epoch obsolète
+  → résultat jeté.
+
+### 8.1 Jamais bloquant (2026-10-19)
+
+Ce qu'on reproche à Redis n'est pas d'être 5 % plus lent : c'est le p99 qui explose quand
+un KEYS, un DEL de gros hash ou un HGETALL de 1 M de champs fige tout le serveur (d'où
+UNLINK, lazyfree, SCAN chez Redis). Principe : **toute commande peut prendre du temps,
+aucune ne bloque les autres.** Le chemin rapide des petites commandes ne change pas.
+
+- **Seuil** : une commande dont le coût estimé dépasse ~1 ms (~10 K éléments, réglable)
+  devient un job. Le coût est connu avant de commencer (HLEN, nombre de clés d'un MGET,
+  `count` de KRANGE, table §2.2).
+- **Atomicité : verrou de lecture par clé.** Un HGETALL produit en tranches pourrait voir un
+  HSET au milieu (réponse à moitié ancienne). Le job déclare ses clés ; une écriture sur
+  l'une d'elles **parque l'écrivain** jusqu'à la fin du job (le collecteur d'effets, §18,
+  est le point de contrôle : toute écriture y passe). Écritures sur les autres clés et
+  lectures : normales. Chez Redis, c'est tout le serveur qui attend.
+  KEYS et SCAN restent « au mieux » (comme Redis), sans verrou.
+- **Libérations lourdes** : DEL d'une grosse valeur → valeur détachée, réponse immédiate,
+  libération par un job. L'équivalent de lazyfree, par défaut.
+- **SAVE** = BGSAVE + connexion demandeuse parquée jusqu'à la fin : synchrone pour elle,
+  rien de bloqué pour les autres. Seule la save d'arrêt reste bloquante.
+- Implémentation après le prototype ; le principe guide dès maintenant la table §2.2 et
+  le collecteur d'effets.
 
 ---
 
@@ -517,11 +774,10 @@ parse par fenêtres de K commandes, précharge `Cmd::main_key`, exécute dans l'
 - Le lot porte sur **toutes les connexions du tour**, pas seulement sur le pipeline d'une
   connexion : l'ordre est gardé par connexion, les connexions différentes sont concurrentes.
   Ça profite donc aussi aux clients sans pipeline.
-- Les `Cmd<'a>` du lot empruntent l'anneau jusqu'à l'exécution : l'invariant §5.2 devient
-  « aucune référence vers l'anneau ne survit au tour ». Les tampons sont rendus après le lot,
-  avant le prochain `enter`.
-- Équité : plafonner le nombre de commandes d'une même connexion par tour, pour qu'un client
-  à pipeline énorme ne monopolise pas le lot.
+- Les `Cmd<'tour>` du lot empruntent l'anneau pendant le tour ; d'un tour à l'autre,
+  seules des `FrameRef` comptées retiennent les tampons (§5.4).
+- Équité : tirage par tours (§2.1) ; le préchargement se fait par fenêtres à l'intérieur
+  d'un tour de tirage, entre connexions.
 
 **Suite (par ordre) :**
 1. Étendre `main_key` aux commandes multi-clés (MGET, MSET, DEL, EXISTS) et aux Set/ZSet.
@@ -565,12 +821,25 @@ parse par fenêtres de K commandes, précharge `Cmd::main_key`, exécute dans l'
 
 ## 9. Temps, timers, signaux
 
-- **Horloge** : une lecture par tour → `art.set_now`. Plus de tâche ticker.
-- **Timers** : petit tas binaire (deadlines BLPOP, autosave, fsync AOF chaque seconde). Le
-  timeout de l'`enter` bloquant = la prochaine échéance, sinon l'horloge gèlerait au repos.
+- **Deux horloges, lues une fois par tour** (vDSO, quelques dizaines de ns amorties) :
+  - **murale** pour le TTL → `art.set_now`. C'est déjà le cas (`tick()` lit `SystemTime`),
+    et c'est ce qu'il faut : les échéances du dump sont absolues, comme chez Redis. Un saut
+    d'horloge en arrière prolonge des TTL, sans casser quoi que ce soit ;
+  - **monotone** pour les timers internes.
+  Plus de tâche ticker.
+- **Budgets de tranche** mesurés au TSC (`rdtsc`, quelques ns), pas aux horloges système.
+- **Timers** : petit tas binaire (deadlines BLPOP, autosave, fsync AOF chaque seconde,
+  balayage), suppression paresseuse par `(slot, epoch)`. Le timeout de l'`enter` bloquant =
+  la prochaine échéance, sinon l'horloge gèlerait au repos.
+- **Inactivité et clients lents à envoyer** : **pas un timer par connexion** (64 K entrées
+  mises à jour à chaque commande). `last_active` en secondes par connexion, et un job de
+  balayage incrémental, comme le `clientsCron` de Redis, qui coupe aussi les frames
+  partielles qui n'avancent plus.
 - **Évicteur TTL** : job à curseur sur le bitmap tagué (remplace le tirage statistique).
 - **Signaux** : `signalfd` lue par io_uring (kind `Signal`). Remplace le sondage toutes les
-  20 ms de `shutdown.rs`. Un second signal sort tout de suite, comme aujourd'hui.
+  20 ms de `shutdown.rs`. ⚠️ Pendant la save d'arrêt (bloquante), la boucle ne lit plus la
+  signalfd : avant de la lancer, débloquer les signaux et réinstaller le gestionnaire
+  `_exit` actuel, pour qu'un second signal sorte tout de suite.
 
 ---
 
@@ -586,15 +855,29 @@ parse par fenêtres de K commandes, précharge `Cmd::main_key`, exécute dans l'
 
 ## 11. Versions noyau
 
+**Décision (2026-10-19) : noyau ≥ 6.12, anneau incrémental obligatoire, pas de mode
+dégradé.** Quelqu'un qui déploie un serveur io_uring en 2026 accepte un noyau de 2024.
+
 | Fonction | Noyau min. |
 |---|---|
 | recv multishot, anneau de tampons | 6.0 / 5.19 |
-| ACCEPT_DIRECT multishot, alloc d'index | 5.19 |
+| accept multishot | 5.19 |
 | `DEFER_TASKRUN` | 6.1 |
 | bundles | 6.10 |
-| anneau incrémental (`IOU_PBUF_RING_INC`) | 6.12 |
-| zcrx (`RecvZc`) | 6.15 |
+| anneau incrémental (`IOU_PBUF_RING_INC`) | **6.12 — minimum retenu** |
+| `NO_IOWAIT` (optionnel) | 6.15 |
+| zcrx (`RecvZc`, optionnel) | 6.15 |
 | Machine de dev | 7.2-zen ✓ |
+
+Distributions (à revérifier au moment du README) : Ubuntu 24.04 sort en 6.8, mais ses
+noyaux HWE suivent (24.04.2 → 6.11, 24.04.3 → 6.14) et les images cloud aussi ; Ubuntu
+26.04, Debian 13 (6.12), RHEL 10 (6.12), Amazon Linux 2023 (6.12 disponible) passent.
+Debian 12 et RHEL 9 non.
+
+**io_uring ou rien.** Bloqué par le seccomp par défaut de Docker, ou par
+`kernel.io_uring_disabled` (GKE/COS, noyaux durcis) : détection au démarrage, message
+clair (« lancez avec `--security-opt seccomp=…` »), une section dans le README. Pas de
+repli epoll.
 
 ---
 
@@ -629,13 +912,25 @@ dans la même zone.
 - **memtier : toujours `--distinct-client-seed --randomize`.** Sinon tous les clients tirent
   la même suite de clés : localité artificielle, débit pipeliné surestimé ×3 (3,6 M contre
   1,16 M ops/s sur 1 M clés). Les chiffres memtier antérieurs, y compris contre Valkey, sont
-  à refaire. Les scripts du dépôt ne passent pas encore l'option.
+  à refaire. `scripts/bench_vs_valkey.sh` passe l'option ; les anciens scripts à la racine
+  (`bench_*.sh`) non.
 - **memtier 2.4.2 : `--key-pattern=Z` est inutilisable** (quasi uniforme quel que soit
   l'exposant). Zipf réaliste : YCSB (scrambled zipfian) ou générateur maison.
 - **Base de 10 M clés réutilisable** : `user:10000000..19999999`, valeurs 100–300 o,
   `target/bench_dump/dump.rxd` (2 Go), reload 0,78 s avec `RADIXOX_DIR=target/bench_dump`.
 - Préciser comment l'arbre a été construit : un reload ou un load séquentiel donne des
   nœuds contigus (ordre DFS), des SET aléatoires des nœuds dispersés.
+- **Topologie CPU** (Ryzen 7600X : cœur physique n = CPU n et n+6) : serveur épinglé
+  (`RADIXOX_CPU_PIN`), client sur d'autres cœurs physiques, jamais sur le frère SMT du
+  serveur.
+- **Clients Node.js** (ioredis) : les pauses du GC de V8 (~40 ms) produisent des rafales
+  et un p99.9 élevé, chez Valkey comme chez nous. Pour la latence : memtier, YCSB ou un
+  client Rust.
+- **Valkey io-threads** : n'aide pas sous ~50 connexions (coût de passage de relais), aide
+  nettement à partir de ~80. Comparer à ressources égales et préciser le nombre de
+  connexions.
+- (Leçons reprises de l'ancien `BENCH_ANALYSIS.md` du 2026-06, supprimé le 2026-10-19 ;
+  ses chiffres étaient biaisés par l'absence de `--distinct-client-seed`.)
 
 ### 12.2 Comparaison Valkey 9.1.2 (base 10 M, uniforme, 1:4, 1 cœur chacun)
 
@@ -653,16 +948,20 @@ profond, persistance. Écart sans pipeline / pipeline 64 : ×7,4.
 
 ## 13. Migration
 
-1. **Binaire parallèle `radixox-uring`** (io-uring 0.7.15) : boucle, accept, recv sur
-   l'anneau incrémental, send, toutes les commandes sync (`execute_sync` ne dépend pas du
-   runtime). Bench A/B contre le binaire monoio, en pipeline 1 et 256 : aucune régression.
-2. Horloge, timers, `signalfd`, évicteur à curseur.
-3. Connexions parquées, jobs KEYS / UNLINK / FLUSHDB, port de BGSAVE.
-4. Pub/Sub.
-5. Suppression de monoio : `oxidart/monoio.rs`, `async_command.rs` (→ curseurs),
-   `#[monoio::test]`, `resp.rs` / `utils/mod.rs`.
-6. Ensuite : lots de recherches sur tout le tour (§8bis), `IOSQE_ASYNC` + règle `TASKRUN`, mode B SQ_POLL à comparer, flush anticipé réglé, cas 3 du parseur, saves auto + AOF,
-   pool enregistré + `SEND_ZC`, allocateur bump, GC.
+*Make it work, make it fast, make it adaptable.* Une seule boucle dans
+`radixox/src/bin/uringloop.rs` (io-uring 0.7.15), qui remplace `resp.rs` une fois
+stabilisée.
+
+| # | Étape | Terminé quand |
+|---|---|---|
+| 0 | **Sous monoio, sans risque** : sortir dispatch + `execute_sync` dans un module indépendant du runtime ; table des commandes (§2.2) ; découpage à trois issues + limites (§5.3) ; KEYS / UNLINK / FLUSHDB en jobs à curseur qui encodent leur réponse en octets (§8) ; retirer les Waker d'oxidart | tests actuels verts ; monoio ne fait plus qu'appeler `step` + `yield_now` |
+| 1 | **Cœur sans I/O** (§1.2) : files de `FrameRef` + refcount des tampons (§5.4), tirage par tours + barrières (§2.1), `Closing` / `Draining`, `epoch`, `check_invariants` | tests sur faux anneau, scénarios et séquences aléatoires : envoi qui traîne, EOF avec pipeline en cours, `ENOBUFS`, multishot terminé, annulation croisée avec une complétion, frame coupée octet par octet |
+| 2 | **`uringloop.rs`** : accept classique + `FilesUpdate` (§4.1), recv sur anneau incrémental, send `MSG_WAITALL`, toutes les commandes sync, préchargement à l'intérieur d'une connexion comme aujourd'hui | `test_resp.sh` + intégration verts ; A/B court contre monoio en pipeline 1 / 32 / 256 ; mesurés : nombre et taille des tampons, `ENOBUFS`, adjacence, fixed file utile ou non, `MSG_WAITALL` |
+| 3 | Horloges, timers, `signalfd`, évicteur à curseur, balayage d'inactivité | horloge vivante au repos, arrêt propre avec et sans save |
+| 4 | Parquage + jobs branchés sur `ready`, port de BGSAVE, SAVE = BGSAVE + parquage, save d'arrêt | p99.99 sous BGSAVE en pipeline 32 ≤ monoio |
+| 5 | Pub/Sub avec limite d'`out` | abonné lent → `Draining`, pas d'OOM |
+| 6 | Bascule par défaut, suppression de monoio (`oxidart/monoio.rs`, `async_command.rs`, `#[monoio::test]`, `resp.rs`, `utils/mod.rs`) | critères de bascule (§15) atteints |
+| 7+ | Une optimisation à la fois, chacune mesurée : préchargement entre connexions + idx + époque (§17), GET par référence, `IOSQE_ASYNC` off/on puis auto (§6.4), jamais bloquant (§8.1), cas 3 du parseur, saves auto + AOF, pool enregistré + `SEND_ZC`, allocateur bump, GC, listes puis BLPOP | |
 
 ---
 
@@ -671,13 +970,20 @@ profond, persistance. Écart sans pipeline / pipeline 64 : ×7,4.
 | Option | Raison |
 |---|---|
 | Runtime à futures maison (`RawTask`, `fn_poll`, `syscall_nb`, `CURRENT_TASK`) | garde la machinerie des futures sans en avoir besoin ; le multishot y est pénible à modéliser |
-| SQ_POLL **par défaut** | incompatible avec `DEFER_TASKRUN` ; gardé comme mode B à mesurer (§2) |
+| SQ_POLL (même en option) | incompatible avec `DEFER_TASKRUN` ; brûle un vCPU en permanence, souvent le frère SMT du nôtre, compté dans le quota du conteneur. Réservé à une machine dédiée ultra-basse latence : non maintenu (2026-10-19) |
+| ACCEPT_DIRECT | optimise l'ouverture, pas le flux ; perd l'adresse du client, `setsockopt` classique, le choix des slots, le message « max clients » (§4.1). `TCP_NODELAY` serait hérité du listener, mais ça ne règle qu'un des quatre points |
+| `WRITE_FIXED` / tampons enregistrés pour les sends ordinaires | un send copie de toute façon ; réservé à `SEND_ZC` et au dump `O_DIRECT` (§6.3) |
+| Anneau non incrémental en repli | noyau ≥ 6.12 imposé (§11) |
+| Repli epoll | io_uring ou rien (§11) |
+| Plusieurs boucles par processus | 1 processus = 1 boucle = 1 base ; le multi-cœur passe par plusieurs processus (sharding par namespace) |
+| Parser à l'arrivée et garder des `Cmd<'a>` d'un tour à l'autre | durée de vie inexprimable sans `unsafe` ; on garde des `FrameRef` comptées et on parse à l'entrée dans le lot (§5.4) |
+| Réordonner les commandes d'une même connexion | casse la causalité vue par les autres clients (§2.1) |
 | Notre propre thread d'envoi (`MSG_RING`) | contrôle total d'io-wq, mais un deuxième thread userland |
 | Dépasser 8–10 clés par lot de préchargement | mesuré : plus lent (§8bis), dans la fenêtre du pipeline. **À re-mesurer** : hors réseau, MGET via `descend_batch` (idx réutilisé, sans seconde descente) va de 155 ns/clé à 8 clés à 105 ns/clé à 32–64 (§17.1) |
 | Slotmap / clé générationnelle | l'index de fixed file est stable tant qu'on ne ferme pas (§4.2) |
 | `READ_FIXED` | un tampon réservé par connexion, pas de multishot, copie noyau de toute façon |
 | Beaucoup de petits tampons dans l'anneau | frontières fréquentes ; le mode incrémental permet quelques gros tampons |
-| Contiguïté par connexion dans l'anneau (un groupe par conn) | ids sur 16 bits, mémoire réservée par connexion |
+| Contiguïté par connexion dans l'anneau (un groupe par conn) | ids sur 16 bits, mémoire réservée par connexion ; l'adjacence se teste au cas par cas (§5.4) |
 | Parseur reprenable à n'importe quel octet | trop d'états ; RESP annonce les tailles (§5.3) |
 | Découper un pipeline par nombre de commandes | un send coûte ~30 commandes de CPU ; découpage par octets à la place (§6.2) |
 | NAPI busy poll par défaut | brûle du CPU pour quelques µs ; coûteux en cloud sur les instances à crédits ou facturées au CPU. Option possible, pas dans le prototype |
@@ -687,12 +993,22 @@ profond, persistance. Écart sans pipeline / pipeline 64 : ×7,4.
 
 ## 15. À valider
 
-- Prototype en binaire parallèle plutôt qu'une réécriture de `resp.rs` sur place.
-- Connexions parquées comme mécanisme unique (rend obsolètes des parties de
-  `CONN_DESIGN.md` et de la mémoire « blocking ops »).
-- Comportement réel de l'anneau incrémental avec plusieurs sockets (entrelacement, §5.1).
-- `TCP_NODELAY` sur socket direct : `SetSockOpt` ou héritage du socket d'écoute (§4.1).
-- Mode A (`DEFER_TASKRUN` + io-wq) contre mode B (SQ_POLL) à budget égal (§2).
+**Décidé le 2026-10-19 :** prototype dans `uringloop.rs` à côté de `resp.rs` ; connexions
+parquées comme mécanisme unique (`CONN_DESIGN.md`, `BENCH_ANALYSIS.md` et la section
+« Refactor RESP server » du CLAUDE.md, devenus obsolètes, ont été retirés le 2026-10-19) ; accept classique ; SQ_POLL
+abandonné ; noyau ≥ 6.12.
+
+**À mesurer ou vérifier dans le prototype :**
+- Entrelacement réel des sockets dans l'anneau incrémental (§5.1), adjacence (§5.4).
+- Nombre et taille des tampons ; fréquence d'`ENOBUFS` ; plafond de relances du multishot
+  et effet de `len` sur `RecvMulti` (§5.1).
+- `MSG_WAITALL` : un seul CQE pour un gros envoi à un client lent (§6.1).
+- Fixed file : gain réel sur le flux (§4.1).
+- `IOSQE_ASYNC` : où tournent les relances après `EAGAIN` (§6.4, piège 3).
+
+**Critères de bascule par défaut (étape 6) :** à définir avant l'étape 2 — bench
+(`scripts/bench_vs_valkey.sh`, base 10 M), profondeurs de pipeline (1, 32, 256), tolérance
+de régression, tests (unitaires, intégration, faux anneau, banc réseau hostile §16).
 
 ---
 
@@ -704,8 +1020,9 @@ profond, persistance. Écart sans pipeline / pipeline 64 : ×7,4.
 - **SQ pleine en plein tour** (beaucoup de connexions sales) : soumettre tout de suite
   puis continuer, au lieu de perdre des sends.
 - **Fin de multishot** : un recv ou un accept multishot peut s'arrêter pour d'autres
-  raisons qu'`ENOBUFS` (CQ pleine, table de fixed files pleine → `ENFILE`). Règle : tout CQE
-  sans `F_MORE` réarme, ou met la connexion (ou l'accept) dans une liste « à réarmer ».
+  raisons qu'`ENOBUFS` (CQ pleine, `EMFILE` sur l'accept). Règle : tout CQE sans `F_MORE`
+  réarme, ou met la connexion (ou l'accept) dans une liste « à réarmer ». Même chemin
+  qu'`ENOBUFS`, testé au faux anneau.
 - **Mode incrémental** : ne jamais rendre un tampon tant que son dernier morceau porte
   `F_BUF_MORE`.
 - **Détection des fonctions noyau au démarrage** (`io_uring_disabled`, version, opcodes
@@ -714,14 +1031,25 @@ profond, persistance. Écart sans pipeline / pipeline 64 : ×7,4.
   tous les slots, puis sortir (ou save d'arrêt).
 
 **Connexions et protection**
-- **Clients lents à envoyer** (« slowloris ») : une frame partielle qui n'avance plus garde
-  un reliquat → limite de taille de `rx` et timeout de frame partielle.
-- **Timeout d'inactivité** (équivalent du `timeout` de Redis), via le tas de timers.
-- **Limite de connexions** : table de fixed files pleine → refuser proprement, et le dire
-  dans `INFO`.
-- **Grosses réponses** (KEYS, HGETALL énorme, MGET de 10 000 clés) : production par
-  tranches avec la backpressure, au lieu d'un `out` géant.
-- AUTH absent, bind `0.0.0.0` (déjà noté côté prod).
+- Clients lents à envoyer, inactivité : balayage incrémental (§9). Limite de connexions :
+  réserve de slots (§4.1). Grosses réponses : jamais bloquant (§8.1).
+- `SELECT n` répond OK et ignore `n` : un client qui croit isoler ses données écrit en base
+  0. Avec « 1 processus = 1 base » : `SELECT 0` → OK, le reste →
+  `-ERR DB index is out of range`.
+
+**Déploiement cloud (2026-10-19)**
+- Quota cgroup et SMT : conditionnent la délégation (§6.4).
+- **Biais du loopback** : en loopback, notre send fait aussi la réception du client et
+  netfilter (la moitié des « 80 % noyau » du §12). Sur une vraie carte, la réception tourne
+  sur le cœur de l'interruption (RSS) : régler l'affinité des IRQ (loin de notre cœur, ou
+  sur celui d'io-wq) et refaire la ventilation du §12 en cloud avant de chiffrer ASYNC.
+- **kTLS** : poignée de main en userland (rustls), puis bascule du socket en TLS noyau ;
+  garde le flux io_uring et ouvre l'offload matériel des cartes.
+
+**Plus tard, à garder en tête**
+- **Configuration** : les `RADIXOX_*` se multiplient → fichier de config et `CONFIG GET`
+  minimal (certaines bibliothèques l'appellent à la connexion).
+- **Comptabilité mémoire** : `out`, `rx`, anneau et jobs comptent dans un futur `maxmemory`.
 
 **Performance et déploiement**
 - **Sockets Unix** pour les clients sur la même machine (sidecar) : pas de pile TCP ni de
@@ -733,15 +1061,15 @@ profond, persistance. Écart sans pipeline / pipeline 64 : ×7,4.
   1–2 octets LFU, mais le nœud de 64 o est plein).
 - **Latence par commande** : histogrammes peu coûteux (TSC) et un slowlog, pour les
   diagnostics.
-- **Horloge du TTL** : la boucle lit une horloge monotone par tour, mais un dump rechargé
-  après redémarrage demande une horloge murale pour les échéances. Vérifier quelle horloge
-  la save et le reload utilisent.
-
 **Tests**
-- **Tests déterministes de la boucle** : comme tout passe par des CQE, on peut alimenter
-  les machines à états avec des séquences de CQE fabriquées (faux anneau) : envoi partiel,
-  `ENOBUFS`, `ECONNRESET` en plein send, annulation qui croise une complétion, CQ pleine.
-  Impossible proprement sous monoio, naturel sans runtime.
+- **Tests déterministes de la boucle** : le cœur sans I/O (§1.2) est alimenté par des
+  `Completion` fabriquées (faux anneau) : send qui traîne, `ENOBUFS`, `ECONNRESET` en plein
+  send, annulation qui croise une complétion, CQ pleine. Impossible proprement sous
+  monoio, naturel sans runtime.
+- **Banc réseau hostile** : clients qui lisent lentement ou plus du tout, resets en plein
+  envoi, frames envoyées octet par octet, pipelines énormes.
+- **Fuzz du découpage / parseur** (il aurait trouvé le débordement de `parse_uint`, §5.3)
+  et différentiel contre Valkey sur le fil.
 
 ---
 
@@ -768,7 +1096,8 @@ thread principal** :
 ```
 loop {
     récolte    : un enter(GETEVENTS) → CQE de toutes les connexions prêtes
-    parse      : toutes les connexions → un lot global de Cmd (ordre gardé par connexion)
+    parse      : tirage par tours dans les files (§2.1) → un lot global de Cmd
+                 (ordre gardé par connexion)
     descente   : descend_batch sur les clés du lot, par fenêtres de W
                  (miss superposés, valeurs préchargées, idx gardés)
     exécution  : dans l'ordre de chaque connexion ; lectures sur les idx gardés (§17.2)
@@ -826,7 +1155,6 @@ loop {
 | Recv multishot + anneau incrémental | un SQE et un réarmement par lecture | §5.1 |
 | Un `enter` par tour (`SINGLE_ISSUER` + `DEFER_TASKRUN`) | un syscall par opération | §2 |
 | Sends délégués (`IOSQE_ASYNC`, io-wq piloté) | la pile TCP d'envoi (~80 % du cœur sans pipeline en loopback) | §6.4 |
-| Mode B : SQ_POLL épinglé | tous les syscalls de soumission | §2 |
 | `SEND_ZC` + pool enregistré, au-delà de ~16 Ko | la copie des grosses réponses (pages KRANGE, HGETALL) | §6.3 |
 | Sockets Unix pour les clients locaux | pile TCP et netfilter (~75 % du coût sans pipeline) | §16 |
 | NAPI busy poll (option) | l'attente des interruptions réseau | §14 : pas par défaut, mode « machine dédiée » |
@@ -857,6 +1185,21 @@ la part « arbre » à chaque étape.
 2. Lot sur tout le tour avec `descend_batch` et réutilisation des idx pour les GET (§17.2.1),
    W = 32, mesure de l'époque contre `invalidate(idx)`.
 3. GET / HGET / HMGET par référence (§17.2.3).
-4. Délégation réseau mesurée : mode A + io-wq contre mode B SQ_POLL, à budget égal (§2, §6.4).
+4. Délégation réseau mesurée : `IOSQE_ASYNC` off/on à 2 vCPU, en loopback puis en cloud,
+   puis mode auto si les courbes se croisent (§6.4).
 5. Fusion des lectures identiques (§17.2.2), avec une charge zipfienne pour la justifier.
 6. Modes extrêmes sur VM dédiée : NAPI busy poll, `SEND_ZC`, zcrx (§17.3) ; bench cloud.
+
+---
+
+## 18. Effets des écritures (2026-10-19)
+
+Plusieurs mécanismes ont besoin de savoir ce qu'une commande a modifié : AOF, réplication,
+WATCH, notifications de keyspace, verrous de lecture des jobs (§8.1), barrière de save.
+L'exécuteur du lot est l'endroit naturel pour le savoir.
+
+- Dès le prototype, l'exécution reçoit un **collecteur d'effets** (`&mut Effects`), vide
+  au début : les commandes d'écriture (table §2.2) y déclarent leurs clés touchées.
+- Ça évite de changer toutes les signatures quand l'AOF arrivera ; la conception de
+  l'AOF elle-même n'est pas bloquante aujourd'hui (fsync groupé par tour, kind `File`,
+  cf. `TX_DESIGN.md`).

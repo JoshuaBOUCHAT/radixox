@@ -3,8 +3,8 @@
 > État : conception validée le 2026-10-09, implémentation en cours.
 > Lire avant de toucher à la persistance, à `oxidart/src/lib.rs` (mutations),
 > à `valart/` ou à `radixox-lib/src/save_barrier.rs`.
-> Remplace §3.2bis (format par nœud) d'`ARCHITECTURE.md` ; le reste du §3
-> (undo-log, atomicité fichier, recovery) reste valable.
+> Remplace l'ancien format par nœud et l'undo-log de l'ancienne version d'`ARCHITECTURE.md`
+> (avant le 2026-10-19) ; principes de fichier et de recovery : `ARCHITECTURE.md` §3.
 
 ## Reprise — état au 2026-10-10 (à lire en premier)
 
@@ -20,7 +20,6 @@
 - **Yield sous monoio** : ne jamais écrire un `yield` à base de `cx.waker().wake_by_ref()` ; monoio remet alors la tâche en tête de file et elle affame les connexions. Utiliser `oxidart::async_command::yield_now` (réveil par micro-tâche). Détail et mesures : §5quater « BGSAVE minimal ».
 - **Le curseur de save** se libère **avant** `finish_save` (il peut contenir des valeurs possédées).
 - **`SET n 42` stocke une chaîne** ; seul `INCR`/`INCRBY` crée un `Value::Int`.
-- `CLAUDE.md` du dépôt est en partie périmé : oxidart n'a plus de feature `monoio` (dépendance inconditionnelle), le binaire s'appelle `radixox` (plus `radixox-resp`), les nœuds font 64 B.
 
 **Benchs** (`scripts/stress_save.sh`)
 - Variables : `MODES="nosave save"`, `RUN_TIME` (s), `PIPELINE` (défaut 1), `RATIO` (défaut `1:4`), `SERVER=valkey`, `OUT_DIR` (le dump y est écrit ; prendre un tmpfs pour comparer à Valkey). Serveur sur CPU 0-1 sous `systemd-run --scope -p MemoryMax=4G`, memtier sur CPU 2-7, 1M clés de 100 B.
@@ -269,7 +268,7 @@ pied          u32 LE crc32 (IEEE, crc32fast) de tout ce qui précède | "RXDE"
 
 | Option | Raison |
 |---|---|
-| `fork()` + COW du noyau | Pages de 2 MB (THP) copiées sur une écriture d'un octet ; oxidart est une lib in-process (ARCHITECTURE.md §3.5). |
+| `fork()` + COW du noyau | Pages de 2 MB (THP) copiées sur une écriture d'un octet ; oxidart est une lib in-process (ARCHITECTURE.md §3). |
 | Parcours linéaire du slab | Dumpe les sous-arbres coupés par un UNLINK en cours (orphelins), et obligeait à bloquer UNLINK pendant la save. |
 | BFS | La frontière peut contenir des millions de feuilles. |
 | Format par nœud avec ids | Lié au layout interne ; inutile avec un DFS. |

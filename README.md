@@ -522,6 +522,7 @@ radixox/
 ├── valart/         # compact radix trees for Hash and Set values
 ├── radixox-lib/    # SharedByte, RESP parser and encoder, save barrier
 ├── radixox/        # server binary (RESP2 over io_uring)
+├── ARCHITECTURE.md # architecture overview, invariants, map of the design docs (French)
 ├── RUNTIME_ARCH.md # design of the custom io_uring loop
 ├── SAVE_DESIGN.md  # design of copy-on-write snapshots
 └── TX_DESIGN.md    # design of atomic conditional transactions

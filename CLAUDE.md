@@ -2,441 +2,54 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> **À chaque nouvelle session** : lire `CONN_DESIGN.md` avant de toucher à
-> `radixox/src/bin/resp.rs` ou d'implémenter des commandes bloquantes (BLPOP,
-> BRPOP, etc.). Ce fichier contient les décisions architecturales actives
-> (ConnState, double-buffer, mode Blocking par transfert complet).
->
-> **Persistance / save** : lire `SAVE_DESIGN.md` avant de toucher à la
-> persistance, aux mutations d'`oxidart/src/lib.rs`, à `valart/` ou à
-> `radixox-lib/src/save_barrier.rs`. Il contient le design validé (COW
-> applicatif, parcours DFS simple + prefetch, format), l'état du code, les options
-> écartées et l'ordre de réalisation (§6).
+> **À chaque session** : lire [`ARCHITECTURE.md`](ARCHITECTURE.md) (vue d'ensemble point
+> par point, invariants, carte des documents), puis le document du sujet touché :
+> - serveur réseau, connexions, Pub/Sub, commandes bloquantes, boucle io_uring →
+>   [`RUNTIME_ARCH.md`](RUNTIME_ARCH.md) ;
+> - persistance, mutations d'`oxidart/src/lib.rs`, `valart/`,
+>   `radixox-lib/src/save_barrier.rs` → [`SAVE_DESIGN.md`](SAVE_DESIGN.md) ;
+> - SCAN → [`SCAN_DESIGN.md`](SCAN_DESIGN.md) ; transactions → [`TX_DESIGN.md`](TX_DESIGN.md) ;
+>   ZSet → [`ANALYSE_ART_UNIFIE.md`](ANALYSE_ART_UNIFIE.md) §13.
 
-## Project Overview
+## Projet
 
-RadixOx is a high-performance in-memory key-value store built on OxidArt (Adaptive Radix Tree). It speaks the Redis RESP2 protocol (drop-in replacement) and also has a native protobuf protocol with a Rust client library. Requires **Linux 5.1+** (io_uring) and **Rust 2024 edition**.
+RadixOx : base clé-valeur en mémoire qui parle RESP2 (sous-ensemble des commandes Redis),
+bâtie sur OxidArt, un radix tree adaptatif. Mono-thread, io_uring (monoio aujourd'hui,
+boucle maison demain), Linux uniquement, Rust 2024.
 
-## Workspace Structure
+## Workspace
 
 ```
-radixox/
-├── oxidart/            # Adaptive Radix Tree engine (ART with TTL, DFA, counters)
-├── radixox-server/     # Server binaries (RESP + legacy protobuf)
-├── radixox-common/     # Shared types, protobuf definitions, build.rs codegen
-├── radixox/            # Native client library (monoio; tokio planned)
-└── Cargo.toml          # Workspace config
+oxidart/        arbre des clés : TTL, préfixe / glob / range, descentes entrelacées, save
+oxidart-legacy/ ancien arbre (nœuds 64 o), oracle des tests différentiels, non publié
+valart/         radix compacts pour les valeurs Hash et Set
+radixox-lib/    SharedByte, parseur RESP (cmd.rs) et encodeur, barrière de save
+radixox/        binaire serveur `radixox` (src/bin/resp.rs) + tests d'intégration
+scripts/        bench_vs_valkey.sh (référence du README), stress_save.sh
 ```
 
-## Build and Run Commands
+`hislab` (slab mmap + THP) est une crate séparée : `~/rust/hislab`.
+
+## Commandes
 
 ```bash
-# Build everything
-cargo build
+cargo build --release -p radixox          # binaire target/release/radixox
+cargo run --release --bin radixox         # écoute 127.0.0.1:6379 (RADIXOX_BIND / RADIXOX_PORT)
 
-# Build specific crate
-cargo build -p oxidart                                # ART engine only
-cargo build -p radixox-server --features resp         # Redis RESP server only
-cargo build -p radixox-server --features legacy       # Legacy protobuf server only
-
-# Run servers
-cargo run --bin radixox-resp --features resp          # Port 6379
-cargo run --bin radixox-legacy --features legacy      # Port 8379
-
-# Tests
-cargo test -p oxidart                                 # ART engine tests
-cargo test -p oxidart -- regex                        # Regex tests only
-cargo test -p oxidart -- counter                      # Counter tests only
-cargo test -p radixox-server                          # Server tests
-
-# Integration tests (requires RESP server running on :6379)
-./radixox-server/test_resp.sh
-
-# Benchmark
-redis-benchmark -p 6379 -t SET,GET -n 100000 -q
+cargo test -p oxidart --features regex    # arbre (dont tests différentiels contre oxidart-legacy)
+cargo test -p radixox-lib                 # parseur, SharedByte, barrière
+cargo test -p radixox                     # intégration : lance le binaire sur un port de test
 ```
 
-## Feature Flags
-
-### oxidart
-- `ttl` (default): Time-to-live support (activates `hislab/tagged`, `hislab/rand`, `rand`)
-- `monoio`: Async integration for monoio (single-thread, io_uring) — implies `ttl`
-- `tokio`: Async integration for tokio (multi-thread) — implies `ttl`
-- `regex`: DFA-based pattern matching via `regex-automata` — implies `ttl`
-- `monoio` and `tokio` are mutually exclusive (compile_error!)
-
-### radixox-server
-- `legacy`: Protobuf server binary (pulls in prost, radixox-common)
-- `resp`: Redis RESP server binary (pulls in redis-protocol)
-- Default: both enabled
-
-## Architecture
-
-### OxidArt — Adaptive Radix Tree (`oxidart/src/`)
-
-O(k) key-value operations where k is key length.
-
-**Core structure (`lib.rs`)**:
-- `OxidArt` struct with `HiSlab<Node>` (hierarchical bitmap slab, O(1) insert/remove)
-- Separate `HiSlab<HugeChilds>` for overflow child pointers
-- With TTL: `now: u64` timestamp for expiration checks
-
-**Node structure** (`repr(C)`, **128 bytes** with TTL — fits allocator bucket exactly):
-- With TTL: `childs: Childs`, `compression: CompactPath` (16 bytes, inline ≤14), `val: Option<(Value, u64)>`, `huge_childs_idx: u32`, `parent_idx: u32`, `parent_radix: u8`
-- Without TTL: `compression: CompactPath`, `val: Option<Value>`, `childs: Childs`
-
-**Two-tier child storage (`node_childs.rs`)**:
-- `Childs`: Inline, up to 9 children (64-byte aligned)
-- `HugeChilds`: Overflow for remaining 118 radix values
-
-**Key algorithms**:
-- **Path compression**: Single-child paths collapse into compression vector
-- **Auto-recompression**: After deletions, absorbs single-child nodes
-- **Prefix operations**: `getn`/`deln` traverse to prefix then collect/delete descendants
-- **DFA pattern matching** (`regex.rs`): `getn_regex` compiles regex → DFA, walks tree iteratively. Dead DFA state → prune subtree. O(m) where m = visited subtree.
-- **Counter operations** (`counter.rs`): `incr`/`decr`/`incrby`/`decrby` via `traverse_to_key` + `node_value_mut` — single traversal, TTL preserved, expired = non-existent
-- **Lazy TTL**: Expired entries filtered on access
-- **Active eviction**: Redis-style probabilistic sampling via `evict_expired()` — sample 20 tagged nodes, delete expired, repeat if ≥25% expired
-
-**Internal helpers (`pub(crate)`)**:
-- `traverse_to_key(&self, key) -> Option<u32>`: Navigate to key, returns node index
-- `node_value_mut(&mut self, idx) -> Option<&mut Bytes>`: Mutable ref to value, checks TTL internally. `NO_EXPIRY` sentinel stays private.
-
-**Public API**:
-
-| Method | Description |
-|--------|-------------|
-| `new()` | Create empty tree |
-| `get(key)` / `set(key, val)` / `del(key)` | Basic CRUD |
-| `set_ttl(key, duration, val)` | Insert with TTL |
-| `getn(prefix)` / `deln(prefix)` | Prefix operations |
-| `get_ttl(key)` / `expire(key, dur)` / `persist(key)` | TTL management |
-| `incr(key)` / `decr(key)` / `incrby(key, n)` / `decrby(key, n)` | Atomic counters |
-| `getn_regex(pattern)` | DFA-pruned regex scan |
-| `set_now(ts)` / `tick()` / `evict_expired()` | Clock & eviction |
-| `shared_with_ticker(interval)` | Shared tree + auto-ticker (monoio/tokio) |
-| `shared_with_evictor(tick, evict)` | Shared tree + ticker + evictor |
-
-### RESP Server (`radixox-server/src/bin/resp.rs`)
-
-Single-threaded, async, connection-per-task model on monoio (io_uring):
-
-```
-Client ──TCP──> io_buf ──extend──> read_buf ──decode_bytes_mut──> Frame
-                                                                    │
-                                                        execute_command
-                                                                    ▼
-                                                                OxidArt
-                                                                    │
-                                                          Response Frame
-                                                                    │
-                                                         extend_encode
-                                                                    ▼
-                                                              write_buf ──TCP──> Client
-```
-
-**Buffer ownership model** (monoio-specific): `io_buf` ownership is transferred to the kernel for io_uring reads, then returned. Data is copied into `read_buf` for parsing. `write_buf` is reused per connection after each TCP write.
-
-**Zero-copy optimizations**: `decode_bytes_mut()` returns `BytesFrame` with `Bytes` slices directly into `read_buf` (no allocation for command arguments). Static responses (`PONG`, `OK`) use `Bytes::from_static()`. Command matching uses `eq_ignore_ascii_case()` to avoid uppercase allocation.
-
-**Shared state**: OxidArt tree is wrapped in `Rc<RefCell<>>` (single-threaded, no locks needed).
-
-**Supported RESP commands**:
-- **Connection**: PING, QUIT, ECHO, SELECT, AUTH, HELLO (RESP2 ; HELLO 3 → NOPROTO), CLIENT (SETNAME/GETNAME/ID/SETINFO), COMMAND
-- **String/Keys**: GET, SET (with EX/PX/NX/XX), SETNX, SETEX, MGET, MSET, DEL, UNLINK, EXISTS, TYPE, KEYS, SCAN (MATCH/COUNT/TYPE, voir `SCAN_DESIGN.md`), KRANGE/KREVRANGE, TTL, PTTL, EXPIRE, PEXPIRE, PERSIST, DBSIZE, FLUSHDB
-- **Counters**: INCR, DECR, INCRBY, DECRBY
-- **Hash**: HSET, HMSET, HGET, HGETALL, HDEL, HEXISTS, HLEN, HKEYS, HVALS, HMGET, HINCRBY
-- **Set**: SADD, SREM, SISMEMBER, SCARD, SMEMBERS, SPOP
-- **ZSet**: ZADD, ZCARD, ZRANGE, ZSCORE, ZREM, ZINCRBY
-- **Pub/Sub**: SUBSCRIBE, UNSUBSCRIBE, PUBLISH
-
-**KEYS glob pattern matching**: Two code paths:
-- **Fast path**: Simple `prefix*` patterns → `art.getn(prefix)` (pure tree traversal, no DFA)
-- **Slow path**: Complex globs → `glob_to_regex()` → `art.getn_regex()` (DFA-pruned traversal)
-
-**Pub/Sub architecture**:
-- Writer task pattern: first SUBSCRIBE spawns a monoio writer task owning the write half
-- Channel: `local_sync::mpsc::unbounded` — sync `send()`, async `recv()`, `Tx` is Clone
-- Registry: `HashMap<Bytes, HashMap<ConnId, Tx<Bytes>>>` in `Rc<RefCell<>>`
-- PUBLISH encodes RESP once → N `Bytes::clone()` (refcount bump) → N `send()`
-- `Conn` struct groups connection state + `send()` / `handle_cmd()` methods
-
-**Performance optimizations**: `SmallVec<[Bytes; 3]>` for `frame_to_args`, GET/SET first in dispatch table, SET condition check skipped when no NX/XX flag.
-
-### Legacy Protobuf Server (`radixox-server/src/bin/legacy.rs`)
-
-Port 8379. Length-prefixed protobuf messages (4-byte big-endian size + payload). Supports SET, GET, DEL, GETN, DELN (prefix operations with `*` wildcard). Uses batch message parsing via `read_message_batch()`.
-
-### Common Library (`radixox-common/`)
-
-- `build.rs` compiles `src/proto/messages.proto` with prost-build (auto-generates Rust types)
-- `NetValidate<T>` / `NetEncode<T>` traits for network message handling
-- Protocol types: `NetCommand` (request) and `NetResponse` (response) with oneof actions
-
-### Client Library (`radixox/`)
-
-`ArtClient` trait defines async operations: `get`, `set`, `del`, `getn`, `deln`, `get_json<T>`, `set_json<T>`.
-
-`SharedMonoIOClient` implementation:
-- Split read/write loop architecture on monoio runtime
-- **Write batching**: accumulates commands in a `BytesMut` buffer, flushes every 1ms
-- **Request tracking**: `SlotMap<DefaultKey, Sender<Response>>` maps request IDs to oneshot channels
-
-## Key Dependencies
-
-- **oxidart** (workspace member): Adaptive Radix Tree with TTL, DFA pattern matching, counters
-- **monoio**: Async runtime with io_uring (Linux-only)
-- **redis-protocol**: RESP2/RESP3 parser with `Bytes` integration
-- **prost / prost-build**: Protobuf codegen (legacy protocol)
-- **slotmap**: Request tracking in client
-- **local-sync**: Thread-local channels for Pub/Sub and client request/response
-- **hislab**: Hierarchical bitmap slab allocator with tagged random sampling
-
-## ✅ Implemented Features
-
-### Data Structures
-- [x] ✅ `Value` enum with all Redis types (String, Int, Hash, List, Set, ZSet)
-- [x] ✅ String ↔ Int transparent (INCR zero-parse, GET formats on-fly, TYPE returns "string")
-- [x] ✅ WRONGTYPE errors between families
-- [x] ✅ Hash commands: HSET, HMSET, HGET, HGETALL, HDEL, HEXISTS, HLEN, HKEYS, HVALS, HMGET, HINCRBY
-- [x] ✅ Set commands: SADD, SREM, SMEMBERS, SISMEMBER, SCARD, SPOP
-- [x] ✅ ZSet commands: ZADD, ZRANGE, ZSCORE, ZREM, ZCARD, ZINCRBY (double-indexed: BTreeSet + HashMap)
-
-### Performance Optimizations
-- [x] ✅ BTreeMap for Hash (O(log n) predictable, excellent p99.9)
-- [x] ✅ BTreeSet for Set (ordered iteration, deterministic)
-- [x] ✅ ZSetInner double-index (BTreeSet for range + HashMap for O(1) score lookup)
-- [x] ✅ Node size = 128 bytes (cache-line optimized)
-- [x] ✅ CompactPath with tinypointers (2byteid → 65k slots)
-
-## Bug Fix — `split_node` / `ensure_key` (2025-02)
-
-**Bug**: Dans `split_node` appelé depuis `ensure_key` avec `val=None`, le nouveau nœud
-était inséré dans le HiSlab mais **jamais enregistré comme enfant** de son parent
-(`push_child_idx` manquant). Résultat : toute clé dont le nom est un préfixe strict
-d'une autre clé insérée ensuite (ex: `user:1` → `user:10`) devenait inaccessible.
-Affectait uniquement HSET/SADD/ZADD (qui passent par `ensure_key`), pas les strings
-(qui utilisent `set_internal` avec `val=Some(...)`).
-
-**Fix** (`lib.rs`, fonction `split_node`, branche `else` de `!val_on_intermediate`) :
-```rust
-let new_node_idx = self.insert(new_node);
-self.push_child_idx(idx, new_node_idx, new_radix);  // ← ligne manquante
-new_node_idx
-```
-
-**Tests** : `oxidart/src/test_structures.rs` — 60 tests couvrant Hash/Set/ZSet avec
-clés à préfixes communs, isolation inter-clés, WRONGTYPE, double-index ZSet, cycles
-add/delete. Ces tests avaient détecté 7 failures avant le fix, 0 après.
-
-## Benchmarks YCSB réels (Workload A, 1M records, fieldlength=100, 100 threads)
-
-Comparaison fair : RadixOx utilise io_uring standard (SQ_POLL désactivé, pas de kernel
-polling thread). 1 thread vs 1 thread, comparaison iso-ressource.
-
-HiSlab backing store : `mmap` anonyme + `MADV_HUGEPAGE` (THP) + pre-fault 10K nœuds (1.25 MB).
-
-### Load (HMSET, 5M inserts)
-| | Redis | RadixOx |
-|--|--|--|
-| Throughput | 77 227 ops/sec | **128 939 ops/sec** |
-| p99 | 2 447 µs | **878 µs** |
-
-### Run (50% READ / 50% UPDATE, 10M ops)
-| | Redis | RadixOx |
-|--|--|--|
-| Throughput | 201 930 ops/sec | **263 622 ops/sec** |
-| READ avg | 490 µs | **377 µs** |
-| READ p95 | 500 µs | **388 µs** |
-| READ p99 | 964 µs | **446 µs** |
-| READ p99.9 | 986 µs | **485 µs** |
-| READ p99.99 | 1 046 µs | **936 µs** |
-| UPDATE p99 | 964 µs | **456 µs** |
-
-## Refactor RESP server — décisions architecturales (à implémenter)
-
-### Contexte
-
-L'architecture actuelle de `radixox-server/src/bin/resp.rs` a deux problèmes :
-1. La gestion de l'écriture a deux chemins implicites (direct en mode normal, channel Tx en mode subscriber) avec un invariant `write_half.is_some() ↔ sub_tx.is_none()` jamais exprimé.
-2. Le dispatch (`Handler` enum sync + `ASYNC_COMMANDS` séparé + SUBSCRIBE géré hors table) va diverger davantage avec les blocking ops (BLPOP/BRPOP/BZPOPMIN).
-
-### Décision 1 — WriteGate : Semaphore(1) + RefCell<Option<WriteHalf>>
-
-Remplacer le pattern writer-task + channel Tx par un `WriteGate` partagé via `Rc` :
-
-```rust
-struct WriteGate {
-    sem: local_sync::semaphore::Semaphore,   // Semaphore(1) = mutex async
-    half: RefCell<Option<WriteHalf<TcpStream>>>,
-}
-
-type SharedWrite = Rc<WriteGate>;
-
-impl WriteGate {
-    async fn write(&self, buf: Bytes) -> io::Result<()> {
-        let permit = self.sem.acquire(1).await.unwrap();
-        let half = self.half.borrow_mut().take().unwrap(); // take avant await
-        let (res, half) = half.write_all(buf).await;
-        *self.half.borrow_mut() = Some(half);              // remet
-        drop(permit);                                       // release explicite
-        res
-    }
-}
-```
-
-**Pourquoi** : monoio io_uring exige la propriété exclusive du buffer pendant write_all. Le semaphore garantit l'exclusion mutuelle entre la boucle read (réponses normales) et les pushes externes (PUBLISH, wakeup BLPOP). Le `RefCell<Option<>>` évite de tenir le borrow à travers l'await.
-
-**Gain PUBLISH** : avec `SharedWrite` dans le registry, `cmd_publish` devient async et fait `join_all` sur tous les subscribers → tous les SQEs soumis en un seul batch io_uring avant le premier await.
-
-**Ce qui disparaît** : `pubsub_writer` task, `write_half: Option<WriteHalf>` dans `handle_connection`, `sub_tx: Option<Tx>` sur `Conn`, `send_via_tx`.
-
-### Décision 2 — ConnMode : state machine explicite
-
-```rust
-enum ConnMode {
-    Normal,
-
-    Subscribed {
-        channels: HashSet<Bytes>,
-        // SharedWrite est clonée (Rc) dans le registry par channel
-    },
-
-    Blocking {
-        keys: SmallVec<[Bytes; 2]>,
-        rx: local_sync::oneshot::Rx<Frame>,
-        deadline: Option<Instant>,   // None si timeout == 0 (bloque indéfiniment)
-    },
-}
-
-struct Conn {
-    id: ConnId,
-    mode: ConnMode,
-    write: SharedWrite,
-}
-```
-
-**Transitions** :
-```
-Normal ──SUBSCRIBE──────────────→ Subscribed
-Subscribed ──UNSUBSCRIBE(all)───→ Normal
-Normal ──BLPOP(liste vide)──────→ Blocking
-Blocking ──push reçu / timeout──→ Normal
-Blocking ──QUIT─────────────────→ disconnect
-```
-
-**Comportement du loop principal selon l'état** :
-- `Normal` / `Subscribed` : read → parse → dispatch (comportement actuel)
-- `Blocking` : `monoio::select!` sur (oneshot wakeup | timeout | read pour QUIT)
-
-### Décision 3 — Ctx unifié pour le dispatch
-
-Toutes les commandes reçoivent un `Ctx` au lieu d'arguments épars :
-
-```rust
-struct Ctx {
-    art: SharedART,
-    pubsub: SharedRegistry,   // HashMap<Bytes, HashMap<ConnId, SharedWrite>>
-    blockers: SharedBlockers, // HashMap<Bytes, VecDeque<oneshot::Tx<Frame>>>
-    conn_id: ConnId,
-}
-```
-
-Le dispatch devient un seul enum :
-
-```rust
-enum Cmd {
-    Sync(fn(&[Bytes], &mut OxidArt) -> Frame),
-    WithCtx(fn(&[Bytes], &Ctx) -> Frame),           // accès registry/blockers sync
-    Async(fn(&[Bytes], Ctx) -> BoxFuture<Frame>),   // KEYS, UNLINK, PUBLISH, BLPOP...
-}
-```
-
-LPUSH/RPUSH restent sync mais appellent `notify_blockers(&ctx.blockers, key, val)` (sync — juste un `oneshot::Tx::send()`).
-
-### Registries
-
-```rust
-// Pub/Sub : remplace HashMap<ConnId, Tx<Bytes>>
-type SharedRegistry = Rc<RefCell<HashMap<Bytes, HashMap<ConnId, SharedWrite>>>>;
-
-// Blocking ops
-type SharedBlockers = Rc<RefCell<HashMap<Bytes, VecDeque<oneshot::Tx<Frame>>>>>;
-```
-
-### Décision 4 — Stratégie write pour PUBLISH : writer task par connexion
-
-**Problème identifié avec WriteGate + join_all** :
-
-Quand PUBLISH fait `join_all` sur les `WriteGate::write()` de tous les subscribers, si l'un d'eux est occupé (sem acquis par sa boucle read en train de flush), PUBLISH se retrouve bloqué jusqu'à ce que ce subscriber relâche. PUBLISH devient aussi lent que le subscriber le plus lent.
-
-**Option "pending buffer"** analysée et rejetée : ajouter un `pending: RefCell<BytesMut>` dans WriteGate pour que PUBLISH soit sync (enqueue sans bloquer). Défaut fatal : un subscriber qui ne reçoit plus de commandes ne flush jamais son pending → messages accumulés jamais envoyés, sans writer task il n'y a pas de background flusher.
-
-**Conclusion** : dès qu'on veut du push non-bloquant vers un subscriber potentiellement inactif, on a besoin d'un background flusher — c'est exactement la writer task.
-
-**Les deux architectures cohérentes :**
-
-| | Writer task par conn | WriteGate + join_all |
-|---|---|---|
-| PUBLISH | O(1) sync toujours | bloqué si subscriber occupé |
-| Batching io_uring | non | oui |
-| Backpressure | aucune | naturelle mais subie |
-| Subscriber lent | message queued | PUBLISH ralenti |
-
-→ **Choix retenu** : **writer task par connexion** pour la robustesse (subscribers lents n'impactent pas les publishers). Le WriteGate + semaphore reste pertinent pour la boucle read↔blocking-op (BLPOP wakeup), mais pas pour pub/sub.
-
-**Architecture hybride finale** :
-- Boucle read ↔ wakeup BLPOP : `WriteGate` (semaphore)
-- Pub/Sub PUBLISH → subscribers : writer task + channel `Tx<Bytes>` (comme actuellement, mais intégré dans ConnMode)
-
-### Fichiers à modifier
-
-- `radixox-server/src/bin/resp.rs` — refactor complet du conn handling
-- Pas de changement dans `oxidart/` pour ce refactor
-
-## TODO / Future Work
-
-- [ ] List commands: LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN
-- [ ] Blocking list ops: BLPOP, BRPOP (nécessite le refactor ConnMode ci-dessus)
-- [ ] Set ops: SINTER, SUNION, SDIFF
-- [ ] ZSet: ZRANK, ZRANGEBYSCORE, BZPOPMIN, BZPOPMAX
-
-### RESP Commands (not yet implemented)
-- [ ] `APPEND key value` - Append to string
-- [ ] `STRLEN key` - Get string length
-- [ ] `GETRANGE key start end` - Get substring
-- [ ] `RENAME key newkey` - Rename key
-
-### Future Features
-- [ ] Cluster mode
-- [ ] Persistence (RDB/AOF)
-
-## Benchmarks YCSB (résumé — dernière run 2026-02-28, 5M records)
-- **Load RadixOx**: 128 939 ops/sec, p99 878 µs
-- **Load Redis**: 77 227 ops/sec, p99 2 447 µs
-- **Run RadixOx**: 263 622 ops/sec, avg 377 µs, p95 388 µs, p99 446 µs, p99.9 485 µs, p99.99 936 µs
-- **Run Redis**: 201 930 ops/sec, avg 490 µs, p95 500 µs, p99 964 µs, p99.9 986 µs, p99.99 1 046 µs
-
-## HiSlab — mmap + Transparent Huge Pages (implémenté)
-
-Le backing store de HiSlab est passé de `Vec` à `mmap` anonyme avec hint THP :
-
-**Architecture implémentée** (`hislab/src/lib.rs`) :
-```
-MmapMut::map_anon(virtual_capacity * size_of::<T>())   // réservation virtuelle totale
-+ madvise(MADV_HUGEPAGE, ptr, virtual_bytes)            // hint THP pour toute la région
-+ madvise(MADV_POPULATE_WRITE, ptr, initial_bytes)      // pre-fault ~10K nœuds (1.25 MB)
-```
-
-**Pourquoi ça marche** :
-- `MADV_HUGEPAGE` : le kernel (`khugepaged`) promeut les pages actives en 2 MB au fil des
-  accès. Pendant la load phase (1M inserts), les ~64 huge pages couvrant les 128 MB chauds
-  sont promues. À l'entrée de la run phase, le STLB couvre toute la zone → p99.9 propre.
-- Pre-fault minimal (10K nœuds = 1.25 MB) : évite les page faults au démarrage sans coût
-  upfront sur les 128 MB totaux. Pas de pression TLB à l'init.
-- Adresses stables : le `virtual_capacity` est réservé d'un coup, les index u32 ne rebased
-  jamais — même sémantique que l'ancien Vec mais sans realloc/copy.
-
-**Vs MAP_HUGETLB explicite** : THP ne nécessite pas de pool kernel pré-alloué
-(`/proc/sys/vm/nr_hugepages`). Fonctionne sur n'importe quelle machine Linux avec THP
-activé (défaut sur la plupart des distros).
+- Tests en mono-thread obligatoires (`RUST_TEST_THREADS=1` dans `.cargo/config.toml`) :
+  les slabs sont des statics globaux.
+- Benchs et tests lourds : courts (ordre de grandeur), sous
+  `systemd-run --scope -p MemoryMax=…`, profil CPU `performance`. memtier toujours avec
+  `--distinct-client-seed --randomize`. Méthode : RUNTIME_ARCH §12.1.
+- Configuration (`RADIXOX_*`) : tableau dans le README, section *Configuration*.
+
+## Profils cargo
+
+`release` : LTO fat, `codegen-units = 1`, **`panic = "abort"`** (un panic arrête le
+serveur : aucune donnée client ne doit pouvoir en provoquer un), symboles retirés.
+`profiling` : release + symboles (pour `perf`).
