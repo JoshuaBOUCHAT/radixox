@@ -3,10 +3,12 @@ set -euo pipefail
 
 # Usage:
 #   ./bench_compare.sh                    # RadixOx vs Valkey (starts/stops both, as before)
-#   SERVER_CORES=2 ./bench_compare.sh     # K physical cores for each server, the rest for YCSB:
-#                                         #   RadixOx: event loop on the first CPU, sends on io-wq
-#                                         #   workers (one per CPU of the other K-1 cores);
-#                                         #   Valkey: io-threads on the same CPUs.
+#   SERVER_CORES=2 ./bench_compare.sh     # K physical cores for each server, the rest for YCSB.
+#                                         # One thread per physical core, same CPUs for both:
+#                                         #   RadixOx: event loop on core 0, one io-wq worker
+#                                         #   pinned on each of the other K-1 cores;
+#                                         #   Valkey: io-threads=K (main + K-1).
+#                                         # The SMT siblings of the server cores stay idle.
 #   ./bench_compare.sh --running [label]  # bench whatever server is ALREADY running on $PORT
 #                                          # (any Redis-compatible service). Does not start or
 #                                          # kill anything. label defaults to "Service".
@@ -45,25 +47,29 @@ if [ "$SERVER_CORES" -lt 1 ] || [ "$SERVER_CORES" -ge "$NCORES" ]; then
   exit 1
 fi
 join() { local IFS=,; echo "$*"; }
-SERVER_SET=(); IOWQ_SET=(); CLIENT_SET=()
+# Un thread par cœur physique : le premier CPU de chaque cœur serveur ; ses frères SMT
+# ne sont donnés à personne (ni serveur, ni client).
+SERVER_SET=(); IOWQ_SET=(); CLIENT_SET=(); IDLE_SET=()
 for i in "${!CORE_IDS[@]}"; do
   cpus="${CORE_CPUS[${CORE_IDS[$i]}]}"
+  first="${cpus%%,*}"
   if [ "$i" -lt "$SERVER_CORES" ]; then
-    SERVER_SET+=("$cpus")
-    [ "$i" -gt 0 ] && IOWQ_SET+=("$cpus")
+    SERVER_SET+=("$first")
+    [ "$i" -gt 0 ] && IOWQ_SET+=("$first")
+    [ "$cpus" != "$first" ] && IDLE_SET+=("${cpus#*,}")
   else
     CLIENT_SET+=("$cpus")
   fi
 done
 SERVER_CPUS=$(join "${SERVER_SET[@]}")
-MAIN_CPU="${CORE_CPUS[${CORE_IDS[0]}]%%,*}"
+MAIN_CPU="${SERVER_SET[0]}"
 IOWQ_CPUS=$(join "${IOWQ_SET[@]+"${IOWQ_SET[@]}"}")
+IDLE_CPUS=$(join "${IDLE_SET[@]+"${IDLE_SET[@]}"}")
 CLIENT_CPUS=$(join "${CLIENT_SET[@]}")
-IOWQ_WORKERS=0
-[ -n "$IOWQ_CPUS" ] && IOWQ_WORKERS=$(echo "$IOWQ_CPUS" | tr ',' '\n' | wc -l)
-# Valkey : boucle principale + un io-thread par CPU de délégation (mêmes CPU que RadixOx)
-VALKEY_IO_THREADS="${VALKEY_IO_THREADS:-$((1 + IOWQ_WORKERS))}"
-VALKEY_CPUS="$MAIN_CPU${IOWQ_CPUS:+,$IOWQ_CPUS}"
+IOWQ_WORKERS=$((SERVER_CORES - 1))
+# Valkey : thread principal + un io-thread par autre cœur, sur les mêmes CPU que RadixOx.
+VALKEY_IO_THREADS="${VALKEY_IO_THREADS:-$SERVER_CORES}"
+VALKEY_CPUS="$SERVER_CPUS"
 
 # ============================================
 # Helpers
@@ -236,8 +242,10 @@ echo "  YCSB Benchmark: RadixOx vs Valkey"
 echo "  Workload A: 50% read / 50% update"
 echo "  Records: $RECORDS | Ops: $OPS | Threads: $THREADS"
 echo "  Field length: $FIELDLENGTH bytes"
-echo "  Server: $SERVER_CORES core(s), CPUs $SERVER_CPUS (event loop on $MAIN_CPU${IOWQ_CPUS:+, io-wq / io-threads on $IOWQ_CPUS}) | YCSB: CPUs $CLIENT_CPUS"
-echo "  Valkey io-threads: $VALKEY_IO_THREADS (CPUs $VALKEY_CPUS)"
+echo "  Server: $SERVER_CORES physical core(s), one thread each: CPUs $SERVER_CPUS"
+echo "    RadixOx: event loop on $MAIN_CPU${IOWQ_CPUS:+, io-wq send workers on $IOWQ_CPUS}"
+echo "    Valkey:  io-threads=$VALKEY_IO_THREADS on $VALKEY_CPUS"
+echo "  Idle (SMT siblings of server cores): ${IDLE_CPUS:-none} | YCSB: CPUs $CLIENT_CPUS"
 echo "═══════════════════════════════════════════════════"
 echo ""
 echo "[0/4] Building RadixOx (release)..."
