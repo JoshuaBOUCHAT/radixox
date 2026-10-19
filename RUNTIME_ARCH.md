@@ -1090,6 +1090,25 @@ Client à 76 % inactif dans les deux cas. Lecture :
   SCAN) au lieu du DFA de `getn_glob`. Limite globale d'accumulation : avec la boucle
   maison (monoio : 1 Go par connexion seulement).
 
+**Étape 1, ce qui a été fait** (`radixox/src/uring/`) :
+- `Core` reçoit des `Completion` (Accept, Recv, Send) et émet des `Op` (AcceptMulti,
+  Install, Reject, RecvMulti, Send, CancelRecv, CancelSend, Close, ProvideBuf) ;
+  `bufs.rs` (anneau incrémental, refcount par tampon, tampons disponibles), `conn.rs`
+  (`ConnIn` / `ConnOut`, `Item::{Ring, Local, ProtoErr}`, `Mode`), `core.rs` (découpage
+  à l'arrivée par `frame_len`, tirage par tours + barrières, flush anticipé et
+  backpressure, `Closing` / `Draining`, `epoch`, `check_invariants`).
+- `execute_into` partagé avec monoio ; KEYS et UNLINK encore d'une traite, FLUSHDB en
+  fond (`run_jobs`) ; Pub/Sub, SAVE, BGSAVE répondent « not supported yet » (étapes 4–5).
+- `tests.rs` : faux noyau (anneau incrémental, entrelacement, `ENOBUFS`, envois partiels
+  ou bloqués, annulations, EOF) ; 15 tests dont un aléatoire contre un oracle (ordre par
+  connexion, `URING_SEEDS=3000` passe), invariants vérifiés à chaque tour.
+- **Bug trouvé par les tests** : un morceau sans frame complète rend son tampon aussitôt ;
+  si le CQE `ENOBUFS` suivant arrive après, la connexion attendait un retour de tampon
+  qui ne viendrait plus. Correctif : sur `ENOBUFS`, réarmer tout de suite si un tampon
+  est déjà revenu (`BufPool::any_available`).
+- Gardé par sécurité : le champ `sent` (renvoi du reste si un send rend moins que demandé
+  malgré `MSG_WAITALL`).
+
 **Organisation du code :** le code commun aux deux serveurs (dispatch, `execute_sync`,
 encodage, jobs, table des commandes) vit dans la bibliothèque `radixox/src/lib.rs` ; second
 binaire `radixox-uring` (`src/bin/uringloop.rs`) ; les tests d'intégration choisissent leur
@@ -1100,13 +1119,13 @@ binaire (`RADIXOX_TEST_BIN`) pour faire tourner la même suite sur les deux.
 `radixox/src/bin/uringloop.rs` (io-uring 0.7.15), qui remplace `resp.rs` une fois
 stabilisée.
 
-**État (2026-10-19) : étape 0 faite** (commits `29d329b`, `7e5b5fc`, `64fa7a3`) — détail
-plus bas. Prochaine : étape 1.
+**État (2026-10-19) : étapes 0 et 1 faites** — détail plus bas. Prochaine : étape 2
+(`uringloop.rs` sur le vrai io_uring).
 
 | # | Étape | Terminé quand |
 |---|---|---|
 | 0 ✅ | **Sous monoio, sans risque** : sortir dispatch + `execute_sync` dans un module indépendant du runtime ; table des commandes (§2.2) ; découpage à trois issues + limites (§5.3) ; KEYS / UNLINK / FLUSHDB en jobs à curseur qui encodent leur réponse en octets (§8) ; retirer les Waker d'oxidart | tests actuels verts ; monoio ne fait plus qu'appeler `step` + `yield_now` |
-| 1 | **Cœur sans I/O** (§1.2) : files de `FrameRef` + refcount des tampons (§5.4), tirage par tours + barrières (§2.1), `Closing` / `Draining`, `epoch`, `check_invariants` | tests sur faux anneau, scénarios et séquences aléatoires : envoi qui traîne, EOF avec pipeline en cours, `ENOBUFS`, multishot terminé, annulation croisée avec une complétion, frame coupée octet par octet |
+| 1 ✅ | **Cœur sans I/O** (§1.2) : files de `FrameRef` + refcount des tampons (§5.4), tirage par tours + barrières (§2.1), `Closing` / `Draining`, `epoch`, `check_invariants` | tests sur faux anneau, scénarios et séquences aléatoires : envoi qui traîne, EOF avec pipeline en cours, `ENOBUFS`, multishot terminé, annulation croisée avec une complétion, frame coupée octet par octet |
 | 2 | **`uringloop.rs`** : accept classique + `FilesUpdate` (§4.1), recv sur anneau incrémental, send `MSG_WAITALL`, toutes les commandes sync, préchargement à l'intérieur d'une connexion comme aujourd'hui | `test_resp.sh` + intégration verts ; A/B court contre monoio en pipeline 1 / 32 / 256 ; mesurés : nombre et taille des tampons, `ENOBUFS`, adjacence, fixed file utile ou non, `MSG_WAITALL` |
 | 3 | Horloges, timers, `signalfd`, évicteur à curseur, balayage d'inactivité | horloge vivante au repos, arrêt propre avec et sans save |
 | 4 | Parquage + jobs branchés sur `ready`, port de BGSAVE, SAVE = BGSAVE + parquage, save d'arrêt | p99.99 sous BGSAVE en pipeline 32 ≤ monoio |
