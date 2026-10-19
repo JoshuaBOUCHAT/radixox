@@ -517,6 +517,64 @@ fn bgsave_writes_a_consistent_dump() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Pub/Sub : abonnement, publication (compte des abonnés atteints), mode
+/// abonné (seules les commandes Pub/Sub, PING et QUIT), désabonnement total
+/// puis retour au mode normal.
+#[test]
+fn pubsub_flow() {
+    let mut f = Fake::new(Config { max_conn: 8, ..Config::default() });
+    let sub = f.connect();
+    let publ = f.connect();
+    f.send(sub, b"SUBSCRIBE news sport news\r\n");
+    f.settle();
+    assert_eq!(
+        f.take(sub),
+        "*3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n\
+         *3\r\n$9\r\nsubscribe\r\n$5\r\nsport\r\n:2\r\n\
+         *3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:2\r\n"
+    );
+    f.send(publ, b"PUBLISH news hello\r\nPUBLISH nobody x\r\n");
+    f.settle();
+    assert_eq!(f.take(publ), ":1\r\n:0\r\n");
+    assert_eq!(f.take(sub), "*3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$5\r\nhello\r\n");
+    f.send(sub, b"GET k\r\nPING\r\n");
+    f.settle();
+    assert_eq!(
+        f.take(sub),
+        "-ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context\r\n\
+         *2\r\n$4\r\npong\r\n$0\r\n\r\n"
+    );
+    f.send(sub, b"UNSUBSCRIBE\r\nPING\r\nUNSUBSCRIBE\r\n");
+    f.settle();
+    let got = f.take(sub);
+    assert!(got.ends_with(":0\r\n+PONG\r\n*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n"), "{got}");
+    f.send(publ, b"PUBLISH news again\r\n");
+    f.settle();
+    assert_eq!(f.take(publ), ":0\r\n");
+}
+
+/// Abonné qui ne lit plus : au-delà de la limite dure de sortie, il est fermé
+/// et ne compte plus parmi les abonnés.
+#[test]
+fn slow_subscriber_is_closed() {
+    let mut f = Fake::new(Config { max_conn: 8, ..Config::default() });
+    let sub = f.connect();
+    let publ = f.connect();
+    f.send(sub, b"SUBSCRIBE ch\r\n");
+    f.settle();
+    f.take(sub);
+    f.peers.get_mut(&sub).unwrap().stalled = true;
+    let big = "x".repeat(1 << 20);
+    for _ in 0..40 {
+        // En RESP : une commande inline est limitée à 64 Ko.
+        f.send(publ, format!("*3\r\n$7\r\nPUBLISH\r\n$2\r\nch\r\n${}\r\n{big}\r\n", big.len()).as_bytes());
+        f.settle();
+    }
+    assert!(f.closed_with(sub).is_some(), "abonné lent fermé");
+    let got = f.take(publ);
+    assert!(got.ends_with(":0\r\n"), "plus d'abonné à la fin");
+}
+
 /// Balayage d'inactivité : une connexion muette au-delà du délai est fermée,
 /// une connexion active reste ouverte (horloge pilotée par le test).
 #[test]

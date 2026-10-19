@@ -5,6 +5,8 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
+use radixox_lib::shared_byte::SharedByte;
+
 use crate::exec::client::Client;
 
 use super::bufs::Bid;
@@ -85,6 +87,10 @@ pub struct ConnOut {
     /// Connexion parquée (§7) : un job travaille pour elle ; elle n'est plus
     /// tirée, ce qu'elle reçoit attend dans `rx`, elle reprend à la réponse.
     pub job_pending: bool,
+    /// Canaux abonnés (Pub/Sub) ; non vide = mode abonné.
+    pub channels: Vec<SharedByte>,
+    /// Depuis quand `out` dépasse la limite souple des abonnés.
+    pub over_soft: Option<Instant>,
 }
 
 impl ConnOut {
@@ -106,6 +112,8 @@ impl ConnOut {
             stop_turn: u64::MAX,
             last_active: Instant::now(),
             job_pending: false,
+            channels: Vec::new(),
+            over_soft: None,
         }
     }
 

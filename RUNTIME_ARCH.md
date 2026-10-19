@@ -1187,6 +1187,18 @@ données reçues reviennent en cache juste avant leur parse.
   passe sur les deux binaires.
 - Pas encore mesuré : p99.99 sous BGSAVE en pipeline 32 (critère de l'étape).
 
+**Étape 5, ce qui a été fait :**
+- Registre canal → (slot, époque) dans le cœur ; PUBLISH encode le message une fois et
+  l'ajoute à l'`out` de chaque abonné (compte rendu = abonnés atteints) ; plus de writer
+  task ni de channel.
+- Limites de sortie des abonnés : 32 Mo dur, 8 Mo pendant 60 s → fermeture (règle le
+  TODO OOM sur abonné lent). Désabonnement immédiat à la fermeture.
+- Comportement de Redis plutôt que de monoio : SUBSCRIBE en double non recompté,
+  UNSUBSCRIBE sans abonnement → `[unsubscribe, nil, 0]`, PING en mode abonné →
+  `[pong, msg]`. PUBLISH ferme la fenêtre de sa connexion (réponse dans l'ordre).
+- Tests : flux complet et abonné lent sur le faux noyau ; `tests/pubsub.rs` (comportement
+  commun) passe sur les deux binaires.
+
 **Organisation du code :** le code commun aux deux serveurs (dispatch, `execute_sync`,
 encodage, jobs, table des commandes) vit dans la bibliothèque `radixox/src/lib.rs` ; second
 binaire `radixox-uring` (`src/bin/uringloop.rs`) ; les tests d'intégration choisissent leur
@@ -1197,8 +1209,9 @@ binaire (`RADIXOX_TEST_BIN`) pour faire tourner la même suite sur les deux.
 `radixox/src/bin/uringloop.rs` (io-uring 0.7.15), qui remplace `resp.rs` une fois
 stabilisée.
 
-**État (2026-10-19) : étapes 0 à 4 faites** — détail plus bas, mesures §12.4.
-Prochaine : étape 5 (Pub/Sub avec limite d'`out`).
+**État (2026-10-19) : étapes 0 à 5 faites** — détail plus bas, mesures §12.4.
+Prochaine : étape 6 (critères de bascule, puis suppression de monoio — décision de
+l'utilisateur).
 
 | # | Étape | Terminé quand |
 |---|---|---|
@@ -1207,7 +1220,7 @@ Prochaine : étape 5 (Pub/Sub avec limite d'`out`).
 | 2 ✅ | **`uringloop.rs`** : accept classique + `FilesUpdate` (§4.1), recv sur anneau incrémental, send `MSG_WAITALL`, toutes les commandes sync, préchargement à l'intérieur d'une connexion comme aujourd'hui | `test_resp.sh` + intégration verts ; A/B court contre monoio en pipeline 1 / 32 / 256 ; mesurés : nombre et taille des tampons, `ENOBUFS`, adjacence, fixed file utile ou non, `MSG_WAITALL` |
 | 3 ✅ | Horloges, timers, `signalfd`, ~~évicteur à curseur~~ (reporté), balayage d'inactivité | horloge vivante au repos, arrêt propre avec et sans save |
 | 4 ✅ | Parquage + jobs branchés sur `ready`, port de BGSAVE, ~~SAVE = BGSAVE + parquage~~ (SAVE reste bloquante, §8.1 plus tard), save d'arrêt | p99.99 sous BGSAVE en pipeline 32 ≤ monoio |
-| 5 | Pub/Sub avec limite d'`out` | abonné lent → `Draining`, pas d'OOM |
+| 5 ✅ | Pub/Sub avec limite d'`out` | abonné lent → `Draining`, pas d'OOM |
 | 6 | Bascule par défaut, suppression de monoio (`oxidart/monoio.rs`, `async_command.rs`, `#[monoio::test]`, `resp.rs`, `utils/mod.rs`) | critères de bascule (§15) atteints |
 | 7+ | Une optimisation à la fois, chacune mesurée : préchargement entre connexions + idx + époque (§17), GET par référence, `IOSQE_ASYNC` off/on puis auto (§6.4), jamais bloquant (§8.1), cas 3 du parseur, saves auto + AOF, pool enregistré + `SEND_ZC`, allocateur bump, GC, listes puis BLPOP | |
 

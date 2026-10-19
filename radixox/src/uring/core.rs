@@ -13,12 +13,13 @@
 //! 5. [`Core::take_ops`] → SQE, puis `enter`.
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 use std::time::{Duration, Instant};
 
 use oxidart::OxidArt;
 use smallvec::SmallVec;
 use radixox_lib::cmd::{Cmd, FrameLen, Parse, frame_len};
+use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::shared_frame::{SharedFrame as Frame, extend_encode};
 
 use crate::exec::client::Client;
@@ -150,6 +151,34 @@ enum After {
     /// BGSAVE / SAVE : dépendent de l'état du serveur (save en cours).
     BgSave,
     Save,
+    /// Pub/Sub : touchent le registre et l'`out` d'autres connexions (§10).
+    Subscribe(SmallVec<[SharedByte; 4]>),
+    Unsubscribe(SmallVec<[SharedByte; 4]>),
+    Publish { channel: SharedByte, message: SharedByte },
+}
+
+/// Limites de sortie des abonnés Pub/Sub (`client-output-buffer-limit pubsub`
+/// de Redis) : au-delà de la limite dure, ou de la souple pendant 60 s, la
+/// connexion est fermée (§10).
+const PUBSUB_HARD: usize = 32 << 20;
+const PUBSUB_SOFT: usize = 8 << 20;
+const PUBSUB_SOFT_FOR: Duration = Duration::from_secs(60);
+
+fn bulk(out: &mut Vec<u8>, b: &[u8]) {
+    radixox_lib::shared_frame::encode_bulk(out, b);
+}
+
+/// `[kind, channel, count]` (réponses de SUBSCRIBE / UNSUBSCRIBE).
+fn encode_sub_reply(out: &mut Vec<u8>, kind: &[u8], channel: Option<&[u8]>, count: usize) {
+    radixox_lib::shared_frame::encode_array_len(out, 3);
+    bulk(out, kind);
+    match channel {
+        Some(ch) => bulk(out, ch),
+        None => out.extend_from_slice(b"$-1\r\n"),
+    }
+    out.push(b':');
+    out.extend_from_slice(count.to_string().as_bytes());
+    out.extend_from_slice(b"\r\n");
 }
 
 /// Job qui répond à une connexion parquée (RUNTIME_ARCH.md §7, §8).
@@ -177,7 +206,8 @@ impl ConnJob {
 /// Après cette commande, plus rien de sa connexion dans la fenêtre : barrière
 /// (§2.1) ou commande qui peut parquer la connexion.
 fn stops_window(cmd: &Cmd<'_>) -> bool {
-    cmd.is_barrier() || matches!(cmd, Cmd::Keys(_) | Cmd::Unlink(_) | Cmd::BgSave | Cmd::Save)
+    cmd.is_barrier()
+        || matches!(cmd, Cmd::Keys(_) | Cmd::Unlink(_) | Cmd::BgSave | Cmd::Save | Cmd::Publish { .. })
 }
 
 pub struct Core {
@@ -205,6 +235,8 @@ pub struct Core {
     timers: BinaryHeap<Reverse<(Instant, Timer)>>,
     sweep_pos: usize,
     bgsave: Option<BgSave>,
+    /// Pub/Sub : canal → abonnés (slot, époque de l'abonnement).
+    subs: HashMap<SharedByte, Vec<(Slot, u32)>>,
     /// Part du thread accordée au BGSAVE sous charge.
     save_share: f64,
     /// Dernière réception, toutes connexions : sans réception depuis 1 ms, le
@@ -241,6 +273,7 @@ impl Core {
             timers,
             sweep_pos: 0,
             bgsave: None,
+            subs: HashMap::new(),
             save_share: cpu_share(),
             last_rx: now,
             cfg,
@@ -460,6 +493,8 @@ impl Core {
         o.client = Client::new();
         o.last_active = self.now;
         o.job_pending = false;
+        o.channels.clear();
+        o.over_soft = None;
         o.dirty = false;
         o.ready = false;
         o.stop_turn = u64::MAX;
@@ -885,9 +920,7 @@ impl Core {
                     match BgSave::start(&mut self.art, zstd_conf()) {
                         Ok(bg) => {
                             self.bgsave = Some(bg);
-                            Frame::SimpleString(radixox_lib::shared_byte::SharedByte::from_slice(
-                                b"Background saving started",
-                            ))
+                            Frame::SimpleString(SharedByte::from_slice(b"Background saving started"))
                         }
                         Err(e) => Frame::Error(format!("ERR {e}")),
                     }
@@ -914,6 +947,12 @@ impl Core {
                 };
                 extend_encode(&mut self.outs[s].out, &frame);
             }
+            After::Subscribe(channels) => self.subscribe(slot, &channels),
+            After::Unsubscribe(channels) => self.unsubscribe(slot, &channels),
+            After::Publish { channel, message } => {
+                let n = self.publish(&channel, &message);
+                extend_encode(&mut self.outs[s].out, &Frame::Integer(n as i64));
+            }
         }
         let o = &mut self.outs[s];
         if !o.out.is_empty() {
@@ -924,6 +963,100 @@ impl Core {
                 self.dirty.push(slot);
             }
         }
+    }
+
+    // ── Pub/Sub (§10) ────────────────────────────────────────────────────
+
+    fn subscribe(&mut self, slot: Slot, channels: &[SharedByte]) {
+        let s = slot as usize;
+        let epoch = self.outs[s].epoch;
+        for ch in channels {
+            let o = &mut self.outs[s];
+            // Déjà abonné : pas compté deux fois (comme Redis).
+            if !o.channels.contains(ch) {
+                o.channels.push(ch.clone());
+                self.subs.entry(ch.clone()).or_default().push((slot, epoch));
+            }
+            let o = &mut self.outs[s];
+            encode_sub_reply(&mut o.out, b"subscribe", Some(ch), o.channels.len());
+        }
+    }
+
+    /// Sans argument : tous les canaux. Plus aucun canal : mode normal.
+    fn unsubscribe(&mut self, slot: Slot, channels: &[SharedByte]) {
+        let s = slot as usize;
+        let targets: Vec<SharedByte> =
+            if channels.is_empty() { self.outs[s].channels.clone() } else { channels.to_vec() };
+        if targets.is_empty() {
+            encode_sub_reply(&mut self.outs[s].out, b"unsubscribe", None, 0);
+            return;
+        }
+        for ch in &targets {
+            let o = &mut self.outs[s];
+            if let Some(pos) = o.channels.iter().position(|c| c == ch) {
+                o.channels.swap_remove(pos);
+                self.remove_sub(ch, slot);
+            }
+            let o = &mut self.outs[s];
+            encode_sub_reply(&mut o.out, b"unsubscribe", Some(ch), o.channels.len());
+        }
+    }
+
+    fn remove_sub(&mut self, ch: &SharedByte, slot: Slot) {
+        if let Some(list) = self.subs.get_mut(ch) {
+            list.retain(|&(sl, _)| sl != slot);
+            if list.is_empty() {
+                self.subs.remove(ch);
+            }
+        }
+    }
+
+    /// Retire la connexion de tous ses canaux (fermeture).
+    fn unsubscribe_all(&mut self, slot: Slot) {
+        for ch in std::mem::take(&mut self.outs[slot as usize].channels) {
+            self.remove_sub(&ch, slot);
+        }
+    }
+
+    /// Encode le message une fois, l'ajoute à l'`out` de chaque abonné ; rend
+    /// le nombre d'abonnés atteints. Abonné au-delà de ses limites de sortie :
+    /// fermé.
+    fn publish(&mut self, channel: &SharedByte, message: &SharedByte) -> usize {
+        let Some(list) = self.subs.get(channel) else { return 0 };
+        let mut msg = Vec::with_capacity(32 + channel.len() + message.len());
+        radixox_lib::shared_frame::encode_array_len(&mut msg, 3);
+        bulk(&mut msg, b"message");
+        bulk(&mut msg, channel);
+        bulk(&mut msg, message);
+        let mut sent = 0;
+        let mut over: Window<Slot> = SmallVec::new();
+        for &(slot, epoch) in list {
+            let o = &mut self.outs[slot as usize];
+            if o.epoch != epoch || !matches!(o.mode, Mode::Normal | Mode::Closing) {
+                continue;
+            }
+            o.out.extend_from_slice(&msg);
+            sent += 1;
+            if o.out.len() > PUBSUB_HARD {
+                over.push(slot);
+            } else if o.out.len() > PUBSUB_SOFT {
+                let since = *o.over_soft.get_or_insert(self.now);
+                if self.now.saturating_duration_since(since) > PUBSUB_SOFT_FOR {
+                    over.push(slot);
+                }
+            } else {
+                o.over_soft = None;
+            }
+            if !o.dirty {
+                o.dirty = true;
+                self.dirty.push(slot);
+            }
+        }
+        for slot in over {
+            eprintln!("[pubsub] abonné {slot} trop lent : limite de sortie dépassée, connexion fermée");
+            self.drain(slot);
+        }
+        sent
     }
 
     /// Parque la connexion : son job répondra. Ses morceaux en attente sont
@@ -1037,6 +1170,7 @@ impl Core {
         let s = slot as usize;
         if self.outs[s].mode == Mode::Normal {
             self.outs[s].mode = Mode::Closing;
+            self.unsubscribe_all(slot);
             self.ins[s].broken = true;
             self.cancel_recv(slot);
             self.closing.push(slot);
@@ -1053,6 +1187,7 @@ impl Core {
             return;
         }
         self.outs[s].mode = Mode::Draining;
+        self.unsubscribe_all(slot);
         self.release_queue(slot);
         self.ins[s] = ConnIn { broken: true, ..ConnIn::default() };
         self.outs[s].out.clear();
@@ -1121,6 +1256,12 @@ impl Core {
                 ring_items[span.bid as usize] += 1;
             }
             assert!(i.rx_ready <= i.rx.len());
+            for ch in &o.channels {
+                assert!(
+                    self.subs.get(ch).is_some_and(|l| l.contains(&(s as Slot, o.epoch))),
+                    "slot {s} abonné hors registre"
+                );
+            }
             if o.job_pending {
                 assert!(i.spans.is_empty(), "slot {s} parqué : l'anneau ne doit pas être retenu");
                 assert!(
@@ -1141,6 +1282,26 @@ impl Core {
 
 /// Exécute une commande d'une connexion.
 fn run_cmd(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) -> After {
+    // Mode abonné : seules les commandes Pub/Sub, PING et QUIT passent.
+    if !o.channels.is_empty() && o.client.authed {
+        match cmd {
+            Cmd::Ping(msg) => {
+                // RESP2 en mode abonné : [pong, message], comme Redis.
+                radixox_lib::shared_frame::encode_array_len(&mut o.out, 2);
+                bulk(&mut o.out, b"pong");
+                bulk(&mut o.out, msg.unwrap_or(b""));
+                return After::Continue;
+            }
+            ref c if !c.allowed_in_pubsub() => {
+                extend_encode(
+                    &mut o.out,
+                    &Frame::Error("ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context".into()),
+                );
+                return After::Continue;
+            }
+            _ => {}
+        }
+    }
     let barrier = cmd.is_barrier();
     match execute_into(cmd, art, &mut o.client, &mut o.out) {
         Executed::Done if barrier => After::Barrier,
@@ -1183,10 +1344,9 @@ fn runtime(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) 
         // Dépendent d'une save en cours : traitées par le cœur (`finish_frame`).
         Cmd::BgSave => After::BgSave,
         Cmd::Save => After::Save,
-        Cmd::Subscribe(_) | Cmd::Unsubscribe(_) | Cmd::Publish { .. } => {
-            extend_encode(&mut o.out, &Frame::Error("ERR not supported yet by radixox-uring".into()));
-            After::Continue
-        }
+        Cmd::Subscribe(ch) => After::Subscribe(ch.into_iter().collect()),
+        Cmd::Unsubscribe(ch) => After::Unsubscribe(ch.into_iter().collect()),
+        Cmd::Publish { channel, message } => After::Publish { channel, message },
         _ => unreachable!("commande sans dépendance au runtime"),
     }
 }
