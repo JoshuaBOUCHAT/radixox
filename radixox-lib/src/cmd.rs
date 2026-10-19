@@ -606,6 +606,13 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
             }
         };
     }
+    macro_rules! at_most {
+        ($k:expr) => {
+            if n > $k {
+                return Err(CmdError::Arity);
+            }
+        };
+    }
     macro_rules! between {
         ($a:expr, $b:expr) => {
             if n < $a || n > $b {
@@ -746,7 +753,7 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
         b"publish" => { exact!(2); Cmd::Publish { channel: sb(args[0]), message: sb(args[1]) } }
 
         // ── Connexion / serveur ──────────────────────────────────────────
-        b"ping" => { between!(0, 1); Cmd::Ping(args.first().copied()) }
+        b"ping" => { at_most!(1); Cmd::Ping(args.first().copied()) }
         b"echo" => { exact!(1); Cmd::Echo(args[0]) }
         b"quit" => Cmd::Quit,
         b"auth" => match *args {
@@ -761,7 +768,7 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
         b"info" => Cmd::Info,
         b"dbsize" => { exact!(0); Cmd::DbSize }
         b"flushdb" => {
-            between!(0, 1);
+            at_most!(1);
             match args.first() {
                 Some(m) if !m.eq_ignore_ascii_case(b"async") && !m.eq_ignore_ascii_case(b"sync") => {
                     return Err(CmdError::Syntax);
@@ -769,7 +776,7 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
                 _ => Cmd::FlushDb,
             }
         }
-        b"bgsave" => { between!(0, 1); Cmd::BgSave }
+        b"bgsave" => { at_most!(1); Cmd::BgSave }
         b"save" => { exact!(0); Cmd::Save }
 
         _ => return Err(CmdError::Unknown),

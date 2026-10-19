@@ -5,10 +5,10 @@
 
 use std::sync::OnceLock;
 
-use crate::Frame;
+use radixox_lib::shared_frame::SharedFrame as Frame;
 
 /// Mot de passe configuré ; `None` (variable absente ou vide) : pas d'AUTH.
-pub(crate) fn password() -> Option<&'static [u8]> {
+pub fn password() -> Option<&'static [u8]> {
     static PASS: OnceLock<Option<Vec<u8>>> = OnceLock::new();
     PASS.get_or_init(|| {
         std::env::var_os("RADIXOX_PASSWORD")
@@ -18,13 +18,13 @@ pub(crate) fn password() -> Option<&'static [u8]> {
     .as_deref()
 }
 
-pub(crate) fn noauth() -> Frame {
+pub fn noauth() -> Frame {
     Frame::Error("NOAUTH Authentication required.".into())
 }
 
 /// AUTH [user] pass. Un échec ne retire pas une authentification déjà
 /// acquise (comme Redis).
-pub(crate) fn cmd_auth(user: Option<&[u8]>, pass: &[u8], authed: &mut bool) -> Frame {
+pub fn cmd_auth(user: Option<&[u8]>, pass: &[u8], authed: &mut bool) -> Frame {
     let Some(expected) = password() else {
         return Frame::Error(
             "ERR AUTH <password> called without any password configured for the default user. \

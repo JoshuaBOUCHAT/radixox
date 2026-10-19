@@ -1,11 +1,11 @@
 use std::time::Duration;
 
-use crate::Frame;
+use radixox_lib::shared_frame::SharedFrame as Frame;
 use oxidart::{OxidArt, PREFETCH_BATCH, TtlResult, counter::CounterError, value::Value};
 use radixox_lib::cmd::{SetCondition, SetOpts};
 use radixox_lib::shared_byte::SharedByte;
 
-pub(crate) fn cmd_get(art: &mut OxidArt, key: &[u8]) -> Frame {
+pub fn cmd_get(art: &mut OxidArt, key: &[u8]) -> Frame {
     match art.get(key) {
         Some(val) => match val.as_bytes() {
             Some(b) => Frame::BulkString(b),
@@ -17,7 +17,7 @@ pub(crate) fn cmd_get(art: &mut OxidArt, key: &[u8]) -> Frame {
     }
 }
 
-pub(crate) fn cmd_set(art: &mut OxidArt, key: &[u8], val: SharedByte, opts: SetOpts) -> Frame {
+pub fn cmd_set(art: &mut OxidArt, key: &[u8], val: SharedByte, opts: SetOpts) -> Frame {
     let value = Value::String(val);
 
     let if_exists = match opts.condition {
@@ -33,7 +33,7 @@ pub(crate) fn cmd_set(art: &mut OxidArt, key: &[u8], val: SharedByte, opts: SetO
     Frame::SimpleString(SharedByte::from_slice(b"OK"))
 }
 
-pub(crate) fn cmd_setnx(art: &mut OxidArt, key: &[u8], val: SharedByte) -> Frame {
+pub fn cmd_setnx(art: &mut OxidArt, key: &[u8], val: SharedByte) -> Frame {
     Frame::Integer(art.set_cond(key, None, Value::String(val), Some(false)) as i64)
 }
 
@@ -46,35 +46,35 @@ fn counter_err(e: CounterError) -> Frame {
     }
 }
 
-pub(crate) fn cmd_incr(art: &mut OxidArt, key: &[u8]) -> Frame {
+pub fn cmd_incr(art: &mut OxidArt, key: &[u8]) -> Frame {
     match art.incr(SharedByte::from_slice(key)) {
         Ok(val) => Frame::Integer(val),
         Err(e) => counter_err(e),
     }
 }
 
-pub(crate) fn cmd_decr(art: &mut OxidArt, key: &[u8]) -> Frame {
+pub fn cmd_decr(art: &mut OxidArt, key: &[u8]) -> Frame {
     match art.decr(SharedByte::from_slice(key)) {
         Ok(val) => Frame::Integer(val),
         Err(e) => counter_err(e),
     }
 }
 
-pub(crate) fn cmd_incrby(art: &mut OxidArt, key: &[u8], delta: i64) -> Frame {
+pub fn cmd_incrby(art: &mut OxidArt, key: &[u8], delta: i64) -> Frame {
     match art.incrby(SharedByte::from_slice(key), delta) {
         Ok(val) => Frame::Integer(val),
         Err(e) => counter_err(e),
     }
 }
 
-pub(crate) fn cmd_decrby(art: &mut OxidArt, key: &[u8], delta: i64) -> Frame {
+pub fn cmd_decrby(art: &mut OxidArt, key: &[u8], delta: i64) -> Frame {
     match art.decrby(SharedByte::from_slice(key), delta) {
         Ok(val) => Frame::Integer(val),
         Err(e) => counter_err(e),
     }
 }
 
-pub(crate) fn cmd_del(art: &mut OxidArt, keys: &[&[u8]]) -> Frame {
+pub fn cmd_del(art: &mut OxidArt, keys: &[&[u8]]) -> Frame {
     let mut count = 0i64;
     // descentes préchargées ensemble, puis suppressions dans un cache chaud
     for chunk in keys.chunks(PREFETCH_BATCH) {
@@ -88,7 +88,7 @@ pub(crate) fn cmd_del(art: &mut OxidArt, keys: &[&[u8]]) -> Frame {
     Frame::Integer(count)
 }
 
-pub(crate) fn cmd_ttl(art: &mut OxidArt, key: &[u8]) -> Frame {
+pub fn cmd_ttl(art: &mut OxidArt, key: &[u8]) -> Frame {
     match art.get_ttl(SharedByte::from_slice(key)) {
         TtlResult::KeyNotExist => Frame::Integer(-2),
         TtlResult::KeyWithoutTtl => Frame::Integer(-1),
@@ -96,7 +96,7 @@ pub(crate) fn cmd_ttl(art: &mut OxidArt, key: &[u8]) -> Frame {
     }
 }
 
-pub(crate) fn cmd_pttl(art: &mut OxidArt, key: &[u8]) -> Frame {
+pub fn cmd_pttl(art: &mut OxidArt, key: &[u8]) -> Frame {
     match art.get_ttl(SharedByte::from_slice(key)) {
         TtlResult::KeyNotExist => Frame::Integer(-2),
         TtlResult::KeyWithoutTtl => Frame::Integer(-1),
@@ -104,15 +104,15 @@ pub(crate) fn cmd_pttl(art: &mut OxidArt, key: &[u8]) -> Frame {
     }
 }
 
-pub(crate) fn cmd_expire(art: &mut OxidArt, key: &[u8], dur: Duration) -> Frame {
+pub fn cmd_expire(art: &mut OxidArt, key: &[u8], dur: Duration) -> Frame {
     if art.expire(SharedByte::from_slice(key), dur) { Frame::Integer(1) } else { Frame::Integer(0) }
 }
 
-pub(crate) fn cmd_persist(art: &mut OxidArt, key: &[u8]) -> Frame {
+pub fn cmd_persist(art: &mut OxidArt, key: &[u8]) -> Frame {
     if art.persist(SharedByte::from_slice(key)) { Frame::Integer(1) } else { Frame::Integer(0) }
 }
 
-pub(crate) fn cmd_exists(art: &mut OxidArt, keys: &[&[u8]]) -> Frame {
+pub fn cmd_exists(art: &mut OxidArt, keys: &[&[u8]]) -> Frame {
     let mut expired = Vec::new();
     let n = art.exists_count(keys, &mut expired);
     if !expired.is_empty() {
@@ -121,7 +121,7 @@ pub(crate) fn cmd_exists(art: &mut OxidArt, keys: &[&[u8]]) -> Frame {
     Frame::Integer(n as i64)
 }
 
-pub(crate) fn cmd_mset(art: &mut OxidArt, pairs: &[(&[u8], SharedByte)]) -> Frame {
+pub fn cmd_mset(art: &mut OxidArt, pairs: &[(&[u8], SharedByte)]) -> Frame {
     let mut keys: [&[u8]; PREFETCH_BATCH] = [&[]; PREFETCH_BATCH];
     for chunk in pairs.chunks(PREFETCH_BATCH) {
         for (slot, (k, _)) in keys.iter_mut().zip(chunk) {
@@ -135,7 +135,7 @@ pub(crate) fn cmd_mset(art: &mut OxidArt, pairs: &[(&[u8], SharedByte)]) -> Fram
     Frame::SimpleString(SharedByte::from_slice(b"OK"))
 }
 
-pub(crate) fn cmd_type(art: &mut OxidArt, key: &[u8]) -> Frame {
+pub fn cmd_type(art: &mut OxidArt, key: &[u8]) -> Frame {
     match art.get(key) {
         Some(val) => {
             Frame::SimpleString(SharedByte::from_slice(val.redis_type().as_str().as_bytes()))
@@ -144,12 +144,12 @@ pub(crate) fn cmd_type(art: &mut OxidArt, key: &[u8]) -> Frame {
     }
 }
 
-pub(crate) fn cmd_dbsize(art: &mut OxidArt) -> Frame {
+pub fn cmd_dbsize(art: &mut OxidArt) -> Frame {
     let count = art.len() as i64;
     Frame::Integer(count)
 }
 
-pub(crate) fn cmd_flushdb(art: &mut OxidArt) -> Frame {
+pub fn cmd_flushdb(art: &mut OxidArt) -> Frame {
     art.deln(b"");
     Frame::SimpleString(SharedByte::from_slice(b"OK"))
 }

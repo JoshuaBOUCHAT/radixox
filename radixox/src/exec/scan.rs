@@ -30,7 +30,7 @@ use oxidart::krange::ScanPage;
 use oxidart::regex::{GlobKind, glob_kind, glob_literal_prefix, glob_match};
 use oxidart::value::RedisType;
 
-use crate::Frame;
+use radixox_lib::shared_frame::SharedFrame as Frame;
 
 const NIL: u32 = u32::MAX;
 const DEFAULT_IDLE_SECS: u64 = 60;
@@ -82,7 +82,7 @@ thread_local! {
 }
 
 /// Nombre de curseurs actifs (pour INFO).
-pub(crate) fn active_cursors() -> usize {
+pub fn active_cursors() -> usize {
     CURSORS.with(|c| c.borrow().active)
 }
 
@@ -281,7 +281,7 @@ fn env_or<T: std::str::FromStr + std::fmt::Display + Copy>(
 
 /// Une page de SCAN : (curseur suivant, 0 = terminé ; clés), ou l'erreur à
 /// renvoyer.
-pub(crate) fn cmd_scan(
+pub fn cmd_scan(
     art: &OxidArt,
     client_id: u64,
     cursor: &[u8],

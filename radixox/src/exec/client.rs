@@ -6,19 +6,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use radixox_lib::shared_byte::SharedByte;
 
-use crate::Frame;
-use crate::resp_cmd::auth;
+use radixox_lib::shared_frame::SharedFrame as Frame;
+use super::auth;
 
 /// État d'une connexion.
-pub(crate) struct Client {
-    pub(crate) authed: bool,
+pub struct Client {
+    pub authed: bool,
     /// CLIENT ID : unique sur la vie du processus, croissant.
-    pub(crate) id: u64,
-    pub(crate) name: Option<SharedByte>,
+    pub id: u64,
+    pub name: Option<SharedByte>,
 }
 
 impl Client {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         Self {
             authed: auth::password().is_none(),
@@ -46,7 +46,7 @@ const BAD_NAME: &str = "ERR Client names cannot contain spaces, newlines or spec
 /// HELLO [protover [AUTH user pass] [SETNAME name]], dans l'ordre de Redis :
 /// version d'abord (rien n'est appliqué si elle est refusée), puis AUTH,
 /// puis exigence d'authentification, puis SETNAME.
-pub(crate) fn cmd_hello(args: &[&[u8]], client: &mut Client) -> Frame {
+pub fn cmd_hello(args: &[&[u8]], client: &mut Client) -> Frame {
     if let Some(v) = args.first() {
         match std::str::from_utf8(v).ok().and_then(|s| s.parse::<i64>().ok()) {
             Some(2) => {}
@@ -107,7 +107,7 @@ pub(crate) fn cmd_hello(args: &[&[u8]], client: &mut Client) -> Frame {
 }
 
 /// CLIENT SETNAME | GETNAME | ID | SETINFO | NO-EVICT | NO-TOUCH.
-pub(crate) fn cmd_client(args: &[&[u8]], client: &mut Client) -> Frame {
+pub fn cmd_client(args: &[&[u8]], client: &mut Client) -> Frame {
     let Some((sub, rest)) = args.split_first() else {
         return Frame::Error("ERR wrong number of arguments for 'client' command".into());
     };
@@ -160,7 +160,7 @@ pub(crate) fn cmd_client(args: &[&[u8]], client: &mut Client) -> Frame {
 
 /// COMMAND [...] : pas de table de commandes publiée. redis-cli demande
 /// `COMMAND DOCS` au démarrage pour ses indications et accepte une liste vide.
-pub(crate) fn cmd_command(args: &[&[u8]]) -> Frame {
+pub fn cmd_command(args: &[&[u8]]) -> Frame {
     match args.first() {
         Some(sub) if sub.eq_ignore_ascii_case(b"count") => Frame::Integer(0),
         _ => Frame::Array(Vec::new()),
