@@ -372,9 +372,11 @@ struct ConnOut {                      // mutable pendant le lot
   le noyau consomme un tampon **par morceaux**. Le CQE porte l'id du tampon
   (`cqueue::buffer_select`), et `cqueue::buffer_more` dit si le noyau continuera d'y
   écrire.
-- **Quelques gros tampons** plutôt que beaucoup de petits : **4 × 2 Mo** (une huge page
-  chacun, cohérent avec le THP de HiSlab), réglables. Soit **8 Mo pour tout le serveur**,
-  contre 3 × 512 Ko réservés par connexion avec monoio.
+- ~~Quelques gros tampons (4 × 2 Mo)~~ **démenti par la mesure (2026-10-19)** : défaut
+  **64 × 32 Ko = 2 Mo** (`RADIXOX_RING_BUFS`, `RADIXOX_RING_BUF_KB`). Un gros tampon reste
+  retenu longtemps par une seule connexion (l'anneau s'épuise : `ENOBUFS`, réarmements),
+  et les données arrivent dans une zone trop vaste pour rester en cache. Petits tampons :
+  rendus vite, réutilisés encore chauds. Mesures : §12.4.
 - Les morceaux de **connexions différentes s'entrelacent** dans un même tampon : c'est
   toujours le tampon en tête du groupe qui sert, quel que soit le socket. Interprétation
   du mécanisme, à confirmer par un test dans le prototype. On ne compte donc pas sur la
@@ -473,6 +475,18 @@ Entiers d'en-tête lus avec `checked_mul` / `checked_add` : corrigé le 2026-10-
 découpage (crash à distance avant AUTH).
 
 ### 5.4 Files de frames et refcount des tampons (2026-10-19)
+
+> **Révisé le 2026-10-19 (implémentation de l'étape 2).** La file ne contient plus des
+> frames découpées à l'arrivée mais des **spans** : les morceaux reçus tels quels (`bid,
+> off, len`, un refcount par morceau ; deux morceaux contigus de la même connexion dans
+> le même tampon fusionnent). Le parse a lieu **au lot, fenêtre par fenêtre** : K frames
+> parsées (une seule passe, `Cmd::parse` donne la longueur), préchargées, exécutées. C'était
+> l'intention (« parser K puis exécuter K ») : découper tout le tour à l'arrivée relisait
+> chaque frame froide plus tard (+500 instructions et +14 défauts L1 par commande,
+> mesuré). Une frame coupée entre deux morceaux est complétée dans `rx` au moment de
+> l'exécuter (par pièces de 4 Ko, l'excédent rendu au morceau) ; un reliquat en fin de
+> dernier morceau est recopié dans `rx` pour rendre le tampon. Le texte ci-dessous décrit
+> la première version (`FrameRef` par frame) ; ses règles de rétention restent valables.
 
 Le handler du recv découpe ; il n'exécute pas. Chaque frame complète devient une
 `FrameRef` dans la file de sa connexion :
@@ -1055,6 +1069,35 @@ Client à 76 % inactif dans les deux cas. Lecture :
 - Conclusion : pour gagner du débit sans pipeline, il faut **paralléliser** le TCP
   (io-wq ≥ 2 workers, §6.4) ; confirme l'abandon de SQ_POLL (§14).
 
+### 12.4 Étape 2 : radixox-uring contre monoio (2026-10-19, loopback, 1 cœur)
+
+80 conns (memtier 8 × 10, CPU 2-5,8-11), 1:4, 1 M clés, 100 o, graines distinctes, 8 s,
+profil `performance`, un run par point (bruit ±5 % ; un run monoio p256 à 3,23 M dans une
+autre série n'a pas été reproduit : 2,54 M dans la même série).
+
+| | p1 | p32 | p256 |
+|---|---|---|---|
+| monoio | 241 K, moy. 0,333 ms | 2,31 M | 2,54 M |
+| radixox-uring | **265 K, moy. 0,302 ms** | 2,32 M | **2,84 M (+12 %)** |
+
+Compteurs par commande en p256 (`perf stat`, sous perf) :
+
+| | instr. user | cycles user | défauts L1 | cycles noyau |
+|---|---|---|---|---|
+| monoio | 3 917 | 1 765 | 29,4 | 296 |
+| uring, découpage à l'arrivée, anneau 8 Mo | 4 425 | 2 055 | 43,4 | 269 |
+| uring, une passe au lot, anneau 8 Mo | 4 139 | 2 000 | 40,8 | 406 |
+| **uring, une passe au lot, anneau 2 Mo (64 × 32 Ko)** | **3 563** | **1 621** | 33,8 | 287 |
+
+Leçons : (1) parser au moment d'exécuter, par fenêtres (§5.4) ; (2) l'anneau doit être
+petit et ses tampons rendus vite (§5.1) ; (3) les défauts L1 de l'arbre sont identiques
+entre les deux binaires : l'écart venait entièrement de la plomberie.
+
+**Prochaine optimisation (idée de l'utilisateur, 2026-10-19) : préchargement anticipé.**
+Pendant qu'on exécute la fenêtre N, précharger déjà les octets des frames et les clés de
+la fenêtre N+1 (distance réglable, comme le préchargement des frères de KRANGE) : les
+données reçues reviennent en cache juste avant leur parse.
+
 ---
 
 ## 13. Migration
@@ -1119,14 +1162,14 @@ binaire (`RADIXOX_TEST_BIN`) pour faire tourner la même suite sur les deux.
 `radixox/src/bin/uringloop.rs` (io-uring 0.7.15), qui remplace `resp.rs` une fois
 stabilisée.
 
-**État (2026-10-19) : étapes 0 et 1 faites** — détail plus bas. Prochaine : étape 2
-(`uringloop.rs` sur le vrai io_uring).
+**État (2026-10-19) : étapes 0, 1 et 2 faites** — détail plus bas, mesures §12.4.
+Prochaine : étape 3 (horloges, timers, signalfd, évicteur à curseur).
 
 | # | Étape | Terminé quand |
 |---|---|---|
 | 0 ✅ | **Sous monoio, sans risque** : sortir dispatch + `execute_sync` dans un module indépendant du runtime ; table des commandes (§2.2) ; découpage à trois issues + limites (§5.3) ; KEYS / UNLINK / FLUSHDB en jobs à curseur qui encodent leur réponse en octets (§8) ; retirer les Waker d'oxidart | tests actuels verts ; monoio ne fait plus qu'appeler `step` + `yield_now` |
 | 1 ✅ | **Cœur sans I/O** (§1.2) : files de `FrameRef` + refcount des tampons (§5.4), tirage par tours + barrières (§2.1), `Closing` / `Draining`, `epoch`, `check_invariants` | tests sur faux anneau, scénarios et séquences aléatoires : envoi qui traîne, EOF avec pipeline en cours, `ENOBUFS`, multishot terminé, annulation croisée avec une complétion, frame coupée octet par octet |
-| 2 | **`uringloop.rs`** : accept classique + `FilesUpdate` (§4.1), recv sur anneau incrémental, send `MSG_WAITALL`, toutes les commandes sync, préchargement à l'intérieur d'une connexion comme aujourd'hui | `test_resp.sh` + intégration verts ; A/B court contre monoio en pipeline 1 / 32 / 256 ; mesurés : nombre et taille des tampons, `ENOBUFS`, adjacence, fixed file utile ou non, `MSG_WAITALL` |
+| 2 ✅ | **`uringloop.rs`** : accept classique + `FilesUpdate` (§4.1), recv sur anneau incrémental, send `MSG_WAITALL`, toutes les commandes sync, préchargement à l'intérieur d'une connexion comme aujourd'hui | `test_resp.sh` + intégration verts ; A/B court contre monoio en pipeline 1 / 32 / 256 ; mesurés : nombre et taille des tampons, `ENOBUFS`, adjacence, fixed file utile ou non, `MSG_WAITALL` |
 | 3 | Horloges, timers, `signalfd`, évicteur à curseur, balayage d'inactivité | horloge vivante au repos, arrêt propre avec et sans save |
 | 4 | Parquage + jobs branchés sur `ready`, port de BGSAVE, SAVE = BGSAVE + parquage, save d'arrêt | p99.99 sous BGSAVE en pipeline 32 ≤ monoio |
 | 5 | Pub/Sub avec limite d'`out` | abonné lent → `Draining`, pas d'OOM |

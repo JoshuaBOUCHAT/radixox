@@ -8,42 +8,34 @@ use crate::exec::client::Client;
 
 use super::bufs::Bid;
 
-/// Une frame complète en attente d'exécution (RUNTIME_ARCH.md §5.4).
+/// Morceau reçu, pas encore exécuté (RUNTIME_ARCH.md §5.4) : des octets bruts
+/// dans un tampon de l'anneau, découpés en frames seulement à l'exécution,
+/// fenêtre par fenêtre (une seule passe, juste avant d'exécuter).
 #[derive(Debug, Clone, Copy)]
-pub enum Item {
-    /// Dans un tampon de l'anneau (`refs[bid]` compté).
-    Ring { bid: Bid, off: u32, len: u32 },
-    /// Dans `ConnIn::rx` (frame qui était coupée entre deux morceaux).
-    Local { off: u32, len: u32 },
-    /// Flux invalide à cet endroit : répondre l'erreur puis fermer.
-    ProtoErr(&'static str),
+pub struct Span {
+    pub bid: Bid,
+    pub off: u32,
+    pub len: u32,
 }
 
 #[derive(Default)]
 pub struct ConnIn {
-    pub queue: VecDeque<Item>,
-    /// Reliquat de frame coupée et frames recopiées (`Item::Local`).
+    /// Morceaux en attente, dans l'ordre (un refcount de tampon par span).
+    pub spans: VecDeque<Span>,
+    /// Frame coupée entre deux morceaux, reconstituée ici (cas des frontières).
     pub rx: Vec<u8>,
-    /// `rx[..framed]` est découpé en frames ; `rx[framed..]` est une frame
-    /// incomplète.
-    pub framed: usize,
-    /// Un `ProtoErr` est en file : la suite du flux est ignorée.
+    /// `rx[..rx_ready]` est une frame complète prête à exécuter (0 : aucune).
+    pub rx_ready: usize,
+    /// Flux invalide : l'erreur est à répondre, puis la connexion se ferme.
+    pub proto_err: Option<&'static str>,
+    /// La suite du flux est ignorée (fermeture en cours, erreur de protocole).
     pub broken: bool,
 }
 
 impl ConnIn {
-    /// Une frame incomplète attend la suite.
-    pub fn has_partial(&self) -> bool {
-        self.rx.len() > self.framed
-    }
-
-    /// Rend la place des frames locales déjà exécutées.
-    pub fn compact(&mut self) {
-        if self.queue.iter().any(|it| matches!(it, Item::Local { .. })) {
-            return;
-        }
-        self.rx.drain(..self.framed);
-        self.framed = 0;
+    /// Il y a de quoi exécuter sans attendre de nouvelles données.
+    pub fn has_work(&self) -> bool {
+        self.rx_ready > 0 || !self.spans.is_empty() || self.proto_err.is_some()
     }
 }
 

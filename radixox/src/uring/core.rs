@@ -3,10 +3,11 @@
 //! tests) traduit les `Op` en SQE et les CQE en `Completion`.
 //!
 //! Un tour de boucle, vu du cœur :
-//! 1. [`Core::complete`] pour chaque CQE : accept, morceaux reçus découpés en
-//!    frames (file de la connexion), fins d'envoi ;
-//! 2. [`Core::run_batch`] : tirage par tours entre connexions (§2.1),
-//!    exécution, réponses écrites dans `out` ;
+//! 1. [`Core::complete`] pour chaque CQE : accept, morceaux reçus rangés tels
+//!    quels dans la file de leur connexion (aucun parse), fins d'envoi ;
+//! 2. [`Core::run_batch`] : par fenêtres de K frames tirées entre connexions
+//!    (§2.1) : parse (une seule passe), préchargement, exécution, réponses
+//!    écrites dans `out` — les données sont lues juste avant d'être utilisées ;
 //! 3. [`Core::run_jobs`] : une tranche de travail de fond ;
 //! 4. [`Core::flush`] : un send par connexion sale, fermetures terminées ;
 //! 5. [`Core::take_ops`] → SQE, puis `enter`.
@@ -21,7 +22,7 @@ use crate::exec::jobs::{FREE_BUDGET, FlushJob, KeysJob, Step, UnlinkJob};
 use crate::exec::{Executed, execute_into, resp_ok};
 
 use super::bufs::{Bid, BufPool};
-use super::conn::{ConnIn, ConnOut, Item, Mode};
+use super::conn::{ConnIn, ConnOut, Mode, Span};
 
 /// Index de connexion = slot dans la table des fichiers enregistrés.
 pub type Slot = u32;
@@ -56,8 +57,11 @@ impl Default for Config {
         Self {
             max_conn: 10_000,
             reserved: 4,
-            bufs: 32,
-            buf_size: 256 << 10,
+            // Petits tampons, rendus vite et réutilisés encore chauds : 64 × 32 Ko
+            // contre 32 × 256 Ko = +27 % en pipeline 256, 15 % d'instructions et
+            // de défauts L1 en moins (mesuré, RUNTIME_ARCH.md §12.4).
+            bufs: 64,
+            buf_size: 32 << 10,
             query_limit: 1 << 30,
             batch_cmds: 1024,
             flush_early: 64 << 10,
@@ -251,7 +255,7 @@ impl Core {
                 let bid = bid.expect("recv avec données sans tampon");
                 let off = self.bufs.chunk(bid, n as u32, buf_more);
                 if self.outs[s].mode == Mode::Normal && !self.ins[s].broken {
-                    self.frame_chunk(slot, bid, off, n as u32);
+                    self.push_span(slot, Span { bid, off, len: n as u32 });
                 }
                 self.try_recycle(bid);
                 if !more && self.outs[s].mode == Mode::Normal && !self.ins[s].broken {
@@ -276,60 +280,21 @@ impl Core {
         self.maybe_close(slot);
     }
 
-    /// Découpe un morceau reçu en frames, rangées dans la file de la connexion.
-    fn frame_chunk(&mut self, slot: Slot, bid: Bid, off: u32, len: u32) {
+    /// Range un morceau reçu dans la file de sa connexion, sans le lire. Un
+    /// morceau contigu au précédent (même tampon, à la suite) le prolonge :
+    /// une frame à cheval entre les deux n'a alors pas besoin d'être recopiée.
+    fn push_span(&mut self, slot: Slot, span: Span) {
         let s = slot as usize;
-        let chunk = self.bufs.slice(bid, off, len);
         let i = &mut self.ins[s];
-        let mut in_ring = 0;
-        if i.has_partial() {
-            // Suite d'une frame coupée : tout passe par `rx`.
-            i.rx.extend_from_slice(chunk);
-            loop {
-                match frame_len(&i.rx[i.framed..]) {
-                    FrameLen::Done(n) => {
-                        i.queue.push_back(Item::Local { off: i.framed as u32, len: n as u32 });
-                        i.framed += n;
-                    }
-                    FrameLen::Incomplete => break,
-                    FrameLen::Invalid(msg) => {
-                        i.queue.push_back(Item::ProtoErr(msg));
-                        i.broken = true;
-                        break;
-                    }
-                }
+        match i.spans.back_mut() {
+            Some(last) if last.bid == span.bid && last.off + last.len == span.off => last.len += span.len,
+            _ => {
+                i.spans.push_back(span);
+                self.bufs.retain(span.bid, 1);
             }
-        } else {
-            let mut pos = 0;
-            while pos < chunk.len() {
-                match frame_len(&chunk[pos..]) {
-                    FrameLen::Done(n) => {
-                        i.queue.push_back(Item::Ring { bid, off: off + pos as u32, len: n as u32 });
-                        in_ring += 1;
-                        pos += n;
-                    }
-                    FrameLen::Incomplete => {
-                        // Le tampon reviendra à l'anneau : le reliquat est copié.
-                        i.rx.extend_from_slice(&chunk[pos..]);
-                        break;
-                    }
-                    FrameLen::Invalid(msg) => {
-                        i.queue.push_back(Item::ProtoErr(msg));
-                        i.broken = true;
-                        break;
-                    }
-                }
-            }
-        }
-        let too_big = i.rx.len() - i.framed > self.cfg.query_limit;
-        let has_work = !i.queue.is_empty();
-        self.bufs.retain(bid, in_ring);
-        if too_big {
-            self.drain(slot);
-            return;
         }
         let o = &mut self.outs[s];
-        if has_work && !o.ready {
+        if !o.ready {
             o.ready = true;
             self.ready.push(slot);
         }
@@ -389,12 +354,12 @@ impl Core {
 
     // ── Lot ──────────────────────────────────────────────────────────────
 
-    /// Tirage par tours (§2.1), par fenêtres de `prefetch` commandes dont les
-    /// clés sont préchargées ensemble (§8bis). Une fenêtre prend d'abord des
-    /// frames consécutives d'une même connexion (son état reste chaud en cache,
-    /// comme quand monoio traitait un pipeline d'un bloc), puis complète avec
-    /// les connexions suivantes : un client sans pipeline donne une frame, un
-    /// pipeline au plus `prefetch` par passage. Ordre gardé par connexion.
+    /// Tirage par tours (§2.1), par fenêtres de `prefetch` frames : parse (une
+    /// seule passe, directement dans les morceaux reçus), préchargement des clés
+    /// (§8bis), exécution, puis on avance dans les morceaux. Une fenêtre prend
+    /// d'abord des frames consécutives d'une connexion, puis complète avec les
+    /// suivantes : un client sans pipeline donne une frame, un pipeline au plus
+    /// `prefetch` par passage. Ordre gardé par connexion.
     pub fn run_batch(&mut self) {
         self.turn += 1;
         let n = self.ready.len();
@@ -405,39 +370,33 @@ impl Core {
         self.rr = self.rr.wrapping_add(1);
         let width = self.cfg.prefetch.clamp(1, oxidart::PREFETCH_BATCH);
         let mut budget = self.cfg.batch_cmds;
-        let mut window: Window<(Slot, Item)> = SmallVec::new();
+        let mut picked: Window<Slot> = SmallVec::new();
         while budget > 0 {
+            // Connexions candidates de la fenêtre (au plus `width`) ; les frames
+            // qui coupent deux morceaux sont reconstituées avant le parse.
+            picked.clear();
             let mut tried = 0;
-            while window.len() < width.min(budget) && tried < n {
+            while picked.len() < width && tried < n {
                 let slot = self.ready[pos % n];
                 pos += 1;
                 tried += 1;
-                if !self.drawable(slot) {
-                    continue;
-                }
-                let room = width.min(budget) - window.len();
-                let queue = &mut self.ins[slot as usize].queue;
-                let before = window.len();
-                while window.len() - before < room
-                    && let Some(item) = queue.pop_front()
-                {
-                    window.push((slot, item));
-                }
-                if window.len() > before {
-                    tried = 0;
+                if self.drawable(slot) && self.prepare(slot) {
+                    picked.push(slot);
                 }
             }
-            if window.is_empty() {
+            if picked.is_empty() {
                 break;
             }
-            budget -= window.len();
-            self.exec_window(&window);
-            window.clear();
+            let done = self.exec_window(&picked, width.min(budget));
+            if done == 0 {
+                break;
+            }
+            budget = budget.saturating_sub(done);
         }
         let (ins, outs) = (&self.ins, &mut self.outs);
         self.ready.retain(|&slot| {
             let s = slot as usize;
-            let keep = !ins[s].queue.is_empty() && matches!(outs[s].mode, Mode::Normal | Mode::Closing);
+            let keep = ins[s].has_work() && matches!(outs[s].mode, Mode::Normal | Mode::Closing);
             outs[s].ready = keep;
             keep
         });
@@ -451,89 +410,209 @@ impl Core {
             && !(o.send_in_flight() && o.out.len() >= self.cfg.out_backpressure)
     }
 
-    /// Parse les frames de la fenêtre, précharge leurs clés, les exécute dans
-    /// l'ordre, puis rend les tampons et applique les suites. Les frames d'une
-    /// connexion qui suivent une barrière dans la fenêtre ne sont pas exécutées :
-    /// elles retournent en tête de sa file (§2.1).
-    fn exec_window(&mut self, window: &[(Slot, Item)]) {
-        let mut afters: Window<Option<After>> = SmallVec::new();
+    /// Rend la tête de la connexion exécutable : si une frame a été coupée
+    /// entre deux morceaux, elle est complétée dans `rx` avec le début des
+    /// morceaux suivants. `false` : rien d'exécutable (frame incomplète en
+    /// attente de données).
+    fn prepare(&mut self, slot: Slot) -> bool {
+        let s = slot as usize;
+        let Core { ins, bufs, cfg, .. } = self;
+        let i = &mut ins[s];
+        if i.proto_err.is_some() || i.rx_ready > 0 {
+            return true;
+        }
+        if i.rx.is_empty() {
+            return !i.spans.is_empty();
+        }
+        // Morceau par morceau de 4 Ko au plus : une petite frame coupée ne
+        // recopie que ce qu'il lui faut ; l'excédent est rendu au morceau.
+        const PIECE: u32 = 4096;
+        let mut freed: Window<Bid> = SmallVec::new();
+        loop {
+            match frame_len(&i.rx) {
+                FrameLen::Done(n) => {
+                    let excess = (i.rx.len() - n) as u32;
+                    if excess > 0 {
+                        let front = i.spans.front_mut().expect("excédent pris dans un morceau");
+                        front.off -= excess;
+                        front.len += excess;
+                        i.rx.truncate(n);
+                    }
+                    i.rx_ready = n;
+                    break;
+                }
+                FrameLen::Invalid(msg) => {
+                    i.proto_err = Some(msg);
+                    i.broken = true;
+                    break;
+                }
+                FrameLen::Incomplete => {
+                    // Morceau de tête épuisé : il retourne à l'anneau.
+                    while let Some(front) = i.spans.front()
+                        && front.len == 0
+                    {
+                        freed.push(front.bid);
+                        i.spans.pop_front();
+                    }
+                    let Some(front) = i.spans.front_mut() else {
+                        break;
+                    };
+                    let take = front.len.min(PIECE);
+                    i.rx.extend_from_slice(bufs.slice(front.bid, front.off, take));
+                    front.off += take;
+                    front.len -= take;
+                }
+            }
+        }
+        let too_big = i.rx.len() > cfg.query_limit;
+        let ready = i.rx_ready > 0 || i.proto_err.is_some();
+        // Morceaux vidés par la reconstitution : rendus à l'anneau.
+        while let Some(front) = i.spans.front()
+            && front.len == 0
+        {
+            freed.push(front.bid);
+            i.spans.pop_front();
+        }
+        for bid in freed {
+            self.bufs.release(bid);
+            self.try_recycle(bid);
+        }
+        if too_big {
+            self.drain(slot);
+            return false;
+        }
+        ready
+    }
+
+    /// Une fenêtre : parse au plus `width` frames des connexions `picked` (dans
+    /// cet ordre, frames consécutives d'abord), précharge, exécute ; puis avance
+    /// dans les morceaux. Rend le nombre de frames prises.
+    fn exec_window(&mut self, picked: &[Slot], width: usize) -> usize {
+        // Ce que la fenêtre a pris à chaque connexion.
+        struct Plan {
+            slot: Slot,
+            /// La frame de `rx` en fait partie.
+            from_rx: bool,
+            /// Octets consommés dans le morceau de tête.
+            consumed: u32,
+            /// Le morceau de tête finit par une frame incomplète.
+            tail: bool,
+            err: Option<&'static str>,
+            /// Index de la première frame de cette connexion dans `frames`.
+            first: usize,
+        }
+        let mut plans: Window<Plan> = SmallVec::new();
+        let mut afters: Window<(Slot, After)> = SmallVec::new();
         {
             let Core { art, ins, outs, bufs, .. } = self;
-            let mut barrier_at: Option<Slot> = None;
-            let cmds: Window<Option<Cmd<'_>>> = window
-                .iter()
-                .map(|&(slot, item)| {
-                    // Fenêtre : les frames d'une connexion y sont contiguës.
-                    if barrier_at == Some(slot) {
-                        return None;
-                    }
-                    let bytes = match item {
-                        Item::ProtoErr(_) => {
-                            barrier_at = Some(slot);
-                            return None;
+            let mut frames: Window<(Slot, Cmd<'_>)> = SmallVec::new();
+            for &slot in picked {
+                if frames.len() >= width {
+                    break;
+                }
+                let i = &ins[slot as usize];
+                let mut plan = Plan { slot, from_rx: false, consumed: 0, tail: false, err: None, first: frames.len() };
+                let mut barrier = false;
+                if i.rx_ready > 0 {
+                    let Parse::Done(cmd, _) = Cmd::parse(&i.rx[..i.rx_ready]) else {
+                        unreachable!("rx_ready : frame complète");
+                    };
+                    barrier = cmd.is_barrier();
+                    frames.push((slot, cmd));
+                    plan.from_rx = true;
+                }
+                if !barrier
+                    && i.proto_err.is_none()
+                    && let Some(front) = i.spans.front()
+                {
+                    let data = bufs.slice(front.bid, front.off, front.len);
+                    let mut pos = 0;
+                    while frames.len() < width && pos < data.len() {
+                        match Cmd::parse(&data[pos..]) {
+                            Parse::Done(cmd, n) => {
+                                pos += n;
+                                let b = cmd.is_barrier();
+                                frames.push((slot, cmd));
+                                if b {
+                                    break;
+                                }
+                            }
+                            Parse::Incomplete => {
+                                plan.tail = true;
+                                break;
+                            }
+                            Parse::Invalid(msg) => {
+                                plan.err = Some(msg);
+                                break;
+                            }
                         }
-                        Item::Ring { bid, off, len } => bufs.slice(bid, off, len),
-                        Item::Local { off, len } => &ins[slot as usize].rx[off as usize..(off + len) as usize],
-                    };
-                    let Parse::Done(cmd, _) = Cmd::parse(bytes) else {
-                        unreachable!("frame découpée à l'arrivée : toujours complète");
-                    };
-                    if cmd.is_barrier() {
-                        barrier_at = Some(slot);
                     }
-                    Some(cmd)
-                })
-                .collect();
-            if window.len() > 1 {
-                let keys: Window<&[u8]> = cmds.iter().flatten().filter_map(Cmd::main_key).collect();
+                    plan.consumed = pos as u32;
+                }
+                if plan.from_rx || plan.consumed > 0 || plan.tail || plan.err.is_some() || i.proto_err.is_some() {
+                    plans.push(plan);
+                }
+            }
+            if frames.len() > 1 {
+                let keys: Window<&[u8]> = frames.iter().filter_map(|(_, c)| c.main_key()).collect();
                 if keys.len() > 1 {
                     art.prefetch_keys(&keys);
                 }
             }
-            let mut skipped: Option<Slot> = None;
-            for (&(slot, item), cmd) in window.iter().zip(cmds) {
-                let o = &mut outs[slot as usize];
-                afters.push(match (item, cmd) {
-                    (Item::ProtoErr(msg), _) if skipped != Some(slot) => {
-                        extend_encode(&mut o.out, &Frame::Error(format!("ERR Protocol error: {msg}")));
-                        skipped = Some(slot);
-                        Some(After::Close)
-                    }
-                    (_, Some(cmd)) => {
-                        let after = run_cmd(cmd, art, o);
-                        if matches!(after, After::Barrier | After::Close) {
-                            skipped = Some(slot);
-                        }
-                        Some(after)
-                    }
-                    // Après une barrière de sa connexion : pas exécutée.
-                    _ => None,
-                });
+            for (slot, cmd) in frames {
+                afters.push((slot, run_cmd(cmd, art, &mut outs[slot as usize])));
             }
         }
-        // Frames non exécutées : remises en tête de leur file, dans l'ordre.
-        for (&(slot, item), after) in window.iter().zip(&afters).rev() {
-            if after.is_none() {
-                self.ins[slot as usize].queue.push_front(item);
+        let done = afters.len();
+        // Avancer dans les morceaux, rendre les tampons vidés.
+        for plan in &plans {
+            let s = plan.slot as usize;
+            let i = &mut self.ins[s];
+            if plan.from_rx {
+                i.rx.clear();
+                i.rx_ready = 0;
             }
-        }
-        for (&(slot, item), after) in window.iter().zip(afters) {
-            if let Some(after) = after {
-                self.finish_item(slot, item, after);
+            let mut freed = None;
+            if let Some(front) = i.spans.front_mut() {
+                front.off += plan.consumed;
+                front.len -= plan.consumed;
+                if plan.tail {
+                    // Frame coupée en fin de morceau : recopiée, le tampon est rendu.
+                    i.rx.extend_from_slice(self.bufs.slice(front.bid, front.off, front.len));
+                    front.len = 0;
+                }
+                if front.len == 0 {
+                    freed = Some(front.bid);
+                    i.spans.pop_front();
+                }
             }
-        }
-    }
-
-    fn finish_item(&mut self, slot: Slot, item: Item, after: After) {
-        let s = slot as usize;
-        match item {
-            Item::Ring { bid, .. } => {
+            if let Some(msg) = plan.err {
+                i.proto_err = Some(msg);
+                i.broken = true;
+            }
+            if let Some(bid) = freed {
                 self.bufs.release(bid);
                 self.try_recycle(bid);
             }
-            Item::Local { .. } => self.ins[s].compact(),
-            Item::ProtoErr(_) => {}
         }
+        for (slot, after) in afters {
+            self.finish_frame(slot, after);
+        }
+        // Erreur de protocole : après les réponses des frames d'avant.
+        for plan in &plans {
+            let s = plan.slot as usize;
+            if let Some(msg) = self.ins[s].proto_err.take() {
+                let o = &mut self.outs[s];
+                extend_encode(&mut o.out, &Frame::Error(format!("ERR Protocol error: {msg}")));
+                self.finish_frame(plan.slot, After::Close);
+            }
+            let _ = plan.first;
+        }
+        done.max(plans.len())
+    }
+
+    fn finish_frame(&mut self, slot: Slot, after: After) {
+        let s = slot as usize;
         match after {
             After::Continue => {}
             After::Barrier => self.outs[s].stop_turn = self.turn,
@@ -580,7 +659,7 @@ impl Core {
                 o.dirty = false;
                 continue;
             }
-            let more_coming = o.mode == Mode::Normal && !self.ins[s].queue.is_empty();
+            let more_coming = o.mode == Mode::Normal && self.ins[s].has_work();
             if o.send_in_flight() || more_coming {
                 // Repart au CQE du send, ou au tour suivant.
                 self.dirty.push(slot);
@@ -594,7 +673,7 @@ impl Core {
             if o.mode != Mode::Closing {
                 continue;
             }
-            if i.queue.is_empty() && o.out.is_empty() && !o.send_in_flight() {
+            if !i.has_work() && o.out.is_empty() && !o.send_in_flight() {
                 self.drain(slot);
             } else {
                 self.closing.push(slot);
@@ -655,12 +734,13 @@ impl Core {
     }
 
     fn release_queue(&mut self, slot: Slot) {
-        let queue = std::mem::take(&mut self.ins[slot as usize].queue);
-        for item in queue {
-            if let Item::Ring { bid, .. } = item {
-                self.bufs.release(bid);
-                self.try_recycle(bid);
-            }
+        let i = &mut self.ins[slot as usize];
+        let spans = std::mem::take(&mut i.spans);
+        i.rx.clear();
+        i.rx_ready = 0;
+        for span in spans {
+            self.bufs.release(span.bid);
+            self.try_recycle(span.bid);
         }
     }
 
@@ -692,19 +772,16 @@ impl Core {
         for (s, (i, o)) in self.ins.iter().zip(&self.outs).enumerate() {
             assert_eq!(o.mode == Mode::Free, in_free[s], "slot {s} : mode {:?}", o.mode);
             if o.mode == Mode::Free {
-                assert!(i.queue.is_empty() && o.refs == 0, "slot libre {s} encore utilisé");
+                assert!(i.spans.is_empty() && o.refs == 0, "slot libre {s} encore utilisé");
                 continue;
             }
             let expected = o.recv_armed as u8 + o.send_in_flight() as u8;
             assert_eq!(o.refs, expected, "slot {s} : refs {} pour recv {} send {}", o.refs, o.recv_armed, o.send_in_flight());
-            for item in &i.queue {
-                match *item {
-                    Item::Ring { bid, .. } => ring_items[bid as usize] += 1,
-                    Item::Local { off, len } => assert!((off + len) as usize <= i.framed),
-                    Item::ProtoErr(_) => {}
-                }
+            for span in &i.spans {
+                ring_items[span.bid as usize] += 1;
             }
-            if !i.queue.is_empty() && matches!(o.mode, Mode::Normal | Mode::Closing) {
+            assert!(i.rx_ready <= i.rx.len());
+            if i.has_work() && matches!(o.mode, Mode::Normal | Mode::Closing) {
                 assert!(o.ready && self.ready.contains(&(s as Slot)), "slot {s} a des frames hors de la liste prête");
             }
             assert!(o.sent <= o.sending.len());
