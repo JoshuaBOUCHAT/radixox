@@ -421,6 +421,51 @@ fn flushdb_frees_in_background() {
     assert_eq!(f.core.art.len(), 0);
 }
 
+/// KEYS long : la connexion est parquée, les autres sont servies pendant ce
+/// temps ; la réponse arrive ensuite, puis les commandes envoyées derrière.
+#[test]
+fn long_keys_parks_without_blocking_others() {
+    let mut f = Fake::new(Config { max_conn: 8, ..Config::default() });
+    let a = f.connect();
+    let b = f.connect();
+    let sets: String = (0..3000).map(|i| format!("SET k{i:04} v\r\n")).collect();
+    f.send(a, sets.as_bytes());
+    f.settle();
+    f.take(a);
+    f.send(a, b"KEYS k*\r\nPING after\r\n");
+    f.step();
+    f.step();
+    assert!(f.peers[&a].received.is_empty(), "KEYS ne répond pas d'un coup : connexion parquée");
+    f.send(b, b"PING\r\n");
+    f.step();
+    f.step();
+    f.apply_ops();
+    assert_eq!(f.take(b), "+PONG\r\n", "servie pendant le KEYS");
+    f.settle();
+    let got = f.take(a);
+    assert!(got.starts_with("*3000\r\n$5\r\nk0000\r\n"), "{}", &got[..40]);
+    assert!(got.ends_with("$5\r\nk2999\r\n$5\r\nafter\r\n"));
+}
+
+/// UNLINK préfixe* : parqué, compte exact, clés invisibles ; une commande
+/// reçue pendant le parquage attend la réponse.
+#[test]
+fn unlink_prefix_parks_and_counts() {
+    let mut f = Fake::new(Config { max_conn: 8, ..Config::default() });
+    let c = f.connect();
+    let sets: String = (0..2000).map(|i| format!("SET u:{i} v\r\n")).collect();
+    f.send(c, sets.as_bytes());
+    f.send(c, b"SET keep 1\r\n");
+    f.settle();
+    f.take(c);
+    f.send(c, b"UNLINK u:*\r\n");
+    f.step();
+    f.step();
+    f.send(c, b"DBSIZE\r\n");
+    f.settle();
+    assert_eq!(f.take(c), ":2000\r\n:1\r\n");
+}
+
 /// Balayage d'inactivité : une connexion muette au-delà du délai est fermée,
 /// une connexion active reste ouverte (horloge pilotée par le test).
 #[test]
@@ -461,7 +506,9 @@ impl Rng {
 fn random_cmd(rng: &mut Rng, n: usize) -> Vec<u8> {
     let key = format!("c{n}:k{}", rng.below(6));
     let val = format!("v{}", rng.below(1000));
-    let args: Vec<String> = match rng.below(8) {
+    let args: Vec<String> = match rng.below(10) {
+        8 => vec!["KEYS".into(), format!("c{n}:k*")],
+        9 => vec!["UNLINK".into(), format!("c{n}:k{}*", rng.below(3))],
         0 => vec!["SET".into(), key, val],
         1 => vec!["GET".into(), key],
         2 => vec!["INCR".into(), format!("c{n}:ctr")],
@@ -494,7 +541,23 @@ fn oracle(stream: &[u8]) -> Vec<u8> {
             panic!("flux de test invalide");
         };
         pos += n;
-        assert!(matches!(execute_into(cmd, &mut art, &mut client, &mut out), Executed::Done));
+        match execute_into(cmd, &mut art, &mut client, &mut out) {
+            Executed::Done => {}
+            Executed::Runtime(radixox_lib::cmd::Cmd::Keys(p)) => {
+                let mut job = crate::exec::jobs::KeysJob::new(p);
+                while job.step(&mut art, usize::MAX) == crate::exec::jobs::Step::More {}
+                out.extend_from_slice(job.response());
+            }
+            Executed::Runtime(radixox_lib::cmd::Cmd::Unlink(keys)) => {
+                let mut job = crate::exec::jobs::UnlinkJob::start(&mut art, &keys);
+                while job.step(&mut art, usize::MAX) == crate::exec::jobs::Step::More {}
+                radixox_lib::shared_frame::extend_encode(
+                    &mut out,
+                    &radixox_lib::shared_frame::SharedFrame::Integer(job.count() as i64),
+                );
+            }
+            Executed::Runtime(_) => panic!("commande inattendue dans le flux de test"),
+        }
     }
     out
 }
@@ -515,6 +578,7 @@ fn random_streams_match_oracle() {
             flush_early: 1 + rng.below(200) as usize,
             out_backpressure: 1 + rng.below(400) as usize,
             prefetch: 1 + rng.below(10) as usize,
+            job_budget: 1 + rng.below(3) as usize,
             ..Config::default()
         });
         f.max_chunk = 1 + rng.below(40) as usize;

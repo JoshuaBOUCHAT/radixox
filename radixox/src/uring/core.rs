@@ -22,7 +22,7 @@ use radixox_lib::cmd::{Cmd, FrameLen, Parse, frame_len};
 use radixox_lib::shared_frame::{SharedFrame as Frame, extend_encode};
 
 use crate::exec::client::Client;
-use crate::exec::jobs::{FREE_BUDGET, FlushJob, KeysJob, Step, UnlinkJob};
+use crate::exec::jobs::{FREE_BUDGET, FlushJob, KEYS_BUDGET, KeysJob, Step, UnlinkJob};
 use crate::exec::persist::{save_sync, sync_level};
 use crate::exec::{Executed, execute_into, resp_ok};
 
@@ -58,6 +58,8 @@ pub struct Config {
     /// Connexion sans rien reçu depuis cette durée : fermée (`timeout` de
     /// Redis ; `RADIXOX_TIMEOUT`, désactivé par défaut).
     pub idle_timeout: Option<Duration>,
+    /// Clés examinées ou nœuds libérés par tranche de job (KEYS, UNLINK).
+    pub job_budget: usize,
 }
 
 impl Default for Config {
@@ -76,6 +78,7 @@ impl Default for Config {
             out_backpressure: 1 << 20,
             prefetch: 8,
             idle_timeout: None,
+            job_budget: KEYS_BUDGET.min(FREE_BUDGET),
         }
     }
 }
@@ -135,6 +138,36 @@ enum After {
     /// QUIT, erreur de protocole : fin propre, file abandonnée.
     Close,
     Background(FlushJob),
+    /// Commande longue : la connexion est parquée, le job répondra (§7).
+    Park(ConnJob),
+}
+
+/// Job qui répond à une connexion parquée (RUNTIME_ARCH.md §7, §8).
+enum ConnJob {
+    Keys(KeysJob),
+    Unlink(UnlinkJob),
+}
+
+impl ConnJob {
+    fn step(&mut self, art: &mut OxidArt, budget: usize) -> Step {
+        match self {
+            ConnJob::Keys(job) => job.step(art, budget),
+            ConnJob::Unlink(job) => job.step(art, budget),
+        }
+    }
+
+    fn respond(&mut self, out: &mut Vec<u8>) {
+        match self {
+            ConnJob::Keys(job) => out.extend_from_slice(job.response()),
+            ConnJob::Unlink(job) => extend_encode(out, &Frame::Integer(job.count() as i64)),
+        }
+    }
+}
+
+/// Après cette commande, plus rien de sa connexion dans la fenêtre : barrière
+/// (§2.1) ou commande qui peut parquer la connexion.
+fn stops_window(cmd: &Cmd<'_>) -> bool {
+    cmd.is_barrier() || matches!(cmd, Cmd::Keys(_) | Cmd::Unlink(_))
 }
 
 pub struct Core {
@@ -152,6 +185,8 @@ pub struct Core {
     /// Recv arrêtés faute de tampon, réarmés quand un tampon revient.
     starved: Vec<Slot>,
     jobs: std::collections::VecDeque<FlushJob>,
+    /// Jobs des connexions parquées, avec l'époque de leur parquage.
+    conn_jobs: std::collections::VecDeque<(Slot, u32, ConnJob)>,
     turn: u64,
     rr: usize,
     /// Horloge monotone du tour (`set_now`) ; le TTL suit l'horloge murale
@@ -183,6 +218,7 @@ impl Core {
             closing: Vec::new(),
             starved: Vec::new(),
             jobs: Default::default(),
+            conn_jobs: Default::default(),
             turn: 0,
             rr: 0,
             now,
@@ -269,6 +305,7 @@ impl Core {
         self.ops.is_empty()
             && self.ready.is_empty()
             && self.jobs.is_empty()
+            && self.conn_jobs.is_empty()
             && self.dirty.iter().all(|&s| self.outs[s as usize].send_in_flight())
     }
 
@@ -324,6 +361,7 @@ impl Core {
         o.sent = 0;
         o.client = Client::new();
         o.last_active = self.now;
+        o.job_pending = false;
         o.dirty = false;
         o.ready = false;
         o.stop_turn = u64::MAX;
@@ -344,7 +382,7 @@ impl Core {
                 let bid = bid.expect("recv avec données sans tampon");
                 let off = self.bufs.chunk(bid, n as u32, buf_more);
                 self.outs[s].last_active = self.now;
-                if self.outs[s].mode == Mode::Normal && !self.ins[s].broken {
+                if matches!(self.outs[s].mode, Mode::Normal | Mode::Closing) && !self.ins[s].broken {
                     self.push_span(slot, Span { bid, off, len: n as u32 });
                 }
                 self.try_recycle(bid);
@@ -376,6 +414,15 @@ impl Core {
     fn push_span(&mut self, slot: Slot, span: Span) {
         let s = slot as usize;
         let i = &mut self.ins[s];
+        if self.outs[s].job_pending {
+            // Parquée : copié tout de suite, l'anneau n'est jamais retenu (§7).
+            i.rx.extend_from_slice(self.bufs.slice(span.bid, span.off, span.len));
+            i.rx_check = true;
+            if i.rx.len() > self.cfg.query_limit {
+                self.drain(slot);
+            }
+            return;
+        }
         match i.spans.back_mut() {
             Some(last) if last.bid == span.bid && last.off + last.len == span.off => last.len += span.len,
             _ => {
@@ -492,7 +539,9 @@ impl Core {
         let (ins, outs) = (&self.ins, &mut self.outs);
         self.ready.retain(|&slot| {
             let s = slot as usize;
-            let keep = ins[s].has_work() && matches!(outs[s].mode, Mode::Normal | Mode::Closing);
+            let keep = ins[s].has_work()
+                && !outs[s].job_pending
+                && matches!(outs[s].mode, Mode::Normal | Mode::Closing);
             outs[s].ready = keep;
             keep
         });
@@ -502,14 +551,15 @@ impl Core {
     fn drawable(&self, slot: Slot) -> bool {
         let o = &self.outs[slot as usize];
         o.stop_turn != self.turn
+            && !o.job_pending
             && matches!(o.mode, Mode::Normal | Mode::Closing)
             && !(o.send_in_flight() && o.out.len() >= self.cfg.out_backpressure)
     }
 
-    /// Rend la tête de la connexion exécutable : si une frame a été coupée
-    /// entre deux morceaux, elle est complétée dans `rx` avec le début des
-    /// morceaux suivants. `false` : rien d'exécutable (frame incomplète en
-    /// attente de données).
+    /// Rend la tête de la connexion exécutable. `rx` passe avant les morceaux :
+    /// une frame coupée entre deux morceaux y est complétée avec le début des
+    /// morceaux suivants, et les octets recopiés pendant un parquage y
+    /// attendent. `false` : rien d'exécutable (frame incomplète, en attente).
     fn prepare(&mut self, slot: Slot) -> bool {
         let s = slot as usize;
         let Core { ins, bufs, cfg, .. } = self;
@@ -518,21 +568,24 @@ impl Core {
             return true;
         }
         if i.rx.is_empty() {
+            i.rx_check = false;
             return !i.spans.is_empty();
         }
         // Morceau par morceau de 4 Ko au plus : une petite frame coupée ne
-        // recopie que ce qu'il lui faut ; l'excédent est rendu au morceau.
+        // recopie que ce qu'il lui faut ; l'excédent du dernier morceau copié
+        // lui est rendu.
         const PIECE: u32 = 4096;
         let mut freed: Window<Bid> = SmallVec::new();
+        let mut last_piece = 0u32;
         loop {
             match frame_len(&i.rx) {
                 FrameLen::Done(n) => {
-                    let excess = (i.rx.len() - n) as u32;
-                    if excess > 0 {
+                    let give_back = ((i.rx.len() - n) as u32).min(last_piece);
+                    if give_back > 0 {
                         let front = i.spans.front_mut().expect("excédent pris dans un morceau");
-                        front.off -= excess;
-                        front.len += excess;
-                        i.rx.truncate(n);
+                        front.off -= give_back;
+                        front.len += give_back;
+                        i.rx.truncate(i.rx.len() - give_back as usize);
                     }
                     i.rx_ready = n;
                     break;
@@ -557,9 +610,11 @@ impl Core {
                     i.rx.extend_from_slice(bufs.slice(front.bid, front.off, take));
                     front.off += take;
                     front.len -= take;
+                    last_piece = take;
                 }
             }
         }
+        i.rx_check = false;
         let too_big = i.rx.len() > cfg.query_limit;
         let ready = i.rx_ready > 0 || i.proto_err.is_some();
         // Morceaux vidés par la reconstitution : rendus à l'anneau.
@@ -600,6 +655,7 @@ impl Core {
         let mut plans: Window<Plan> = SmallVec::new();
         let mut afters: Window<(Slot, After)> = SmallVec::new();
         {
+            let job_budget = self.cfg.job_budget;
             let Core { art, ins, outs, bufs, .. } = self;
             let mut frames: Window<(Slot, Cmd<'_>)> = SmallVec::new();
             for &slot in picked {
@@ -613,12 +669,15 @@ impl Core {
                     let Parse::Done(cmd, _) = Cmd::parse(&i.rx[..i.rx_ready]) else {
                         unreachable!("rx_ready : frame complète");
                     };
-                    barrier = cmd.is_barrier();
+                    barrier = stops_window(&cmd);
                     frames.push((slot, cmd));
                     plan.from_rx = true;
                 }
+                // Des octets attendent encore dans `rx` après cette frame : les
+                // morceaux viennent après eux, pas dans cette fenêtre.
                 if !barrier
                     && i.proto_err.is_none()
+                    && i.rx.len() == i.rx_ready
                     && let Some(front) = i.spans.front()
                 {
                     let data = bufs.slice(front.bid, front.off, front.len);
@@ -627,7 +686,7 @@ impl Core {
                         match Cmd::parse(&data[pos..]) {
                             Parse::Done(cmd, n) => {
                                 pos += n;
-                                let b = cmd.is_barrier();
+                                let b = stops_window(&cmd);
                                 frames.push((slot, cmd));
                                 if b {
                                     break;
@@ -656,7 +715,7 @@ impl Core {
                 }
             }
             for (slot, cmd) in frames {
-                afters.push((slot, run_cmd(cmd, art, &mut outs[slot as usize])));
+                afters.push((slot, run_cmd(cmd, art, &mut outs[slot as usize], job_budget)));
             }
         }
         let done = afters.len();
@@ -665,8 +724,9 @@ impl Core {
             let s = plan.slot as usize;
             let i = &mut self.ins[s];
             if plan.from_rx {
-                i.rx.clear();
+                i.rx.drain(..i.rx_ready);
                 i.rx_ready = 0;
+                i.rx_check = !i.rx.is_empty();
             }
             let mut freed = None;
             if let Some(front) = i.spans.front_mut() {
@@ -718,6 +778,7 @@ impl Core {
                     self.jobs.push_back(job);
                 }
             }
+            After::Park(job) => self.park(slot, job),
         }
         let o = &mut self.outs[s];
         if !o.out.is_empty() {
@@ -730,12 +791,59 @@ impl Core {
         }
     }
 
-    /// Une tranche de travail de fond (libération de FLUSHDB).
+    /// Parque la connexion : son job répondra. Ses morceaux en attente sont
+    /// recopiés dans `rx` (rien ne retient l'anneau pendant le parquage).
+    fn park(&mut self, slot: Slot, job: ConnJob) {
+        let s = slot as usize;
+        let o = &mut self.outs[s];
+        o.job_pending = true;
+        o.epoch = o.epoch.wrapping_add(1);
+        let epoch = o.epoch;
+        let spans = std::mem::take(&mut self.ins[s].spans);
+        for span in spans {
+            self.ins[s].rx.extend_from_slice(self.bufs.slice(span.bid, span.off, span.len));
+            self.bufs.release(span.bid);
+            self.try_recycle(span.bid);
+        }
+        self.ins[s].rx_check = !self.ins[s].rx.is_empty();
+        self.conn_jobs.push_back((slot, epoch, job));
+    }
+
+    /// Une tranche de travail de fond : un job de connexion parquée (tour à
+    /// tour), puis la libération de FLUSHDB.
     pub fn run_jobs(&mut self) {
+        if let Some((slot, epoch, mut job)) = self.conn_jobs.pop_front() {
+            if job.step(&mut self.art, self.cfg.job_budget) == Step::More {
+                self.conn_jobs.push_back((slot, epoch, job));
+            } else {
+                self.unpark(slot, epoch, job);
+            }
+        }
         if let Some(mut job) = self.jobs.pop_front()
             && job.step(&mut self.art, FREE_BUDGET) == Step::More
         {
             self.jobs.push_back(job);
+        }
+    }
+
+    /// Le job a fini : sa réponse part, la connexion reprend (ce qu'elle a reçu
+    /// entre-temps est exécuté aux tours suivants). Époque différente : la
+    /// connexion n'est plus celle qui attendait, la réponse est jetée.
+    fn unpark(&mut self, slot: Slot, epoch: u32, mut job: ConnJob) {
+        let s = slot as usize;
+        let o = &mut self.outs[s];
+        if o.epoch != epoch || !o.job_pending || !matches!(o.mode, Mode::Normal | Mode::Closing) {
+            return;
+        }
+        o.job_pending = false;
+        job.respond(&mut o.out);
+        if !o.dirty {
+            o.dirty = true;
+            self.dirty.push(slot);
+        }
+        if self.ins[s].has_work() && !o.ready {
+            o.ready = true;
+            self.ready.push(slot);
         }
     }
 
@@ -769,7 +877,7 @@ impl Core {
             if o.mode != Mode::Closing {
                 continue;
             }
-            if !i.has_work() && o.out.is_empty() && !o.send_in_flight() {
+            if !i.has_work() && !o.job_pending && o.out.is_empty() && !o.send_in_flight() {
                 self.drain(slot);
             } else {
                 self.closing.push(slot);
@@ -877,7 +985,14 @@ impl Core {
                 ring_items[span.bid as usize] += 1;
             }
             assert!(i.rx_ready <= i.rx.len());
-            if i.has_work() && matches!(o.mode, Mode::Normal | Mode::Closing) {
+            if o.job_pending {
+                assert!(i.spans.is_empty(), "slot {s} parqué : l'anneau ne doit pas être retenu");
+                assert!(
+                    self.conn_jobs.iter().any(|&(js, je, _)| js as usize == s && je == o.epoch),
+                    "slot {s} parqué sans job"
+                );
+            }
+            if i.has_work() && !o.job_pending && matches!(o.mode, Mode::Normal | Mode::Closing) {
                 assert!(o.ready && self.ready.contains(&(s as Slot)), "slot {s} a des frames hors de la liste prête");
             }
             assert!(o.sent <= o.sending.len());
@@ -889,36 +1004,40 @@ impl Core {
 }
 
 /// Exécute une commande d'une connexion.
-fn run_cmd(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut) -> After {
+fn run_cmd(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) -> After {
     let barrier = cmd.is_barrier();
     match execute_into(cmd, art, &mut o.client, &mut o.out) {
         Executed::Done if barrier => After::Barrier,
         Executed::Done => After::Continue,
-        Executed::Runtime(cmd) => runtime(cmd, art, o),
+        Executed::Runtime(cmd) => runtime(cmd, art, o, job_budget),
     }
 }
 
 /// Commandes qui dépendent du runtime. KEYS et UNLINK s'exécutent encore d'une
 /// traite (parquage + jobs : étape 4) ; Pub/Sub et saves : étapes 4–5.
-fn runtime(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut) -> After {
+fn runtime(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) -> After {
     match cmd {
         Cmd::Quit => {
             extend_encode(&mut o.out, &resp_ok());
             After::Close
         }
+        // Une première tranche tout de suite : un petit KEYS ou un UNLINK de clés
+        // exactes répond sans parquer la connexion.
         Cmd::Keys(pattern) => {
-            let mut job = KeysJob::new(pattern);
-            while job.step(art, usize::MAX) == Step::More {}
-            o.out.extend_from_slice(job.response());
-            After::Continue
+            let mut job = ConnJob::Keys(KeysJob::new(pattern));
+            if job.step(art, job_budget) == Step::Done {
+                job.respond(&mut o.out);
+                return After::Continue;
+            }
+            After::Park(job)
         }
         Cmd::Unlink(keys) => {
-            // Pas de save dans ce binaire avant l'étape 4 : la libération finit.
-            debug_assert!(!art.is_saving());
-            let mut job = UnlinkJob::start(art, &keys);
-            while job.step(art, usize::MAX) == Step::More {}
-            extend_encode(&mut o.out, &Frame::Integer(job.count() as i64));
-            After::Continue
+            let mut job = ConnJob::Unlink(UnlinkJob::start(art, &keys));
+            if job.step(art, job_budget) == Step::Done {
+                job.respond(&mut o.out);
+                return After::Continue;
+            }
+            After::Park(job)
         }
         Cmd::FlushDb => {
             let job = FlushJob::start(art);

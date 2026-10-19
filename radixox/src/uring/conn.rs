@@ -27,6 +27,8 @@ pub struct ConnIn {
     pub rx: Vec<u8>,
     /// `rx[..rx_ready]` est une frame complète prête à exécuter (0 : aucune).
     pub rx_ready: usize,
+    /// `rx` a changé et peut contenir une frame complète : à réexaminer.
+    pub rx_check: bool,
     /// Flux invalide : l'erreur est à répondre, puis la connexion se ferme.
     pub proto_err: Option<&'static str>,
     /// La suite du flux est ignorée (fermeture en cours, erreur de protocole).
@@ -36,7 +38,7 @@ pub struct ConnIn {
 impl ConnIn {
     /// Il y a de quoi exécuter sans attendre de nouvelles données.
     pub fn has_work(&self) -> bool {
-        self.rx_ready > 0 || !self.spans.is_empty() || self.proto_err.is_some()
+        self.rx_ready > 0 || self.rx_check || !self.spans.is_empty() || self.proto_err.is_some()
     }
 }
 
@@ -80,6 +82,9 @@ pub struct ConnOut {
     pub stop_turn: u64,
     /// Dernière réception (balayage d'inactivité).
     pub last_active: Instant,
+    /// Connexion parquée (§7) : un job travaille pour elle ; elle n'est plus
+    /// tirée, ce qu'elle reçoit attend dans `rx`, elle reprend à la réponse.
+    pub job_pending: bool,
 }
 
 impl ConnOut {
@@ -100,6 +105,7 @@ impl ConnOut {
             ready: false,
             stop_turn: u64::MAX,
             last_active: Instant::now(),
+            job_pending: false,
         }
     }
 
