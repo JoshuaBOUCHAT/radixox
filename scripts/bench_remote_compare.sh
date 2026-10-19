@@ -9,12 +9,14 @@
 # `scripts/bench_server.sh prep` lancé depuis son dernier démarrage. Chaque serveur est
 # démarré, chargé, mesuré puis arrêté par `scripts/bench_server.sh` (mêmes CPU pour les
 # deux). Variables : RECORDS (5M), OPS (10M), THREADS (100), PORT (6379), HOST (adresse
-# réseau du serveur, défaut : la machine de la cible ssh).
+# réseau du serveur, défaut : celle que ssh résout pour la cible, alias compris).
 set -euo pipefail
 
 TARGET="${1:?usage: $0 user@serveur [K]}"
 K="${2:-1}"
-HOST="${HOST:-${TARGET#*@}}"
+# Adresse réseau du serveur : celle que ssh résout pour la cible (un alias de
+# ~/.ssh/config comme « server » n'est connu ni de redis-cli ni de YCSB).
+HOST="${HOST:-$(ssh -G "$TARGET" | awk '$1 == "hostname" {print $2; exit}')}"
 PORT="${PORT:-6379}"
 REMOTE_DIR="${REMOTE_DIR:-radixox}"
 RECORDS="${RECORDS:-5000000}"
