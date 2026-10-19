@@ -1168,6 +1168,25 @@ données reçues reviennent en cache juste avant leur parse.
   d'arrêt et le refus d'un dump corrompu passent ; les 4 tests BGSAVE attendent l'étape 4.
   (`cargo test --no-fail-fast` pour voir toutes les suites malgré un échec.)
 
+**Étape 4, ce qui a été fait :**
+- **Parquage** (`job_pending`, pas de mode de plus) : KEYS et UNLINK font une première
+  tranche ; s'ils n'ont pas fini, la connexion est parquée (époque incrémentée), ses
+  morceaux en attente et ce qu'elle reçoit sont recopiés dans `rx` (l'anneau n'est jamais
+  retenu), le job avance d'une tranche par tour (`Config::job_budget`), la réponse part et
+  la connexion reprend. EOF pendant le parquage : la réponse part avant la fermeture.
+  KEYS, UNLINK, BGSAVE, SAVE ferment la fenêtre de leur connexion, comme une barrière.
+- **BGSAVE** (`exec::bgsave`, machine synchrone) : DFS par tranches, vidage de la liste
+  différée, zstd par tranches, double tampon ; écritures et fsync en ops io_uring
+  (`FileWrite`, `FileSync`, une à la fois) ; plafond de 10 % du CPU tant qu'une réception
+  date de moins d'1 ms. Différence assumée avec monoio : un échec d'ouverture du fichier
+  est répondu tout de suite (`ERR …`) au lieu de « started » puis un échec en fond.
+- Arrêt sur signal : un BGSAVE en cours est abandonné avant la save d'arrêt.
+- Tests : faux noyau (KEYS long sans bloquer les autres, UNLINK `prefix*` parqué, BGSAVE
+  cohérent avec écritures concurrentes, horloge du faux noyau) ; oracle aléatoire avec
+  KEYS / UNLINK parqués (budgets 1–3) ; toute la suite d'intégration, `bgsave.rs` compris,
+  passe sur les deux binaires.
+- Pas encore mesuré : p99.99 sous BGSAVE en pipeline 32 (critère de l'étape).
+
 **Organisation du code :** le code commun aux deux serveurs (dispatch, `execute_sync`,
 encodage, jobs, table des commandes) vit dans la bibliothèque `radixox/src/lib.rs` ; second
 binaire `radixox-uring` (`src/bin/uringloop.rs`) ; les tests d'intégration choisissent leur
@@ -1178,8 +1197,8 @@ binaire (`RADIXOX_TEST_BIN`) pour faire tourner la même suite sur les deux.
 `radixox/src/bin/uringloop.rs` (io-uring 0.7.15), qui remplace `resp.rs` une fois
 stabilisée.
 
-**État (2026-10-19) : étapes 0 à 3 faites** — détail plus bas, mesures §12.4.
-Prochaine : étape 4 (parquage, jobs, BGSAVE).
+**État (2026-10-19) : étapes 0 à 4 faites** — détail plus bas, mesures §12.4.
+Prochaine : étape 5 (Pub/Sub avec limite d'`out`).
 
 | # | Étape | Terminé quand |
 |---|---|---|
@@ -1187,7 +1206,7 @@ Prochaine : étape 4 (parquage, jobs, BGSAVE).
 | 1 ✅ | **Cœur sans I/O** (§1.2) : files de `FrameRef` + refcount des tampons (§5.4), tirage par tours + barrières (§2.1), `Closing` / `Draining`, `epoch`, `check_invariants` | tests sur faux anneau, scénarios et séquences aléatoires : envoi qui traîne, EOF avec pipeline en cours, `ENOBUFS`, multishot terminé, annulation croisée avec une complétion, frame coupée octet par octet |
 | 2 ✅ | **`uringloop.rs`** : accept classique + `FilesUpdate` (§4.1), recv sur anneau incrémental, send `MSG_WAITALL`, toutes les commandes sync, préchargement à l'intérieur d'une connexion comme aujourd'hui | `test_resp.sh` + intégration verts ; A/B court contre monoio en pipeline 1 / 32 / 256 ; mesurés : nombre et taille des tampons, `ENOBUFS`, adjacence, fixed file utile ou non, `MSG_WAITALL` |
 | 3 ✅ | Horloges, timers, `signalfd`, ~~évicteur à curseur~~ (reporté), balayage d'inactivité | horloge vivante au repos, arrêt propre avec et sans save |
-| 4 | Parquage + jobs branchés sur `ready`, port de BGSAVE, SAVE = BGSAVE + parquage, save d'arrêt | p99.99 sous BGSAVE en pipeline 32 ≤ monoio |
+| 4 ✅ | Parquage + jobs branchés sur `ready`, port de BGSAVE, ~~SAVE = BGSAVE + parquage~~ (SAVE reste bloquante, §8.1 plus tard), save d'arrêt | p99.99 sous BGSAVE en pipeline 32 ≤ monoio |
 | 5 | Pub/Sub avec limite d'`out` | abonné lent → `Draining`, pas d'OOM |
 | 6 | Bascule par défaut, suppression de monoio (`oxidart/monoio.rs`, `async_command.rs`, `#[monoio::test]`, `resp.rs`, `utils/mod.rs`) | critères de bascule (§15) atteints |
 | 7+ | Une optimisation à la fois, chacune mesurée : préchargement entre connexions + idx + époque (§17), GET par référence, `IOSQE_ASYNC` off/on puis auto (§6.4), jamais bloquant (§8.1), cas 3 du parseur, saves auto + AOF, pool enregistré + `SEND_ZC`, allocateur bump, GC, listes puis BLPOP | |

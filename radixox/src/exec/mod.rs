@@ -5,6 +5,7 @@
 //! (RUNTIME_ARCH.md §13).
 
 pub mod auth;
+pub mod bgsave;
 pub mod client;
 pub mod jobs;
 pub mod persist;

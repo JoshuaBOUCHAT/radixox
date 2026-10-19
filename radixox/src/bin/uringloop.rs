@@ -5,7 +5,7 @@
 //!
 //! Étapes 2–3 (§13) : accept, recv multishot sur anneau incrémental, send,
 //! commandes sync, SAVE, timers (évicteur, inactivité), arrêt sur signal avec
-//! save (`signalfd`). Pas encore : parquage, BGSAVE, Pub/Sub.
+//! save (`signalfd`), parquage (KEYS, UNLINK), BGSAVE. Pas encore : Pub/Sub.
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("RadixOx requires Linux to run (io_uring).");
@@ -35,6 +35,7 @@ const K_SEND: u64 = 3;
 const K_CANCEL: u64 = 4;
 const K_CLOSE: u64 = 5;
 const K_SIGNAL: u64 = 6;
+const K_FILE: u64 = 7;
 
 fn ud(kind: u64, slot: Slot) -> u64 {
     kind << 32 | slot as u64
@@ -159,7 +160,7 @@ extern "C" fn exit_now(_sig: i32) {
 }
 
 /// Signal reçu : save puis sortie (second signal : sortie immédiate).
-fn shutdown(art: &mut OxidArt) -> ! {
+fn shutdown(core: &mut Core) -> ! {
     eprintln!("[shutdown] signal reçu : save puis sortie (second signal : sortie immédiate)");
     // La boucle ne lira plus la signalfd pendant la save : gestionnaire classique.
     // SAFETY: gestionnaire réduit à `_exit` ; masque initialisé.
@@ -172,7 +173,9 @@ fn shutdown(art: &mut OxidArt) -> ! {
         libc::sigaddset(&mut mask, libc::SIGTERM);
         libc::pthread_sigmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut());
     }
-    match radixox::exec::persist::save_sync(art, radixox::exec::persist::sync_level()) {
+    // BGSAVE en cours : abandonné (la save d'arrêt le remplace).
+    core.abort_bgsave();
+    match radixox::exec::persist::save_sync(&mut core.art, radixox::exec::persist::sync_level()) {
         Ok(st) => {
             eprintln!(
                 "[shutdown] {:.1} MB ({:.1} MB bruts) en {:.2?} (DFS {:.2?})",
@@ -242,6 +245,18 @@ impl Server {
                     .build()
                     .flags(squeue::Flags::SKIP_SUCCESS)
                     .user_data(ud(K_CLOSE, slot)),
+                Op::FileWrite { fd, off } => {
+                    // Le tampon reste intact jusqu'au CQE (invariant du BGSAVE).
+                    let buf = self.core.pending_file_write();
+                    opcode::Write::new(Fd(fd), buf.as_ptr(), buf.len() as u32)
+                        .offset(off)
+                        .build()
+                        .user_data(ud(K_FILE, 0))
+                }
+                Op::FileSync { fd } => opcode::Fsync::new(Fd(fd))
+                    .flags(io_uring::types::FsyncFlags::DATASYNC)
+                    .build()
+                    .user_data(ud(K_FILE, 0)),
                 Op::ProvideBuf { bid } => {
                     self.bufring.push(&mut self.core, bid);
                     provided = true;
@@ -287,7 +302,8 @@ impl Server {
                     more: cqueue::more(flags),
                 },
                 K_SEND => Completion::Send { slot, res },
-                K_SIGNAL => shutdown(&mut self.core.art),
+                K_SIGNAL => shutdown(&mut self.core),
+                K_FILE => Completion::File { res },
                 // Annulation d'une op déjà finie, close d'un slot : rien à faire.
                 K_CANCEL | K_CLOSE => {
                     if res < 0 && res != -libc::ENOENT && res != -libc::EALREADY {

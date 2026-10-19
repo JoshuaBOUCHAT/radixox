@@ -53,6 +53,8 @@ struct Fake {
     fd_slot: HashMap<i32, Slot>,
     ops: Vec<Op>,
     completions: Vec<Completion>,
+    /// Horloge du faux noyau : avance de 50 µs par tour, déplaçable par le test.
+    clock: Instant,
 }
 
 impl Fake {
@@ -71,6 +73,7 @@ impl Fake {
             fd_slot: HashMap::new(),
             ops: Vec::new(),
             completions: Vec::new(),
+            clock: Instant::now(),
         }
     }
 
@@ -130,6 +133,18 @@ impl Fake {
                     self.closed.push((slot, peer.received));
                 }
                 Op::ProvideBuf { bid } => self.ring.push_back(bid),
+                // Fichier du BGSAVE : écritures réelles (le dump est relu par le test).
+                Op::FileWrite { fd, off } => {
+                    let buf = self.core.pending_file_write();
+                    // SAFETY: fd ouvert par le BGSAVE, tampon valide.
+                    let res = unsafe { libc::pwrite(fd, buf.as_ptr().cast(), buf.len(), off as i64) };
+                    self.completions.push(Completion::File { res: res as i32 });
+                }
+                Op::FileSync { fd } => {
+                    // SAFETY: fd ouvert par le BGSAVE.
+                    let res = unsafe { libc::fdatasync(fd) };
+                    self.completions.push(Completion::File { res });
+                }
             }
         }
     }
@@ -169,6 +184,8 @@ impl Fake {
 
     /// Un tour de boucle.
     fn step(&mut self) -> bool {
+        self.clock += Duration::from_micros(50);
+        self.core.set_now(self.clock);
         self.apply_ops();
         self.deliver();
         let busy = !self.completions.is_empty() || !self.core.idle();
@@ -466,18 +483,53 @@ fn unlink_prefix_parks_and_counts() {
     assert_eq!(f.take(c), ":2000\r\n:1\r\n");
 }
 
+/// BGSAVE dans la boucle : les clients sont servis pendant la save, les
+/// écritures et le fsync passent par des ops ; le dump relu contient la vue
+/// T0 (les écritures faites pendant la save n'y sont pas).
+#[test]
+fn bgsave_writes_a_consistent_dump() {
+    let dir = std::env::temp_dir().join(format!("radixox-uring-bgsave-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // SAFETY: tests en mono-thread (RUST_TEST_THREADS=1).
+    unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
+    let mut f = Fake::new(Config { max_conn: 8, ..Config::default() });
+    let c = f.connect();
+    let sets: String = (0..5000).map(|i| format!("SET b{i} v{i}\r\n")).collect();
+    f.send(c, sets.as_bytes());
+    f.settle();
+    f.take(c);
+    f.send(c, b"BGSAVE\r\nSET b0 changed\r\nBGSAVE\r\nSAVE\r\n");
+    f.step();
+    f.step();
+    f.apply_ops();
+    assert_eq!(
+        f.take(c),
+        "+Background saving started\r\n+OK\r\n-ERR Background save already in progress\r\n\
+         -ERR Background save already in progress\r\n"
+    );
+    f.settle();
+    assert!(!f.core.bgsave_running());
+    unsafe { std::env::remove_var("RADIXOX_DIR") };
+    let mut art = OxidArt::new();
+    art.load_file(std::fs::File::open(dir.join("dump.rxd")).unwrap()).unwrap();
+    assert_eq!(art.len(), 5000);
+    assert_eq!(art.get(b"b0"), Some(oxidart::Value::from_str("v0")), "vue T0");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Balayage d'inactivité : une connexion muette au-delà du délai est fermée,
 /// une connexion active reste ouverte (horloge pilotée par le test).
 #[test]
 fn idle_connections_are_closed() {
     let mut f = Fake::new(Config { max_conn: 8, idle_timeout: Some(Duration::from_secs(5)), ..Config::default() });
-    let t0 = Instant::now();
+    let t0 = f.clock;
     let idle = f.connect();
     let busy = f.connect();
-    f.core.set_now(t0 + Duration::from_secs(3));
+    f.clock = t0 + Duration::from_secs(3);
     f.send(busy, b"PING\r\n");
     f.settle();
-    f.core.set_now(t0 + Duration::from_secs(7));
+    f.clock = t0 + Duration::from_secs(7);
+    f.step();
     f.core.fire_timers();
     f.settle();
     assert!(f.closed_with(idle).is_some(), "connexion muette fermée");

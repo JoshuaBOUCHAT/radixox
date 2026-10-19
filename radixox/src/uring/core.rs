@@ -23,6 +23,7 @@ use radixox_lib::shared_frame::{SharedFrame as Frame, extend_encode};
 
 use crate::exec::client::Client;
 use crate::exec::jobs::{FREE_BUDGET, FlushJob, KEYS_BUDGET, KeysJob, Step, UnlinkJob};
+use crate::exec::bgsave::{BgSave, FileOp, cpu_share, zstd_conf};
 use crate::exec::persist::{save_sync, sync_level};
 use crate::exec::{Executed, execute_into, resp_ok};
 
@@ -92,6 +93,8 @@ pub enum Completion {
     Recv { slot: Slot, res: i32, bid: Option<Bid>, buf_more: bool, more: bool },
     /// Send : octets envoyés ou `-errno`.
     Send { slot: Slot, res: i32 },
+    /// Écriture ou fsync du fichier de BGSAVE : octets écrits, 0, ou `-errno`.
+    File { res: i32 },
 }
 
 /// Opération à soumettre au noyau.
@@ -111,6 +114,10 @@ pub enum Op {
     Close { slot: Slot },
     /// Rendre le tampon à l'anneau.
     ProvideBuf { bid: Bid },
+    /// Écrire [`Core::pending_file_write`] dans le fichier de BGSAVE à `off`.
+    FileWrite { fd: i32, off: u64 },
+    /// fsync (données) du fichier de BGSAVE.
+    FileSync { fd: i32 },
 }
 
 /// Une fenêtre de préchargement, sur la pile (pas d'allocation par fenêtre).
@@ -140,6 +147,9 @@ enum After {
     Background(FlushJob),
     /// Commande longue : la connexion est parquée, le job répondra (§7).
     Park(ConnJob),
+    /// BGSAVE / SAVE : dépendent de l'état du serveur (save en cours).
+    BgSave,
+    Save,
 }
 
 /// Job qui répond à une connexion parquée (RUNTIME_ARCH.md §7, §8).
@@ -167,7 +177,7 @@ impl ConnJob {
 /// Après cette commande, plus rien de sa connexion dans la fenêtre : barrière
 /// (§2.1) ou commande qui peut parquer la connexion.
 fn stops_window(cmd: &Cmd<'_>) -> bool {
-    cmd.is_barrier() || matches!(cmd, Cmd::Keys(_) | Cmd::Unlink(_))
+    cmd.is_barrier() || matches!(cmd, Cmd::Keys(_) | Cmd::Unlink(_) | Cmd::BgSave | Cmd::Save)
 }
 
 pub struct Core {
@@ -194,6 +204,12 @@ pub struct Core {
     now: Instant,
     timers: BinaryHeap<Reverse<(Instant, Timer)>>,
     sweep_pos: usize,
+    bgsave: Option<BgSave>,
+    /// Part du thread accordée au BGSAVE sous charge.
+    save_share: f64,
+    /// Dernière réception, toutes connexions : sans réception depuis 1 ms, le
+    /// BGSAVE n'est plus plafonné (le thread est libre).
+    last_rx: Instant,
 }
 
 impl Core {
@@ -224,6 +240,9 @@ impl Core {
             now,
             timers,
             sweep_pos: 0,
+            bgsave: None,
+            save_share: cpu_share(),
+            last_rx: now,
             cfg,
         }
     }
@@ -306,6 +325,7 @@ impl Core {
             && self.ready.is_empty()
             && self.jobs.is_empty()
             && self.conn_jobs.is_empty()
+            && self.bgsave.as_ref().is_none_or(|b| !b.wants_slice())
             && self.dirty.iter().all(|&s| self.outs[s as usize].send_in_flight())
     }
 
@@ -338,7 +358,85 @@ impl Core {
                 self.on_recv(slot, res, bid, buf_more, more)
             }
             Completion::Send { slot, res } => self.on_send(slot, res),
+            Completion::File { res } => self.on_file(res),
         }
+    }
+
+    /// Octets de l'écriture de BGSAVE en vol (`Op::FileWrite`).
+    pub fn pending_file_write(&self) -> &[u8] {
+        self.bgsave.as_ref().map_or(&[], |b| b.writing())
+    }
+
+    /// Un BGSAVE est en cours (DFS, vidage ou écriture du fichier).
+    pub fn bgsave_running(&self) -> bool {
+        self.bgsave.is_some()
+    }
+
+    /// Arrêt du serveur : abandonne le BGSAVE en cours (barrière fermée,
+    /// fichier temporaire supprimé).
+    pub fn abort_bgsave(&mut self) {
+        if let Some(mut bg) = self.bgsave.take() {
+            bg.abort(&mut self.art);
+        }
+    }
+
+    fn on_file(&mut self, res: i32) {
+        let Some(bg) = self.bgsave.as_mut() else {
+            debug_assert!(false, "CQE de fichier sans BGSAVE");
+            return;
+        };
+        if bg.syncing() {
+            bg.sync_done(res);
+        } else {
+            bg.write_done(res);
+            if let Some(op) = bg.resume_write() {
+                self.push_file_op(op);
+                return;
+            }
+        }
+        self.bgsave_next();
+    }
+
+    fn push_file_op(&mut self, op: FileOp) {
+        self.ops.push(match op {
+            FileOp::Write { fd, off } => Op::FileWrite { fd, off },
+            FileOp::Sync { fd } => Op::FileSync { fd },
+        });
+    }
+
+    /// Soumet l'écriture suivante du BGSAVE s'il y en a une ; termine-le.
+    fn bgsave_next(&mut self) {
+        let Some(bg) = self.bgsave.as_mut() else { return };
+        if !bg.in_flight()
+            && let Some(op) = bg.next_file_op()
+        {
+            self.push_file_op(op);
+        }
+        let bg = self.bgsave.as_mut().unwrap();
+        if bg.in_flight() {
+            return;
+        }
+        if let Some(res) = bg.finished(&mut self.art) {
+            if let Err(e) = res {
+                eprintln!("[bgsave] échec : {e}");
+            }
+            self.bgsave = None;
+        }
+    }
+
+    /// Une tranche de BGSAVE, sous le plafond de CPU quand des clients sont
+    /// actifs (SAVE_DESIGN.md, « Plafond de CPU du BGSAVE »).
+    fn bgsave_slice(&mut self) {
+        let Some(bg) = self.bgsave.as_mut() else { return };
+        if bg.wants_slice() {
+            let active = self.now.saturating_duration_since(self.last_rx) < Duration::from_millis(1);
+            let elapsed = self.now.saturating_duration_since(bg.started()).as_secs_f64();
+            let paced = self.save_share < 1.0 && active && bg.work().as_secs_f64() > self.save_share * elapsed;
+            if !paced {
+                bg.slice(&mut self.art);
+            }
+        }
+        self.bgsave_next();
     }
 
     fn accept(&mut self, fd: i32) {
@@ -382,6 +480,7 @@ impl Core {
                 let bid = bid.expect("recv avec données sans tampon");
                 let off = self.bufs.chunk(bid, n as u32, buf_more);
                 self.outs[s].last_active = self.now;
+                self.last_rx = self.now;
                 if matches!(self.outs[s].mode, Mode::Normal | Mode::Closing) && !self.ins[s].broken {
                     self.push_span(slot, Span { bid, off, len: n as u32 });
                 }
@@ -779,6 +878,42 @@ impl Core {
                 }
             }
             After::Park(job) => self.park(slot, job),
+            After::BgSave => {
+                let frame = if self.bgsave.is_some() || self.art.is_saving() {
+                    Frame::Error("ERR Background save already in progress".into())
+                } else {
+                    match BgSave::start(&mut self.art, zstd_conf()) {
+                        Ok(bg) => {
+                            self.bgsave = Some(bg);
+                            Frame::SimpleString(radixox_lib::shared_byte::SharedByte::from_slice(
+                                b"Background saving started",
+                            ))
+                        }
+                        Err(e) => Frame::Error(format!("ERR {e}")),
+                    }
+                };
+                extend_encode(&mut self.outs[s].out, &frame);
+            }
+            After::Save => {
+                let frame = if self.bgsave.is_some() {
+                    Frame::Error("ERR Background save already in progress".into())
+                } else {
+                    match save_sync(&mut self.art, sync_level()) {
+                        Ok(st) => {
+                            eprintln!(
+                                "[save] {:.1} MB ({:.1} MB bruts) en {:.2?} (DFS {:.2?})",
+                                st.written as f64 / 1e6,
+                                st.raw as f64 / 1e6,
+                                st.total,
+                                st.walk
+                            );
+                            resp_ok()
+                        }
+                        Err(e) => Frame::Error(format!("ERR {e}")),
+                    }
+                };
+                extend_encode(&mut self.outs[s].out, &frame);
+            }
         }
         let o = &mut self.outs[s];
         if !o.out.is_empty() {
@@ -824,6 +959,7 @@ impl Core {
         {
             self.jobs.push_back(job);
         }
+        self.bgsave_slice();
     }
 
     /// Le job a fini : sa réponse part, la connexion reprend (ce qu'elle a reçu
@@ -1044,25 +1180,10 @@ fn runtime(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) 
             extend_encode(&mut o.out, &resp_ok());
             After::Background(job)
         }
-        Cmd::Save => {
-            // Bloquante, comme celle de Redis (BGSAVE : étape 4).
-            let frame = match save_sync(art, sync_level()) {
-                Ok(st) => {
-                    eprintln!(
-                        "[save] {:.1} MB ({:.1} MB bruts) en {:.2?} (DFS {:.2?})",
-                        st.written as f64 / 1e6,
-                        st.raw as f64 / 1e6,
-                        st.total,
-                        st.walk
-                    );
-                    resp_ok()
-                }
-                Err(e) => Frame::Error(format!("ERR {e}")),
-            };
-            extend_encode(&mut o.out, &frame);
-            After::Continue
-        }
-        Cmd::Subscribe(_) | Cmd::Unsubscribe(_) | Cmd::Publish { .. } | Cmd::BgSave => {
+        // Dépendent d'une save en cours : traitées par le cœur (`finish_frame`).
+        Cmd::BgSave => After::BgSave,
+        Cmd::Save => After::Save,
+        Cmd::Subscribe(_) | Cmd::Unsubscribe(_) | Cmd::Publish { .. } => {
             extend_encode(&mut o.out, &Frame::Error("ERR not supported yet by radixox-uring".into()));
             After::Continue
         }
