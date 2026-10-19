@@ -145,6 +145,7 @@ run_ycsb() {
       -p fieldcount=1 -p fieldnamekey=false \
       -p fieldlength="$FIELDLENGTH" \
       -p operationcount="$OPS" \
+      -p recordcount="$RECORDS" \
       -threads "$THREADS" \
       -p percentiles=95,99,99.9,99.99 \
       $extra_args \

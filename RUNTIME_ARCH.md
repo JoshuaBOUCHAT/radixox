@@ -1093,7 +1093,7 @@ Leçons : (1) parser au moment d'exécuter, par fenêtres (§5.4) ; (2) l'anneau
 petit et ses tampons rendus vite (§5.1) ; (3) les défauts L1 de l'arbre sont identiques
 entre les deux binaires : l'écart venait entièrement de la plomberie.
 
-**YCSB workload A** (`bench_compare.sh`, 5 M hashes de 100 o, 10 M ops 50/50, 100
+**YCSB workload A** (⚠ phase *run* sur 1 000 clés seulement : `workloada` fixe `recordcount=1000` et `bench_compare.sh` ne le remplaçait pas pour le run — corrigé le 2026-10-19, à refaire ; même biais pour les deux serveurs) (`bench_compare.sh`, 5 M hashes de 100 o, 10 M ops 50/50, 100
 threads, RadixOx sur CPU 0-1, un run chacun, lancé par l'utilisateur le 2026-10-19).
 Les deux runs n'ont pas le même profil d'énergie : comparer l'écart à Valkey du même run.
 
@@ -1159,7 +1159,7 @@ en pipeline profond, déléguer ne rapporte rien (goulot = l'arbre) et peut coû
 mode `auto` (déléguer quand le noyau sature notre cœur) a une raison d'être. Repère :
 Valkey 4 io-threads faisait ~500 K en p1 en mai, sur 4 cœurs.
 
-**YCSB A à ressources égales, 3 cœurs physiques chacun** (`SERVER_CORES=3 bench_compare.sh`,
+**YCSB A à ressources égales, 3 cœurs physiques chacun** (⚠ même biais : run sur 1 000 clés ; `SERVER_CORES=3 bench_compare.sh`,
 un thread par cœur, frères SMT des cœurs serveur inactifs, YCSB sur les 3 autres cœurs ;
 RadixOx : boucle + 2 workers io-wq ; Valkey : io-threads=3 ; un run, 2026-10-19).
 

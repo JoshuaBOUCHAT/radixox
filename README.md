@@ -58,7 +58,10 @@ Missing for primary data:
 ## Highlights
 
 With the custom io_uring loop (2026-10-19, loopback, **single runs**; see
-[Custom io_uring loop](#custom-io_uring-loop-2026-10-19)):
+[Custom io_uring loop](#custom-io_uring-loop-2026-10-19)). **Caveat, to be re-run**: the
+YCSB *run* phase of these two series only touched 1,000 of the 5M keys (a script bug, fixed
+since); both servers had the same bias, but the absolute figures describe a hot-key
+workload:
 
 | | RadixOx | Valkey 9.1.2 | |
 |---|---|---|---|
@@ -132,6 +135,10 @@ others. Valkey: `io-threads K` on the same CPUs.
 | Valkey, 1 core | 76 k | 199 k | 500 µs | 602 µs | 971 µs | 892 µs | 1,065 µs | 2,053 MB |
 | RadixOx, 3 cores | **223 k** | **411 k** | **234 µs** | 329 µs | 484 µs | 727 µs | **1,983 µs** | **1,556 MB** |
 | Valkey, 3 cores (`io-threads 3`) | 182 k | 366 k | 271 µs | **319 µs** | **440 µs** | **702 µs** | 2,283 µs | 2,056 MB |
+
+⚠ The *run* phase of these series only touched 1,000 of the 5M keys (YCSB's `workloada`
+sets `recordcount=1000` and the script did not override it for the run; fixed since): a
+hot-key workload, the same for both servers. To be re-run on the whole key space.
 
 On three cores, Valkey has a slightly better p95–p99.9 (3–10 %): handing sends to the
 kernel's workers adds some variance, which a planned adaptive mode should reduce.
