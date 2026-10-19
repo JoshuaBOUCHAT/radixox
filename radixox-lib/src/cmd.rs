@@ -287,13 +287,16 @@ pub enum Cmd<'a> {
 // RESP parser — single pass, no backtracking
 // ---------------------------------------------------------------------------
 
+/// Entier décimal d'en-tête (`*N`, `$N`). Débordement → `None` : sans ce
+/// contrôle (release = arithmétique modulaire), `$18446744073709551615`
+/// faisait passer le test de longueur puis paniquer le découpage.
 fn parse_uint(d: &[u8], pos: &mut usize) -> Option<usize> {
     let mut n = 0usize;
     loop {
         match d.get(*pos)? {
             b'\r' => break,
             b if b.is_ascii_digit() => {
-                n = n * 10 + (*b - b'0') as usize;
+                n = n.checked_mul(10)?.checked_add((*b - b'0') as usize)?;
                 *pos += 1;
             }
             _ => return None,
@@ -734,7 +737,8 @@ impl<'a> Cmd<'a> {
             pos += 1;
             let len = parse_uint(d, &mut pos)?;
             expect_crlf(d, &mut pos)?;
-            if pos + len > d.len() {
+            // `pos <= d.len()` (crlf lu juste avant) : pas de débordement possible.
+            if len > d.len() - pos {
                 return None;
             }
             raw.push(&d[pos..pos + len]);
@@ -765,5 +769,22 @@ mod tests {
         assert_eq!(n, d.len());
         // Lignes vides seules : rien à exécuter, on attend la suite.
         assert!(Cmd::parse(b"\r\n").is_none());
+    }
+
+    /// Longueurs énormes ou qui débordent : refusées, sans panic (un paquet
+    /// envoyé avant AUTH faisait tomber le serveur).
+    #[test]
+    fn huge_or_overflowing_lengths_do_not_panic() {
+        let cases: [&[u8]; 6] = [
+            b"*1\r\n$18446744073709551615\r\nGET\r\n",
+            b"*1\r\n$18446744073709551610\r\nGET\r\n",
+            b"*1\r\n$99999999999999999999999\r\nGET\r\n",
+            b"*99999999999999999999999\r\n$3\r\nGET\r\n",
+            b"*18446744073709551615\r\n$3\r\nGET\r\n",
+            b"*2\r\n$3\r\nGET\r\n$9223372036854775807\r\nk\r\n",
+        ];
+        for d in cases {
+            assert!(Cmd::parse(d).is_none(), "{:?}", d.escape_ascii().to_string());
+        }
     }
 }
