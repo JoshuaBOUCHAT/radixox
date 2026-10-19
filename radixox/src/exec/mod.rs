@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod client;
 pub mod jobs;
+pub mod persist;
 mod hash;
 pub mod scan;
 mod sset;

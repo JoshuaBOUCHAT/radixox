@@ -14,6 +14,11 @@ categories = ["database-implementations", "network-programming"]
 name = "radixox"
 path = "src/bin/resp.rs"
 
+# Boucle io_uring maison (RUNTIME_ARCH.md) ; remplacera `radixox` une fois stabilisée.
+[[bin]]
+name = "radixox-uring"
+path = "src/bin/uringloop.rs"
+
 [dependencies]
 monoio.workspace = true
 oxidart = { workspace = true, features = ["regex"] }
@@ -22,6 +27,9 @@ smallvec.workspace = true
 
 local-sync = "0.1.1"
 io-uring = "0.6.4"
+# Boucle maison ; la 0.6.4 reste pour monoio jusqu'à sa suppression.
+io-uring-07 = { package = "io-uring", version = "0.7.15" }
+libc = "0.2"
 crc32fast = "1.4"
 zstd-safe = { version = "8.1", default-features = false, features = ["experimental", "std"] }
 

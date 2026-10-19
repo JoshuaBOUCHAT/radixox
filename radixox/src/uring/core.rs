@@ -45,6 +45,9 @@ pub struct Config {
     /// `out` au-delà duquel une connexion qui a déjà un send en vol n'est plus
     /// tirée (backpressure, §6.2).
     pub out_backpressure: usize,
+    /// Commandes dont les clés sont préchargées ensemble (`RADIXOX_PREFETCH`,
+    /// 1 = pas de préchargement). Au plus une par connexion par fenêtre.
+    pub prefetch: usize,
 }
 
 impl Default for Config {
@@ -58,6 +61,7 @@ impl Default for Config {
             batch_cmds: 1024,
             flush_early: 64 << 10,
             out_backpressure: 1 << 20,
+            prefetch: 8,
         }
     }
 }
@@ -164,7 +168,12 @@ impl Core {
 
     /// Plus rien à faire sans nouvel événement : la boucle peut attendre.
     pub fn idle(&self) -> bool {
-        self.ops.is_empty() && self.ready.is_empty() && self.dirty.is_empty() && self.jobs.is_empty()
+        // Une connexion sale qui attend la fin de son send n'est pas du travail :
+        // le CQE réveillera la boucle.
+        self.ops.is_empty()
+            && self.ready.is_empty()
+            && self.jobs.is_empty()
+            && self.dirty.iter().all(|&s| self.outs[s as usize].send_in_flight())
     }
 
     pub fn mode(&self, slot: Slot) -> Mode {
@@ -377,40 +386,42 @@ impl Core {
     // ── Lot ──────────────────────────────────────────────────────────────
 
     /// Tirage par tours (§2.1) : la 1re frame de chaque connexion, puis la 2e…
-    /// jusqu'au budget. Ordre gardé à l'intérieur d'une connexion.
+    /// jusqu'au budget. Ordre gardé à l'intérieur d'une connexion. Les frames
+    /// tirées forment des fenêtres de `prefetch` commandes de connexions
+    /// différentes, dont les clés sont préchargées ensemble (§8bis).
     pub fn run_batch(&mut self) {
         self.turn += 1;
         let n = self.ready.len();
         if n == 0 {
             return;
         }
-        let start = self.rr % n;
+        let mut pos = self.rr % n;
         self.rr = self.rr.wrapping_add(1);
+        let width = self.cfg.prefetch.clamp(1, n.min(oxidart::PREFETCH_BATCH));
         let mut budget = self.cfg.batch_cmds;
-        loop {
-            let mut progressed = false;
-            for k in 0..n {
-                if budget == 0 {
-                    break;
-                }
-                let slot = self.ready[(start + k) % n];
-                let o = &self.outs[slot as usize];
-                if o.stop_turn == self.turn || !matches!(o.mode, Mode::Normal | Mode::Closing) {
+        let mut window: Vec<(Slot, Item)> = Vec::with_capacity(width);
+        while budget > 0 {
+            // Une fenêtre : au plus une frame par connexion (une barrière ne
+            // laisse donc jamais passer la frame suivante de sa connexion).
+            let mut tried = 0;
+            while window.len() < width.min(budget) && tried < n {
+                let slot = self.ready[pos % n];
+                pos += 1;
+                tried += 1;
+                if window.iter().any(|&(s, _)| s == slot) || !self.drawable(slot) {
                     continue;
                 }
-                if o.send_in_flight() && o.out.len() >= self.cfg.out_backpressure {
-                    continue;
+                if let Some(item) = self.ins[slot as usize].queue.pop_front() {
+                    window.push((slot, item));
+                    tried = 0;
                 }
-                let Some(item) = self.ins[slot as usize].queue.pop_front() else {
-                    continue;
-                };
-                self.exec_item(slot, item);
-                budget -= 1;
-                progressed = true;
             }
-            if !progressed || budget == 0 {
+            if window.is_empty() {
                 break;
             }
+            budget -= window.len();
+            self.exec_window(&window);
+            window.clear();
         }
         let (ins, outs) = (&self.ins, &mut self.outs);
         self.ready.retain(|&slot| {
@@ -421,22 +432,59 @@ impl Core {
         });
     }
 
-    fn exec_item(&mut self, slot: Slot, item: Item) {
-        let s = slot as usize;
-        let after = {
+    /// La connexion peut donner une frame à ce tour-ci.
+    fn drawable(&self, slot: Slot) -> bool {
+        let o = &self.outs[slot as usize];
+        o.stop_turn != self.turn
+            && matches!(o.mode, Mode::Normal | Mode::Closing)
+            && !(o.send_in_flight() && o.out.len() >= self.cfg.out_backpressure)
+    }
+
+    /// Parse les frames de la fenêtre, précharge leurs clés, les exécute dans
+    /// l'ordre, puis rend les tampons et applique les suites.
+    fn exec_window(&mut self, window: &[(Slot, Item)]) {
+        let mut afters: Vec<After> = Vec::with_capacity(window.len());
+        {
             let Core { art, ins, outs, bufs, .. } = self;
-            let o = &mut outs[s];
-            match item {
-                Item::ProtoErr(msg) => {
-                    extend_encode(&mut o.out, &Frame::Error(format!("ERR Protocol error: {msg}")));
-                    After::Close
-                }
-                Item::Ring { bid, off, len } => run_frame(bufs.slice(bid, off, len), art, o),
-                Item::Local { off, len } => {
-                    run_frame(&ins[s].rx[off as usize..(off + len) as usize], art, o)
+            let cmds: Vec<Option<Cmd<'_>>> = window
+                .iter()
+                .map(|&(slot, item)| {
+                    let bytes = match item {
+                        Item::ProtoErr(_) => return None,
+                        Item::Ring { bid, off, len } => bufs.slice(bid, off, len),
+                        Item::Local { off, len } => &ins[slot as usize].rx[off as usize..(off + len) as usize],
+                    };
+                    let Parse::Done(cmd, _) = Cmd::parse(bytes) else {
+                        unreachable!("frame découpée à l'arrivée : toujours complète");
+                    };
+                    Some(cmd)
+                })
+                .collect();
+            if window.len() > 1 {
+                let keys: Vec<&[u8]> = cmds.iter().flatten().filter_map(Cmd::main_key).collect();
+                if keys.len() > 1 {
+                    art.prefetch_keys(&keys);
                 }
             }
-        };
+            for (&(slot, item), cmd) in window.iter().zip(cmds) {
+                let o = &mut outs[slot as usize];
+                afters.push(match (item, cmd) {
+                    (Item::ProtoErr(msg), _) => {
+                        extend_encode(&mut o.out, &Frame::Error(format!("ERR Protocol error: {msg}")));
+                        After::Close
+                    }
+                    (_, Some(cmd)) => run_cmd(cmd, art, o),
+                    (_, None) => unreachable!(),
+                });
+            }
+        }
+        for (&(slot, item), after) in window.iter().zip(afters) {
+            self.finish_item(slot, item, after);
+        }
+    }
+
+    fn finish_item(&mut self, slot: Slot, item: Item, after: After) {
+        let s = slot as usize;
         match item {
             Item::Ring { bid, .. } => {
                 self.bufs.release(bid);
@@ -478,13 +526,27 @@ impl Core {
     // ── Envoi et fermeture ───────────────────────────────────────────────
 
     /// Fin de tour : un send par connexion sale, fermetures terminées.
+    ///
+    /// Une connexion qui a encore des frames en file (pipeline plus long que sa
+    /// part du tour) garde ses réponses pour le tour suivant, jusqu'au seuil de
+    /// flush anticipé : sinon un pipeline de 256 commandes partait en ~20
+    /// petits sends au lieu d'un (débit pipeliné divisé par deux, mesuré).
     pub fn flush(&mut self) {
         for slot in std::mem::take(&mut self.dirty) {
-            let o = &mut self.outs[slot as usize];
-            o.dirty = false;
-            if matches!(o.mode, Mode::Normal | Mode::Closing) && !o.send_in_flight() && !o.out.is_empty() {
-                self.send(slot);
+            let s = slot as usize;
+            let o = &mut self.outs[s];
+            if !matches!(o.mode, Mode::Normal | Mode::Closing) || o.out.is_empty() {
+                o.dirty = false;
+                continue;
             }
+            let more_coming = o.mode == Mode::Normal && !self.ins[s].queue.is_empty();
+            if o.send_in_flight() || more_coming {
+                // Repart au CQE du send, ou au tour suivant.
+                self.dirty.push(slot);
+                continue;
+            }
+            o.dirty = false;
+            self.send(slot);
         }
         for slot in std::mem::take(&mut self.closing) {
             let (i, o) = (&self.ins[slot as usize], &self.outs[slot as usize]);
@@ -612,11 +674,8 @@ impl Core {
     }
 }
 
-/// Parse et exécute une frame découpée à l'arrivée.
-fn run_frame(bytes: &[u8], art: &mut OxidArt, o: &mut ConnOut) -> After {
-    let Parse::Done(cmd, _) = Cmd::parse(bytes) else {
-        unreachable!("frame découpée à l'arrivée : toujours complète");
-    };
+/// Exécute une commande d'une connexion.
+fn run_cmd(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut) -> After {
     let barrier = cmd.is_barrier();
     match execute_into(cmd, art, &mut o.client, &mut o.out) {
         Executed::Done if barrier => After::Barrier,

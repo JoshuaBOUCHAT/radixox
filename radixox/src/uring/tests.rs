@@ -494,6 +494,7 @@ fn random_streams_match_oracle() {
             batch_cmds: 1 + rng.below(20) as usize,
             flush_early: 1 + rng.below(200) as usize,
             out_backpressure: 1 + rng.below(400) as usize,
+            prefetch: 1 + rng.below(10) as usize,
             ..Config::default()
         });
         f.max_chunk = 1 + rng.below(40) as usize;

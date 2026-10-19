@@ -377,8 +377,8 @@ impl OxidArt {
 
     /// Nœud désigné par la racine ou par une entrée enfant d'un nœud vivant,
     /// lu sans consulter le bitmap d'occupation (une ligne de cache de moins
-    /// par étage). Réservé aux descentes synchrones : un idx gardé d'un tour à
-    /// l'autre passe par [`try_get_node`](Self::try_get_node).
+    /// par étage). Réservé aux descentes synchrones : aucun idx de l'arbre
+    /// vivant n'est gardé d'un tour à l'autre (les jobs reprennent sur une clé).
     #[inline(always)]
     pub(crate) fn node(&self, idx: u32) -> &Node {
         debug_assert!(self.map.is_occupied(idx), "idx de nœud {idx} libre");
@@ -386,11 +386,6 @@ impl OxidArt {
         // parent, dans le même appel synchrone ; une entrée enfant vivante
         // désigne donc toujours un slot occupé.
         unsafe { self.map.get_unchecked(idx) }
-    }
-
-    #[inline]
-    pub(crate) fn try_get_node(&self, idx: u32) -> Option<&Node> {
-        self.map.get(idx)
     }
 
     #[inline]
