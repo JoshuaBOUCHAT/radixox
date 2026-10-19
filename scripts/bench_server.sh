@@ -44,13 +44,22 @@ running_pid() {
   kill -0 "$pid" 2>/dev/null && echo "$pid"
 }
 
+# Processus qui écoute sur $PORT (vide si aucun).
+port_owner() {
+  ss -ltnpH "sport = :$PORT" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1 || true
+}
+
+# Prêt quand c'est bien notre processus qui écoute et répond.
 wait_ready() {
+  local pid; pid=$(cat "$PIDFILE")
   for _ in $(seq 1 100); do
-    redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG && return 0
     running_pid >/dev/null || { tail -20 "$STATE/server.log" >&2; die "le serveur s'est arrêté au démarrage"; }
+    if [ "$(port_owner)" = "$pid" ] && redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG; then
+      return 0
+    fi
     sleep 0.1
   done
-  die "pas de réponse sur :$PORT après 10 s"
+  die "pas de réponse de notre serveur sur :$PORT après 10 s (log : $STATE/server.log)"
 }
 
 cmd_stop() {
@@ -71,6 +80,10 @@ cmd_start() {
   main=${cpus%%,*}
   iowq=${cpus#"$main"}; iowq=${iowq#,}
   cmd_stop >/dev/null
+  local other; other=$(port_owner)
+  if [ -n "$other" ]; then
+    die "port $PORT déjà pris par : $(ps -o pid=,comm= -p "$other" 2>/dev/null || echo "pid $other") — service système ? (sudo systemctl disable --now redis-server / valkey-server)"
+  fi
   rm -f "$STATE"/dump.rxd*
   ulimit -n 65536 2>/dev/null || true
   case "$which" in
