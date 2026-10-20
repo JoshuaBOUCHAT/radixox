@@ -31,6 +31,22 @@ impl Default for SetOpts {
     }
 }
 
+/// `REPLICATE` : ajoute ou retire une cible de réplication.
+#[derive(Debug)]
+pub enum Replicate<'a> {
+    Start { host: &'a [u8], port: u16, auth: Option<&'a [u8]> },
+    Stop { host: &'a [u8], port: u16 },
+}
+
+/// `RXLOAD` : synchronisation complète, le dump en morceaux.
+#[derive(Debug)]
+pub enum RxLoad<'a> {
+    /// Taille totale du dump.
+    Begin(u64),
+    Data(&'a [u8]),
+    End,
+}
+
 // ---------------------------------------------------------------------------
 // Cmd
 //
@@ -91,6 +107,24 @@ pub enum Cmd<'a> {
     Save,
     /// LASTSAVE : date (Unix) de la dernière save réussie
     LastSave,
+    /// DEBUG DIGEST [at] : condensé du contenu (clés vivantes à `at`, défaut :
+    /// l'horloge du serveur), pour comparer deux serveurs.
+    DebugDigest(Option<u64>),
+
+    // --- Réplication (DURABILITY_DESIGN.md §10) ----------------------
+    /// REPLICATE host port [AUTH pass] | REPLICATE STOP host port
+    Replicate(Replicate<'a>),
+    /// REPLICAOF NO ONE (`None`) ; REPLICAOF host port est refusé (la
+    /// réplication est poussée par le primaire).
+    ReplicaOf(Option<(&'a [u8], &'a [u8])>),
+    /// RXHELLO replid
+    RxHello(&'a [u8]),
+    /// RXLOAD BEGIN len | RXLOAD DATA octets | RXLOAD END
+    RxLoad(RxLoad<'a>),
+    /// RXBLOCK bloc
+    RxBlock(&'a [u8]),
+    /// RXTICK now : horloge du primaire, entre deux blocs.
+    RxTick(u64),
 
     // --- String / clés -----------------------------------------------
     /// GET key
@@ -543,6 +577,10 @@ fn float(s: &[u8]) -> Result<f64, CmdError> {
 
 /// Construit une valeur possédée — réservé aux champs qui doivent survivre
 /// à la commande (valeur stockée, ou donnée traversant une commande async).
+fn port_num(s: &[u8]) -> Result<u16, CmdError> {
+    u16::try_from(uint(s)?).map_err(|_| CmdError::NotInt)
+}
+
 fn sb(s: &[u8]) -> SharedByte {
     SharedByte::from_slice(s)
 }
@@ -821,6 +859,40 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
         b"bgrewriteaof" => { exact!(0); Cmd::BgRewriteAof }
         b"save" => { exact!(0); Cmd::Save }
         b"lastsave" => { exact!(0); Cmd::LastSave }
+        b"debug" => match *args {
+            [sub] if sub.eq_ignore_ascii_case(b"digest") => Cmd::DebugDigest(None),
+            [sub, at] if sub.eq_ignore_ascii_case(b"digest") => Cmd::DebugDigest(Some(uint(at)?)),
+            [] => return Err(CmdError::Arity),
+            _ => return Err(CmdError::Syntax),
+        },
+
+        // ── Réplication ──────────────────────────────────────────────────
+        b"replicate" => match *args {
+            [stop, host, port] if stop.eq_ignore_ascii_case(b"stop") => {
+                Cmd::Replicate(Replicate::Stop { host, port: port_num(port)? })
+            }
+            [host, port] => Cmd::Replicate(Replicate::Start { host, port: port_num(port)?, auth: None }),
+            [host, port, kw, pass] if kw.eq_ignore_ascii_case(b"auth") => {
+                Cmd::Replicate(Replicate::Start { host, port: port_num(port)?, auth: Some(pass) })
+            }
+            [_, _, _] | [_, _, _, _] => return Err(CmdError::Syntax),
+            _ => return Err(CmdError::Arity),
+        },
+        b"replicaof" | b"slaveof" => match *args {
+            [no, one] if no.eq_ignore_ascii_case(b"no") && one.eq_ignore_ascii_case(b"one") => Cmd::ReplicaOf(None),
+            [host, port] => Cmd::ReplicaOf(Some((host, port))),
+            _ => return Err(CmdError::Arity),
+        },
+        b"rxhello" => { exact!(1); Cmd::RxHello(args[0]) }
+        b"rxload" => match *args {
+            [sub, len] if sub.eq_ignore_ascii_case(b"begin") => Cmd::RxLoad(RxLoad::Begin(uint(len)?)),
+            [sub, data] if sub.eq_ignore_ascii_case(b"data") => Cmd::RxLoad(RxLoad::Data(data)),
+            [sub] if sub.eq_ignore_ascii_case(b"end") => Cmd::RxLoad(RxLoad::End),
+            [] => return Err(CmdError::Arity),
+            _ => return Err(CmdError::Syntax),
+        },
+        b"rxblock" => { exact!(1); Cmd::RxBlock(args[0]) }
+        b"rxtick" => { exact!(1); Cmd::RxTick(uint(args[0])?) }
 
         _ => return Err(CmdError::Unknown),
     })

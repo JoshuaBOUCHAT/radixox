@@ -99,6 +99,11 @@ pub struct ConnOut {
     pub channels: Vec<SharedByte>,
     /// Depuis quand `out` dépasse la limite souple des abonnés.
     pub over_soft: Option<Instant>,
+    /// Lien sortant de réplication (DURABILITY_DESIGN.md §10) : ce qu'il reçoit
+    /// sont des réponses de la cible, lues par le cœur, jamais exécutées.
+    pub link: bool,
+    /// `connect` en vol (lien sortant).
+    pub connecting: bool,
 }
 
 impl ConnOut {
@@ -124,6 +129,8 @@ impl ConnOut {
             holds: Default::default(),
             channels: Vec::new(),
             over_soft: None,
+            link: false,
+            connecting: false,
         }
     }
 

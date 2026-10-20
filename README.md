@@ -29,11 +29,13 @@ Good fit today:
 
 Missing for primary data:
 - **no memory limit or eviction** (`maxmemory`, LRU/LFU): a growing dataset ends in OOM;
-- **AOF, no replication yet**: `RADIXOX_APPENDONLY=yes` logs every write (`everysec`, `no`, or
-  `always` with group commit), rewrites the log in the background and replays it at startup; without
-  it, automatic `BGSAVE` rules as in Valkey and a save on SIGTERM, and a crash loses what was
-  written since the last snapshot;
-- no replication, no cluster, no TLS, no ACLs (one password);
+- **AOF and basic replication**: `RADIXOX_APPENDONLY=yes` logs every write (`everysec`, `no`,
+  or `always` with group commit), rewrites the log in the background and replays it at startup;
+  without it, automatic `BGSAVE` rules as in Valkey and a save on SIGTERM, and a crash loses
+  what was written since the last snapshot. Replication is asynchronous and pushed by the
+  primary (`REPLICATE host port`); no `WAIT` yet, no AOF on a replica, no chaining (see
+  [Replication](#replication));
+- no cluster, no TLS, no ACLs (one password);
 - no lists, `MULTI`/`EXEC` or Lua, which queue and job libraries (Sidekiq, Celery, BullMQ)
   rely on;
 - Linux only, and io_uring must be allowed (see [Deployment](#deployment)).
@@ -503,6 +505,7 @@ own synchronization.
 | Set | `SADD` `SREM` `SISMEMBER` `SCARD` `SMEMBERS` `SPOP` |
 | Sorted set | `ZADD` `ZREM` `ZSCORE` `ZCARD` `ZRANGE` (`WITHSCORES`) `ZINCRBY` |
 | Pub/Sub | `SUBSCRIBE` `UNSUBSCRIBE` `PUBLISH` |
+| Replication | `REPLICATE` (`host port [AUTH pass]`, `STOP host port`) `REPLICAOF NO ONE` `DEBUG DIGEST` (internal: `RXHELLO` `RXLOAD` `RXBLOCK` `RXTICK`) |
 
 - `UNLINK key` deletes that key only; `UNLINK prefix*` deletes every key under `prefix`.
 - `KEYS`, `UNLINK prefix*` and `FLUSHDB` never block other clients: the work is done in
@@ -510,8 +513,7 @@ own synchronization.
   frees the memory in the background.
 - Commands can also be sent inline, as with Redis (`SET k "a b"` from telnet or `nc`).
 
-Not yet: list commands, `MULTI`/`EXEC`, `CONFIG`, RESP3, Lua,
-replication, cluster.
+Not yet: list commands, `MULTI`/`EXEC`, `CONFIG`, RESP3, Lua, `WAIT`, cluster.
 
 ---
 
@@ -537,7 +539,7 @@ replication, cluster.
   truncated or corrupted dump prevents startup instead of loading partial data.
 - **Save on SIGINT / SIGTERM** when automatic saves are on, as Valkey does
   (`RADIXOX_SAVE_ON_EXIT=0` / `1` to force).
-- **Append-only file** (`RADIXOX_APPENDONLY=yes`, in progress): the commands received are
+- **Append-only file** (`RADIXOX_APPENDONLY=yes`): the commands received are
   logged in blocks, one per loop turn, each carrying the clock of its turn, so that TTLs and
   lazy expiry replay identically; only non-deterministic commands are rewritten (`SPOP` →
   `SREM` of the popped members). Files live in `RADIXOX_DIR/appendonlydir/` (a base dump, log
@@ -555,13 +557,46 @@ replication, cluster.
   `RADIXOX_AUTO_AOF_REWRITE_MIN_SIZE`) writes a new base at an exact cut point in the stream
   of commands, in slices as any `BGSAVE`, while the log moves on to a new segment; the old
   files are deleted once the new manifest is on disk. `SAVE` still writes `dump.rxd`.
-- Not yet: replication.
 - Every dump ends with a **content digest** checked at load time, computed by two different
   traversals (the save's and one of the reloaded tree): a dump that reloads into anything but
   the saved state is refused.
 - Not yet: `CONFIG GET` / `CONFIG SET` (settings are environment variables).
 
 Design: [`SAVE_DESIGN.md`](SAVE_DESIGN.md), [`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md).
+
+---
+
+## Replication
+
+The primary pushes to its replicas: `REPLICATE <host> <port> [AUTH <password>]` on the
+primary (or `RADIXOX_REPLICATE="host1:port1,host2:port2"` at startup) adds a target, which it
+connects to as a client and keeps reconnecting every second. A replica is an ordinary RadixOx
+server: it follows the first source that connects, refuses writes from other clients
+(`-READONLY`) and serves reads.
+
+- The replica receives **the same blocks as the AOF**, byte for byte (commands received, with
+  the clock of their turn): it replays them with the normal executor, so TTLs expire on the
+  replica as on the primary whatever its own clock. Each block is acknowledged.
+- **Partial resync**: after a short cut, the replica resumes from the last block it applied if
+  the primary still has the following ones in memory (`RADIXOX_REPL_BACKLOG_MB`). Otherwise
+  **full sync**: a `BGSAVE` cut at an exact point in the stream (an AOF rewrite when the AOF is
+  on), sent in 1 MiB chunks; the replica loads it (CRC and content digest checked) and the
+  blocks written meanwhile follow.
+- A replica that falls behind by more than `RADIXOX_REPL_MAX_LAG_MB` is disconnected (and
+  resyncs).
+- **Failover** (by the operator): `REPLICAOF NO ONE` on the chosen replica, then `REPLICATE` on
+  it towards the others. The promoted server starts a new history and refuses to become a
+  replica again until restarted, so that the old primary, if still alive and configured,
+  cannot overwrite it.
+- A primary restart always leads to a full resync (new history id at each start: a primary that
+  lost the end of its log in a crash cannot be mistaken for the same history).
+- `INFO` has a `# Replication` section (`role`, `connected_replicas`, one `replicaN:` line per
+  target with its state and lag, `sync_full`, `sync_partial_ok`); `DEBUG DIGEST [at]` returns
+  the content digest, to compare two servers.
+- Not yet: `WAIT` / `min-replicas-to-write`, AOF on a replica, chained replicas, zero-copy
+  sends, TLS. The replica blocks while loading a full sync.
+
+Design and deviations: [`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md) §10.
 
 ---
 
@@ -574,7 +609,7 @@ Environment variables:
 | `RADIXOX_PORT` | `6379` | listening port |
 | `RADIXOX_BIND` | `127.0.0.1` | listening address (`0.0.0.0` or `::` to accept remote clients; a warning is printed if no password is set) |
 | `RADIXOX_PASSWORD` | unset | require `AUTH <password>` (or `AUTH default <password>`) before any other command; use a long random value |
-| `RADIXOX_DIR` | `.` | directory of `dump.rxd` |
+| `RADIXOX_DIR` | `.` | directory of `dump.rxd`, of `appendonlydir/`, and of a full sync being received by a replica |
 | `RADIXOX_CPU_PIN` | unset | pin the server thread to this CPU |
 | `RADIXOX_PREFETCH` | `8` | pipelined commands whose key lookups are interleaved (`0` = off) |
 | `RADIXOX_SAVE_ZSTD` | `3` | `BGSAVE` zstd level (`0` = raw) |
@@ -588,6 +623,10 @@ Environment variables:
 | `RADIXOX_AOF_LOAD_TRUNCATED` | `yes` | at startup, cut a block left incomplete by a crash at the end of the log instead of refusing to start |
 | `RADIXOX_AOF_MAX_PENDING_MB` | `64` | log bytes not yet written beyond which writers wait (reads go on) |
 | `RADIXOX_AUTO_AOF_REWRITE_PERCENTAGE` / `_MIN_SIZE` | `100` / `64mb` | rewrite the log when it has grown by this percentage of the base and at least this size (`0` = never) |
+| `RADIXOX_REPLICATE` | unset | replicas to push to, `host:port,host:port` (IPv6 in brackets) |
+| `RADIXOX_REPLICATE_AUTH` | unset | password sent with `AUTH` to the replicas of `RADIXOX_REPLICATE` |
+| `RADIXOX_REPL_BACKLOG_MB` | `64` | recent blocks kept in memory for partial resyncs |
+| `RADIXOX_REPL_MAX_LAG_MB` | `256` | bytes waiting for a replica beyond which it is disconnected |
 | `RADIXOX_SAVE_CPU_SHARE` | `0.1` | share of the server thread a `BGSAVE` is guaranteed while clients are active; whenever no client and no kernel completion is waiting, background work (save, `FLUSHDB` freeing, long `KEYS`) runs uncapped |
 | `RADIXOX_SCAN_IDLE_SECS` | `60` | idle time after which a `SCAN` cursor can be reclaimed |
 | `RADIXOX_SCAN_MAX_CURSORS` | `65536` | active `SCAN` cursors at most; beyond, a new `SCAN` gets an error |
@@ -715,7 +754,9 @@ across cores is meant to come from sharding by namespace, not from shared-state 
 - **Atomic conditional transactions**: `MULTI ATOMIC` where an empty read aborts the whole
   block, `DELPREFIX` (delete a whole namespace in O(prefix length)), durable commits —
   [`TX_DESIGN.md`](TX_DESIGN.md).
-- Replication fed by the same stream of blocks as the AOF ([`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md)).
+- Replication, next steps ([`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md)): zero-copy sends
+  of the shared blocks (`SEND_ZC`, `splice` of the dump), `WAIT` and `min-replicas-to-write`
+  on the same group-commit mechanism as `appendfsync always`, AOF on replicas, chaining.
 - Lower memory per key on random keys: long suffixes stored inline on several cells (no
   separate allocation), a smaller node class for nodes with two or three entries.
 - Client compatibility: `CONFIG`, RESP3.

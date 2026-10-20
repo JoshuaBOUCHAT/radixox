@@ -160,6 +160,14 @@ impl FlushJob {
     }
 }
 
+/// Le reste d'un UNLINK dont la réponse ne compte plus (rejeu du flux) :
+/// seulement de la mémoire à rendre.
+impl From<UnlinkJob> for FlushJob {
+    fn from(job: UnlinkJob) -> Self {
+        Self { detached: job.detached }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -68,6 +68,8 @@ struct Fake {
     /// fsync de l'AOF retenus (disque lent à commiter).
     sync_stalled: bool,
     sync_held: Vec<Op>,
+    /// `connect` sortants pas encore aboutis (le test les accepte ou refuse).
+    connecting: Vec<(Slot, std::net::SocketAddr)>,
 }
 
 impl Fake {
@@ -94,6 +96,7 @@ impl Fake {
             journal_held: Vec::new(),
             sync_stalled: false,
             sync_held: Vec::new(),
+            connecting: Vec::new(),
         }
     }
 
@@ -191,6 +194,7 @@ impl Fake {
                     let res = unsafe { libc::fdatasync(fd) };
                     self.completions.push(Completion::JournalSync { res });
                 }
+                Op::Connect { slot, addr } => self.connecting.push((slot, addr)),
             }
         }
     }
@@ -259,6 +263,8 @@ impl Fake {
             self.core.take_ops(&mut self.ops);
         }
         self.core.end_turn();
+        // Comme la boucle : les opérations de la fin de tour partent avec lui.
+        self.core.take_ops(&mut self.ops);
         if std::env::var("FAKE_TRACE").is_ok() {
             eprintln!("  ops={:?}", self.ops);
         }
@@ -290,6 +296,16 @@ impl Fake {
 
     fn take(&mut self, slot: Slot) -> String {
         String::from_utf8_lossy(&std::mem::take(&mut self.peers.get_mut(&slot).expect("peer").received)).into()
+    }
+
+    /// Le `connect` sortant vers `slot` aboutit (`res` 0) ou échoue.
+    fn finish_connect(&mut self, slot: Slot, res: i32) {
+        let i = self.connecting.iter().position(|&(s, _)| s == slot).expect("connect en vol");
+        self.connecting.remove(i);
+        if res == 0 {
+            self.peers.insert(slot, Peer::default());
+        }
+        self.completions.push(Completion::Connect { slot, res });
     }
 
     fn closed_with(&self, slot: Slot) -> Option<String> {
@@ -965,7 +981,7 @@ fn journal_replay_matches_state() {
             }
         }
         f.settle();
-        let blocks: Vec<u8> = f.core.journal_mut().unwrap().closed.iter().flatten().copied().collect();
+        let blocks: Vec<u8> = f.core.journal_mut().unwrap().closed.iter().flat_map(|b| b.iter()).copied().collect();
         let mut replayed = replay(&blocks);
         replayed.set_now(f.core.art.now);
         let (got, want) = (state(&mut replayed), state(&mut f.core.art));
@@ -1058,7 +1074,7 @@ fn journaled_run(seed: u64) -> (Vec<Vec<u8>>, Fake) {
         f.wall = Some(wall);
     }
     f.settle();
-    let blocks = f.core.journal_mut().unwrap().closed.drain(..).collect();
+    let blocks = f.core.journal_mut().unwrap().closed.drain(..).map(|b| b.to_vec()).collect();
     (blocks, f)
 }
 
@@ -1413,5 +1429,352 @@ fn always_random_traffic_replays_and_answers() {
         let (got, _) = recover_state(&dir, 1_000, false).unwrap();
         assert_eq!(got, state(&mut f.core.art), "graine {seed}");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Réplication (DURABILITY_DESIGN.md §10, test 7) ──────────────────────────
+
+/// Un primaire et un réplica sur deux faux noyaux, reliés par un fil simulé :
+/// ce que le primaire envoie sur son lien arrive à une connexion acceptée par
+/// le réplica, et inversement.
+struct Pair {
+    p: Fake,
+    r: Fake,
+    /// Fil en place : (lien chez le primaire, connexion chez le réplica ;
+    /// `Err(fd)` : acceptée, pas encore installée).
+    wire: Option<(Slot, Result<Slot, i32>)>,
+    /// Réseau coupé : les `connect` échouent.
+    down: bool,
+}
+
+const REPLICA_PORT: u16 = 7001;
+
+impl Pair {
+    fn new(cfg: Config) -> Self {
+        Self { p: Fake::new(cfg.clone()), r: Fake::new(cfg), wire: None, down: false }
+    }
+
+    /// Le fil : connexions sortantes acceptées (ou refusées), octets passés.
+    fn pump(&mut self) {
+        for (slot, addr) in std::mem::take(&mut self.p.connecting) {
+            assert_eq!(addr.port(), REPLICA_PORT);
+            self.p.connecting.push((slot, addr));
+            if self.down || self.wire.is_some() {
+                self.p.finish_connect(slot, -111);
+                continue;
+            }
+            self.p.finish_connect(slot, 0);
+            let fd = self.r.next_fd;
+            self.r.next_fd += 1;
+            self.r.completions.push(Completion::Accept { fd, more: true });
+            self.wire = Some((slot, Err(fd)));
+        }
+        let Some((l, c)) = self.wire else { return };
+        let c = match c {
+            Ok(c) => c,
+            Err(fd) => match self.r.fd_slot.get(&fd) {
+                Some(&c) if self.r.peers.contains_key(&c) => {
+                    self.wire = Some((l, Ok(c)));
+                    c
+                }
+                _ => return,
+            },
+        };
+        // Un côté fermé par son serveur : l'autre voit la fin.
+        let (pl, rc) = (self.p.peers.contains_key(&l), self.r.peers.contains_key(&c));
+        if !pl || !rc {
+            self.wire = None;
+            if pl {
+                self.p.peers.get_mut(&l).unwrap().eof = true;
+            }
+            if rc {
+                self.r.peers.get_mut(&c).unwrap().eof = true;
+            }
+            return;
+        }
+        let out = std::mem::take(&mut self.p.peers.get_mut(&l).unwrap().received);
+        self.r.peers.get_mut(&c).unwrap().inbound.extend(out);
+        let back = std::mem::take(&mut self.r.peers.get_mut(&c).unwrap().received);
+        self.p.peers.get_mut(&l).unwrap().inbound.extend(back);
+    }
+
+    fn step(&mut self) -> bool {
+        let a = self.p.step();
+        self.pump();
+        let b = self.r.step();
+        self.pump();
+        let in_flight = self.wire.is_some_and(|(l, c)| {
+            self.p.peers.get(&l).is_some_and(|p| !p.received.is_empty() || !p.inbound.is_empty())
+                || c.is_ok_and(|c| self.r.peers.get(&c).is_some_and(|p| !p.received.is_empty() || !p.inbound.is_empty()))
+        });
+        a || b || in_flight || !self.p.connecting.is_empty()
+    }
+
+    fn settle(&mut self) {
+        for _ in 0..200_000 {
+            if !self.step() {
+                return;
+            }
+        }
+        panic!("pas de repos après 200 000 tours");
+    }
+
+    /// Une seconde passe : timers (reconnexion, RXTICK, fsync).
+    fn second(&mut self) {
+        for f in [&mut self.p, &mut self.r] {
+            f.clock += Duration::from_secs(1);
+            f.core.set_now(f.clock);
+            f.core.fire_timers();
+        }
+    }
+
+    /// Coupure du réseau : les octets en route sont perdus, chaque côté voit
+    /// une erreur (reset) ou la fin.
+    fn cut(&mut self) {
+        let Some((l, c)) = self.wire.take() else { return };
+        if let Some(peer) = self.p.peers.get_mut(&l) {
+            peer.inbound.clear();
+            peer.received.clear();
+            if peer.armed {
+                peer.armed = false;
+                self.p.completions.push(Completion::Recv { slot: l, res: -104, bid: None, buf_more: false, more: false });
+            } else {
+                // Recv pas encore armé : la fin sera vue à l'armement.
+                peer.eof = true;
+            }
+        }
+        if let Ok(c) = c
+            && let Some(peer) = self.r.peers.get_mut(&c)
+        {
+            peer.inbound.clear();
+            peer.received.clear();
+            peer.eof = true;
+        }
+    }
+
+    fn cmd(f: &mut Fake, c: Slot, cmd: &[u8]) -> String {
+        f.send(c, cmd);
+        f.settle();
+        f.take(c)
+    }
+
+    /// États métier égaux (le réplica vu à l'horloge du primaire).
+    fn assert_same(&mut self, what: &str) {
+        self.r.core.art.set_now(self.p.core.art.now);
+        assert_eq!(state(&mut self.r.core.art), state(&mut self.p.core.art), "{what}");
+    }
+}
+
+fn info_field(info: &str, name: &str) -> Option<String> {
+    info.lines().find_map(|l| l.strip_prefix(&format!("{name}:")).map(str::to_string))
+}
+
+/// Réplica ≡ primaire après un flux aléatoire (tous types, TTL, horloge du
+/// réplica décalée), avec des coupures du réseau : reprise partielle dans le
+/// backlog, synchronisation complète au-delà ; BGSAVE des clients mêlés.
+#[test]
+fn replica_follows_random_traffic_across_cuts() {
+    let dir = test_dir("repl-rand");
+    // SAFETY: tests en mono-thread (RUST_TEST_THREADS=1).
+    unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
+    let seeds: u64 = std::env::var("URING_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
+    // `URING_SEED_FROM=n` : reprendre à une graine ; `SEED_LOG=1` : les afficher.
+    let from: u64 = std::env::var("URING_SEED_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    for seed in from..=seeds {
+        if std::env::var("SEED_LOG").is_ok() {
+            eprintln!("==== graine {seed}");
+        }
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let backlog = if seed % 3 == 0 { 200 } else { 64 << 20 };
+        let mut pair = Pair::new(Config { max_conn: 16, reserved: 1, repl_backlog: backlog, ..Config::default() });
+        pair.p.idle_work = seed % 2 == 0;
+        let mut wall = 1_000u64;
+        pair.p.wall = Some(wall);
+        // L'horloge du réplica est ailleurs (±1 h) : elle ne doit pas compter.
+        pair.r.wall = Some(if seed % 2 == 0 { wall + 3600 } else { wall - 900 });
+        let conns: Vec<Slot> = (0..1 + rng.below(3)).map(|_| pair.p.connect()).collect();
+        let admin = pair.p.connect();
+        let start_at = rng.below(10);
+        for round in 0..40 {
+            if round == start_at {
+                let r = Pair::cmd(&mut pair.p, admin, format!("REPLICATE 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes());
+                assert_eq!(r, "+OK\r\n");
+            }
+            for &c in &conns {
+                for _ in 0..rng.below(10) {
+                    let cmd = if rng.below(60) == 0 { vec!["BGSAVE".to_string()] } else { random_write(&mut rng, true) };
+                    pair.p.send(c, &resp(&cmd));
+                }
+            }
+            for _ in 0..1 + rng.below(3) {
+                pair.step();
+            }
+            wall += rng.below(3);
+            pair.p.wall = Some(wall);
+            match rng.below(12) {
+                0 => pair.cut(),
+                1 | 2 => pair.second(),
+                _ => {}
+            }
+        }
+        // Réseau rétabli, la cible se reconnecte et rattrape.
+        for _ in 0..3 {
+            pair.second();
+            pair.settle();
+        }
+        while pair.p.core.bgsave_running() {
+            pair.step();
+        }
+        pair.settle();
+        let info = Pair::cmd(&mut pair.p, admin, b"INFO\r\n");
+        assert_eq!(info_field(&info, "connected_replicas").as_deref(), Some("1"), "graine {seed} : {info}");
+        pair.assert_same(&format!("graine {seed}"));
+        // Le réplica sert les lectures, refuse les écritures.
+        let rc = pair.r.connect();
+        assert!(Pair::cmd(&mut pair.r, rc, b"SET z 1\r\n").starts_with("-READONLY"), "graine {seed}");
+        assert!(Pair::cmd(&mut pair.r, rc, b"DBSIZE\r\n").starts_with(':'));
+        let rinfo = Pair::cmd(&mut pair.r, rc, b"INFO\r\n");
+        assert_eq!(info_field(&rinfo, "role").as_deref(), Some("replica"));
+        assert_eq!(info_field(&rinfo, "repl_seq"), info_field(&info, "repl_seq"), "graine {seed}");
+    }
+    unsafe { std::env::remove_var("RADIXOX_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Coupure courte : reprise partielle dans le backlog. Backlog dépassé :
+/// synchronisation complète. Les deux redonnent le même état.
+#[test]
+fn replica_resumes_from_backlog_or_resyncs() {
+    let dir = test_dir("repl-backlog");
+    unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
+    let mut pair = Pair::new(Config { max_conn: 16, reserved: 1, repl_backlog: 4096, ..Config::default() });
+    pair.p.wall = Some(1_000);
+    let (c, admin) = (pair.p.connect(), pair.p.connect());
+    Pair::cmd(&mut pair.p, c, b"SET a 1\r\n");
+    assert_eq!(Pair::cmd(&mut pair.p, admin, format!("REPLICATE 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes()), "+OK\r\n");
+    pair.settle();
+    while pair.p.core.bgsave_running() {
+        pair.step();
+    }
+    pair.settle();
+    pair.assert_same("première synchronisation");
+    let sync = |pair: &mut Pair, admin| {
+        let info = Pair::cmd(&mut pair.p, admin, b"INFO\r\n");
+        (info_field(&info, "sync_full").unwrap(), info_field(&info, "sync_partial_ok").unwrap())
+    };
+    assert_eq!(sync(&mut pair, admin), ("1".into(), "0".into()));
+    // Coupure courte : quelques blocs, dans le backlog.
+    pair.cut();
+    pair.down = true;
+    pair.settle();
+    for i in 0..5 {
+        pair.p.send(c, format!("SET k{i} {i}\r\n").as_bytes());
+        pair.settle();
+    }
+    pair.down = false;
+    pair.second();
+    pair.settle();
+    pair.assert_same("reprise partielle");
+    assert_eq!(sync(&mut pair, admin), ("1".into(), "1".into()));
+    // Coupure longue : bien plus que 4 Ko de blocs.
+    pair.cut();
+    pair.down = true;
+    pair.settle();
+    for i in 0..300 {
+        pair.p.send(c, format!("SET big{i} {}\r\n", "x".repeat(40)).as_bytes());
+        pair.settle();
+    }
+    pair.down = false;
+    pair.second();
+    pair.settle();
+    while pair.p.core.bgsave_running() {
+        pair.step();
+    }
+    pair.settle();
+    pair.assert_same("synchronisation complète");
+    assert_eq!(sync(&mut pair, admin), ("2".into(), "1".into()));
+    unsafe { std::env::remove_var("RADIXOX_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Promotion : nouvel identifiant, écritures acceptées ; l'ancienne source,
+/// toujours configurée, est refusée et n'écrase pas le promu. Une seconde
+/// source pendant que la première est connectée est refusée.
+#[test]
+fn promotion_and_second_source() {
+    let dir = test_dir("repl-promote");
+    unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
+    let mut pair = Pair::new(Config { max_conn: 16, reserved: 1, ..Config::default() });
+    pair.p.wall = Some(1_000);
+    let c = pair.p.connect();
+    Pair::cmd(&mut pair.p, c, b"SET a 1\r\nSET b 2\r\n");
+    Pair::cmd(&mut pair.p, c, format!("REPLICATE 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes());
+    pair.settle();
+    while pair.p.core.bgsave_running() {
+        pair.step();
+    }
+    pair.settle();
+    pair.assert_same("synchronisé");
+    // Une seconde source : refusée.
+    let other = pair.r.connect();
+    let id = "ab".repeat(20);
+    assert!(Pair::cmd(&mut pair.r, other, format!("RXHELLO {id}\r\n").as_bytes()).starts_with("-ERR already following"));
+    // Un client qui n'est pas la source ne pousse pas de bloc.
+    assert!(Pair::cmd(&mut pair.r, other, b"RXTICK 5\r\n").starts_with("-ERR not the replication source"));
+    let rc = pair.r.connect();
+    let before = info_field(&Pair::cmd(&mut pair.r, rc, b"INFO\r\n"), "master_replid").unwrap();
+    assert_eq!(Pair::cmd(&mut pair.r, rc, b"REPLICAOF NO ONE\r\n"), "+OK\r\n");
+    let info = Pair::cmd(&mut pair.r, rc, b"INFO\r\n");
+    assert_eq!(info_field(&info, "role").as_deref(), Some("master"));
+    assert_ne!(info_field(&info, "replid").unwrap(), before);
+    assert_eq!(Pair::cmd(&mut pair.r, rc, b"SET c 3\r\n"), "+OK\r\n");
+    // L'ancienne source se reconnecte : refusée, le promu garde ses données.
+    pair.second();
+    pair.settle();
+    pair.second();
+    pair.settle();
+    assert_eq!(Pair::cmd(&mut pair.r, rc, b"GET c\r\n"), "$1\r\n3\r\n");
+    let pinfo = Pair::cmd(&mut pair.p, c, b"INFO\r\n");
+    assert_eq!(info_field(&pinfo, "connected_replicas").as_deref(), Some("0"), "{pinfo}");
+    assert_eq!(Pair::cmd(&mut pair.p, c, format!("REPLICATE STOP 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes()), "+OK\r\n");
+    unsafe { std::env::remove_var("RADIXOX_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Un BGSAVE sur le réplica pendant qu'un bloc apporte FLUSHDB et
+/// `UNLINK prefix*` : les clés disparaissent tout de suite, la mémoire est
+/// rendue après la save (pas d'attente active), les états restent égaux.
+#[test]
+fn replica_bgsave_during_flush_blocks() {
+    let dir = test_dir("repl-bgsave");
+    unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
+    let mut pair = Pair::new(Config { max_conn: 16, reserved: 1, ..Config::default() });
+    pair.p.wall = Some(1_000);
+    let c = pair.p.connect();
+    let sets: String = (0..30_000).map(|i| format!("SET u:{i} {i}\r\n")).collect();
+    Pair::cmd(&mut pair.p, c, sets.as_bytes());
+    Pair::cmd(&mut pair.p, c, format!("REPLICATE 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes());
+    pair.settle();
+    while pair.p.core.bgsave_running() {
+        pair.step();
+    }
+    pair.settle();
+    pair.assert_same("synchronisé");
+    let rc = pair.r.connect();
+    pair.r.send(rc, b"BGSAVE\r\n");
+    while !pair.r.core.bgsave_running() {
+        pair.step();
+    }
+    pair.p.send(c, b"UNLINK u:1*\r\nSET after 1\r\nFLUSHDB\r\nSET last 2\r\n");
+    for _ in 0..20 {
+        pair.step();
+    }
+    assert!(pair.r.core.bgsave_running(), "la save du réplica dure encore");
+    pair.assert_same("pendant la save");
+    pair.settle();
+    assert!(!pair.r.core.bgsave_running());
+    pair.assert_same("après la save");
+    assert_eq!(pair.r.core.art.len(), 1);
+    unsafe { std::env::remove_var("RADIXOX_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }

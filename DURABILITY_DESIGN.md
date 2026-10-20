@@ -8,7 +8,10 @@
 > `appendfsync no|everysec`, plafond, erreurs, `INFO aof_*`, arrêt propre), test 5
 > (`radixox/tests/aof.rs`) ; réécriture (coupure `CUT`, rotation, publication de la base,
 > `BGREWRITEAOF`, automatique), test 6 ; `appendfsync always` en commit groupé (réponses
-> retenues, §7.5), test 8. Pas encore : réplication. Suite : étape 7. Ce document doit suffire à
+> retenues, §7.5), test 8 ; **réplication de base (étape 7, 2026-10-21)** : liens sortants du
+> cœur (`Op::Connect`), `REPLICATE`, `RXHELLO` / `RXLOAD` / `RXBLOCK` / `RXTICK`, backlog,
+> synchronisation complète par un BGSAVE coupé, mode suivi, `REPLICAOF NO ONE`, `INFO
+> # Replication`, test 7 (§10.9, avec les écarts). Suite : étape 8. Ce document doit suffire à
 > un agent qui ne connaît pas le projet : §1 donne le contexte du code, §2–§11 la conception,
 > §12 les tests, §13 l'ordre de travail avec ses critères d'acceptation. Il remplace le
 > « collecteur d'effets » de RUNTIME_ARCH.md §18 et complète ARCHITECTURE.md §3.
@@ -703,6 +706,79 @@ les autres. Les autres réplicas répondent `:-1` à `RXHELLO` (nouveau `replid`
 complète. (Reprise partielle après basculement = « second identifiant » du PSYNC2 de Redis : le
 nouveau primaire accepterait l'ancien `replid` jusqu'au `seq` de sa promotion. Plus tard.)
 
+### 10.9 Fait (étape 7)
+
+Code : `radixox/src/uring/core/repl.rs` (source et cible, `impl Core`), `Op::Connect` /
+`Completion::Connect` (la couche io_uring crée le socket, l'installe dans le slot comme un
+accept, puis `IORING_OP_CONNECT`), `Stream::tap` (chaque bloc fermé, partagé par `Rc` entre
+l'écrivain de l'AOF et la réplication), `journal::apply_into`.
+
+- **Source.** Chaque cible est un lien : une connexion du cœur (`ConnOut::link`) dont les
+  réponses sont lues par `link_replies`, jamais exécutées. États : `Down` (nouvel essai chaque
+  seconde, erreur journalisée une fois), `Connecting`, `Hello`, `WaitSave`, `Loading`,
+  `Online`. Le flux est créé au premier `REPLICATE` s'il n'existe pas (sans AOF il ne garde
+  rien hors du backlog : `Stream::keep = false`). À chaque fin de tour, les blocs fermés vont
+  au backlog (`RADIXOX_REPL_BACKLOG_MB`) et à chaque lien en ligne (`RXBLOCK`, octets du
+  disque) ; un lien qui synchronise les met en file après sa base. Lien qui retient plus de
+  `RADIXOX_REPL_MAX_LAG_MB` (sortie + file) : coupé.
+- **Synchronisation complète.** Un BGSAVE lancé pour les cibles en attente (ou à la fin de
+  celui en cours) : avec l'AOF c'est une réécriture (base `base.N.rxdb`), sans AOF le dump
+  `dump.rxd`, coupé dans le flux comme une réécriture (sa position est dans l'en-tête v2).
+  Le fichier est ouvert à la fin du BGSAVE (une réécriture suivante peut le supprimer, le fd
+  reste lisible) et envoyé par morceaux de 1 Mio, au rythme de l'envoi (4 Mio en attente au
+  plus) ; puis `RXLOAD END` et les blocs mis en file.
+- **Cible.** `RXHELLO` lie la connexion (une seule source à la fois) ; `RXLOAD` écrit le dump
+  dans `RADIXOX_DIR/replica-sync.rxdb.tmp`, puis à `END` : BGSAVE local abandonné, arbre vidé,
+  dump chargé (CRC et condensé exigés), mode suivi à la coupure du dump. `RXBLOCK` : bloc
+  validé (`read_block` : CRC, continuité), `now` posé, charge appliquée ; une charge
+  inapplicable fait oublier l'histoire (prochaine connexion : dump). Les libérations de
+  FLUSHDB / `UNLINK prefix*` qui ne peuvent pas se faire tout de suite (BGSAVE du réplica)
+  partent en fond (`apply_into`), les clés disparaissent tout de suite.
+- **Mode suivi** : horloge des blocs (`Core::tick` et `set_wall` ignorés), écritures des
+  clients refusées (`-READONLY`), lectures servies.
+
+Écarts avec §10.1–10.8 (décidés pendant l'étape, à reprendre si besoin) :
+
+- **`RXLOAD BEGIN <taille>` / `RXLOAD DATA <morceau>` / `RXLOAD END`** au lieu d'une seule
+  bulk string : une bulk string est bornée à 512 Mio (`MAX_BULK_LEN`) et la cible devrait
+  tout garder en mémoire.
+- **`RXTICK <now>`** (nouveau) : chaque seconde, la source envoie aux cibles en ligne son
+  `now` (le plus grand posé, ≤ celui des blocs suivants) ; sans écriture, le réplica fait
+  quand même expirer ses clés. Les lectures du réplica voient donc l'horloge de la source à
+  1 s près ; le masquage par l'horloge locale (§10.1, point 1) n'est pas fait.
+- **`replid` propre au processus** (`Core::replid`), nouveau à chaque démarrage et à chaque
+  promotion, distinct de celui du manifeste de l'AOF ; la cible adopte celui du `RXHELLO`
+  (pas celui de l'en-tête du dump). Raison : un primaire `everysec` tué peut perdre la fin de
+  son flux qu'un réplica a déjà reçue ; avec le même `replid`, de nouveaux blocs aux mêmes
+  `seq` passeraient pour la suite. Prix : synchronisation complète après tout redémarrage du
+  primaire (comme Valkey sans `repl-diskless`).
+- **Un promu refuse de redevenir réplica** (`-ERR this server was promoted…`) jusqu'à son
+  redémarrage : sinon l'ancien primaire, encore configuré, l'écraserait à sa prochaine
+  reconnexion.
+- **Refusé pour l'instant** : réplica avec AOF (`-ERR a replica with appendonly is not
+  supported yet`, §10.7) et chaînage (un réplica ne fait pas `REPLICATE`, un serveur qui a des
+  cibles ne suit pas).
+- **Copies** : les blocs sont recopiés dans la sortie de chaque lien, le dump est lu par
+  `pread` synchrone (1 Mio par morceau, depuis le cache de pages) ; zéro copie et `splice` :
+  étape 8. La résolution du nom de la cible est synchrone, à chaque essai (une IP en pratique).
+- **Chargement synchrone** sur la cible : elle ne sert personne pendant le chargement du dump
+  (comme un réplica Valkey sans `repl-diskless-load`).
+- Un bloc de plus de 512 Mio (une seule commande énorme) ne passe pas en `RXBLOCK`.
+- `DEBUG DIGEST [at]` (nouveau) : condensé du contenu (§6.4) des clés vivantes à `at` ; sert
+  aux tests à comparer deux serveurs.
+
+Bugs d'oxidart trouvés par le test 7 (corrigés à part : e46b808, 143f5a2) : l'évicteur pouvait
+tirer un nœud d'un sous-arbre détaché pas encore libéré, et FLUSHDB pendant la libération d'un
+`UNLINK prefix*` faisait décompter deux fois ses clés.
+
+Tests : `uring/tests.rs` (deux faux noyaux reliés par un fil simulé, `Pair`) :
+`replica_follows_random_traffic_across_cuts` (flux aléatoire de tous types, TTL, horloge du
+réplica décalée de ±1 h, coupures du réseau, BGSAVE des clients ; 3000 graines vertes,
+`URING_SEEDS`), `replica_resumes_from_backlog_or_resyncs`, `promotion_and_second_source`,
+`replica_bgsave_during_flush_blocks` ; `tests/replication.rs` (deux processus) :
+`replica_survives_kill9_and_converges` (dump de ~13 Mo, réplica tué trois fois sous charge),
+`link_cut_resumes_from_backlog`, `primary_restart_then_promotion` (primaire avec AOF tué).
+
 ---
 
 ## 11. Configuration, commandes, INFO
@@ -716,12 +792,13 @@ nouveau primaire accepterait l'ancien `replid` jusqu'au `seq` de sa promotion. P
 | `RADIXOX_AOF_LOAD_TRUNCATED` | `yes` | `aof-load-truncated` |
 | `RADIXOX_AOF_MAX_PENDING_MB` | `64` | (pas d'équivalent ; retard d'`everysec`) |
 | `RADIXOX_REPLICATE` | vide | (`replicaof`, mais en poussée) |
+| `RADIXOX_REPLICATE_AUTH` | vide | (`masterauth`, côté source : mot de passe des cibles) |
 | `RADIXOX_REPL_BACKLOG_MB` | `64` | `repl-backlog-size` |
 | `RADIXOX_REPL_MAX_LAG_MB` | `256` | `client-output-buffer-limit replica` |
 | `RADIXOX_MIN_REPLICAS_TO_WRITE` | `0` | `min-replicas-to-write` |
 
-Commandes : `BGREWRITEAOF`, `WAIT`, `REPLICATE`, `REPLICAOF NO ONE`, et les commandes internes
-`RXHELLO`, `RXLOAD`, `RXBLOCK` (§10.2).
+Commandes : `BGREWRITEAOF`, `WAIT`, `REPLICATE`, `REPLICAOF NO ONE`, `DEBUG DIGEST [at]`, et les
+commandes internes `RXHELLO`, `RXLOAD`, `RXBLOCK`, `RXTICK` (§10.2, §10.9).
 
 `INFO` :
 
@@ -729,7 +806,11 @@ Commandes : `BGREWRITEAOF`, `WAIT`, `REPLICATE`, `REPLICAOF NO ONE`, et les comm
   `aof_last_fsync_status`, `aof_current_size`, `aof_base_size`, `aof_pending_bytes`,
   `aof_delayed_fsync` ;
 - `# Replication` : `role:master|replica`, `replid`, `master_repl_offset` (`offset` courant),
-  `repl_seq`, `connected_replicas`, puis par réplica `replicaN:ip=…,port=…,state=sync|online,offset=…,lag=…`.
+  `repl_seq`, `connected_replicas`, puis par réplica
+  `replicaN:ip=…,port=…,state=down|connecting|handshake|sync|online,seq=…,lag_bytes=…`, puis
+  `repl_backlog_size`, `repl_backlog_first_seq`, `sync_full`, `sync_partial_ok` ; sur un
+  réplica : `master_replid`, `master_link_status:up|down`, `repl_seq`, `master_repl_offset`,
+  `master_sync_in_progress`.
 
 ---
 
@@ -792,7 +873,7 @@ Valkey sur le CPU 1, memtier SET seul 100 o, 4 × 10 clients, 8 s, profil `perfo
 | 4 ✅ | `appendfsync no` / `everysec`, deux canaux de fichiers, plafond §7.6, erreurs §7.7, `INFO aof_*` | test 5 en `everysec` et `no` — `radixox/tests/aof.rs` (`kill -9` × N, préfixe exact, `INCR` une fois, SIGTERM sans perte ; `AOF_CRASH_ITERS`), `uring/tests.rs` : `aof_files_replay_to_the_served_state`, `aof_backlog_parks_writers_not_readers` |
 | 5 ✅ | Réécriture : coupure `CUT`, rotation, ordre §8.2–8.3, automatique, `BGREWRITEAOF` | tests 5 (avec rotations) et 6 ; test 1 depuis un dump — `uring/tests.rs` : `rewrite_cut_is_exact_inside_a_pipeline`, `rewrites_under_random_traffic_replay_to_the_served_state` ; `tests/aof.rs` : `kill9_during_rewrites_keeps_an_exact_prefix` |
 | 6 ✅ | `always` : marquage §7.5, un fsync en vol | tests 5 (`always`) et 8 — `uring/tests.rs` : `always_holds_replies_until_their_fsync`, `always_random_traffic_replays_and_answers` ; `tests/aof.rs` : `kill9_always_loses_nothing_acknowledged` ; bench contre Valkey : voir §12bis |
-| 7 | Réplication : mode suivi, `RXHELLO`/`RXLOAD`/`RXBLOCK`, `REPLICATE`, backlog, `REPLICAOF NO ONE` | test 7 |
+| 7 ✅ | Réplication : mode suivi, `RXHELLO`/`RXLOAD`/`RXBLOCK`, `REPLICATE`, backlog, `REPLICAOF NO ONE` | test 7 — voir §10.9 (tests et écarts) |
 | 8 | Pool de tampons enregistrés, `SEND(MSG)_ZC`, `splice`, `WAIT`, `min-replicas-to-write` | test 7 + mesure deux machines |
 
 Chaque étape met à jour ce document (section « État ») et le README (Status, Persistence,
@@ -842,5 +923,7 @@ Configuration, commandes supportées).
 
 - `PX` / `PEXPIRE` arrondis à la seconde aujourd'hui (§1.2) : incompatibilité Redis à corriger
   un jour ; le `now` des blocs passera alors en millisecondes (nouvelle `version`).
-- Reprise partielle après basculement (second identifiant, §10.8).
+- Reprise partielle après basculement (second identifiant, §10.8), et après un redémarrage
+  propre du primaire (§10.9 : `replid` neuf à chaque démarrage).
+- Réplica avec AOF et chaînage (§10.7, refusés à l'étape 7).
 - Comptage mémoire du pool, du backlog et des tampons d'envoi dans le futur `maxmemory`.

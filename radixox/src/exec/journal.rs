@@ -10,6 +10,7 @@
 //! - [`apply`] : rejeu d'une charge sur l'arbre (§9, réplica §10).
 
 use std::collections::VecDeque;
+use std::rc::Rc;
 
 use oxidart::OxidArt;
 use radixox_lib::cmd::{Cmd, Parse, SetCondition};
@@ -263,6 +264,10 @@ pub fn read_block<'d>(d: &'d [u8], cur: &mut Cursor) -> Result<(Block, &'d [u8])
 
 // ── Construction des blocs (§7.1) ───────────────────────────────────────────
 
+/// Bloc fermé, encodé (en-tête + charge) : partagé entre l'écrivain de l'AOF
+/// et la réplication (backlog, envois), jamais modifié.
+pub type Blk = Rc<Vec<u8>>;
+
 /// Le flux du serveur : bloc en cours, blocs fermés en attente de leurs
 /// consommateurs (disque, réplicas ; le test les lit).
 pub struct Stream {
@@ -270,8 +275,13 @@ pub struct Stream {
     cur: Vec<u8>,
     cur_now: u64,
     cur_flags: u16,
-    /// Blocs fermés, encodés (en-tête + charge), dans l'ordre.
-    pub closed: VecDeque<Vec<u8>>,
+    /// Blocs fermés, dans l'ordre, pour l'écrivain de l'AOF (et les tests) ;
+    /// rien n'y est gardé si `keep` est faux.
+    pub closed: VecDeque<Blk>,
+    pub keep: bool,
+    /// Chaque bloc fermé y est aussi rangé pour la réplication, si présent :
+    /// le cœur le vide à chaque fin de tour (DURABILITY_DESIGN.md §10).
+    pub tap: Option<Vec<Blk>>,
     /// Octets de `closed` (tenu par `close` et `take_closed`).
     closed_bytes: u64,
     /// Prochain `seq` (le premier bloc d'une histoire porte 1).
@@ -296,6 +306,8 @@ impl Stream {
             cur_now: 0,
             cur_flags: 0,
             closed: VecDeque::new(),
+            keep: true,
+            tap: None,
             closed_bytes: 0,
             next_seq: at.seq + 1,
             offset: at.offset,
@@ -399,8 +411,14 @@ impl Stream {
         let mut blk = std::mem::replace(&mut self.cur, vec![0; HEADER]);
         let (head, payload) = blk.split_at_mut(HEADER);
         write_header(head, &b, payload);
-        self.closed_bytes += blk.len() as u64;
-        self.closed.push_back(blk);
+        let blk = Rc::new(blk);
+        if let Some(tap) = &mut self.tap {
+            tap.push(blk.clone());
+        }
+        if self.keep {
+            self.closed_bytes += blk.len() as u64;
+            self.closed.push_back(blk);
+        }
         self.next_seq += 1;
         self.offset += b.size();
         self.cur_flags = 0;
@@ -415,8 +433,22 @@ pub struct BadPayload(pub String);
 
 /// Applique la charge d'un bloc : chaque commande par l'exécuteur normal, avec
 /// un client interne authentifié, sans réponse ni journalisation. L'appelant
-/// a fait `art.set_now(bloc.now)`.
+/// a fait `art.set_now(bloc.now)`. Hors save (reprise au démarrage) : la
+/// mémoire des FLUSHDB / UNLINK est rendue tout de suite.
 pub fn apply(art: &mut OxidArt, payload: &[u8]) -> Result<(), BadPayload> {
+    let mut pending = Vec::new();
+    let res = apply_into(art, payload, &mut pending);
+    for mut job in pending {
+        while job.step(art, usize::MAX) == Step::More {}
+    }
+    res
+}
+
+/// Comme [`apply`], mais la libération qui ne peut pas se faire tout de
+/// suite (save en cours : les sous-arbres détachés restent dans la vue T0)
+/// est rendue dans `pending`, à faire en fond (réplica). Les clés, elles,
+/// disparaissent tout de suite : l'état ne dépend pas de la libération.
+pub fn apply_into(art: &mut OxidArt, payload: &[u8], pending: &mut Vec<FlushJob>) -> Result<(), BadPayload> {
     let mut client = Client::new();
     client.authed = true;
     let mut out = Vec::new();
@@ -439,12 +471,16 @@ pub fn apply(art: &mut OxidArt, payload: &[u8]) -> Result<(), BadPayload> {
         match execute_into(cmd, art, &mut client, &mut out) {
             Executed::Done => {}
             Executed::Runtime(Cmd::Unlink(keys)) => {
-                let mut job = UnlinkJob::start(art, &keys);
-                while job.step(art, usize::MAX) == Step::More {}
+                let mut job = FlushJob::from(UnlinkJob::start(art, &keys));
+                if job.step(art, usize::MAX) == Step::More {
+                    pending.push(job);
+                }
             }
             Executed::Runtime(Cmd::FlushDb) => {
                 let mut job = FlushJob::start(art);
-                while job.step(art, usize::MAX) == Step::More {}
+                if job.step(art, usize::MAX) == Step::More {
+                    pending.push(job);
+                }
             }
             Executed::Runtime(_) => unreachable!("plan() n'accepte que des écritures"),
         }
@@ -466,7 +502,7 @@ mod tests {
     }
 
     fn concat(s: &Stream) -> Vec<u8> {
-        s.closed.iter().flatten().copied().collect()
+        s.closed.iter().flat_map(|b| b.iter()).copied().collect()
     }
 
     #[test]

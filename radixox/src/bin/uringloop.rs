@@ -41,6 +41,7 @@ const K_SIGNAL: u64 = 6;
 const K_FILE: u64 = 7;
 const K_JWRITE: u64 = 8;
 const K_JSYNC: u64 = 9;
+const K_CONNECT: u64 = 10;
 
 fn ud(kind: u64, slot: Slot) -> u64 {
     kind << 32 | slot as u64
@@ -126,6 +127,9 @@ struct Server {
     min_wait: Option<(u32, u32)>,
     /// `signalfd` de SIGINT / SIGTERM (save à l'arrêt).
     signals: Option<Signals>,
+    /// Adresses des `connect` en vol (liens de réplication) : lues par le
+    /// noyau jusqu'au CQE.
+    connects: std::collections::HashMap<Slot, Box<(libc::sockaddr_storage, libc::socklen_t)>>,
 }
 
 /// Arrêt propre sur signal : la `signalfd` est lue par io_uring ; à réception,
@@ -310,6 +314,30 @@ impl Server {
                     provided = true;
                     continue;
                 }
+                // Lien de réplication (DURABILITY_DESIGN.md §10) : socket créé ici,
+                // installé dans le slot comme un accept, puis `connect` asynchrone.
+                Op::Connect { slot, addr } => {
+                    let sa = Box::new(sockaddr(addr));
+                    // SAFETY: appel libc simple.
+                    let fd = unsafe { libc::socket(sa.0.ss_family as i32, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+                    if fd < 0 {
+                        let e = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
+                        self.core.complete(Completion::Connect { slot, res: -e });
+                        continue;
+                    }
+                    tune_socket(fd);
+                    let res = self.ring.submitter().register_files_update(slot, &[fd]);
+                    close(fd);
+                    if let Err(e) = res {
+                        self.core.complete(Completion::Connect { slot, res: -e.raw_os_error().unwrap_or(libc::EBADF) });
+                        continue;
+                    }
+                    let sqe = opcode::Connect::new(Fixed(slot), (&sa.0 as *const libc::sockaddr_storage).cast(), sa.1)
+                        .build()
+                        .user_data(ud(K_CONNECT, slot));
+                    self.connects.insert(slot, sa);
+                    sqe
+                }
             };
             self.push_sqe(&sqe)?;
         }
@@ -357,6 +385,10 @@ impl Server {
                 K_FILE => Completion::File { res },
                 K_JWRITE => Completion::JournalWrite { res },
                 K_JSYNC => Completion::JournalSync { res },
+                K_CONNECT => {
+                    self.connects.remove(&slot);
+                    Completion::Connect { slot, res }
+                }
                 // Annulation d'une op déjà finie, close d'un slot : rien à faire.
                 K_CANCEL | K_CLOSE => {
                     if res < 0 && res != -libc::ENOENT && res != -libc::EALREADY {
@@ -409,8 +441,10 @@ impl Server {
                 }
                 self.idle_work();
             }
-            // Le bloc du tour se ferme ici, travail au repos compris.
+            // Le bloc du tour se ferme ici, travail au repos compris ; ses
+            // écritures (AOF) et ses envois (réplicas) partent avec ce tour.
             self.core.end_turn();
+            self.submit_ops()?;
             let res = if self.core.idle() {
                 self.wait()
             } else {
@@ -478,6 +512,49 @@ fn setsockopt_i32(fd: RawFd, level: i32, name: i32, val: i32) {
     if r != 0 {
         eprintln!("[uring] setsockopt({level}, {name}) : {}", io::Error::last_os_error());
     }
+}
+
+/// `SocketAddr` → adresse C pour `connect`.
+fn sockaddr(addr: std::net::SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    // SAFETY: structure C, tout à zéro est valide ; les vues `sockaddr_in(6)`
+    // tiennent dans `sockaddr_storage`.
+    unsafe {
+        let mut st: libc::sockaddr_storage = std::mem::zeroed();
+        let len = match addr {
+            std::net::SocketAddr::V4(a) => {
+                let sin = &mut *(&mut st as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in>();
+                sin.sin_family = libc::AF_INET as libc::sa_family_t;
+                sin.sin_port = a.port().to_be();
+                sin.sin_addr = libc::in_addr { s_addr: u32::from_ne_bytes(a.ip().octets()) };
+                size_of::<libc::sockaddr_in>()
+            }
+            std::net::SocketAddr::V6(a) => {
+                let sin6 = &mut *(&mut st as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in6>();
+                sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                sin6.sin6_port = a.port().to_be();
+                sin6.sin6_flowinfo = a.flowinfo();
+                sin6.sin6_addr = libc::in6_addr { s6_addr: a.ip().octets() };
+                sin6.sin6_scope_id = a.scope_id();
+                size_of::<libc::sockaddr_in6>()
+            }
+        };
+        (st, len as libc::socklen_t)
+    }
+}
+
+/// `RADIXOX_REPLICATE="h1:p1,h2:p2"` : cibles de réplication au démarrage
+/// (`RADIXOX_REPLICATE_AUTH` : mot de passe des cibles). IPv6 entre crochets.
+fn replicate_from_env(core: &mut Core) -> io::Result<()> {
+    let Ok(list) = std::env::var("RADIXOX_REPLICATE") else { return Ok(()) };
+    let auth = std::env::var("RADIXOX_REPLICATE_AUTH").ok().filter(|p| !p.is_empty()).map(String::into_bytes);
+    for t in list.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let (host, port) = t
+            .rsplit_once(':')
+            .and_then(|(h, p)| Some((h.trim_start_matches('[').trim_end_matches(']'), p.parse::<u16>().ok()?)))
+            .ok_or_else(|| io::Error::other(format!("RADIXOX_REPLICATE : cible {t:?} (attendu host:port)")))?;
+        core.replicate(host.to_string(), port, auth.clone()).map_err(io::Error::other)?;
+    }
+    Ok(())
 }
 
 /// Réglages d'un socket accepté (RUNTIME_ARCH.md §4.1, §4.2).
@@ -733,11 +810,18 @@ fn main() -> io::Result<()> {
         cfg.aof_rewrite_min_size =
             parse_size(&v).ok_or_else(|| io::Error::other(format!("RADIXOX_AUTO_AOF_REWRITE_MIN_SIZE : {v:?}")))?;
     }
+    if let Some(mb) = std::env::var("RADIXOX_REPL_BACKLOG_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
+        cfg.repl_backlog = mb << 20;
+    }
+    if let Some(mb) = std::env::var("RADIXOX_REPL_MAX_LAG_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
+        cfg.repl_max_lag = mb.max(1) << 20;
+    }
     let aof_on = aof.is_some();
     let mut core = Core::new(cfg, art);
     if let Some((stream, writer)) = aof {
         core.set_aof(stream, writer);
     }
+    replicate_from_env(&mut core)?;
     let bufring = BufRing::new(&ring, &mut core)?;
     let listener = TcpListener::bind(&addr)?;
     println!("RadixOx RESP Server (io_uring loop) listening on {addr}");
@@ -746,6 +830,7 @@ fn main() -> io::Result<()> {
     let signals = Signals::install(core.autosave_on() && !aof_on, aof_on)?;
     let mut server = Server { ring, bufring, core, listener, ops: Vec::new(), no_iowait, send_async, file_async, min_wait,
         signals,
+        connects: Default::default(),
     };
     server.run()
 }

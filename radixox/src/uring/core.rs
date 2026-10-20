@@ -25,8 +25,8 @@ use radixox_lib::shared_frame::{SharedFrame as Frame, extend_encode};
 use crate::exec::client::Client;
 use crate::exec::jobs::{FREE_BUDGET, FlushJob, KEYS_BUDGET, KeysJob, Step, UnlinkJob};
 use crate::exec::autosave::{Persistence, Rule};
-use crate::exec::aof::{AofOp, AofWriter};
-use crate::exec::journal::{self, Stream};
+use crate::exec::aof::{AofOp, AofWriter, ReplId, new_replid};
+use crate::exec::journal::{self, Cursor, Stream};
 use crate::exec::bgsave::{BgSave, FileOp, cpu_share, zstd_conf};
 use crate::exec::persist::{Target, save_sync, sync_level};
 use crate::exec::{Executed, execute_into, resp_ok};
@@ -34,6 +34,8 @@ use crate::tsc;
 
 use super::bufs::{Bid, BufPool};
 use super::conn::{ConnIn, ConnOut, Mode, Span};
+
+mod repl;
 
 /// Index de connexion = slot dans la table des fichiers enregistrés.
 pub type Slot = u32;
@@ -79,6 +81,12 @@ pub struct Config {
     /// Réécriture automatique (`auto-aof-rewrite-percentage`, `-min-size`, §8.4).
     pub aof_rewrite_percentage: u64,
     pub aof_rewrite_min_size: u64,
+    /// Blocs gardés pour la reprise partielle des réplicas
+    /// (`RADIXOX_REPL_BACKLOG_MB`, DURABILITY_DESIGN.md §10.5).
+    pub repl_backlog: u64,
+    /// Retard d'un réplica (octets à lui envoyer) au-delà duquel il est
+    /// déconnecté (`RADIXOX_REPL_MAX_LAG_MB`).
+    pub repl_max_lag: u64,
 }
 
 impl Default for Config {
@@ -106,6 +114,8 @@ impl Default for Config {
             aof_max_pending: 64 << 20,
             aof_rewrite_percentage: 100,
             aof_rewrite_min_size: 64 << 20,
+            repl_backlog: 64 << 20,
+            repl_max_lag: 256 << 20,
         }
     }
 }
@@ -125,6 +135,8 @@ pub enum Completion {
     JournalWrite { res: i32 },
     /// fsync du segment de l'AOF : 0 ou `-errno`.
     JournalSync { res: i32 },
+    /// Connexion sortante (réplication) : 0 ou `-errno`.
+    Connect { slot: Slot, res: i32 },
 }
 
 /// Opération à soumettre au noyau.
@@ -152,6 +164,9 @@ pub enum Op {
     JournalWrite { fd: i32, off: u64 },
     /// fsync (données) du segment de l'AOF.
     JournalSync { fd: i32 },
+    /// Connexion sortante vers un réplica : socket installé dans `slot`
+    /// (réglages comme `Install`), puis `connect`.
+    Connect { slot: Slot, addr: std::net::SocketAddr },
 }
 
 /// Une fenêtre de préchargement, sur la pile (pas d'allocation par fenêtre).
@@ -166,6 +181,8 @@ const SWEEP_EVERY: Duration = Duration::from_millis(100);
 const AUTOSAVE_EVERY: Duration = Duration::from_millis(100);
 /// fsync `everysec` de l'AOF, nouvel essai après une erreur d'écriture.
 const AOF_EVERY: Duration = Duration::from_secs(1);
+/// Réplication : reconnexion des cibles perdues, horloge envoyée aux réplicas.
+const REPL_EVERY: Duration = Duration::from_secs(1);
 const SWEEP_SLOTS: usize = 1024;
 
 /// Échéances du tas de timers (RUNTIME_ARCH.md §9).
@@ -175,6 +192,7 @@ enum Timer {
     Sweep,
     AutoSave,
     Aof,
+    Repl,
 }
 
 /// Suite à donner après l'exécution d'une frame.
@@ -198,6 +216,17 @@ enum After {
     Subscribe(SmallVec<[SharedByte; 4]>),
     Unsubscribe(SmallVec<[SharedByte; 4]>),
     Publish { channel: SharedByte, message: SharedByte },
+    /// Réplication (DURABILITY_DESIGN.md §10) : état du serveur ; les
+    /// octets reçus sont recopiés (la frame est rendue à l'anneau avant).
+    Replicate { host: String, port: u16, auth: Option<Vec<u8>> },
+    ReplicateStop { host: String, port: u16 },
+    ReplicaOfNoOne,
+    RxHello(Vec<u8>),
+    RxLoadBegin(u64),
+    RxLoadData(Vec<u8>),
+    RxLoadEnd,
+    RxBlock(Vec<u8>),
+    RxTick(u64),
 }
 
 /// Limites de sortie des abonnés Pub/Sub (`client-output-buffer-limit pubsub`
@@ -252,7 +281,18 @@ fn stops_window(cmd: &Cmd<'_>) -> bool {
     cmd.is_barrier()
         || matches!(
             cmd,
-            Cmd::Keys(_) | Cmd::Unlink(_) | Cmd::BgSave | Cmd::BgRewriteAof | Cmd::Save | Cmd::Publish { .. }
+            Cmd::Keys(_)
+                | Cmd::Unlink(_)
+                | Cmd::BgSave
+                | Cmd::BgRewriteAof
+                | Cmd::Save
+                | Cmd::Publish { .. }
+                | Cmd::Replicate(_)
+                | Cmd::ReplicaOf(_)
+                | Cmd::RxHello(_)
+                | Cmd::RxLoad(_)
+                | Cmd::RxBlock(_)
+                | Cmd::RxTick(_)
         )
 }
 
@@ -297,6 +337,23 @@ pub struct Core {
     aof_waiting: Vec<Slot>,
     /// Connexions qui ont des réponses retenues jusqu'au fsync (§7.5).
     held: Vec<Slot>,
+    /// Identifiant de l'histoire servie aux réplicas : nouveau à chaque
+    /// démarrage et à chaque promotion (DURABILITY_DESIGN.md §10.3).
+    replid: ReplId,
+    /// Position où reprend le flux s'il est créé plus tard (première cible,
+    /// après une promotion : la suite de l'histoire suivie).
+    resume: Cursor,
+    /// Source de réplication : cibles et backlog (créée au premier REPLICATE).
+    src: Option<repl::Source>,
+    /// Mode suivi : ce serveur est un réplica (§10.1).
+    follow: Option<repl::Follow>,
+    /// Connexion de la source qui nous pousse (slot, époque).
+    upstream: Option<repl::Upstream>,
+    /// Synchronisation complète en cours de réception.
+    loading: Option<repl::LoadIn>,
+    /// Promu par `REPLICAOF NO ONE` : refuse de redevenir réplica (une
+    /// ancienne source encore vivante l'écraserait).
+    promoted: bool,
 }
 
 impl Core {
@@ -338,6 +395,13 @@ impl Core {
             aof: None,
             aof_waiting: Vec::new(),
             held: Vec::new(),
+            replid: new_replid(),
+            resume: Cursor::default(),
+            src: None,
+            follow: None,
+            upstream: None,
+            loading: None,
+            promoted: false,
             cfg,
         }
     }
@@ -352,12 +416,19 @@ impl Core {
     /// Horloge murale du TTL, une fois par tour ; avec le flux, jamais en
     /// arrière du dernier `now` écrit (DURABILITY_DESIGN.md §4).
     pub fn tick(&mut self) {
+        // Réplica : l'horloge est celle des blocs reçus (§10.1).
+        if self.follow.is_some() {
+            return;
+        }
         self.art.tick();
         self.set_wall(self.art.now);
     }
 
     /// Pose l'horloge murale du TTL (secondes), rendue monotone avec le flux.
     pub fn set_wall(&mut self, secs: u64) {
+        if self.follow.is_some() {
+            return;
+        }
         let secs = self.journal.as_mut().map_or(secs, |j| j.observe_now(secs));
         self.art.set_now(secs);
     }
@@ -369,6 +440,8 @@ impl Core {
             j.end_turn();
         }
         self.aof_pump();
+        self.repl_absorb();
+        self.repl_pump();
     }
 
     /// Flux de commandes (blocs fermés), si `cfg.journal`.
@@ -517,6 +590,10 @@ impl Core {
                     }
                     self.timers.push(Reverse((self.now + AUTOSAVE_EVERY, Timer::AutoSave)));
                 }
+                Timer::Repl => {
+                    self.repl_timer();
+                    self.timers.push(Reverse((self.now + REPL_EVERY, Timer::Repl)));
+                }
             }
         }
     }
@@ -623,6 +700,7 @@ impl Core {
                 self.release_held();
                 self.aof_pump();
             }
+            Completion::Connect { slot, res } => self.on_connect(slot, res),
         }
     }
 
@@ -685,11 +763,13 @@ impl Core {
                 eprintln!("[bgsave] échec : {e}");
             }
             self.persist.bgsave_finished(Instant::now(), res.is_ok());
+            let target = bg.target().clone();
             if let Some(w) = &mut self.aof {
-                w.rewrite_done(bg.target(), res.is_ok());
+                w.rewrite_done(&target, res.is_ok());
             }
             self.bgsave = None;
             self.aof_pump();
+            self.repl_bgsave_done(&target, res.is_ok());
         }
     }
 
@@ -701,6 +781,13 @@ impl Core {
         let target = match (&mut self.aof, &mut self.journal) {
             (Some(w), _) if w.rewriting() => return Err("Background append only file rewriting already in progress".into()),
             (Some(w), Some(j)) => w.begin_rewrite(j),
+            // Flux sans AOF (réplication) : le dump est coupé au même point,
+            // il sert aux synchronisations complètes (§10.3).
+            (None, Some(j)) => {
+                let cut = j.cut();
+                let pos = oxidart::JournalPos { seq: cut.seq, offset: cut.offset, replid: self.replid };
+                Target { pos, ..Target::dump() }
+            }
             _ => Target::dump(),
         };
         self.persist.bgsave_started(now);
@@ -749,13 +836,23 @@ impl Core {
             return;
         }
         let slot = self.free.pop().expect("slot libre");
+        self.open_slot(slot);
+        let o = &mut self.outs[slot as usize];
+        // Le premier recv est chaîné à l'installation (Op::Install).
+        o.refs = 1;
+        o.recv_armed = true;
+        self.ops.push(Op::Install { slot, fd });
+    }
+
+    /// Slot pris dans la liste libre : état d'une connexion neuve (nouvelle
+    /// époque), sans opération en vol.
+    fn open_slot(&mut self, slot: Slot) {
         let o = &mut self.outs[slot as usize];
         debug_assert_eq!(o.mode, Mode::Free);
         o.mode = Mode::Normal;
         o.epoch = o.epoch.wrapping_add(1);
-        // Le premier recv est chaîné à l'installation (Op::Install).
-        o.refs = 1;
-        o.recv_armed = true;
+        o.refs = 0;
+        o.recv_armed = false;
         o.recv_cancelled = false;
         o.send_cancelled = false;
         o.out.clear();
@@ -771,13 +868,17 @@ impl Core {
         o.dirty = false;
         o.ready = false;
         o.stop_turn = u64::MAX;
+        o.link = false;
+        o.connecting = false;
         self.ins[slot as usize] = ConnIn::default();
-        self.ops.push(Op::Install { slot, fd });
     }
 
     fn on_recv(&mut self, slot: Slot, res: i32, bid: Option<Bid>, buf_more: bool, more: bool) {
         let s = slot as usize;
         debug_assert_ne!(self.outs[s].mode, Mode::Free, "recv sur un slot libre");
+        if self.outs[s].link {
+            return self.link_recv(slot, res, bid, buf_more, more);
+        }
         if !more {
             let o = &mut self.outs[s];
             o.refs -= 1;
@@ -1090,7 +1191,9 @@ impl Core {
         let mut aof_stops: Window<(Slot, Option<u32>)> = SmallVec::new();
         {
             let job_budget = self.cfg.job_budget;
-            let Core { art, ins, outs, bufs, persist, journal, aof, cfg, held, .. } = self;
+            let Core { art, ins, outs, bufs, persist, journal, aof, cfg, held, follow, .. } = self;
+            // Réplica : les écritures des clients sont refusées (§10.1).
+            let read_only = follow.is_some();
             // `always` : les réponses attendent le fsync qui couvre leur marque.
             let release_upto = aof.as_ref().and_then(|w| w.release_upto());
             // Écritures refusées : BGSAVE en échec, AOF en erreur (§7.7).
@@ -1176,6 +1279,11 @@ impl Core {
                 let o = &mut outs[slot as usize];
                 let weight = cmd.write_weight();
                 if weight > 0 && o.client.authed {
+                    if read_only {
+                        extend_encode(&mut o.out, &Frame::Error("READONLY You can't write against a read only replica.".into()));
+                        afters.push((slot, After::Continue));
+                        continue;
+                    }
                     if let Some(err) = &refuse_writes {
                         extend_encode(&mut o.out, err);
                         afters.push((slot, After::Continue));
@@ -1339,6 +1447,8 @@ impl Core {
                     _ => info.push_str("aof_enabled:0\r\n"),
                 }
                 info.push_str("\r\n");
+                self.repl_info(&mut info);
+                info.push_str("\r\n");
                 crate::exec::info_stats(&mut info);
                 extend_encode(&mut self.outs[s].out, &Frame::BulkString(SharedByte::from_slice(info.as_bytes())));
             }
@@ -1347,6 +1457,22 @@ impl Core {
             After::Publish { channel, message } => {
                 let n = self.publish(&channel, &message);
                 extend_encode(&mut self.outs[s].out, &Frame::Integer(n as i64));
+            }
+            After::Replicate { .. }
+            | After::ReplicateStop { .. }
+            | After::ReplicaOfNoOne
+            | After::RxHello(_)
+            | After::RxLoadBegin(_)
+            | After::RxLoadData(_)
+            | After::RxLoadEnd
+            | After::RxBlock(_)
+            | After::RxTick(_) => {
+                if let Err(e) = self.repl_command(slot, after) {
+                    extend_encode(&mut self.outs[s].out, &Frame::Error(e.text));
+                    if e.close {
+                        self.begin_closing(slot, true);
+                    }
+                }
             }
         }
         let o = &mut self.outs[s];
@@ -1675,6 +1801,9 @@ impl Core {
         if matches!(self.outs[s].mode, Mode::Draining | Mode::Free) {
             return;
         }
+        if self.outs[s].link {
+            self.link_lost(slot);
+        }
         self.outs[s].mode = Mode::Draining;
         self.unsubscribe_all(slot);
         self.release_queue(slot);
@@ -1720,6 +1849,8 @@ impl Core {
         o.out = Vec::new();
         o.holds.clear();
         o.sending = Vec::new();
+        o.link = false;
+        o.connecting = false;
         self.ins[s] = ConnIn::default();
         self.free.push(slot);
         self.ops.push(Op::Close { slot });
@@ -1741,7 +1872,7 @@ impl Core {
                 assert!(i.spans.is_empty() && o.refs == 0, "slot libre {s} encore utilisé");
                 continue;
             }
-            let expected = o.recv_armed as u8 + o.send_in_flight() as u8;
+            let expected = o.recv_armed as u8 + o.send_in_flight() as u8 + o.connecting as u8;
             assert_eq!(o.refs, expected, "slot {s} : refs {} pour recv {} send {}", o.refs, o.recv_armed, o.send_in_flight());
             for span in &i.spans {
                 ring_items[span.bid as usize] += 1;
@@ -1768,6 +1899,14 @@ impl Core {
                 assert!(o.ready && self.ready.contains(&(s as Slot)), "slot {s} a des frames hors de la liste prête");
             }
             assert!(o.sent <= o.sending.len());
+            if o.link {
+                assert!(!i.has_work() && !o.ready, "lien {s} : rien n'est exécuté");
+                assert!(
+                    self.src.as_ref().is_some_and(|src| src.links.iter().any(|l| l.slot == Some((s as Slot, o.epoch))))
+                        || o.mode == Mode::Draining,
+                    "lien {s} hors des cibles"
+                );
+            }
             assert!(
                 o.holds.iter().zip(o.holds.iter().skip(1)).all(|(a, b)| a.0 <= b.0 && a.1 <= b.1)
                     && o.holds.back().is_none_or(|h| h.0 <= o.out.len()),
@@ -1869,6 +2008,34 @@ fn runtime(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) 
         Cmd::Subscribe(ch) => After::Subscribe(ch.into_iter().collect()),
         Cmd::Unsubscribe(ch) => After::Unsubscribe(ch.into_iter().collect()),
         Cmd::Publish { channel, message } => After::Publish { channel, message },
+        Cmd::DebugDigest(at) => {
+            let d = art.content_digest(at.unwrap_or(art.now)).value();
+            bulk(&mut o.out, format!("{d:08x}").as_bytes());
+            After::Continue
+        }
+        Cmd::Replicate(radixox_lib::cmd::Replicate::Start { host, port, auth }) => {
+            After::Replicate { host: String::from_utf8_lossy(host).into_owned(), port, auth: auth.map(<[u8]>::to_vec) }
+        }
+        Cmd::Replicate(radixox_lib::cmd::Replicate::Stop { host, port }) => {
+            After::ReplicateStop { host: String::from_utf8_lossy(host).into_owned(), port }
+        }
+        Cmd::ReplicaOf(None) => After::ReplicaOfNoOne,
+        Cmd::ReplicaOf(Some(_)) => {
+            extend_encode(
+                &mut o.out,
+                &Frame::Error(
+                    "ERR RadixOx replication is pushed by the primary: run REPLICATE <host> <port> on the primary"
+                        .into(),
+                ),
+            );
+            After::Continue
+        }
+        Cmd::RxHello(id) => After::RxHello(id.to_vec()),
+        Cmd::RxLoad(radixox_lib::cmd::RxLoad::Begin(len)) => After::RxLoadBegin(len),
+        Cmd::RxLoad(radixox_lib::cmd::RxLoad::Data(d)) => After::RxLoadData(d.to_vec()),
+        Cmd::RxLoad(radixox_lib::cmd::RxLoad::End) => After::RxLoadEnd,
+        Cmd::RxBlock(b) => After::RxBlock(b.to_vec()),
+        Cmd::RxTick(now) => After::RxTick(now),
         _ => unreachable!("commande sans dépendance au runtime"),
     }
 }
