@@ -91,11 +91,14 @@ pub struct Manifest {
     pub base_offset: u64,
     /// Segments, dans l'ordre du flux.
     pub incrs: Vec<String>,
+    /// Réplica : l'histoire de la source suivie (DURABILITY_DESIGN.md §10.7) ;
+    /// le serveur redémarre en mode suivi.
+    pub follow: Option<ReplId>,
 }
 
 impl Manifest {
     pub fn parse(text: &str) -> Result<Self, String> {
-        let (mut version, mut replid, mut base, mut incrs) = (None, None, None, Vec::new());
+        let (mut version, mut replid, mut base, mut incrs, mut follow) = (None, None, None, Vec::new(), None);
         for (n, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -116,6 +119,7 @@ impl Manifest {
                     file_index(name).ok_or_else(bad)?;
                     incrs.push(name.to_string());
                 }
+                ["follow", id] => follow = Some(unhex(id).ok_or_else(bad)?),
                 _ => return Err(bad()),
             }
         }
@@ -125,7 +129,7 @@ impl Manifest {
             None => return Err("version absente".into()),
         }
         let (base, base_seq, base_offset) = base.ok_or("base absente")?;
-        Ok(Self { replid: replid.ok_or("replid absent")?, base, base_seq, base_offset, incrs })
+        Ok(Self { replid: replid.ok_or("replid absent")?, base, base_seq, base_offset, incrs, follow })
     }
 
     pub fn render(&self) -> String {
@@ -138,6 +142,9 @@ impl Manifest {
         );
         for name in &self.incrs {
             s += &format!("incr {name}\n");
+        }
+        if let Some(id) = &self.follow {
+            s += &format!("follow {}\n", hex(id));
         }
         s
     }
@@ -363,7 +370,7 @@ pub fn create(art: &mut OxidArt, dir: &Path) -> io::Result<Resume> {
     // Un reste d'une tentative précédente (crash avant le manifeste).
     let _ = std::fs::remove_file(dir.join(&seg));
     create_segment(dir, &seg)?;
-    let manifest = Manifest { replid, base, base_seq: 0, base_offset: 0, incrs: vec![seg] };
+    let manifest = Manifest { replid, base, base_seq: 0, base_offset: 0, incrs: vec![seg], follow: None };
     manifest.write(dir)?;
     Ok(Resume {
         manifest,
@@ -479,6 +486,9 @@ pub struct AofWriter {
     rotation: Option<Rotation>,
     /// Base écrite par une réécriture finie avant la rotation : publiée après.
     pending_base: Option<(String, JournalPos)>,
+    /// Génération : un réplica qui recharge un dump remplace son écrivain ;
+    /// les opérations de l'ancien encore en vol sont reconnues par ce numéro.
+    pub generation: u32,
 }
 
 impl AofWriter {
@@ -509,7 +519,21 @@ impl AofWriter {
             delayed_fsync: 0,
             rotation: None,
             pending_base: None,
+            generation: 0,
         })
+    }
+
+    /// Réplica / promotion : marque (ou démarque) le manifeste `follow`.
+    pub fn set_follow(&mut self, follow: Option<ReplId>) -> io::Result<()> {
+        let m = Manifest { follow, ..self.manifest.clone() };
+        m.write(&self.dir)?;
+        self.manifest = m;
+        Ok(())
+    }
+
+    /// Une opération est en vol (le noyau lit `writing` ou le fichier).
+    pub fn busy(&self) -> bool {
+        self.in_flight || self.syncing.is_some()
     }
 
     fn fd(&self) -> i32 {
@@ -742,6 +766,7 @@ impl AofWriter {
             base_seq: pos.seq,
             base_offset: pos.offset,
             incrs: self.manifest.incrs.iter().filter(|n| file_index(n).is_some_and(|i| i >= from)).cloned().collect(),
+            follow: self.manifest.follow,
         };
         if let Err(e) = m.write(&self.dir) {
             // L'ancien manifeste reste valide ; la prochaine réécriture réessaiera.
@@ -856,8 +881,11 @@ mod tests {
             base_seq: 120_345,
             base_offset: 9_876_543,
             incrs: vec![segment_name(18), segment_name(19)],
+            follow: None,
         };
         assert_eq!(Manifest::parse(&m.render()).unwrap(), m);
+        let f = Manifest { follow: Some([0x5c; 20]), ..m.clone() };
+        assert_eq!(Manifest::parse(&f.render()).unwrap(), f);
         assert_eq!(m.last_index(), 19);
         assert!(Manifest::parse("version 2\n").is_err());
         assert!(Manifest::parse("version 1\nreplid zz\n").is_err());

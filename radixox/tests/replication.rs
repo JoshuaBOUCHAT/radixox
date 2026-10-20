@@ -252,3 +252,76 @@ fn primary_restart_then_promotion() {
     let _ = std::fs::remove_dir_all(&pdir);
     let _ = std::fs::remove_dir_all(&rdir);
 }
+
+/// Réplica avec AOF tué (`kill -9`) sous charge : relancé sur ses fichiers,
+/// il revient en réplica (lecture seule tout de suite) et reprend dans le
+/// backlog du primaire, sans nouveau dump.
+#[test]
+fn replica_with_aof_resumes_after_kill9() {
+    let (pdir, rdir) = (test_dir("repl-raof-p"), test_dir("repl-raof-r"));
+    let renv = [("RADIXOX_APPENDONLY", "yes")];
+    let mut replica = start(REPLICA, &rdir, &renv);
+    let target = format!("127.0.0.1:{REPLICA}");
+    let _primary = start(PRIMARY, &pdir, &[("RADIXOX_REPLICATE", &target)]);
+    load_keys(PRIMARY, 20_000);
+    wait_caught_up(PRIMARY, REPLICA, Duration::from_secs(10));
+    let stop = Arc::new(AtomicBool::new(false));
+    let w = {
+        let stop = stop.clone();
+        std::thread::spawn(move || writer(PRIMARY, 7, stop))
+    };
+    std::thread::sleep(Duration::from_millis(400));
+    // SAFETY: pid de notre enfant.
+    unsafe { libc::kill(replica.0.id() as i32, libc::SIGKILL) };
+    let _ = replica.0.wait();
+    drop(replica);
+    let replica = start(REPLICA, &rdir, &renv);
+    let mut r = common::conn(REPLICA);
+    assert_eq!(field(&info(&mut r), "role").as_deref(), Some("replica"));
+    let err = redis::cmd("SET").arg("x").arg(1).query::<()>(&mut r).unwrap_err();
+    assert!(err.to_string().contains("read only replica"), "{err}");
+    std::thread::sleep(Duration::from_millis(400));
+    stop.store(true, Ordering::Relaxed);
+    w.join().unwrap();
+    wait_caught_up(PRIMARY, REPLICA, Duration::from_secs(10));
+    let at = unix_now();
+    assert_eq!(digest(PRIMARY, at), digest(REPLICA, at));
+    let pi = info(&mut common::conn(PRIMARY));
+    assert_eq!(field(&pi, "sync_full").as_deref(), Some("1"), "{pi}");
+    assert_eq!(field(&pi, "sync_partial_ok").as_deref(), Some("1"), "{pi}");
+    drop(replica);
+    let _ = std::fs::remove_dir_all(&pdir);
+    let _ = std::fs::remove_dir_all(&rdir);
+}
+
+/// Chaîne de trois processus : primaire → réplica (avec AOF) → réplica.
+#[test]
+fn chain_of_three_converges() {
+    let (pdir, mdir, rdir) = (test_dir("repl-c-p"), test_dir("repl-c-m"), test_dir("repl-c-r"));
+    let _leaf = start(REPLICA_2, &rdir, &[]);
+    let leaf_target = format!("127.0.0.1:{REPLICA_2}");
+    let _middle = start(REPLICA, &mdir, &[("RADIXOX_APPENDONLY", "yes"), ("RADIXOX_REPLICATE", &leaf_target)]);
+    let target = format!("127.0.0.1:{REPLICA}");
+    let _primary = start(PRIMARY, &pdir, &[("RADIXOX_REPLICATE", &target)]);
+    load_keys(PRIMARY, 20_000);
+    let stop = Arc::new(AtomicBool::new(false));
+    let w = {
+        let stop = stop.clone();
+        std::thread::spawn(move || writer(PRIMARY, 9, stop))
+    };
+    std::thread::sleep(Duration::from_millis(800));
+    stop.store(true, Ordering::Relaxed);
+    w.join().unwrap();
+    wait_caught_up(PRIMARY, REPLICA, Duration::from_secs(10));
+    wait_caught_up(REPLICA, REPLICA_2, Duration::from_secs(10));
+    let at = unix_now();
+    let d = digest(PRIMARY, at);
+    assert_eq!(digest(REPLICA, at), d);
+    assert_eq!(digest(REPLICA_2, at), d);
+    let mut leaf = common::conn(REPLICA_2);
+    let p = field(&info(&mut common::conn(PRIMARY)), "replid");
+    assert_eq!(field(&info(&mut leaf), "master_replid"), p, "le bout suit l'histoire du primaire");
+    let _ = std::fs::remove_dir_all(&pdir);
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&rdir);
+}

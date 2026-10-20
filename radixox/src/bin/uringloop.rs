@@ -278,35 +278,37 @@ impl Server {
                     .build()
                     .flags(squeue::Flags::SKIP_SUCCESS)
                     .user_data(ud(K_CLOSE, slot)),
-                Op::FileWrite { fd, off } => {
+                // Numéro du BGSAVE dans le champ slot du user_data.
+                Op::FileWrite { fd, off, save } => {
                     // Le tampon reste intact jusqu'au CQE (invariant du BGSAVE).
-                    let buf = self.core.pending_file_write();
+                    let buf = self.core.pending_file_write(save);
                     let sqe = opcode::Write::new(Fd(fd), buf.as_ptr(), buf.len() as u32)
                         .offset(off)
                         .build()
-                        .user_data(ud(K_FILE, 0));
+                        .user_data(ud(K_FILE, save));
                     // Sinon la copie dans le cache de pages se fait dans notre `enter`.
                     if self.file_async { sqe.flags(squeue::Flags::ASYNC) } else { sqe }
                 }
-                Op::FileSync { fd } => opcode::Fsync::new(Fd(fd))
+                Op::FileSync { fd, save } => opcode::Fsync::new(Fd(fd))
                     .flags(io_uring::types::FsyncFlags::DATASYNC)
                     .build()
-                    .user_data(ud(K_FILE, 0)),
+                    .user_data(ud(K_FILE, save)),
                 // Second canal de fichiers : le segment de l'AOF (DURABILITY_DESIGN.md §7.3).
-                Op::JournalWrite { fd, off } => {
+                // Génération de l'écrivain dans le champ slot du user_data.
+                Op::JournalWrite { fd, off, writer } => {
                     // Le tampon reste intact jusqu'au CQE (invariant de l'écrivain).
-                    let buf = self.core.pending_journal_write();
+                    let buf = self.core.pending_journal_write(writer);
                     let sqe = opcode::Write::new(Fd(fd), buf.as_ptr(), buf.len() as u32)
                         .offset(off)
                         .build()
-                        .user_data(ud(K_JWRITE, 0));
+                        .user_data(ud(K_JWRITE, writer));
                     if self.file_async { sqe.flags(squeue::Flags::ASYNC) } else { sqe }
                 }
-                Op::JournalSync { fd } => {
+                Op::JournalSync { fd, writer } => {
                     let sqe = opcode::Fsync::new(Fd(fd))
                         .flags(io_uring::types::FsyncFlags::DATASYNC)
                         .build()
-                        .user_data(ud(K_JSYNC, 0));
+                        .user_data(ud(K_JSYNC, writer));
                     if self.file_async { sqe.flags(squeue::Flags::ASYNC) } else { sqe }
                 }
                 Op::ProvideBuf { bid } => {
@@ -382,9 +384,9 @@ impl Server {
                     let save = self.signals.as_ref().is_some_and(|s| s.save);
                     shutdown(&mut self.core, save)
                 }
-                K_FILE => Completion::File { res },
-                K_JWRITE => Completion::JournalWrite { res },
-                K_JSYNC => Completion::JournalSync { res },
+                K_FILE => Completion::File { res, save: slot },
+                K_JWRITE => Completion::JournalWrite { res, writer: slot },
+                K_JSYNC => Completion::JournalSync { res, writer: slot },
                 K_CONNECT => {
                     self.connects.remove(&slot);
                     Completion::Connect { slot, res }

@@ -282,6 +282,9 @@ pub struct Stream {
     /// Chaque bloc fermé y est aussi rangé pour la réplication, si présent :
     /// le cœur le vide à chaque fin de tour (DURABILITY_DESIGN.md §10).
     pub tap: Option<Vec<Blk>>,
+    /// Réplica : les blocs viennent de la source ([`push_raw`](Self::push_raw)),
+    /// une coupure n'en ferme pas (même numérotation que la source, §10.7).
+    pub follow: bool,
     /// Octets de `closed` (tenu par `close` et `take_closed`).
     closed_bytes: u64,
     /// Prochain `seq` (le premier bloc d'une histoire porte 1).
@@ -308,6 +311,7 @@ impl Stream {
             closed: VecDeque::new(),
             keep: true,
             tap: None,
+            follow: false,
             closed_bytes: 0,
             next_seq: at.seq + 1,
             offset: at.offset,
@@ -379,6 +383,10 @@ impl Stream {
     /// avec `CUT`, même vide, au `now` du tour. Rend la position après lui :
     /// tout ce qui a été exécuté avant y est, rien de ce qui suit.
     pub fn cut(&mut self) -> Cursor {
+        if self.follow {
+            debug_assert!(self.is_empty(), "réplica : pas de commande locale dans le flux");
+            return self.cursor();
+        }
         if self.is_empty() {
             self.cur_now = self.last_now;
         }
@@ -397,6 +405,23 @@ impl Stream {
             self.close(0);
         }
         self.cur_flags = 0;
+    }
+
+    /// Réplica : ajoute un bloc reçu de la source, tel quel (validé par
+    /// l'appelant : `b` est son en-tête, il suit le dernier bloc).
+    pub fn push_raw(&mut self, blk: Blk, b: &Block) {
+        debug_assert!(self.follow && self.is_empty());
+        debug_assert_eq!((b.seq, b.offset), (self.next_seq, self.offset), "bloc reçu hors séquence");
+        self.next_seq = b.seq + 1;
+        self.offset = b.offset + b.size();
+        self.last_now = self.last_now.max(b.now);
+        if let Some(tap) = &mut self.tap {
+            tap.push(blk.clone());
+        }
+        if self.keep {
+            self.closed_bytes += blk.len() as u64;
+            self.closed.push_back(blk);
+        }
     }
 
     fn close(&mut self, extra: u16) {

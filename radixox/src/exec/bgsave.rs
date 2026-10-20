@@ -109,6 +109,8 @@ enum Phase {
 }
 
 pub struct BgSave {
+    /// Numéro donné par le cœur : reconnaît les CQE d'un BGSAVE abandonné.
+    pub id: u32,
     /// Fichier visé (`dump.rxd`, ou une base de l'AOF) et position du flux.
     target: Target,
     file: std::fs::File,
@@ -163,6 +165,7 @@ impl BgSave {
         };
         let start_took = t0.elapsed();
         Ok(Self {
+            id: 0,
             target,
             file,
             pos: 0,

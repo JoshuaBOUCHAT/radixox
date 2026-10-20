@@ -165,34 +165,34 @@ impl Fake {
                 }
                 Op::ProvideBuf { bid } => self.ring.push_back(bid),
                 // Fichier du BGSAVE : écritures réelles (le dump est relu par le test).
-                Op::FileWrite { fd, off } => {
-                    let buf = self.core.pending_file_write();
+                Op::FileWrite { fd, off, save } => {
+                    let buf = self.core.pending_file_write(save);
                     // SAFETY: fd ouvert par le BGSAVE, tampon valide.
                     let res = unsafe { libc::pwrite(fd, buf.as_ptr().cast(), buf.len(), off as i64) };
-                    self.completions.push(Completion::File { res: res as i32 });
+                    self.completions.push(Completion::File { res: res as i32, save });
                 }
-                Op::FileSync { fd } => {
+                Op::FileSync { fd, save } => {
                     // SAFETY: fd ouvert par le BGSAVE.
                     let res = unsafe { libc::fdatasync(fd) };
-                    self.completions.push(Completion::File { res });
+                    self.completions.push(Completion::File { res, save });
                 }
                 // Segment de l'AOF : écritures réelles (relues par le test).
                 Op::JournalWrite { .. } if self.journal_stalled => self.journal_held.push(op),
                 Op::JournalSync { .. } if self.sync_stalled => self.sync_held.push(op),
-                Op::JournalWrite { fd, off } => {
-                    let buf = self.core.pending_journal_write();
+                Op::JournalWrite { fd, off, writer } => {
+                    let buf = self.core.pending_journal_write(writer);
                     let n = match self.journal_write_max {
                         Some(max) => buf.len().min(max),
                         None => buf.len(),
                     };
                     // SAFETY: fd ouvert par l'écrivain, tampon valide.
                     let res = unsafe { libc::pwrite(fd, buf.as_ptr().cast(), n, off as i64) };
-                    self.completions.push(Completion::JournalWrite { res: res as i32 });
+                    self.completions.push(Completion::JournalWrite { res: res as i32, writer });
                 }
-                Op::JournalSync { fd } => {
+                Op::JournalSync { fd, writer } => {
                     // SAFETY: fd ouvert par l'écrivain.
                     let res = unsafe { libc::fdatasync(fd) };
-                    self.completions.push(Completion::JournalSync { res });
+                    self.completions.push(Completion::JournalSync { res, writer });
                 }
                 Op::Connect { slot, addr } => self.connecting.push((slot, addr)),
             }
@@ -1434,85 +1434,115 @@ fn always_random_traffic_replays_and_answers() {
 
 // ── Réplication (DURABILITY_DESIGN.md §10, test 7) ──────────────────────────
 
-/// Un primaire et un réplica sur deux faux noyaux, reliés par un fil simulé :
-/// ce que le primaire envoie sur son lien arrive à une connexion acceptée par
-/// le réplica, et inversement.
-struct Pair {
-    p: Fake,
-    r: Fake,
-    /// Fil en place : (lien chez le primaire, connexion chez le réplica ;
-    /// `Err(fd)` : acceptée, pas encore installée).
-    wire: Option<(Slot, Result<Slot, i32>)>,
+/// Des serveurs sur des faux noyaux, reliés par des fils simulés : le nœud
+/// `i` écoute sur le port `7000 + i` ; un lien sortant vers ce port arrive à
+/// une connexion acceptée par ce nœud, et inversement.
+struct Net {
+    n: Vec<Fake>,
+    wires: Vec<Wire>,
     /// Réseau coupé : les `connect` échouent.
     down: bool,
-    /// Fil bloqué : les octets attendent (connexion vivante, rien ne passe).
+    /// Fils bloqués : les octets attendent (connexions vivantes, rien ne passe).
     hold: bool,
 }
 
+/// Un fil : lien `link` du nœud `from` vers une connexion du nœud `to`
+/// (`Err(fd)` : acceptée, pas encore installée).
+struct Wire {
+    from: usize,
+    link: Slot,
+    to: usize,
+    conn: Result<Slot, i32>,
+}
+
+/// Port du nœud 1, cible de réplication du nœud 0.
 const REPLICA_PORT: u16 = 7001;
 
-impl Pair {
-    fn new(cfg: Config) -> Self {
-        Self { p: Fake::new(cfg.clone()), r: Fake::new(cfg), wire: None, down: false, hold: false }
+impl Net {
+    fn new(cfg: Config, nodes: usize) -> Self {
+        Self { n: (0..nodes).map(|_| Fake::new(cfg.clone())).collect(), wires: Vec::new(), down: false, hold: false }
     }
 
-    /// Le fil : connexions sortantes acceptées (ou refusées), octets passés.
+    /// Un dossier de dumps par nœud (`dir/n<i>`), comme des serveurs séparés.
+    fn with_dirs(cfg: Config, nodes: usize, dir: &std::path::Path) -> Self {
+        let n = (0..nodes)
+            .map(|i| {
+                let d = dir.join(format!("n{i}"));
+                std::fs::create_dir_all(&d).unwrap();
+                Fake::new(Config { dir: Some(d), ..cfg.clone() })
+            })
+            .collect();
+        Self { n, wires: Vec::new(), down: false, hold: false }
+    }
+
+    /// Les fils : connexions sortantes acceptées (ou refusées), octets passés.
     fn pump(&mut self) {
-        for (slot, addr) in std::mem::take(&mut self.p.connecting) {
-            assert_eq!(addr.port(), REPLICA_PORT);
-            self.p.connecting.push((slot, addr));
-            if self.down || self.wire.is_some() {
-                self.p.finish_connect(slot, -111);
+        for from in 0..self.n.len() {
+            for (slot, addr) in std::mem::take(&mut self.n[from].connecting) {
+                self.n[from].connecting.push((slot, addr));
+                let to = (addr.port() - 7000) as usize;
+                assert!(to < self.n.len() && to != from, "port {}", addr.port());
+                if self.down {
+                    self.n[from].finish_connect(slot, -111);
+                    continue;
+                }
+                self.n[from].finish_connect(slot, 0);
+                let fd = self.n[to].next_fd;
+                self.n[to].next_fd += 1;
+                self.n[to].completions.push(Completion::Accept { fd, more: true });
+                self.wires.push(Wire { from, link: slot, to, conn: Err(fd) });
+            }
+        }
+        let mut i = 0;
+        while i < self.wires.len() {
+            let Wire { from, link, to, conn } = self.wires[i];
+            let c = match conn {
+                Ok(c) => c,
+                Err(fd) => match self.n[to].fd_slot.get(&fd) {
+                    Some(&c) if self.n[to].peers.contains_key(&c) => {
+                        self.wires[i].conn = Ok(c);
+                        c
+                    }
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                },
+            };
+            // Un côté fermé par son serveur : l'autre voit la fin.
+            let (pl, rc) = (self.n[from].peers.contains_key(&link), self.n[to].peers.contains_key(&c));
+            if !pl || !rc {
+                self.wires.swap_remove(i);
+                if pl {
+                    self.n[from].peers.get_mut(&link).unwrap().eof = true;
+                }
+                if rc {
+                    self.n[to].peers.get_mut(&c).unwrap().eof = true;
+                }
                 continue;
             }
-            self.p.finish_connect(slot, 0);
-            let fd = self.r.next_fd;
-            self.r.next_fd += 1;
-            self.r.completions.push(Completion::Accept { fd, more: true });
-            self.wire = Some((slot, Err(fd)));
-        }
-        let Some((l, c)) = self.wire else { return };
-        let c = match c {
-            Ok(c) => c,
-            Err(fd) => match self.r.fd_slot.get(&fd) {
-                Some(&c) if self.r.peers.contains_key(&c) => {
-                    self.wire = Some((l, Ok(c)));
-                    c
-                }
-                _ => return,
-            },
-        };
-        // Un côté fermé par son serveur : l'autre voit la fin.
-        let (pl, rc) = (self.p.peers.contains_key(&l), self.r.peers.contains_key(&c));
-        if !pl || !rc {
-            self.wire = None;
-            if pl {
-                self.p.peers.get_mut(&l).unwrap().eof = true;
+            if !self.hold {
+                let out = std::mem::take(&mut self.n[from].peers.get_mut(&link).unwrap().received);
+                self.n[to].peers.get_mut(&c).unwrap().inbound.extend(out);
+                let back = std::mem::take(&mut self.n[to].peers.get_mut(&c).unwrap().received);
+                self.n[from].peers.get_mut(&link).unwrap().inbound.extend(back);
             }
-            if rc {
-                self.r.peers.get_mut(&c).unwrap().eof = true;
-            }
-            return;
+            i += 1;
         }
-        if self.hold {
-            return;
-        }
-        let out = std::mem::take(&mut self.p.peers.get_mut(&l).unwrap().received);
-        self.r.peers.get_mut(&c).unwrap().inbound.extend(out);
-        let back = std::mem::take(&mut self.r.peers.get_mut(&c).unwrap().received);
-        self.p.peers.get_mut(&l).unwrap().inbound.extend(back);
     }
 
     fn step(&mut self) -> bool {
-        let a = self.p.step();
-        self.pump();
-        let b = self.r.step();
-        self.pump();
-        let in_flight = !self.hold && self.wire.is_some_and(|(l, c)| {
-            self.p.peers.get(&l).is_some_and(|p| !p.received.is_empty() || !p.inbound.is_empty())
-                || c.is_ok_and(|c| self.r.peers.get(&c).is_some_and(|p| !p.received.is_empty() || !p.inbound.is_empty()))
-        });
-        a || b || in_flight || !self.p.connecting.is_empty()
+        let mut busy = false;
+        for i in 0..self.n.len() {
+            busy |= self.n[i].step();
+            self.pump();
+        }
+        let in_flight = !self.hold
+            && self.wires.iter().any(|w| {
+                let live = |f: &Fake, s: Slot| f.peers.get(&s).is_some_and(|p| !p.received.is_empty() || !p.inbound.is_empty());
+                live(&self.n[w.from], w.link) || w.conn.is_ok_and(|c| live(&self.n[w.to], c))
+            });
+        busy || in_flight || self.n.iter().any(|f| !f.connecting.is_empty())
     }
 
     fn settle(&mut self) {
@@ -1526,35 +1556,52 @@ impl Pair {
 
     /// Une seconde passe : timers (reconnexion, RXTICK, fsync).
     fn second(&mut self) {
-        for f in [&mut self.p, &mut self.r] {
+        for f in &mut self.n {
             f.clock += Duration::from_secs(1);
             f.core.set_now(f.clock);
             f.core.fire_timers();
         }
     }
 
-    /// Coupure du réseau : les octets en route sont perdus, chaque côté voit
-    /// une erreur (reset) ou la fin.
-    fn cut(&mut self) {
-        let Some((l, c)) = self.wire.take() else { return };
-        if let Some(peer) = self.p.peers.get_mut(&l) {
-            peer.inbound.clear();
-            peer.received.clear();
-            if peer.armed {
-                peer.armed = false;
-                self.p.completions.push(Completion::Recv { slot: l, res: -104, bid: None, buf_more: false, more: false });
-            } else {
-                // Recv pas encore armé : la fin sera vue à l'armement.
+    /// Coupure des fils (tous, ou ceux vers `to`) : les octets en route sont
+    /// perdus, chaque côté voit une erreur (reset) ou la fin.
+    fn cut_to(&mut self, to: Option<usize>) {
+        let mut kept = Vec::new();
+        for w in std::mem::take(&mut self.wires) {
+            if to.is_some_and(|t| t != w.to) {
+                kept.push(w);
+                continue;
+            }
+            if let Some(peer) = self.n[w.from].peers.get_mut(&w.link) {
+                peer.inbound.clear();
+                peer.received.clear();
+                if peer.armed {
+                    peer.armed = false;
+                    self.n[w.from].completions.push(Completion::Recv {
+                        slot: w.link,
+                        res: -104,
+                        bid: None,
+                        buf_more: false,
+                        more: false,
+                    });
+                } else {
+                    // Recv pas encore armé : la fin sera vue à l'armement.
+                    peer.eof = true;
+                }
+            }
+            if let Ok(c) = w.conn
+                && let Some(peer) = self.n[w.to].peers.get_mut(&c)
+            {
+                peer.inbound.clear();
+                peer.received.clear();
                 peer.eof = true;
             }
         }
-        if let Ok(c) = c
-            && let Some(peer) = self.r.peers.get_mut(&c)
-        {
-            peer.inbound.clear();
-            peer.received.clear();
-            peer.eof = true;
-        }
+        self.wires = kept;
+    }
+
+    fn cut(&mut self) {
+        self.cut_to(None);
     }
 
     fn cmd(f: &mut Fake, c: Slot, cmd: &[u8]) -> String {
@@ -1563,10 +1610,23 @@ impl Pair {
         f.take(c)
     }
 
-    /// États métier égaux (le réplica vu à l'horloge du primaire).
+    /// Jusqu'au repos, BGSAVE de synchronisation compris.
+    fn settle_all(&mut self) {
+        self.settle();
+        while self.n.iter().any(|f| f.core.bgsave_running()) {
+            self.step();
+        }
+        self.settle();
+    }
+
+    /// États métier égaux à celui du nœud 0 (vus à son horloge).
     fn assert_same(&mut self, what: &str) {
-        self.r.core.art.set_now(self.p.core.art.now);
-        assert_eq!(state(&mut self.r.core.art), state(&mut self.p.core.art), "{what}");
+        let now = self.n[0].core.art.now;
+        let want = state(&mut self.n[0].core.art);
+        for i in 1..self.n.len() {
+            self.n[i].core.art.set_now(now);
+            assert_eq!(state(&mut self.n[i].core.art), want, "{what}, nœud {i}");
+        }
     }
 }
 
@@ -1591,18 +1651,18 @@ fn replica_follows_random_traffic_across_cuts() {
         }
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let backlog = if seed % 3 == 0 { 200 } else { 64 << 20 };
-        let mut pair = Pair::new(Config { max_conn: 16, reserved: 1, repl_backlog: backlog, ..Config::default() });
-        pair.p.idle_work = seed % 2 == 0;
+        let mut pair = Net::new(Config { max_conn: 16, reserved: 1, repl_backlog: backlog, ..Config::default() }, 2);
+        pair.n[0].idle_work = seed % 2 == 0;
         let mut wall = 1_000u64;
-        pair.p.wall = Some(wall);
+        pair.n[0].wall = Some(wall);
         // L'horloge du réplica est ailleurs (±1 h) : elle ne doit pas compter.
-        pair.r.wall = Some(if seed % 2 == 0 { wall + 3600 } else { wall - 900 });
-        let conns: Vec<Slot> = (0..1 + rng.below(3)).map(|_| pair.p.connect()).collect();
-        let admin = pair.p.connect();
+        pair.n[1].wall = Some(if seed % 2 == 0 { wall + 3600 } else { wall - 900 });
+        let conns: Vec<Slot> = (0..1 + rng.below(3)).map(|_| pair.n[0].connect()).collect();
+        let admin = pair.n[0].connect();
         let start_at = rng.below(10);
         for round in 0..40 {
             if round == start_at {
-                let r = Pair::cmd(&mut pair.p, admin, format!("REPLICATE 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes());
+                let r = Net::cmd(&mut pair.n[0], admin, format!("REPLICATE 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes());
                 assert_eq!(r, "+OK\r\n");
             }
             for &c in &conns {
@@ -1612,14 +1672,14 @@ fn replica_follows_random_traffic_across_cuts() {
                         1 => vec!["WAIT".to_string(), "1".to_string(), "100".to_string()],
                         _ => random_write(&mut rng, true),
                     };
-                    pair.p.send(c, &resp(&cmd));
+                    pair.n[0].send(c, &resp(&cmd));
                 }
             }
             for _ in 0..1 + rng.below(3) {
                 pair.step();
             }
             wall += rng.below(3);
-            pair.p.wall = Some(wall);
+            pair.n[0].wall = Some(wall);
             match rng.below(12) {
                 0 => pair.cut(),
                 1 | 2 => pair.second(),
@@ -1631,18 +1691,18 @@ fn replica_follows_random_traffic_across_cuts() {
             pair.second();
             pair.settle();
         }
-        while pair.p.core.bgsave_running() {
+        while pair.n[0].core.bgsave_running() {
             pair.step();
         }
         pair.settle();
-        let info = Pair::cmd(&mut pair.p, admin, b"INFO\r\n");
+        let info = Net::cmd(&mut pair.n[0], admin, b"INFO\r\n");
         assert_eq!(info_field(&info, "connected_replicas").as_deref(), Some("1"), "graine {seed} : {info}");
         pair.assert_same(&format!("graine {seed}"));
         // Le réplica sert les lectures, refuse les écritures.
-        let rc = pair.r.connect();
-        assert!(Pair::cmd(&mut pair.r, rc, b"SET z 1\r\n").starts_with("-READONLY"), "graine {seed}");
-        assert!(Pair::cmd(&mut pair.r, rc, b"DBSIZE\r\n").starts_with(':'));
-        let rinfo = Pair::cmd(&mut pair.r, rc, b"INFO\r\n");
+        let rc = pair.n[1].connect();
+        assert!(Net::cmd(&mut pair.n[1], rc, b"SET z 1\r\n").starts_with("-READONLY"), "graine {seed}");
+        assert!(Net::cmd(&mut pair.n[1], rc, b"DBSIZE\r\n").starts_with(':'));
+        let rinfo = Net::cmd(&mut pair.n[1], rc, b"INFO\r\n");
         assert_eq!(info_field(&rinfo, "role").as_deref(), Some("replica"));
         assert_eq!(info_field(&rinfo, "repl_seq"), info_field(&info, "repl_seq"), "graine {seed}");
     }
@@ -1656,19 +1716,19 @@ fn replica_follows_random_traffic_across_cuts() {
 fn replica_resumes_from_backlog_or_resyncs() {
     let dir = test_dir("repl-backlog");
     unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
-    let mut pair = Pair::new(Config { max_conn: 16, reserved: 1, repl_backlog: 4096, ..Config::default() });
-    pair.p.wall = Some(1_000);
-    let (c, admin) = (pair.p.connect(), pair.p.connect());
-    Pair::cmd(&mut pair.p, c, b"SET a 1\r\n");
-    assert_eq!(Pair::cmd(&mut pair.p, admin, format!("REPLICATE 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes()), "+OK\r\n");
+    let mut pair = Net::new(Config { max_conn: 16, reserved: 1, repl_backlog: 4096, ..Config::default() }, 2);
+    pair.n[0].wall = Some(1_000);
+    let (c, admin) = (pair.n[0].connect(), pair.n[0].connect());
+    Net::cmd(&mut pair.n[0], c, b"SET a 1\r\n");
+    assert_eq!(Net::cmd(&mut pair.n[0], admin, format!("REPLICATE 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes()), "+OK\r\n");
     pair.settle();
-    while pair.p.core.bgsave_running() {
+    while pair.n[0].core.bgsave_running() {
         pair.step();
     }
     pair.settle();
     pair.assert_same("première synchronisation");
-    let sync = |pair: &mut Pair, admin| {
-        let info = Pair::cmd(&mut pair.p, admin, b"INFO\r\n");
+    let sync = |pair: &mut Net, admin| {
+        let info = Net::cmd(&mut pair.n[0], admin, b"INFO\r\n");
         (info_field(&info, "sync_full").unwrap(), info_field(&info, "sync_partial_ok").unwrap())
     };
     assert_eq!(sync(&mut pair, admin), ("1".into(), "0".into()));
@@ -1677,7 +1737,7 @@ fn replica_resumes_from_backlog_or_resyncs() {
     pair.down = true;
     pair.settle();
     for i in 0..5 {
-        pair.p.send(c, format!("SET k{i} {i}\r\n").as_bytes());
+        pair.n[0].send(c, format!("SET k{i} {i}\r\n").as_bytes());
         pair.settle();
     }
     pair.down = false;
@@ -1690,13 +1750,13 @@ fn replica_resumes_from_backlog_or_resyncs() {
     pair.down = true;
     pair.settle();
     for i in 0..300 {
-        pair.p.send(c, format!("SET big{i} {}\r\n", "x".repeat(40)).as_bytes());
+        pair.n[0].send(c, format!("SET big{i} {}\r\n", "x".repeat(40)).as_bytes());
         pair.settle();
     }
     pair.down = false;
     pair.second();
     pair.settle();
-    while pair.p.core.bgsave_running() {
+    while pair.n[0].core.bgsave_running() {
         pair.step();
     }
     pair.settle();
@@ -1713,39 +1773,39 @@ fn replica_resumes_from_backlog_or_resyncs() {
 fn promotion_and_second_source() {
     let dir = test_dir("repl-promote");
     unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
-    let mut pair = Pair::new(Config { max_conn: 16, reserved: 1, ..Config::default() });
-    pair.p.wall = Some(1_000);
-    let c = pair.p.connect();
-    Pair::cmd(&mut pair.p, c, b"SET a 1\r\nSET b 2\r\n");
-    Pair::cmd(&mut pair.p, c, format!("REPLICATE 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes());
+    let mut pair = Net::new(Config { max_conn: 16, reserved: 1, ..Config::default() }, 2);
+    pair.n[0].wall = Some(1_000);
+    let c = pair.n[0].connect();
+    Net::cmd(&mut pair.n[0], c, b"SET a 1\r\nSET b 2\r\n");
+    Net::cmd(&mut pair.n[0], c, format!("REPLICATE 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes());
     pair.settle();
-    while pair.p.core.bgsave_running() {
+    while pair.n[0].core.bgsave_running() {
         pair.step();
     }
     pair.settle();
     pair.assert_same("synchronisé");
     // Une seconde source : refusée.
-    let other = pair.r.connect();
+    let other = pair.n[1].connect();
     let id = "ab".repeat(20);
-    assert!(Pair::cmd(&mut pair.r, other, format!("RXHELLO {id}\r\n").as_bytes()).starts_with("-ERR already following"));
+    assert!(Net::cmd(&mut pair.n[1], other, format!("RXHELLO {id}\r\n").as_bytes()).starts_with("-ERR already following"));
     // Un client qui n'est pas la source ne pousse pas de bloc.
-    assert!(Pair::cmd(&mut pair.r, other, b"RXTICK 5\r\n").starts_with("-ERR not the replication source"));
-    let rc = pair.r.connect();
-    let before = info_field(&Pair::cmd(&mut pair.r, rc, b"INFO\r\n"), "master_replid").unwrap();
-    assert_eq!(Pair::cmd(&mut pair.r, rc, b"REPLICAOF NO ONE\r\n"), "+OK\r\n");
-    let info = Pair::cmd(&mut pair.r, rc, b"INFO\r\n");
+    assert!(Net::cmd(&mut pair.n[1], other, b"RXTICK 5\r\n").starts_with("-ERR not the replication source"));
+    let rc = pair.n[1].connect();
+    let before = info_field(&Net::cmd(&mut pair.n[1], rc, b"INFO\r\n"), "master_replid").unwrap();
+    assert_eq!(Net::cmd(&mut pair.n[1], rc, b"REPLICAOF NO ONE\r\n"), "+OK\r\n");
+    let info = Net::cmd(&mut pair.n[1], rc, b"INFO\r\n");
     assert_eq!(info_field(&info, "role").as_deref(), Some("master"));
     assert_ne!(info_field(&info, "replid").unwrap(), before);
-    assert_eq!(Pair::cmd(&mut pair.r, rc, b"SET c 3\r\n"), "+OK\r\n");
+    assert_eq!(Net::cmd(&mut pair.n[1], rc, b"SET c 3\r\n"), "+OK\r\n");
     // L'ancienne source se reconnecte : refusée, le promu garde ses données.
     pair.second();
     pair.settle();
     pair.second();
     pair.settle();
-    assert_eq!(Pair::cmd(&mut pair.r, rc, b"GET c\r\n"), "$1\r\n3\r\n");
-    let pinfo = Pair::cmd(&mut pair.p, c, b"INFO\r\n");
+    assert_eq!(Net::cmd(&mut pair.n[1], rc, b"GET c\r\n"), "$1\r\n3\r\n");
+    let pinfo = Net::cmd(&mut pair.n[0], c, b"INFO\r\n");
     assert_eq!(info_field(&pinfo, "connected_replicas").as_deref(), Some("0"), "{pinfo}");
-    assert_eq!(Pair::cmd(&mut pair.p, c, format!("REPLICATE STOP 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes()), "+OK\r\n");
+    assert_eq!(Net::cmd(&mut pair.n[0], c, format!("REPLICATE STOP 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes()), "+OK\r\n");
     unsafe { std::env::remove_var("RADIXOX_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1757,33 +1817,33 @@ fn promotion_and_second_source() {
 fn replica_bgsave_during_flush_blocks() {
     let dir = test_dir("repl-bgsave");
     unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
-    let mut pair = Pair::new(Config { max_conn: 16, reserved: 1, ..Config::default() });
-    pair.p.wall = Some(1_000);
-    let c = pair.p.connect();
+    let mut pair = Net::new(Config { max_conn: 16, reserved: 1, ..Config::default() }, 2);
+    pair.n[0].wall = Some(1_000);
+    let c = pair.n[0].connect();
     let sets: String = (0..30_000).map(|i| format!("SET u:{i} {i}\r\n")).collect();
-    Pair::cmd(&mut pair.p, c, sets.as_bytes());
-    Pair::cmd(&mut pair.p, c, format!("REPLICATE 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes());
+    Net::cmd(&mut pair.n[0], c, sets.as_bytes());
+    Net::cmd(&mut pair.n[0], c, format!("REPLICATE 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes());
     pair.settle();
-    while pair.p.core.bgsave_running() {
+    while pair.n[0].core.bgsave_running() {
         pair.step();
     }
     pair.settle();
     pair.assert_same("synchronisé");
-    let rc = pair.r.connect();
-    pair.r.send(rc, b"BGSAVE\r\n");
-    while !pair.r.core.bgsave_running() {
+    let rc = pair.n[1].connect();
+    pair.n[1].send(rc, b"BGSAVE\r\n");
+    while !pair.n[1].core.bgsave_running() {
         pair.step();
     }
-    pair.p.send(c, b"UNLINK u:1*\r\nSET after 1\r\nFLUSHDB\r\nSET last 2\r\n");
+    pair.n[0].send(c, b"UNLINK u:1*\r\nSET after 1\r\nFLUSHDB\r\nSET last 2\r\n");
     for _ in 0..20 {
         pair.step();
     }
-    assert!(pair.r.core.bgsave_running(), "la save du réplica dure encore");
+    assert!(pair.n[1].core.bgsave_running(), "la save du réplica dure encore");
     pair.assert_same("pendant la save");
     pair.settle();
-    assert!(!pair.r.core.bgsave_running());
+    assert!(!pair.n[1].core.bgsave_running());
     pair.assert_same("après la save");
-    assert_eq!(pair.r.core.art.len(), 1);
+    assert_eq!(pair.n[1].core.art.len(), 1);
     unsafe { std::env::remove_var("RADIXOX_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1794,41 +1854,178 @@ fn replica_bgsave_during_flush_blocks() {
 fn wait_counts_acknowledged_replicas() {
     let dir = test_dir("repl-wait");
     unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
-    let mut pair = Pair::new(Config { max_conn: 16, reserved: 1, ..Config::default() });
-    pair.p.wall = Some(1_000);
-    let c = pair.p.connect();
+    let mut pair = Net::new(Config { max_conn: 16, reserved: 1, ..Config::default() }, 2);
+    pair.n[0].wall = Some(1_000);
+    let c = pair.n[0].connect();
     // Sans réplica : 0 tout de suite si on n'en demande aucun (WAIT 1 0
     // attendrait sans fin, comme Valkey).
-    assert_eq!(Pair::cmd(&mut pair.p, c, b"SET a 1\r\nWAIT 0 0\r\n"), "+OK\r\n:0\r\n");
-    Pair::cmd(&mut pair.p, c, format!("REPLICATE 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes());
+    assert_eq!(Net::cmd(&mut pair.n[0], c, b"SET a 1\r\nWAIT 0 0\r\n"), "+OK\r\n:0\r\n");
+    Net::cmd(&mut pair.n[0], c, format!("REPLICATE 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes());
     pair.settle();
-    while pair.p.core.bgsave_running() {
+    while pair.n[0].core.bgsave_running() {
         pair.step();
     }
     pair.settle();
-    pair.p.send(c, b"SET b 2\r\nWAIT 1 0\r\nGET b\r\n");
+    pair.n[0].send(c, b"SET b 2\r\nWAIT 1 0\r\nGET b\r\n");
     pair.settle();
-    assert_eq!(pair.p.take(c), "+OK\r\n:1\r\n$1\r\n2\r\n");
+    assert_eq!(pair.n[0].take(c), "+OK\r\n:1\r\n$1\r\n2\r\n");
     // Fil bloqué : rien n'arrive au réplica, WAIT attend son délai.
     pair.hold = true;
-    pair.p.send(c, b"SET c 3\r\nWAIT 1 500\r\nPING\r\n");
+    pair.n[0].send(c, b"SET c 3\r\nWAIT 1 500\r\nPING\r\n");
     for _ in 0..50 {
         pair.step();
     }
-    assert_eq!(pair.p.take(c), "+OK\r\n", "WAIT attend, la suite aussi");
-    pair.p.clock += Duration::from_millis(600);
-    pair.p.core.set_now(pair.p.clock);
-    pair.p.core.fire_timers();
+    assert_eq!(pair.n[0].take(c), "+OK\r\n", "WAIT attend, la suite aussi");
+    pair.n[0].clock += Duration::from_millis(600);
+    let clock = pair.n[0].clock;
+    pair.n[0].core.set_now(clock);
+    pair.n[0].core.fire_timers();
     pair.settle();
-    assert_eq!(pair.p.take(c), ":0\r\n+PONG\r\n");
+    assert_eq!(pair.n[0].take(c), ":0\r\n+PONG\r\n");
     // Fil rétabli : le WAIT suivant compte le réplica.
     pair.hold = false;
-    pair.p.send(c, b"WAIT 1 0\r\n");
+    pair.n[0].send(c, b"WAIT 1 0\r\n");
     pair.settle();
-    assert_eq!(pair.p.take(c), ":1\r\n");
+    assert_eq!(pair.n[0].take(c), ":1\r\n");
     // Sur le réplica : refusé.
-    let rc = pair.r.connect();
-    assert!(Pair::cmd(&mut pair.r, rc, b"WAIT 1 0\r\n").starts_with("-ERR WAIT cannot be used with replica"));
+    let rc = pair.n[1].connect();
+    assert!(Net::cmd(&mut pair.n[1], rc, b"WAIT 1 0\r\n").starts_with("-ERR WAIT cannot be used with replica"));
+    unsafe { std::env::remove_var("RADIXOX_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Serveur sur le faux noyau qui reprend l'AOF existant de `dir`.
+fn fake_recover(dir: &std::path::Path, cfg: Config) -> Fake {
+    use crate::exec::aof;
+    let mut f = Fake::new(cfg);
+    let res = aof::recover(&mut f.core.art, dir, true).unwrap().expect("manifeste");
+    let w = aof::AofWriter::open(dir, &res, aof::Fsync::EverySec).unwrap();
+    f.core.set_aof(crate::exec::journal::Stream::new(res.cursor), w);
+    f
+}
+
+/// Flux aléatoire du nœud 0 (tous types, TTL, BGSAVE, WAIT), coupures au
+/// hasard des fils vers `cut_targets`.
+fn net_traffic(net: &mut Net, rng: &mut Rng, conns: &[Slot], rounds: usize, cut_targets: &[usize]) {
+    let mut wall = net.n[0].wall.unwrap_or(1_000);
+    for _ in 0..rounds {
+        for &c in conns {
+            for _ in 0..rng.below(10) {
+                let cmd = match rng.below(80) {
+                    0 => vec!["BGSAVE".to_string()],
+                    1 => vec!["WAIT".to_string(), "1".to_string(), "100".to_string()],
+                    _ => random_write(rng, true),
+                };
+                net.n[0].send(c, &resp(&cmd));
+            }
+        }
+        for _ in 0..1 + rng.below(3) {
+            net.step();
+        }
+        wall += rng.below(3);
+        net.n[0].wall = Some(wall);
+        match rng.below(12) {
+            0 if !cut_targets.is_empty() => net.cut_to(Some(cut_targets[rng.below(cut_targets.len() as u64) as usize])),
+            1 | 2 => net.second(),
+            _ => {}
+        }
+    }
+    for _ in 0..3 {
+        net.second();
+        net.settle_all();
+    }
+}
+
+/// Réplica avec AOF : ses fichiers redonnent l'état servi, le manifeste le
+/// marque réplica ; redémarré sur ses fichiers, il revient en mode suivi et
+/// reprend dans le backlog du primaire (pas de nouveau dump).
+#[test]
+fn replica_with_aof_restarts_as_replica() {
+    let dir = test_dir("repl-raof");
+    unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
+    let seeds: u64 = std::env::var("URING_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+    for seed in 1..=seeds {
+        let rdir = dir.join(format!("r{seed}"));
+        let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
+        let cfg = Config { max_conn: 16, reserved: 1, ..Config::default() };
+        let mut net = Net::new(cfg.clone(), 2);
+        net.n[1] = fake_with_aof(&rdir, cfg.clone());
+        net.n[1].journal_write_max = (seed % 2 == 0).then(|| 1 + rng.below(200) as usize);
+        net.n[0].wall = Some(1_000);
+        let conns: Vec<Slot> = (0..2).map(|_| net.n[0].connect()).collect();
+        let admin = net.n[0].connect();
+        Net::cmd(&mut net.n[0], admin, format!("REPLICATE 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes());
+        net_traffic(&mut net, &mut rng, &conns, 30, &[1]);
+        net.assert_same(&format!("graine {seed}"));
+        let m = crate::exec::aof::Manifest::read(&rdir).unwrap().unwrap();
+        assert!(m.follow.is_some(), "graine {seed} : manifeste du réplica");
+        let mut back = OxidArt::new();
+        crate::exec::aof::recover(&mut back, &rdir, false).unwrap().unwrap();
+        back.set_now(net.n[0].core.art.now);
+        assert_eq!(state(&mut back), state(&mut net.n[0].core.art), "graine {seed} : fichiers du réplica");
+        // Redémarrage du réplica sur ses fichiers.
+        let before = info_field(&Net::cmd(&mut net.n[0], admin, b"INFO\r\n"), "sync_partial_ok").unwrap();
+        net.cut_to(Some(1));
+        net.n[1] = fake_recover(&rdir, cfg.clone());
+        let rc = net.n[1].connect();
+        let rinfo = Net::cmd(&mut net.n[1], rc, b"INFO\r\n");
+        assert_eq!(info_field(&rinfo, "role").as_deref(), Some("replica"), "graine {seed}");
+        assert!(Net::cmd(&mut net.n[1], rc, b"SET x 1\r\n").starts_with("-READONLY"));
+        for i in 0..5 {
+            net.n[0].send(conns[0], format!("SET after{i} {i}\r\n").as_bytes());
+        }
+        net.settle();
+        for _ in 0..2 {
+            net.second();
+            net.settle_all();
+        }
+        net.assert_same(&format!("graine {seed}, après redémarrage"));
+        let after = info_field(&Net::cmd(&mut net.n[0], admin, b"INFO\r\n"), "sync_partial_ok").unwrap();
+        assert!(after.parse::<u64>().unwrap() > before.parse::<u64>().unwrap(), "graine {seed} : reprise partielle");
+        drop(net);
+        let _ = std::fs::remove_dir_all(&rdir);
+    }
+    unsafe { std::env::remove_var("RADIXOX_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Chaîne primaire → réplica → réplica (le réplica du milieu avec ou sans
+/// AOF) : coupures des deux fils, mêmes états au bout, même histoire.
+#[test]
+fn chained_replicas_follow_the_primary() {
+    let dir = test_dir("repl-chain");
+    unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
+    let seeds: u64 = std::env::var("URING_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+    let from: u64 = std::env::var("URING_SEED_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    for seed in from..=seeds {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let backlog = if seed % 3 == 0 { 300 } else { 64 << 20 };
+        let cfg = Config { max_conn: 16, reserved: 1, repl_backlog: backlog, ..Config::default() };
+        let ndir = dir.join(format!("s{seed}"));
+        let mut net = Net::with_dirs(cfg.clone(), 3, &ndir);
+        if seed % 2 == 0 {
+            let mcfg = Config { dir: Some(ndir.join("n1")), ..cfg.clone() };
+            net.n[1] = fake_with_aof(&ndir.join("m-aof"), mcfg);
+        }
+        net.n[0].wall = Some(1_000);
+        let conns: Vec<Slot> = (0..2).map(|_| net.n[0].connect()).collect();
+        let (a0, a1) = (net.n[0].connect(), net.n[1].connect());
+        Net::cmd(&mut net.n[0], a0, b"REPLICATE 127.0.0.1 7001\r\n");
+        assert_eq!(Net::cmd(&mut net.n[1], a1, b"REPLICATE 127.0.0.1 7002\r\n"), "+OK\r\n");
+        net_traffic(&mut net, &mut rng, &conns, 40, &[1, 2]);
+        net.assert_same(&format!("graine {seed}"));
+        let id = |net: &mut Net, i: usize| {
+            let c = net.n[i].connect();
+            let info = Net::cmd(&mut net.n[i], c, b"INFO\r\n");
+            (info_field(&info, "replid").or(info_field(&info, "master_replid")), info_field(&info, "repl_seq"))
+        };
+        let (p, m, r) = (id(&mut net, 0), id(&mut net, 1), id(&mut net, 2));
+        assert_eq!(p, m, "graine {seed} : le milieu suit le primaire");
+        assert_eq!(m, r, "graine {seed} : le bout suit la même histoire");
+        // Segments préalloués (64 Mio) : pas de reste d'une graine à l'autre.
+        drop(net);
+        let _ = std::fs::remove_dir_all(&ndir);
+    }
     unsafe { std::env::remove_var("RADIXOX_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }

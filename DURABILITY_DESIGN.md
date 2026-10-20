@@ -11,8 +11,9 @@
 > retenues, §7.5), test 8 ; **réplication de base (étape 7, 2026-10-21)** : liens sortants du
 > cœur (`Op::Connect`), `REPLICATE`, `RXHELLO` / `RXLOAD` / `RXBLOCK` / `RXTICK`, backlog,
 > synchronisation complète par un BGSAVE coupé, mode suivi, `REPLICAOF NO ONE`, `INFO
-> # Replication`, test 7 (§10.9, avec les écarts) ; `WAIT` (étape 8, §10.9). Suite : reste de
-> l'étape 8 (zéro copie, `min-replicas-to-write`). Ce document doit suffire à
+> # Replication`, test 7 (§10.9, avec les écarts) ; `WAIT`, réplica avec AOF et chaînage
+> (§10.9). Pas fait : zéro copie (la mesure ne le justifie pas, §12bis) et
+> `min-replicas-to-write` (sémantique à trancher, §16). Ce document doit suffire à
 > un agent qui ne connaît pas le projet : §1 donne le contexte du code, §2–§11 la conception,
 > §12 les tests, §13 l'ordre de travail avec ses critères d'acceptation. Il remplace le
 > « collecteur d'effets » de RUNTIME_ARCH.md §18 et complète ARCHITECTURE.md §3.
@@ -395,6 +396,9 @@ incr journal.19.rxj
 - Écrit en entier dans `manifest.tmp`, `fdatasync`, `rename`, fsync du dossier.
 - Les fichiers non cités sont des restes (crash pendant une rotation) : ignorés, supprimés au
   démarrage après un chargement réussi.
+- `follow <replid>` (réplica avec AOF, §10.9) : l'histoire de la source suivie ; au
+  démarrage, le serveur reprend en mode suivi à la fin de ses fichiers. `replid` reste
+  l'identifiant des fichiers (celui de la position écrite dans la base).
 
 ---
 
@@ -756,9 +760,8 @@ l'écrivain de l'AOF et la réplication), `journal::apply_into`.
 - **Un promu refuse de redevenir réplica** (`-ERR this server was promoted…`) jusqu'à son
   redémarrage : sinon l'ancien primaire, encore configuré, l'écraserait à sa prochaine
   reconnexion.
-- **Refusé pour l'instant** : réplica avec AOF (`-ERR a replica with appendonly is not
-  supported yet`, §10.7) et chaînage (un réplica ne fait pas `REPLICATE`, un serveur qui a des
-  cibles ne suit pas).
+- Réplica avec AOF et chaînage : refusés dans un premier temps, faits ensuite (paragraphe
+  suivant).
 - **Copies** : les blocs sont recopiés dans la sortie de chaque lien, le dump est lu par
   `pread` synchrone (1 Mio par morceau, depuis le cache de pages) ; zéro copie et `splice` :
   étape 8. La résolution du nom de la cible est synchrone, à chaque essai (une IP en pratique).
@@ -779,6 +782,40 @@ attend sans fin, comme Valkey ; sur un réplica : refusé. Une connexion parqué
 Test : `wait_counts_acknowledged_replicas` (fil bloqué : réponse au délai), `WAIT` mêlé au flux
 aléatoire de `replica_follows_random_traffic_across_cuts`, et dans
 `replica_survives_kill9_and_converges`.
+
+**Réplica avec AOF et chaînage (§10.7).** En mode suivi, le flux du réplica
+(`Stream::follow`) prend les blocs reçus tels quels (`push_raw`, mêmes octets, même
+numérotation) : l'écrivain de l'AOF les écrit, les cibles d'un réplica qui chaîne les
+reçoivent par le même `tap`. Une coupure (réécriture locale, synchronisation d'un réplica
+chaîné) n'ajoute pas de bloc : elle se fait après le dernier bloc reçu.
+
+- `RXLOAD END` sur un réplica avec AOF : le dump reçu, fsyncé, devient `base.N.rxdb`, suivi
+  d'un segment vide, manifeste marqué `follow` ; les anciens fichiers sont supprimés et un
+  nouvel écrivain prend la suite. L'ancien peut avoir une écriture ou un fsync en vol : il est
+  gardé jusqu'à son CQE, reconnu par une **génération** (`AofWriter::generation`, portée par
+  `Op::JournalWrite` / `JournalSync` dans le champ slot du `user_data`). Les réponses retenues
+  (`always`) de l'ancienne histoire sont libérées.
+- Le BGSAVE local abandonné par `RXLOAD END` a pareil son opération de fichier en vol : chaque
+  BGSAVE a un numéro (`BgSave::id`, dans `Op::FileWrite` / `FileSync`), un BGSAVE abandonné
+  est gardé jusqu'à son CQE (avant, `abort_bgsave` ne servait qu'à l'arrêt du processus).
+- `RXBLOCK` sur un réplica avec AOF en retard sur son disque (`RADIXOX_AOF_MAX_PENDING_MB`) :
+  la connexion de la source attend comme un écrivain (§7.6) ; en `always`, l'acquittement
+  `:seq` attend le fsync du bloc (`WAIT` compte alors des blocs durables sur le réplica).
+- Redémarrage : un manifeste marqué `follow` remet le serveur en mode suivi (lecture seule
+  tout de suite, horloge du dernier bloc) ; la source le retrouve à sa position et reprend dans
+  son backlog (reprise partielle, pas de dump).
+- Chaînage : un réplica fait `REPLICATE` ; il annonce l'histoire qu'il suit (`RXHELLO <replid
+  suivi>`) et retransmet blocs et `RXTICK`. Quand il recharge un dump, ses cibles sont coupées
+  (elles repartent d'un dump de sa nouvelle position). Promotion d'un réplica du milieu : ses
+  cibles continuent (même numérotation, ses écritures à la suite). Un cycle de `REPLICATE`
+  (A → B → A) n'est pas détecté.
+- Le cœur a un dossier de dumps (`Config::dir`, défaut `RADIXOX_DIR`) : les tests font tourner
+  plusieurs serveurs dans un processus, chacun le sien.
+
+Tests : `replica_with_aof_restarts_as_replica` (fichiers du réplica ≡ état servi, redémarrage
+en réplica, reprise partielle), `chained_replicas_follow_the_primary` (primaire → réplica
+avec ou sans AOF → réplica, coupures des deux fils, 600 graines vertes) ; `tests/replication.rs`
+: `replica_with_aof_resumes_after_kill9`, `chain_of_three_converges`.
 
 Bugs d'oxidart trouvés par le test 7 (corrigés à part : e46b808, 143f5a2) : l'évicteur pouvait
 tirer un nœud d'un sous-arbre détaché pas encore libéré, et FLUSHDB pendant la libération d'un
@@ -871,10 +908,19 @@ Valkey sur le CPU 1, memtier SET seul 100 o, 4 × 10 clients, 8 s, profil `perfo
 | RadixOx `always` | 21 926 | 4,4 ms | 163 020 | 54,8 ms |
 | Valkey `always` | 22 150 | 4,8 ms | 149 688 | 56,8 ms |
 
-- `everysec` : gratuit sans pipeline ; −23 % en pipeline 16 (recopie des blocs dans le tampon
-  d'écriture, écriture sur io-wq) : c'est ce que vise le pool de tampons de l'étape 8.
+- `everysec` : gratuit sans pipeline ; −23 % en pipeline 16. **Attribution corrigée par un
+  profil** (2026-10-21, `perf record -g`, binaire `profiling`, même bench, 1,18 M ops/s sans
+  AOF contre 882 k) : la recopie des blocs pèse ≈ 0,4 % des échantillons ; l'écart vient
+  surtout des **réécritures automatiques** pendant le bench (≈ 300 Mo de journal en 8 s, trois
+  réécritures : `save_step`, barrière, `SaveCursor::record` ≈ 7 %) et des CRC (≈ 2 %, blocs et
+  condensé de la save). Le pool de tampons enregistrés de l'étape 8 ne viserait donc pas ce
+  coût : pas fait (§16).
 - `always` : à égalité avec Valkey, plafonné par le fsync de ce disque (~2 ms) ; le commit
   groupé ne peut pas faire mieux que « un fsync en vol ». Sur NVMe à PLP, à refaire.
+- `always` à 200 / 500 / 1000 connexions sans pipeline (2026-10-21, machine chargée par un
+  autre programme : écarts de ×2 entre deux passes, à refaire) : ~43–82 k ops/s pour RadixOx,
+  ~60–71 k pour Valkey, CPU serveur 20–50 % ; le débit suit le nombre d'écritures en attente
+  divisé par la durée du fsync (le fsync s'allonge avec la taille écrite).
 
 ## 13. Ordre d'implémentation (une étape = un commit vert, poussé)
 
@@ -887,7 +933,7 @@ Valkey sur le CPU 1, memtier SET seul 100 o, 4 × 10 clients, 8 s, profil `perfo
 | 5 ✅ | Réécriture : coupure `CUT`, rotation, ordre §8.2–8.3, automatique, `BGREWRITEAOF` | tests 5 (avec rotations) et 6 ; test 1 depuis un dump — `uring/tests.rs` : `rewrite_cut_is_exact_inside_a_pipeline`, `rewrites_under_random_traffic_replay_to_the_served_state` ; `tests/aof.rs` : `kill9_during_rewrites_keeps_an_exact_prefix` |
 | 6 ✅ | `always` : marquage §7.5, un fsync en vol | tests 5 (`always`) et 8 — `uring/tests.rs` : `always_holds_replies_until_their_fsync`, `always_random_traffic_replays_and_answers` ; `tests/aof.rs` : `kill9_always_loses_nothing_acknowledged` ; bench contre Valkey : voir §12bis |
 | 7 ✅ | Réplication : mode suivi, `RXHELLO`/`RXLOAD`/`RXBLOCK`, `REPLICATE`, backlog, `REPLICAOF NO ONE` | test 7 — voir §10.9 (tests et écarts) |
-| 8 | Pool de tampons enregistrés, `SEND(MSG)_ZC`, `splice`, `WAIT`, `min-replicas-to-write` | test 7 + mesure deux machines |
+| 8 (partiel) | Pool de tampons enregistrés, `SEND(MSG)_ZC`, `splice`, `WAIT`, `min-replicas-to-write` | `WAIT` ✅ ; réplica avec AOF et chaînage ✅ (§10.7, §10.9) ; zéro copie et `min-replicas-to-write` : pas faits (§12bis, §16) ; mesure deux machines : pas faite (une seule machine ici) |
 
 Chaque étape met à jour ce document (section « État ») et le README (Status, Persistence,
 Configuration, commandes supportées).
@@ -938,5 +984,14 @@ Configuration, commandes supportées).
   un jour ; le `now` des blocs passera alors en millisecondes (nouvelle `version`).
 - Reprise partielle après basculement (second identifiant, §10.8), et après un redémarrage
   propre du primaire (§10.9 : `replid` neuf à chaque démarrage).
-- Réplica avec AOF et chaînage (§10.7, refusés à l'étape 7).
+- `min-replicas-to-write` : la conception (§10.6) en fait une réplication synchrone (réponses
+  retenues jusqu'à `n` acquittements, le marquage du §7.5) ; dans Valkey, c'est un refus des
+  écritures (`-NOREPLICAS`) quand moins de `n` réplicas sont à jour. Même nom, sémantiques
+  différentes : à trancher avant de l'écrire. Les deux se combinent (refus si moins de `n`
+  cibles en ligne, sinon réponses retenues).
+- Zéro copie (pool enregistré, `WRITE_FIXED`, `SEND_ZC`, `splice` du dump) : la recopie des
+  blocs mesure ≈ 0,4 % (§12bis) ; à revoir seulement sur une mesure à deux machines (vraie
+  carte réseau, gros blocs).
+- Coût des réécritures automatiques sous forte écriture (≈ 7 % en pipeline 16) : seuil par
+  défaut (`64mb`, 100 %) atteint toutes les ~3 s à 880 k SET/s.
 - Comptage mémoire du pool, du backlog et des tampons d'envoi dans le futur `maxmemory`.

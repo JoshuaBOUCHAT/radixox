@@ -33,8 +33,8 @@ Missing for primary data:
   or `always` with group commit), rewrites the log in the background and replays it at startup;
   without it, automatic `BGSAVE` rules as in Valkey and a save on SIGTERM, and a crash loses
   what was written since the last snapshot. Replication is asynchronous and pushed by the
-  primary (`REPLICATE host port`), with `WAIT`; no AOF on a replica, no chaining yet (see
-  [Replication](#replication));
+  primary (`REPLICATE host port`), with `WAIT`, replicas with their own AOF and chained
+  replicas; no synchronous replication (see [Replication](#replication));
 - no cluster, no TLS, no ACLs (one password);
 - no lists, `MULTI`/`EXEC` or Lua, which queue and job libraries (Sidekiq, Celery, BullMQ)
   rely on;
@@ -584,6 +584,12 @@ server: it follows the first source that connects, refuses writes from other cli
   blocks written meanwhile follow.
 - A replica that falls behind by more than `RADIXOX_REPL_MAX_LAG_MB` is disconnected (and
   resyncs).
+- A replica can have its own AOF (`RADIXOX_APPENDONLY=yes`): it writes the blocks it receives
+  as is; restarted on its files, it comes back as a replica (read-only at once) and resumes
+  from the primary's backlog without a new full sync. With `appendfsync always`, its
+  acknowledgements wait for its fsync.
+- **Chained replicas**: a replica can itself `REPLICATE` to others; it forwards the same blocks
+  under the primary's history id.
 - **Failover** (by the operator): `REPLICAOF NO ONE` on the chosen replica, then `REPLICATE` on
   it towards the others. The promoted server starts a new history and refuses to become a
   replica again until restarted, so that the old primary, if still alive and configured,
@@ -596,8 +602,8 @@ server: it follows the first source that connects, refuses writes from other cli
 - `INFO` has a `# Replication` section (`role`, `connected_replicas`, one `replicaN:` line per
   target with its state and lag, `sync_full`, `sync_partial_ok`); `DEBUG DIGEST [at]` returns
   the content digest, to compare two servers.
-- Not yet: `min-replicas-to-write`, AOF on a replica, chained replicas, zero-copy sends, TLS.
-  The replica blocks while loading a full sync.
+- Not yet: `min-replicas-to-write`, zero-copy sends, TLS, partial resync after a primary
+  restart or a failover. The replica blocks while loading a full sync.
 
 Design and deviations: [`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md) §10.
 
@@ -758,8 +764,9 @@ across cores is meant to come from sharding by namespace, not from shared-state 
   block, `DELPREFIX` (delete a whole namespace in O(prefix length)), durable commits —
   [`TX_DESIGN.md`](TX_DESIGN.md).
 - Replication, next steps ([`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md)): zero-copy sends
-  of the shared blocks (`SEND_ZC`, `splice` of the dump), `min-replicas-to-write`, AOF on
-  replicas, chaining.
+  of the shared blocks (`SEND_ZC`, `splice` of the dump) if a two-machine measurement shows
+  the copies matter (they are ~0.4 % of a profile on one machine), `min-replicas-to-write`,
+  partial resync after a failover.
 - Lower memory per key on random keys: long suffixes stored inline on several cells (no
   separate allocation), a smaller node class for nodes with two or three entries.
 - Client compatibility: `CONFIG`, RESP3.

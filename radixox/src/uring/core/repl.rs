@@ -21,10 +21,10 @@ use std::time::{Duration, Instant};
 
 use radixox_lib::shared_frame::{SharedFrame as Frame, encode_array_len, encode_bulk, extend_encode};
 
-use crate::exec::aof::{ReplId, hex, new_replid, unhex};
+use crate::exec::aof::{self, AofWriter, Manifest, ReplId, Resume, hex, new_replid, unhex};
 use crate::exec::jobs::{FlushJob, Step};
 use crate::exec::journal::{self, Blk, Cursor, Stream};
-use crate::exec::persist::{Target, save_dir};
+use crate::exec::persist::Target;
 use crate::exec::resp_ok;
 
 use super::super::conn::{ConnOut, Mode};
@@ -250,10 +250,15 @@ impl Core {
         if self.src.is_some() {
             return;
         }
-        let resume = self.resume;
+        // Réplica qui chaîne : le flux suit la source (blocs reçus, retransmis).
+        let (resume, follow) = match &self.follow {
+            Some(f) => (f.cur, true),
+            None => (self.resume, false),
+        };
         let j = self.journal.get_or_insert_with(|| {
             let mut s = Stream::new(resume);
             s.keep = false;
+            s.follow = follow;
             s
         });
         j.observe_now(self.art.now);
@@ -265,9 +270,6 @@ impl Core {
     /// `REPLICATE host port [AUTH pass]` (et `RADIXOX_REPLICATE`) : ajoute une
     /// cible, connectée tout de suite puis à chaque coupure.
     pub fn replicate(&mut self, host: String, port: u16, auth: Option<Vec<u8>>) -> Result<(), String> {
-        if self.follow.is_some() {
-            return Err("ERR this server is a replica: chained replication is not supported yet".into());
-        }
         self.ensure_source();
         let now = self.now;
         let src = self.src.as_mut().unwrap();
@@ -378,7 +380,8 @@ impl Core {
         }
         let i = i.unwrap();
         self.arm_recv(slot);
-        let replid = hex(&self.replid);
+        // Réplica qui chaîne : l'histoire suivie, retransmise telle quelle (§10.7).
+        let replid = hex(self.follow.as_ref().map_or(&self.replid, |f| &f.replid));
         let Core { src, outs, dirty, .. } = self;
         let l = &mut src.as_mut().unwrap().links[i];
         let o = &mut outs[s];
@@ -832,12 +835,6 @@ impl Core {
             }
             After::RxHello(id) => {
                 let id = std::str::from_utf8(&id).ok().and_then(unhex).ok_or_else(|| refuse("ERR invalid replication id"))?;
-                if self.src.as_ref().is_some_and(|src| !src.links.is_empty()) {
-                    return Err(refuse("ERR this server replicates to others: chained replication is not supported yet"));
-                }
-                if self.aof.is_some() {
-                    return Err(refuse("ERR a replica with appendonly is not supported yet"));
-                }
                 if self.promoted {
                     return Err(refuse(
                         "ERR this server was promoted (REPLICAOF NO ONE): restart it to make it a replica again",
@@ -858,7 +855,7 @@ impl Core {
             }
             After::RxLoadBegin(len) => {
                 self.check_upstream(slot)?;
-                let path = save_dir().join(LOAD_TMP);
+                let path = self.dir().join(LOAD_TMP);
                 let file = File::create(&path).map_err(|e| fatal(format!("ERR {}: {e}", path.display())))?;
                 self.loading = Some(LoadIn { file, path, len, got: 0 });
                 reply(self, resp_ok());
@@ -908,13 +905,35 @@ impl Core {
                     return Err(fatal(format!("ERR block {}: {}", blk.seq, e.0)));
                 }
                 f.cur = cur;
+                let start = self.outs[s].out.len();
                 reply(self, Frame::Integer(blk.seq as i64));
+                // Réplica avec AOF ou qui chaîne : le bloc reçu, tel quel.
+                if let Some(j) = &mut self.journal {
+                    j.push_raw(std::rc::Rc::new(b), &blk);
+                    // `always` : l'acquittement attend le fsync du bloc.
+                    if let Some(durable) = self.aof.as_ref().and_then(|w| w.release_upto()) {
+                        let mark = j.end_mark();
+                        let o = &mut self.outs[s];
+                        if mark > durable {
+                            o.holds.push_back((start, mark));
+                            if o.holds.len() == 1 {
+                                self.held.push(slot);
+                            }
+                        }
+                    }
+                }
             }
             After::Wait { replicas, timeout_ms } => self.wait(slot, replicas, timeout_ms)?,
             After::RxTick(now) => {
                 self.check_upstream(slot)?;
-                if self.follow.is_some() && now > self.art.now {
-                    self.art.set_now(now);
+                if self.follow.is_some() {
+                    if now > self.art.now {
+                        self.art.set_now(now);
+                    }
+                    // Retransmise aux réplicas chaînés.
+                    if let Some(j) = &mut self.journal {
+                        j.observe_now(now);
+                    }
                 }
                 reply(self, resp_ok());
             }
@@ -937,17 +956,37 @@ impl Core {
         self.art.set_now(0);
         let res = File::open(&l.path)
             .map_err(|e| e.to_string())
-            .and_then(|f| self.art.load_file(f).map_err(|e| e.to_string()));
-        let _ = std::fs::remove_file(&l.path);
-        // Plus de source propre : ce serveur suit.
-        if self.aof.is_none() {
-            self.journal = None;
+            .and_then(|f| self.art.load_file(f).map_err(|e| e.to_string()))
+            .and_then(|stats| if stats.digest_checked { Ok(stats) } else { Err("dump sans condensé (v1)".into()) });
+        // Nouvelle histoire : les réplicas chaînés repartent d'un dump.
+        if let Some(src) = &mut self.src {
+            src.backlog.clear();
+            src.backlog_bytes = 0;
+            for i in 0..src.links.len() {
+                self.link_drop(i, "la source de ce serveur a changé d'histoire".into());
+            }
         }
-        self.src = None;
+        let res = res.and_then(|stats| {
+            let cur = Cursor { seq: stats.pos.seq, offset: stats.pos.offset, now: stats.t0 };
+            // Avec l'AOF, le dump reçu devient la base, suivie d'un segment vide.
+            if self.aof.is_some() {
+                self.rebase_aof(&l.path, stats.pos, cur, replid).map_err(|e| format!("AOF du réplica : {e}"))?;
+            }
+            Ok((stats, cur))
+        });
+        let _ = std::fs::remove_file(&l.path);
         match res {
-            Ok(stats) if stats.digest_checked => {
+            Ok((stats, cur)) => {
                 self.art.set_now(stats.t0);
-                self.follow = Some(Follow { replid, cur: Cursor { seq: stats.pos.seq, offset: stats.pos.offset, now: stats.t0 } });
+                self.follow = Some(Follow { replid, cur });
+                // Flux : pour l'AOF (blocs reçus écrits tels quels) et les réplicas chaînés.
+                self.journal = (self.aof.is_some() || self.src.is_some()).then(|| {
+                    let mut j = Stream::new(cur);
+                    j.follow = true;
+                    j.keep = self.aof.is_some();
+                    j.tap = self.src.is_some().then(Vec::new);
+                    j
+                });
                 eprintln!(
                     "[repl] synchronisé avec {} : {} clés en {:.2?}, bloc {}",
                     hex(&replid),
@@ -957,14 +996,10 @@ impl Core {
                 );
                 Ok(())
             }
-            res => {
+            Err(why) => {
                 // Contenu indéterminé : vidé ; en lecture seule jusqu'au prochain dump.
                 self.flush_tree();
                 self.follow = Some(Follow { replid: [0; 20], cur: Cursor::default() });
-                let why = match res {
-                    Ok(_) => "dump sans condensé (v1)".to_string(),
-                    Err(e) => e,
-                };
                 eprintln!("[repl] chargement du dump de synchronisation : {why}");
                 Err(fatal(format!("ERR RXLOAD: {why}")))
             }
@@ -984,6 +1019,16 @@ impl Core {
         self.resume = Cursor { now: f.cur.now.max(self.art.now), ..f.cur };
         self.replid = new_replid();
         self.promoted = true;
+        // Le flux continue la numérotation, avec les écritures locales.
+        if let Some(j) = &mut self.journal {
+            j.follow = false;
+            j.observe_now(self.art.now);
+        }
+        if let Some(w) = &mut self.aof
+            && let Err(e) = w.set_follow(None)
+        {
+            eprintln!("[repl] manifeste de l'AOF après la promotion : {e} ; un redémarrage reviendrait en réplica");
+        }
         if let Some(l) = self.loading.take() {
             let _ = std::fs::remove_file(&l.path);
         }
@@ -994,34 +1039,89 @@ impl Core {
         eprintln!("[repl] promu (REPLICAOF NO ONE) : nouvelle histoire {}, après le bloc {}", hex(&self.replid), f.cur.seq);
     }
 
+    /// Réplica avec AOF qui reçoit un dump : il devient la base (renommé
+    /// dans `appendonlydir`), suivi d'un segment vide, manifeste marqué
+    /// `follow` ; nouvel écrivain (l'ancien finit ses opérations en vol).
+    fn rebase_aof(&mut self, dump: &std::path::Path, pos: oxidart::JournalPos, cur: Cursor, follow: ReplId) -> std::io::Result<()> {
+        let w = self.aof.as_ref().expect("AOF");
+        let (dir, fsync) = (w.dir.clone(), w.fsync);
+        let index = w.manifest.last_index() + 1;
+        let (base, seg) = (aof::base_name(index), aof::segment_name(index));
+        // Le dump sur disque avant que le manifeste ne le cite.
+        File::open(dump)?.sync_all()?;
+        std::fs::rename(dump, dir.join(&base))?;
+        let _ = std::fs::remove_file(dir.join(&seg));
+        aof::create_segment(&dir, &seg)?;
+        let manifest = Manifest {
+            replid: pos.replid,
+            base,
+            base_seq: pos.seq,
+            base_offset: pos.offset,
+            incrs: vec![seg],
+            follow: Some(follow),
+        };
+        manifest.write(&dir)?;
+        aof::remove_unlisted(&dir, &manifest)?;
+        let res = Resume { manifest, cursor: cur, tail_end: 0, tail_start_offset: pos.offset };
+        let w = AofWriter::open(&dir, &res, fsync)?;
+        self.replace_aof(w);
+        // Les marques des réponses retenues sont celles de l'ancienne histoire.
+        for slot in std::mem::take(&mut self.held) {
+            let o = &mut self.outs[slot as usize];
+            o.holds.clear();
+            if !o.dirty && !o.out.is_empty() {
+                o.dirty = true;
+                self.dirty.push(slot);
+            }
+        }
+        Ok(())
+    }
+
+    /// Démarrage d'un réplica avec AOF (manifeste marqué `follow`) : il
+    /// reprend en mode suivi, à la fin de ses fichiers.
+    pub(super) fn resume_follow(&mut self, replid: ReplId) {
+        let Some(j) = &mut self.journal else { return };
+        j.follow = true;
+        let cur = j.cursor();
+        self.art.set_now(cur.now);
+        self.follow = Some(Follow { replid, cur });
+        eprintln!("[repl] réplica de {} (manifeste de l'AOF), après le bloc {}", hex(&replid), cur.seq);
+    }
+
     // ── INFO ─────────────────────────────────────────────────────────────
 
     /// Section `# Replication`.
     pub(super) fn repl_info(&self, out: &mut String) {
         use std::fmt::Write as _;
         out.push_str("# Replication\r\n");
-        if let Some(f) = &self.follow {
-            let _ = write!(
-                out,
-                "role:replica\r\nmaster_replid:{}\r\nmaster_link_status:{}\r\nrepl_seq:{}\r\nmaster_repl_offset:{}\r\nmaster_sync_in_progress:{}\r\n",
-                hex(&f.replid),
-                if self.upstream_live().is_some() { "up" } else { "down" },
-                f.cur.seq,
-                f.cur.offset,
-                u8::from(self.loading.is_some()),
-            );
-            return;
-        }
-        let cur = self.journal.as_ref().map_or(self.resume, |j| j.cursor());
+        let cur = match &self.follow {
+            Some(f) => {
+                let _ = write!(
+                    out,
+                    "role:replica\r\nmaster_replid:{}\r\nmaster_link_status:{}\r\nrepl_seq:{}\r\nmaster_repl_offset:{}\r\nmaster_sync_in_progress:{}\r\n",
+                    hex(&f.replid),
+                    if self.upstream_live().is_some() { "up" } else { "down" },
+                    f.cur.seq,
+                    f.cur.offset,
+                    u8::from(self.loading.is_some()),
+                );
+                f.cur
+            }
+            None => {
+                let cur = self.journal.as_ref().map_or(self.resume, |j| j.cursor());
+                let _ = write!(
+                    out,
+                    "role:master\r\nreplid:{}\r\nmaster_repl_offset:{}\r\nrepl_seq:{}\r\n",
+                    hex(&self.replid),
+                    cur.offset,
+                    cur.seq,
+                );
+                cur
+            }
+        };
         let links = self.src.as_ref().map_or(&[][..], |s| &s.links[..]);
         let online = links.iter().filter(|l| matches!(l.state, State::Online)).count();
-        let _ = write!(
-            out,
-            "role:master\r\nreplid:{}\r\nmaster_repl_offset:{}\r\nrepl_seq:{}\r\nconnected_replicas:{online}\r\n",
-            hex(&self.replid),
-            cur.offset,
-            cur.seq,
-        );
+        let _ = write!(out, "connected_replicas:{online}\r\n");
         for (i, l) in links.iter().enumerate() {
             let _ = write!(
                 out,

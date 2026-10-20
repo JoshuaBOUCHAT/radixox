@@ -28,7 +28,7 @@ use crate::exec::autosave::{Persistence, Rule};
 use crate::exec::aof::{AofOp, AofWriter, ReplId, new_replid};
 use crate::exec::journal::{self, Cursor, Stream};
 use crate::exec::bgsave::{BgSave, FileOp, cpu_share, zstd_conf};
-use crate::exec::persist::{Target, save_sync, sync_level};
+use crate::exec::persist::{Target, save_dir, save_sync_to, sync_level};
 use crate::exec::{Executed, execute_into, resp_ok};
 use crate::tsc;
 
@@ -87,6 +87,9 @@ pub struct Config {
     /// Retard d'un réplica (octets à lui envoyer) au-delà duquel il est
     /// déconnecté (`RADIXOX_REPL_MAX_LAG_MB`).
     pub repl_max_lag: u64,
+    /// Dossier de `dump.rxd` et du dump reçu par un réplica (`None` :
+    /// `RADIXOX_DIR`, lu à chaque save).
+    pub dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -116,6 +119,7 @@ impl Default for Config {
             aof_rewrite_min_size: 64 << 20,
             repl_backlog: 64 << 20,
             repl_max_lag: 256 << 20,
+            dir: None,
         }
     }
 }
@@ -129,12 +133,14 @@ pub enum Completion {
     Recv { slot: Slot, res: i32, bid: Option<Bid>, buf_more: bool, more: bool },
     /// Send : octets envoyés ou `-errno`.
     Send { slot: Slot, res: i32 },
-    /// Écriture ou fsync du fichier de BGSAVE : octets écrits, 0, ou `-errno`.
-    File { res: i32 },
-    /// Écriture du segment de l'AOF : octets écrits ou `-errno`.
-    JournalWrite { res: i32 },
+    /// Écriture ou fsync du fichier de BGSAVE : octets écrits, 0, ou `-errno` ;
+    /// `save` : numéro du BGSAVE qui l'a demandée.
+    File { res: i32, save: u32 },
+    /// Écriture du segment de l'AOF : octets écrits ou `-errno` ; `writer` :
+    /// génération de l'écrivain qui l'a demandée.
+    JournalWrite { res: i32, writer: u32 },
     /// fsync du segment de l'AOF : 0 ou `-errno`.
-    JournalSync { res: i32 },
+    JournalSync { res: i32, writer: u32 },
     /// Connexion sortante (réplication) : 0 ou `-errno`.
     Connect { slot: Slot, res: i32 },
 }
@@ -156,14 +162,14 @@ pub enum Op {
     Close { slot: Slot },
     /// Rendre le tampon à l'anneau.
     ProvideBuf { bid: Bid },
-    /// Écrire [`Core::pending_file_write`] dans le fichier de BGSAVE à `off`.
-    FileWrite { fd: i32, off: u64 },
+    /// Écrire [`Core::pending_file_write`]`(save)` dans le fichier de BGSAVE à `off`.
+    FileWrite { fd: i32, off: u64, save: u32 },
     /// fsync (données) du fichier de BGSAVE.
-    FileSync { fd: i32 },
-    /// Écrire [`Core::pending_journal_write`] dans le segment de l'AOF à `off`.
-    JournalWrite { fd: i32, off: u64 },
+    FileSync { fd: i32, save: u32 },
+    /// Écrire [`Core::pending_journal_write`]`(writer)` dans le segment de l'AOF à `off`.
+    JournalWrite { fd: i32, off: u64, writer: u32 },
     /// fsync (données) du segment de l'AOF.
-    JournalSync { fd: i32 },
+    JournalSync { fd: i32, writer: u32 },
     /// Connexion sortante vers un réplica : socket installé dans `slot`
     /// (réglages comme `Install`), puis `connect`.
     Connect { slot: Slot, addr: std::net::SocketAddr },
@@ -324,6 +330,10 @@ pub struct Core {
     timers: BinaryHeap<Reverse<(Instant, Timer)>>,
     sweep_pos: usize,
     bgsave: Option<BgSave>,
+    /// BGSAVE abandonnés (réplica qui recharge un dump) dont une opération de
+    /// fichier est en vol : gardés jusqu'à son CQE ; numéro du dernier lancé.
+    bgsave_dead: Vec<BgSave>,
+    bgsave_seq: u32,
     /// Pub/Sub : canal → abonnés (slot, époque de l'abonnement).
     subs: HashMap<SharedByte, Vec<(Slot, u32)>>,
     /// Part du thread accordée au BGSAVE sous charge.
@@ -337,6 +347,11 @@ pub struct Core {
     journal: Option<Stream>,
     /// Écriture du flux dans l'AOF.
     aof: Option<AofWriter>,
+    /// Écrivains remplacés (réplica qui recharge un dump) dont une opération
+    /// est encore en vol : gardés jusqu'à son CQE.
+    aof_old: Vec<AofWriter>,
+    /// Dernière génération d'écrivain attribuée.
+    aof_gen: u32,
     /// Écrivains parqués faute de place dans le flux (§7.6).
     aof_waiting: Vec<Slot>,
     /// Connexions qui ont des réponses retenues jusqu'au fsync (§7.5).
@@ -393,12 +408,16 @@ impl Core {
             timers,
             sweep_pos: 0,
             bgsave: None,
+            bgsave_dead: Vec::new(),
+            bgsave_seq: 0,
             subs: HashMap::new(),
             save_share: cpu_share(),
             last_rx: now,
             persist: Persistence::new(cfg.save_rules.clone(), cfg.stop_writes_on_bgsave_error, now),
             journal: cfg.journal.then(Stream::default),
             aof: None,
+            aof_old: Vec::new(),
+            aof_gen: 0,
             aof_waiting: Vec::new(),
             held: Vec::new(),
             replid: new_replid(),
@@ -460,8 +479,27 @@ impl Core {
     /// fichiers), ses blocs sont écrits par `w`.
     pub fn set_aof(&mut self, stream: Stream, w: AofWriter) {
         self.journal = Some(stream);
-        self.aof = Some(w);
-        self.timers.push(Reverse((self.now + AOF_EVERY, Timer::Aof)));
+        let first = self.aof.is_none() && self.aof_old.is_empty();
+        let follow = w.manifest.follow;
+        self.replace_aof(w);
+        if first {
+            self.timers.push(Reverse((self.now + AOF_EVERY, Timer::Aof)));
+        }
+        if let Some(replid) = follow {
+            self.resume_follow(replid);
+        }
+    }
+
+    /// Nouvel écrivain (nouvelle génération) ; l'ancien est gardé tant qu'une
+    /// de ses opérations est en vol.
+    fn replace_aof(&mut self, mut w: AofWriter) {
+        self.aof_gen += 1;
+        w.generation = self.aof_gen;
+        if let Some(old) = self.aof.replace(w)
+            && old.busy()
+        {
+            self.aof_old.push(old);
+        }
     }
 
     pub fn aof(&self) -> Option<&AofWriter> {
@@ -476,9 +514,9 @@ impl Core {
         }
     }
 
-    /// Octets de l'écriture de l'AOF en vol (`Op::JournalWrite`).
-    pub fn pending_journal_write(&self) -> &[u8] {
-        self.aof.as_ref().map_or(&[], |w| w.writing())
+    /// Octets de l'écriture de l'AOF en vol (`Op::JournalWrite`) de l'écrivain `writer`.
+    pub fn pending_journal_write(&self, writer: u32) -> &[u8] {
+        self.aof.iter().chain(&self.aof_old).find(|w| w.generation == writer).map_or(&[], |w| w.writing())
     }
 
     /// Arrêt : tout le flux sur disque, fsync compris, d'une traite.
@@ -493,10 +531,11 @@ impl Core {
     /// fsync (`everysec`, rotation).
     fn aof_pump(&mut self) {
         let (Some(w), Some(j)) = (&mut self.aof, &mut self.journal) else { return };
+        let writer = w.generation;
         while let Some(op) = w.next_op(j, self.now) {
             self.ops.push(match op {
-                AofOp::Write { fd, off } => Op::JournalWrite { fd, off },
-                AofOp::Sync { fd } => Op::JournalSync { fd },
+                AofOp::Write { fd, off } => Op::JournalWrite { fd, off, writer },
+                AofOp::Sync { fd } => Op::JournalSync { fd, writer },
             });
         }
     }
@@ -693,15 +732,30 @@ impl Core {
                 self.on_recv(slot, res, bid, buf_more, more)
             }
             Completion::Send { slot, res } => self.on_send(slot, res),
-            Completion::File { res } => self.on_file(res),
-            Completion::JournalWrite { res } => {
+            Completion::File { res, save } => self.on_file(res, save),
+            Completion::JournalWrite { res, writer } | Completion::JournalSync { res, writer }
+                if self.aof.as_ref().is_none_or(|w| w.generation != writer) =>
+            {
+                // Écrivain remplacé : son opération est finie, il peut partir.
+                if let Some(i) = self.aof_old.iter().position(|w| w.generation == writer) {
+                    let w = &mut self.aof_old[i];
+                    match c {
+                        Completion::JournalWrite { .. } => w.write_done(res, self.now),
+                        _ => w.sync_done(res, self.now),
+                    }
+                    if !w.busy() {
+                        self.aof_old.swap_remove(i);
+                    }
+                }
+            }
+            Completion::JournalWrite { res, .. } => {
                 if let Some(w) = &mut self.aof {
                     w.write_done(res, self.now);
                 }
                 self.aof_pump();
                 self.aof_unpark();
             }
-            Completion::JournalSync { res } => {
+            Completion::JournalSync { res, .. } => {
                 if let Some(w) = &mut self.aof {
                     w.sync_done(res, self.now);
                 }
@@ -712,9 +766,9 @@ impl Core {
         }
     }
 
-    /// Octets de l'écriture de BGSAVE en vol (`Op::FileWrite`).
-    pub fn pending_file_write(&self) -> &[u8] {
-        self.bgsave.as_ref().map_or(&[], |b| b.writing())
+    /// Octets de l'écriture en vol (`Op::FileWrite`) du BGSAVE `save`.
+    pub fn pending_file_write(&self, save: u32) -> &[u8] {
+        self.bgsave.iter().chain(&self.bgsave_dead).find(|b| b.id == save).map_or(&[], |b| b.writing())
     }
 
     /// Un BGSAVE est en cours (DFS, vidage ou écriture du fichier).
@@ -722,19 +776,31 @@ impl Core {
         self.bgsave.is_some()
     }
 
-    /// Arrêt du serveur : abandonne le BGSAVE en cours (barrière fermée,
-    /// fichier temporaire supprimé).
+    /// Abandonne le BGSAVE en cours (barrière fermée, fichier temporaire
+    /// supprimé) : arrêt du serveur, réplica qui recharge un dump. Son
+    /// opération en vol garde son tampon et son fichier jusqu'au CQE.
     pub fn abort_bgsave(&mut self) {
         if let Some(mut bg) = self.bgsave.take() {
+            // Avant `abort`, qui marque la save finie.
+            let in_flight = bg.in_flight();
             bg.abort(&mut self.art);
+            if in_flight {
+                self.bgsave_dead.push(bg);
+            }
         }
     }
 
-    fn on_file(&mut self, res: i32) {
-        let Some(bg) = self.bgsave.as_mut() else {
-            debug_assert!(false, "CQE de fichier sans BGSAVE");
+    fn on_file(&mut self, res: i32, save: u32) {
+        if self.bgsave.as_ref().is_none_or(|b| b.id != save) {
+            // BGSAVE abandonné : son opération est finie, il peut partir.
+            let found = self.bgsave_dead.iter().position(|b| b.id == save);
+            debug_assert!(found.is_some(), "CQE de fichier d'un BGSAVE inconnu");
+            if let Some(i) = found {
+                self.bgsave_dead.swap_remove(i);
+            }
             return;
-        };
+        }
+        let bg = self.bgsave.as_mut().unwrap();
         if bg.syncing() {
             bg.sync_done(res);
         } else {
@@ -748,9 +814,10 @@ impl Core {
     }
 
     fn push_file_op(&mut self, op: FileOp) {
+        let save = self.bgsave.as_ref().expect("opération de fichier sans BGSAVE").id;
         self.ops.push(match op {
-            FileOp::Write { fd, off } => Op::FileWrite { fd, off },
-            FileOp::Sync { fd } => Op::FileSync { fd },
+            FileOp::Write { fd, off } => Op::FileWrite { fd, off, save },
+            FileOp::Sync { fd } => Op::FileSync { fd, save },
         });
     }
 
@@ -794,13 +861,15 @@ impl Core {
             (None, Some(j)) => {
                 let cut = j.cut();
                 let pos = oxidart::JournalPos { seq: cut.seq, offset: cut.offset, replid: self.replid };
-                Target { pos, ..Target::dump() }
+                Target { pos, ..self.dump_target() }
             }
-            _ => Target::dump(),
+            _ => self.dump_target(),
         };
         self.persist.bgsave_started(now);
         match BgSave::start(&mut self.art, zstd_conf(), target.clone()) {
-            Ok(bg) => {
+            Ok(mut bg) => {
+                self.bgsave_seq += 1;
+                bg.id = self.bgsave_seq;
                 self.bgsave = Some(bg);
                 Ok(())
             }
@@ -812,6 +881,16 @@ impl Core {
                 Err(e.to_string())
             }
         }
+    }
+
+    /// Dossier des dumps (`Config::dir`, sinon `RADIXOX_DIR`).
+    fn dir(&self) -> std::path::PathBuf {
+        self.cfg.dir.clone().unwrap_or_else(save_dir)
+    }
+
+    /// `dump.rxd` de ce serveur, sans flux.
+    fn dump_target(&self) -> Target {
+        Target { dir: self.dir(), ..Target::dump() }
     }
 
     /// Les règles de save automatique sont actives (save à l'arrêt, comme Redis).
@@ -1285,6 +1364,11 @@ impl Core {
                     continue;
                 }
                 let o = &mut outs[slot as usize];
+                // Réplica avec AOF : les blocs reçus attendent aussi le disque.
+                if over_cap && matches!(cmd, Cmd::RxBlock(_)) {
+                    aof_stops.push((slot, end.map(|e| e - raw.len() as u32)));
+                    continue;
+                }
                 let weight = cmd.write_weight();
                 if weight > 0 && o.client.authed {
                     if read_only {
@@ -1430,7 +1514,8 @@ impl Core {
                 let frame = if self.bgsave.is_some() {
                     Frame::Error("ERR Background save already in progress".into())
                 } else {
-                    match save_sync(&mut self.art, sync_level()) {
+                    let target = self.dump_target();
+                    match save_sync_to(&mut self.art, sync_level(), &target) {
                         Ok(st) => {
                             eprintln!(
                                 "[save] {:.1} MB ({:.1} MB bruts) en {:.2?} (DFS {:.2?})",
