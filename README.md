@@ -10,10 +10,12 @@ the engine, **OxidArt**, is also usable as an embedded Rust library.
 
 The data path is **single-threaded by design**: one thread owns the data, with no locks and
 no shared state. The network work runs in the kernel through a hand-written io_uring loop
-(no async runtime), and can be spread over more cores by the kernel's io_uring workers. On
-YCSB workload A (5M records), against Valkey 9.1.2 with the same resources: **+30 %
-throughput on one core**, **+12 % on three physical cores each**, with lower average latency
-and about a quarter less memory (see [Benchmarks](#benchmarks)).
+(no async runtime), and can be spread over more cores by the kernel's io_uring workers.
+Against Valkey 9.1.2 on the same cores, without pipelining (loopback, 1M keys, see
+[Benchmarks](#benchmarks)): **+29 % capacity on one core and +54 % on three**; at the same
+60–80 % load, **p99 and p99.9 about half of Valkey's**; a `BGSAVE` **5–6× shorter** with no
+`fork` and no copy-on-write memory, even with Valkey's child given a core of its own. The
+p99.99 during a save is a tie.
 
 ---
 
@@ -57,7 +59,22 @@ Missing for primary data:
 
 ## Highlights
 
-With the custom io_uring loop (2026-10-19, loopback, **single runs**; see
+Against Valkey 9.1.2, 2026-10-20 (loopback, no pipeline, 1M keys of 100 random bytes, 1:4
+SET:GET, 78 connections, saves on a SATA SSD with fsync; two runs per point; see
+[Against Valkey: partial load and BGSAVE](#against-valkey-partial-load-and-bgsave-2026-10-20)):
+
+| | RadixOx | Valkey 9.1.2 | |
+|---|---|---|---|
+| Capacity, **1 core** each | **266 k ops/s** | 207 k | **+29 %** |
+| Capacity, **3 physical cores** each | **622 k ops/s** | 404 k | **+54 %** |
+| Same traffic, 60–80 % of Valkey's capacity, 1 core: p99 | **0.41–0.44 ms** | 0.73–0.77 ms | ÷1.8 |
+| same, p99.9 | **0.47–0.52 ms** | 0.84–0.94 ms | ÷1.8 |
+| same, p99.99 during a `BGSAVE` | 0.88–1.31 ms | 1.00–1.16 ms | tie |
+| `BGSAVE` of 105–113 MB under that load (Valkey's child on a **second, free core**) | **0.35–0.43 s**, same core | 2.1–2.2 s + ~2 core-seconds | **÷5–6** |
+| Extra memory during the save | **~0** | +160–170 MB (copy-on-write) | |
+| Server RSS | **141 MB** | 190 MB | −26 % |
+
+Older series, with the custom io_uring loop (2026-10-19, loopback, **single runs**; see
 [Custom io_uring loop](#custom-io_uring-loop-2026-10-19)). **Caveat, to be re-run**: the
 YCSB *run* phase of these two series only touched 1,000 of the 5M keys (a script bug, fixed
 since); both servers had the same bias, but the absolute figures describe a hot-key
@@ -115,6 +132,62 @@ Requirements: **Linux 6.12 or newer** with io_uring (developed on 6.12 LTS and 7
 ---
 
 ## Benchmarks
+
+### Against Valkey: partial load and BGSAVE (2026-10-20)
+
+A cache rarely runs at 100 %: this series compares the two servers at the **same offered
+load** (60, 70 and 80 % of Valkey's one-core capacity), with a `BGSAVE` in every run.
+
+**Setup.** Ryzen 5 7600X, Linux 7.2-zen, power profile `performance`, loopback. Server on
+CPU 0 (one core each); memtier on cores 3–5 (and their SMT siblings), 6 threads × 13
+connections, no pipeline, `--distinct-client-seed --randomize`, 1:4 SET:GET over 1,000,001
+keys of 100 random bytes (`--random-data`), 12 s per run, `BGSAVE` at t = 3 s. **Valkey gets
+an advantage**: its `BGSAVE` child runs on CPU 1, a core of its own (`bgsave-cpulist`);
+RadixOx saves on its only core. Dumps go to a SATA SSD (PNY CS900), fsync included. Two
+runs per point, server order alternated; ranges cover both runs. Server CPU is the busy time
+of CPU 0 from `/proc/stat`, softirq included.
+
+RadixOx writes a **raw dump** here (`RADIXOX_SAVE_ZSTD=0`): memtier's "random" values repeat
+from key to key, which RadixOx's streaming zstd compresses away (an 11–24 MB dump) while
+Valkey's per-value LZF cannot (113 MB). Raw, both write about the same volume.
+
+| Load | | p50 | p99 | p99.9 | p99.99 | `BGSAVE` | Server CPU |
+|---|---|---|---|---|---|---|---|
+| ~124 k ops/s (60 %) | RadixOx | **0.29 ms** | **0.42 ms** | **0.50–0.51 ms** | 1.03–1.31 ms | **348–360 ms** | **0.4 core** |
+| | Valkey | 0.37 ms | 0.76–0.77 ms | 0.93–0.94 ms | 1.10–1.16 ms | 2,061–2,153 ms | 0.6 core + child |
+| ~145 k ops/s (70 %) | RadixOx | **0.29 ms** | **0.42 ms** | **0.50 ms** | 1.08–1.21 ms | **376–383 ms** | **0.5 core** |
+| | Valkey | 0.37 ms | 0.75 ms | 0.89–0.90 ms | 1.04–1.16 ms | 2,150–2,245 ms | 0.6–0.7 core + child |
+| ~165 k ops/s (80 %) | RadixOx | **0.29 ms** | **0.41–0.44 ms** | **0.48–0.54 ms** | 0.88–1.27 ms | **408–427 ms** | **0.5–0.6 core** |
+| | Valkey | 0.36–0.38 ms | 0.73–0.77 ms | 0.84–0.91 ms | 1.00–1.07 ms | 2,149–2,163 ms | 0.7–0.8 core + child |
+| 213 k ops/s (80 % of RadixOx's capacity) | RadixOx | 0.29 ms | 0.38–0.42 ms | 0.47–0.50 ms | 1.04–1.26 ms | 613–671 ms | 0.7 core |
+| ~165 k ops/s, **no save** | RadixOx | **0.29 ms** | **0.42–0.45 ms** | **0.47–0.52 ms** | **0.57–0.73 ms** | — | **0.6 core** |
+| | Valkey | 0.37 ms | 0.74–0.75 ms | 0.86 ms | 0.96–1.02 ms | — | 0.7–0.8 core |
+
+- p99 and p99.9 are about **half of Valkey's** at every load, save or not. At 80 % of its own
+  capacity, RadixOx still has a lower p99 than Valkey at 60 % of its own.
+- **The p99.99 during a save is a tie**, the only figure where Valkey's extra core pays off:
+  RadixOx's save adds 0.3–0.6 ms to its p99.99, as the dump's writes share its only core.
+- Valkey's child keeps CPU 1 busy for the whole save (~2 core-seconds per save, on top of
+  the server's CPU); RadixOx's slices take ~60 ms of CPU on its own core, plus the kernel's
+  writes. Valkey also needs 160–170 MB of copy-on-write memory during the save (20 % of
+  writes over uniformly random keys touch nearly every page: the worst case for `fork`,
+  but a common one for a cache). RadixOx's RSS: 141–145 MB; Valkey's: 190 MB.
+
+**Saturated, 3 physical cores each** (CPUs 0–2; RadixOx: event loop + 2 io_uring send
+workers; Valkey: `io-threads 3`, its child on the same CPUs; single runs):
+
+| | Throughput | p99 | p99.9 | p99.99 | `BGSAVE` |
+|---|---|---|---|---|---|
+| RadixOx | **622 k ops/s** | **0.21 ms** | **0.26 ms** | **0.76 ms** | — |
+| Valkey | 404 k ops/s | 0.24 ms | 0.33 ms | 1.19 ms | — |
+| RadixOx, `BGSAVE` at t = 3 s | **536 k ops/s** | **0.27 ms** | **0.39 ms** | **2.08 ms** | **355 ms** |
+| Valkey, `BGSAVE` at t = 3 s | 379 k ops/s | 0.49 ms | 2.27 ms | 3.01 ms | 3,032 ms |
+
+Caveats: loopback (the client's TCP stack runs on the same machine); memtier's rate limiter
+delivers ±10 % around the target, but both servers of a pair received the same load; the
+3-core save figures predate a scheduling fix that lowered RadixOx's save tail on one core
+(p99.99 1.7–2.4 → 0.9–1.3 ms). Details and the method: [`RUNTIME_ARCH.md`](RUNTIME_ARCH.md)
+§12.6; background work while idle: §8.2.
 
 ### Custom io_uring loop (2026-10-19)
 
@@ -294,10 +367,14 @@ cost excluded), two separate runs (2026-10-18):
 | Valkey, no save (reference) | — | 207,954 ops/s | 0.743 ms | 0.767 ms | 1.007 ms | — |
 | Valkey, during `BGSAVE` (runs 1 / 2) | 1,728 / 1,781 ms (fork 2.1 / 2.4 ms) | 185,512 / 206,334 | 0.751 / 0.743 ms | 0.855 / 0.791 ms | 1.175 / 0.927 ms | 3.74 / 4.06 ms |
 
-RadixOx snapshots in the server thread, in slices. While clients are active, the save takes
-at most 10 % of the thread (`RADIXOX_SAVE_CPU_SHARE`), so client latency stays at its
-reference level; on an idle server it runs at full speed (about 50 ms for these 1M keys).
-Without that cap, the save took about 60 % of the thread for 100 ms and doubled the p99.9.
+RadixOx snapshots in the server thread, in slices. *(Since 2026-10-20 — see the
+[series above](#against-valkey-partial-load-and-bgsave-2026-10-20) — the save also runs
+whenever neither a client nor the kernel has anything waiting, uncapped; the share below is
+only a floor when the server is saturated.)* At the time of this table, while clients were
+active, the save took at most 10 % of the thread (`RADIXOX_SAVE_CPU_SHARE`), so client
+latency stayed at its reference level; on an idle server it runs at full speed (about 50 ms
+for these 1M keys). Without that cap, the save took about 60 % of the thread for 100 ms and
+doubled the p99.9.
 Valkey forks: its child works on a second core (`bgsave-cpulist`), and the fork itself costs
 about 2 ms here, growing with the heap (tens to hundreds of ms on tens of GB).
 
@@ -319,6 +396,8 @@ Restart with 1M keys (dump on tmpfs, 2026-10-17): RadixOx ~0.17 s (105 MB raw du
 
 - Loopback only: the client's TCP receive path and netfilter are billed to the same machine.
   Two-machine numbers are planned.
+- Check where a benchmark writes its dumps: on tmpfs (`/tmp` on many distributions) the
+  fsync is free for both servers and saves look several times faster than on a disk.
 - Short runs: memtier results are the median of 3 rounds of 10 s; YCSB is a single run and
   the `BGSAVE` measurement two runs. Treat the numbers as orders of magnitude, not as precise ratios.
 - These numbers move as the project changes (the tree was redesigned on 2026-10-17); the
