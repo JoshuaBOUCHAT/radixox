@@ -85,6 +85,8 @@ pub enum Cmd<'a> {
     FlushDb,
     /// BGSAVE
     BgSave,
+    /// BGREWRITEAOF : réécriture de l'AOF (avec l'AOF, = BGSAVE).
+    BgRewriteAof,
     /// SAVE (bloquante)
     Save,
     /// LASTSAVE : date (Unix) de la dernière save réussie
@@ -816,6 +818,7 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
             }
         }
         b"bgsave" => { at_most!(1); Cmd::BgSave }
+        b"bgrewriteaof" => { exact!(0); Cmd::BgRewriteAof }
         b"save" => { exact!(0); Cmd::Save }
         b"lastsave" => { exact!(0); Cmd::LastSave }
 

@@ -1,11 +1,14 @@
 # Durabilité — AOF et réplication par un seul flux de commandes
 
-> **État : étapes 1–3 faites (2026-10-20)** : `exec/journal.rs` (plan / finish, format de
+> **État : étapes 1–6 faites (2026-10-20)** : `exec/journal.rs` (plan / finish, format de
 > bloc, `Stream` en mémoire, rejeu `apply`), plomberie dans `Core::exec_window`, tests 1 et 2 ;
 > dump v2 (position du journal, condensé `oxidart/src/digest.rs` vérifié au reload), test 3 ;
 > `exec/aof.rs` (manifeste, segments préalloués, reprise `recover`, création `create`,
-> nettoyage), test 4. Le flux n'est pas encore écrit sur disque pendant le service
-> (`Config::journal`, désactivé dans le binaire, pas de `RADIXOX_APPENDONLY`). Suite : étape 4. Ce document doit suffire à
+> nettoyage), test 4 ; écriture pendant le service (`AofWriter`, `RADIXOX_APPENDONLY`,
+> `appendfsync no|everysec`, plafond, erreurs, `INFO aof_*`, arrêt propre), test 5
+> (`radixox/tests/aof.rs`) ; réécriture (coupure `CUT`, rotation, publication de la base,
+> `BGREWRITEAOF`, automatique), test 6 ; `appendfsync always` en commit groupé (réponses
+> retenues, §7.5), test 8. Pas encore : réplication. Suite : étape 7. Ce document doit suffire à
 > un agent qui ne connaît pas le projet : §1 donne le contexte du code, §2–§11 la conception,
 > §12 les tests, §13 l'ordre de travail avec ses critères d'acceptation. Il remplace le
 > « collecteur d'effets » de RUNTIME_ARCH.md §18 et complète ARCHITECTURE.md §3.
@@ -423,6 +426,27 @@ incr journal.19.rxj
 - Partage avec le BGSAVE : un seul canal de fichiers en vol aujourd'hui (`K_FILE`,
   `Core::on_file`). Il faut **deux canaux** (dump, journal) avec chacun son `user_data`.
 
+### 7.3bis Fait (étape 4)
+
+- `exec/aof.rs::AofWriter` : machine à états sans I/O (comme `BgSave`) ; le cœur la pompe en fin
+  de tour (`Core::end_turn` → `Op::JournalWrite`) et à chaque CQE d'écriture. Les blocs fermés
+  sont **recopiés** dans un tampon d'écriture (4 Mio au plus par opération) : le pool de
+  tampons partagés sans copie est l'étape 8.
+- Second canal : `Op::JournalWrite` / `Op::JournalSync`, `Completion::JournalWrite` /
+  `JournalSync`, `user_data` `K_JWRITE` / `K_JSYNC` ; `IOSQE_ASYNC` avec `RADIXOX_FILE_CPUS`.
+- Préallocation du palier suivant par `fallocate` **synchrone**, une fois par 64 Mio (rapide sur
+  ext4 : métadonnées seulement) ; à passer en `IORING_OP_FALLOCATE` si une mesure le demande.
+- Arrêt (SIGINT / SIGTERM) : la `signalfd` est installée dès que l'AOF est actif ; le bloc en
+  cours est fermé, tout ce qui reste est écrit et fsyncé d'une traite (`flush_sync`), puis la
+  save d'arrêt si elle est demandée.
+- **Écart avec Valkey, à trancher** : ici une réponse peut partir avant que son bloc soit écrit
+  dans le cache de pages (bloc fermé en fin de tour, écriture asynchrone). Valkey écrit son AOF
+  (`write`) avant d'envoyer les réponses : un crash **du processus** (`kill -9`, panic) n'y perd
+  rien d'acquitté, seule une coupure de courant perd ≤ 1 s. Ici, un crash du processus peut perdre
+  les écritures acquittées du dernier tour (millisecondes). Le marquage du §7.5 le corrigerait
+  au prix d'une écriture par tour avant les réponses (condition `marque ≤ written` au lieu de
+  `durable`) : naturel à ajouter avec l'étape 6.
+
 ### 7.4 Modes de fsync (`RADIXOX_APPENDFSYNC`)
 
 | Mode | Écriture | fsync | Réponses |
@@ -450,6 +474,15 @@ plafond du §7.6 joue ce rôle sans bloquer la boucle.
 - CQE du fsync → `durable` avance → les connexions concernées redeviennent `dirty`.
 - Le même mécanisme sert à `WAIT` et à la réplication synchrone (§10.6) : la condition de sortie
   devient `marque ≤ min(durable, offset acquitté par N réplicas)`.
+- **Fait (étape 6)** : `ConnOut::holds` = `(début de la réponse dans out, marque)`, la marque
+  étant `Stream::end_mark()` (fin des blocs fermés, ou position dans le bloc en cours : un fsync
+  couvre des blocs entiers, donc `durable ≥ marque` ⇔ la commande est durable). Posée dans
+  `exec_window` après chaque commande, et au `unpark` d'un job, si `marque > durable`.
+  `send` n'envoie que le préfixe libéré (`ConnOut::sendable`) ; `Core::release_held` remet les
+  connexions concernées en sale à chaque CQE de fsync. En `always`, l'écrivain soumet un fsync
+  dès qu'il y a du non-durable et qu'aucun n'est en vol (pas de lien `IOSQE_IO_LINK` en v1 :
+  écriture puis fsync, deux allers-retours io-wq) ; erreur d'écriture ou de fsync → `exit(1)`.
+  Le même `release_upto` pourra rendre `written` au lieu de `durable` en `everysec` (§7.3bis).
 - Coût fixé par le disque : ~20–100 µs par fsync sur NVMe avec protection contre les coupures
   (PLP), ~1–5 ms sur un SSD grand public (vidage de son cache). Le regroupement se fait entre
   connexions : pipeline ou non, tout ce qui arrive pendant un fsync part dans le suivant.
@@ -465,6 +498,9 @@ plafond du §7.6 joue ce rôle sans bloquer la boucle.
 - `everysec` / `no` : `aof_last_write_status:err`, écritures refusées
   (`-MISCONF Errors writing to the AOF file: <erreur>`), nouvel essai chaque seconde depuis le
   dernier octet écrit avec succès ; retour à `ok` au premier succès.
+- fsync en échec en `everysec` (fait) : jamais réessayé (cache de pages dans un état inconnu),
+  `aof_last_fsync_status:err`, écritures refusées jusqu'au redémarrage (la réécriture de
+  l'étape 5 pourra en sortir avec une nouvelle base).
 - `always` : write ou fsync en échec → **arrêt du processus** (log puis `exit(1)`), comme
   Valkey : des réponses retenues ne peuvent plus être garanties, et un fsync raté laisse le
   cache de pages dans un état inconnu (on ne réessaie jamais un fsync en échec).
@@ -513,6 +549,28 @@ toujours tous les segments qui contiennent des blocs, quelle que soit l'étape d
 `RADIXOX_AUTO_AOF_REWRITE_PERCENTAGE` (100) et `RADIXOX_AUTO_AOF_REWRITE_MIN_SIZE` (64 MiB) :
 réécriture quand la taille des segments depuis la dernière base dépasse `min_size` et
 `pourcentage × taille de la base`. Vérifié avec le timer des saves automatiques.
+
+### 8.4bis Fait (étape 5)
+
+- `Core::start_bgsave` (commande `BGSAVE` / `BGREWRITEAOF` dans `finish_frame`, règle de save
+  automatique, seuil du §8.4 vérifié par le timer d'une seconde) appelle
+  `AofWriter::begin_rewrite` : `Stream::cut` ferme le bloc en cours avec `CUT` (même vide, au
+  `now` du tour) ; la cible du BGSAVE devient `base.<N+1>.rxdb` avec la position du `CUT`
+  (`persist::Target`, `BgSave::start(.., target)`).
+- Rotation (`AofWriter`, sans I/O) : l'écrivain ne prend plus de bloc au-delà de la frontière ;
+  une fois le segment écrit jusqu'à elle, **fsync dans tous les modes**, `no` compris (sinon une
+  coupure de courant pourrait laisser N déchiré et N+1 valide : refus de démarrer) ; puis
+  `set_len` à la fin logique, création et préallocation de `journal.<N+1>.rxj`, manifeste qui
+  le cite, et l'écriture reprend. Ces appels système sont **synchrones**, une fois par
+  réécriture (à passer en io_uring si une mesure le demande).
+- Fin du BGSAVE réussie : la base est publiée (manifeste `base.<N+1>` + segments ≥ N+1, puis
+  `remove_unlisted`) dès que la rotation est finie ; en échec, rien (l'ancien manifeste cite
+  déjà le nouveau segment). Une base publiée lève une erreur de fsync antérieure.
+- Écarts assumés : `SAVE` (bloquante) écrit toujours `dump.rxd`, ce n'est pas une réécriture
+  (snapshot autonome, comme le `SAVE` de Valkey avec l'AOF actif) ; à l'arrêt avec l'AOF, pas de
+  save par défaut (le flux est complet ; `RADIXOX_SAVE_ON_EXIT=1` la force) ; les blocs qui
+  suivent un `CUT` dans le même tour ne portent pas `CONT` (drapeau informatif) ;
+  `BGREWRITEAOF` sans AOF répond une erreur.
 
 ### 8.5 Interaction avec les jobs
 
@@ -706,6 +764,24 @@ Commandes : `BGREWRITEAOF`, `WAIT`, `REPLICATE`, `REPLICAOF NO ONE`, et les comm
 
 ---
 
+## 12bis. Mesures
+
+`scripts/bench_aof.sh` (2026-10-20, ext4 sur `/dev/sda5`, un cœur serveur, io-wq / bio de
+Valkey sur le CPU 1, memtier SET seul 100 o, 4 × 10 clients, 8 s, profil `performance`) :
+
+| Configuration | p1 ops/s | p1 p99 | p16 ops/s | p16 p99.9 |
+|---|---|---|---|---|
+| RadixOx sans AOF | 173 483 | 0,88 ms | 1 059 707 | 2,0 ms |
+| RadixOx `everysec` | 172 547 | 0,90 ms | 813 521 | 2,6 ms |
+| Valkey `everysec` | 117 606 | 1,10 ms | 603 395 | 24,1 ms |
+| RadixOx `always` | 21 926 | 4,4 ms | 163 020 | 54,8 ms |
+| Valkey `always` | 22 150 | 4,8 ms | 149 688 | 56,8 ms |
+
+- `everysec` : gratuit sans pipeline ; −23 % en pipeline 16 (recopie des blocs dans le tampon
+  d'écriture, écriture sur io-wq) : c'est ce que vise le pool de tampons de l'étape 8.
+- `always` : à égalité avec Valkey, plafonné par le fsync de ce disque (~2 ms) ; le commit
+  groupé ne peut pas faire mieux que « un fsync en vol ». Sur NVMe à PLP, à refaire.
+
 ## 13. Ordre d'implémentation (une étape = un commit vert, poussé)
 
 | # | Étape | Fini quand |
@@ -713,9 +789,9 @@ Commandes : `BGREWRITEAOF`, `WAIT`, `REPLICATE`, `REPLICAOF NO ONE`, et les comm
 | 1 ✅ | `exec/journal.rs` (`plan`, `finish`, `Stream` en mémoire), plomberie `raw` + réponse | test 1 (oracle depuis vide) et test 2 verts — `uring/tests.rs` : `journal_replay_matches_state`, `expired_keys_are_absent_for_writes` (1000 graines vertes) |
 | 2 ✅ | Dump v2 : `base_seq`, `replid`, `base_offset`, condensé ; vérification au rechargement | test 3 ; tous les tests de save existants verts ; v1 toujours lisible — `oxidart/src/test_save.rs` : `save_digest_is_the_t0_state_under_mutations`, `reload_checks_digest_even_with_expired_keys`, `reload_refuses_altered_content_with_valid_crc`, `reload_reads_version_1`, `journal_position_roundtrip` |
 | 3 ✅ | Format de bloc, segments préalloués, manifeste, rejeu au démarrage, troncature | test 4 — `uring/tests.rs` : `aof_recovery_matches_state_across_segments`, `aof_truncated_tail_is_cut_only_at_the_end`, `aof_unlisted_files_are_removed` ; le test 6 (coupure) passe à l'étape 5, qui introduit `CUT` |
-| 4 | `appendfsync no` / `everysec`, deux canaux de fichiers, plafond §7.6, erreurs §7.7, `INFO aof_*` | test 5 en `everysec` et `no` |
-| 5 | Réécriture : coupure `CUT`, rotation, ordre §8.2–8.3, automatique, `BGREWRITEAOF` | tests 5 (avec rotations) et 6 ; test 1 depuis un dump |
-| 6 | `always` : marquage §7.5, un fsync en vol | tests 5 (`always`) et 8 ; bench `always` contre Valkey `appendfsync always` (même disque, pas tmpfs) |
+| 4 ✅ | `appendfsync no` / `everysec`, deux canaux de fichiers, plafond §7.6, erreurs §7.7, `INFO aof_*` | test 5 en `everysec` et `no` — `radixox/tests/aof.rs` (`kill -9` × N, préfixe exact, `INCR` une fois, SIGTERM sans perte ; `AOF_CRASH_ITERS`), `uring/tests.rs` : `aof_files_replay_to_the_served_state`, `aof_backlog_parks_writers_not_readers` |
+| 5 ✅ | Réécriture : coupure `CUT`, rotation, ordre §8.2–8.3, automatique, `BGREWRITEAOF` | tests 5 (avec rotations) et 6 ; test 1 depuis un dump — `uring/tests.rs` : `rewrite_cut_is_exact_inside_a_pipeline`, `rewrites_under_random_traffic_replay_to_the_served_state` ; `tests/aof.rs` : `kill9_during_rewrites_keeps_an_exact_prefix` |
+| 6 ✅ | `always` : marquage §7.5, un fsync en vol | tests 5 (`always`) et 8 — `uring/tests.rs` : `always_holds_replies_until_their_fsync`, `always_random_traffic_replays_and_answers` ; `tests/aof.rs` : `kill9_always_loses_nothing_acknowledged` ; bench contre Valkey : voir §12bis |
 | 7 | Réplication : mode suivi, `RXHELLO`/`RXLOAD`/`RXBLOCK`, `REPLICATE`, backlog, `REPLICAOF NO ONE` | test 7 |
 | 8 | Pool de tampons enregistrés, `SEND(MSG)_ZC`, `splice`, `WAIT`, `min-replicas-to-write` | test 7 + mesure deux machines |
 

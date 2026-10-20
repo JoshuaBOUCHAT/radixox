@@ -25,9 +25,10 @@ use radixox_lib::shared_frame::{SharedFrame as Frame, extend_encode};
 use crate::exec::client::Client;
 use crate::exec::jobs::{FREE_BUDGET, FlushJob, KEYS_BUDGET, KeysJob, Step, UnlinkJob};
 use crate::exec::autosave::{Persistence, Rule};
+use crate::exec::aof::{AofOp, AofWriter};
 use crate::exec::journal::{self, Stream};
 use crate::exec::bgsave::{BgSave, FileOp, cpu_share, zstd_conf};
-use crate::exec::persist::{save_sync, sync_level};
+use crate::exec::persist::{Target, save_sync, sync_level};
 use crate::exec::{Executed, execute_into, resp_ok};
 use crate::tsc;
 
@@ -72,6 +73,12 @@ pub struct Config {
     pub stop_writes_on_bgsave_error: bool,
     /// Flux de commandes (AOF, réplication ; DURABILITY_DESIGN.md) tenu à jour.
     pub journal: bool,
+    /// Retard du flux sur le disque au-delà duquel les écrivains sont parqués
+    /// (`RADIXOX_AOF_MAX_PENDING_MB`, DURABILITY_DESIGN.md §7.6).
+    pub aof_max_pending: u64,
+    /// Réécriture automatique (`auto-aof-rewrite-percentage`, `-min-size`, §8.4).
+    pub aof_rewrite_percentage: u64,
+    pub aof_rewrite_min_size: u64,
 }
 
 impl Default for Config {
@@ -96,6 +103,9 @@ impl Default for Config {
             save_rules: Vec::new(),
             stop_writes_on_bgsave_error: true,
             journal: false,
+            aof_max_pending: 64 << 20,
+            aof_rewrite_percentage: 100,
+            aof_rewrite_min_size: 64 << 20,
         }
     }
 }
@@ -111,6 +121,10 @@ pub enum Completion {
     Send { slot: Slot, res: i32 },
     /// Écriture ou fsync du fichier de BGSAVE : octets écrits, 0, ou `-errno`.
     File { res: i32 },
+    /// Écriture du segment de l'AOF : octets écrits ou `-errno`.
+    JournalWrite { res: i32 },
+    /// fsync du segment de l'AOF : 0 ou `-errno`.
+    JournalSync { res: i32 },
 }
 
 /// Opération à soumettre au noyau.
@@ -134,6 +148,10 @@ pub enum Op {
     FileWrite { fd: i32, off: u64 },
     /// fsync (données) du fichier de BGSAVE.
     FileSync { fd: i32 },
+    /// Écrire [`Core::pending_journal_write`] dans le segment de l'AOF à `off`.
+    JournalWrite { fd: i32, off: u64 },
+    /// fsync (données) du segment de l'AOF.
+    JournalSync { fd: i32 },
 }
 
 /// Une fenêtre de préchargement, sur la pile (pas d'allocation par fenêtre).
@@ -146,6 +164,8 @@ const EVICT_EVERY: Duration = Duration::from_secs(1);
 const SWEEP_EVERY: Duration = Duration::from_millis(100);
 /// Vérification des règles de save automatique (`serverCron` de Redis, hz 10).
 const AUTOSAVE_EVERY: Duration = Duration::from_millis(100);
+/// fsync `everysec` de l'AOF, nouvel essai après une erreur d'écriture.
+const AOF_EVERY: Duration = Duration::from_secs(1);
 const SWEEP_SLOTS: usize = 1024;
 
 /// Échéances du tas de timers (RUNTIME_ARCH.md §9).
@@ -154,6 +174,7 @@ enum Timer {
     Evict,
     Sweep,
     AutoSave,
+    Aof,
 }
 
 /// Suite à donner après l'exécution d'une frame.
@@ -169,6 +190,7 @@ enum After {
     /// BGSAVE / SAVE / LASTSAVE / INFO : dépendent de l'état du serveur (save
     /// en cours, dernière save).
     BgSave,
+    BgRewriteAof,
     Save,
     LastSave,
     Info,
@@ -228,7 +250,10 @@ impl ConnJob {
 /// (§2.1) ou commande qui peut parquer la connexion.
 fn stops_window(cmd: &Cmd<'_>) -> bool {
     cmd.is_barrier()
-        || matches!(cmd, Cmd::Keys(_) | Cmd::Unlink(_) | Cmd::BgSave | Cmd::Save | Cmd::Publish { .. })
+        || matches!(
+            cmd,
+            Cmd::Keys(_) | Cmd::Unlink(_) | Cmd::BgSave | Cmd::BgRewriteAof | Cmd::Save | Cmd::Publish { .. }
+        )
 }
 
 pub struct Core {
@@ -264,8 +289,14 @@ pub struct Core {
     last_rx: Instant,
     /// Saves automatiques, dernière save, écritures depuis.
     persist: Persistence,
-    /// Flux de commandes, si `cfg.journal`.
+    /// Flux de commandes, si `cfg.journal` ou l'AOF.
     journal: Option<Stream>,
+    /// Écriture du flux dans l'AOF.
+    aof: Option<AofWriter>,
+    /// Écrivains parqués faute de place dans le flux (§7.6).
+    aof_waiting: Vec<Slot>,
+    /// Connexions qui ont des réponses retenues jusqu'au fsync (§7.5).
+    held: Vec<Slot>,
 }
 
 impl Core {
@@ -304,6 +335,9 @@ impl Core {
             last_rx: now,
             persist: Persistence::new(cfg.save_rules.clone(), cfg.stop_writes_on_bgsave_error, now),
             journal: cfg.journal.then(Stream::default),
+            aof: None,
+            aof_waiting: Vec::new(),
+            held: Vec::new(),
             cfg,
         }
     }
@@ -334,11 +368,101 @@ impl Core {
         if let Some(j) = &mut self.journal {
             j.end_turn();
         }
+        self.aof_pump();
     }
 
     /// Flux de commandes (blocs fermés), si `cfg.journal`.
     pub fn journal_mut(&mut self) -> Option<&mut Stream> {
         self.journal.as_mut()
+    }
+
+    /// Active l'AOF : le flux reprend à `stream` (après la reprise des
+    /// fichiers), ses blocs sont écrits par `w`.
+    pub fn set_aof(&mut self, stream: Stream, w: AofWriter) {
+        self.journal = Some(stream);
+        self.aof = Some(w);
+        self.timers.push(Reverse((self.now + AOF_EVERY, Timer::Aof)));
+    }
+
+    pub fn aof(&self) -> Option<&AofWriter> {
+        self.aof.as_ref()
+    }
+
+    /// Octets du flux pas encore écrits dans l'AOF.
+    pub fn aof_pending(&self) -> u64 {
+        match (&self.aof, &self.journal) {
+            (Some(w), Some(j)) => w.pending(j),
+            _ => 0,
+        }
+    }
+
+    /// Octets de l'écriture de l'AOF en vol (`Op::JournalWrite`).
+    pub fn pending_journal_write(&self) -> &[u8] {
+        self.aof.as_ref().map_or(&[], |w| w.writing())
+    }
+
+    /// Arrêt : tout le flux sur disque, fsync compris, d'une traite.
+    pub fn flush_journal_sync(&mut self) -> std::io::Result<()> {
+        match (&mut self.aof, &mut self.journal) {
+            (Some(w), Some(j)) => w.flush_sync(j),
+            _ => Ok(()),
+        }
+    }
+
+    /// Soumet les opérations dues de l'AOF : écriture des blocs fermés,
+    /// fsync (`everysec`, rotation).
+    fn aof_pump(&mut self) {
+        let (Some(w), Some(j)) = (&mut self.aof, &mut self.journal) else { return };
+        while let Some(op) = w.next_op(j, self.now) {
+            self.ops.push(match op {
+                AofOp::Write { fd, off } => Op::JournalWrite { fd, off },
+                AofOp::Sync { fd } => Op::JournalSync { fd },
+            });
+        }
+    }
+
+    /// Le durable a avancé : les connexions dont une réponse retenue est
+    /// maintenant couverte redeviennent sales (§7.5).
+    fn release_held(&mut self) {
+        let Some(upto) = self.aof.as_ref().and_then(|w| w.release_upto()) else { return };
+        let (outs, dirty) = (&mut self.outs, &mut self.dirty);
+        self.held.retain(|&slot| {
+            let o = &mut outs[slot as usize];
+            // Marques croissantes : les couvertes sont en tête.
+            let before = o.holds.len();
+            while o.holds.front().is_some_and(|&(_, m)| m <= upto) {
+                o.holds.pop_front();
+            }
+            if o.holds.len() < before && !o.dirty {
+                o.dirty = true;
+                dirty.push(slot);
+            }
+            !o.holds.is_empty()
+        });
+    }
+
+    /// Le retard du flux est repassé sous la moitié du plafond : les écrivains
+    /// parqués reprennent (§7.6).
+    fn aof_unpark(&mut self) {
+        if self.aof_waiting.is_empty() {
+            return;
+        }
+        let (Some(w), Some(j)) = (&self.aof, &self.journal) else { return };
+        if w.pending(j) > self.cfg.aof_max_pending / 2 {
+            return;
+        }
+        for slot in std::mem::take(&mut self.aof_waiting) {
+            let s = slot as usize;
+            let o = &mut self.outs[s];
+            if !o.aof_wait {
+                continue;
+            }
+            o.aof_wait = false;
+            if self.ins[s].has_work() && !o.ready && matches!(o.mode, Mode::Normal | Mode::Closing) {
+                o.ready = true;
+                self.ready.push(slot);
+            }
+        }
     }
 
     /// Prochaine échéance : borne l'attente dans `enter` (sinon l'horloge et
@@ -364,6 +488,22 @@ impl Core {
                 Timer::Sweep => {
                     self.sweep_idle();
                     self.timers.push(Reverse((self.now + SWEEP_EVERY, Timer::Sweep)));
+                }
+                Timer::Aof => {
+                    if let Some(w) = &mut self.aof {
+                        w.tick();
+                    }
+                    self.aof_pump();
+                    let due = self.aof.as_ref().is_some_and(|w| {
+                        w.rewrite_due(self.cfg.aof_rewrite_percentage, self.cfg.aof_rewrite_min_size)
+                    });
+                    if due && self.bgsave.is_none() && !self.art.is_saving() {
+                        eprintln!("[aof] journal au-delà du seuil de réécriture automatique : BGREWRITEAOF");
+                        if let Err(e) = self.start_bgsave() {
+                            eprintln!("[aof] échec du démarrage de la réécriture : {e}");
+                        }
+                    }
+                    self.timers.push(Reverse((self.now + AOF_EVERY, Timer::Aof)));
                 }
                 Timer::AutoSave => {
                     if self.bgsave.is_none()
@@ -469,6 +609,20 @@ impl Core {
             }
             Completion::Send { slot, res } => self.on_send(slot, res),
             Completion::File { res } => self.on_file(res),
+            Completion::JournalWrite { res } => {
+                if let Some(w) = &mut self.aof {
+                    w.write_done(res, self.now);
+                }
+                self.aof_pump();
+                self.aof_unpark();
+            }
+            Completion::JournalSync { res } => {
+                if let Some(w) = &mut self.aof {
+                    w.sync_done(res, self.now);
+                }
+                self.release_held();
+                self.aof_pump();
+            }
         }
     }
 
@@ -531,21 +685,35 @@ impl Core {
                 eprintln!("[bgsave] échec : {e}");
             }
             self.persist.bgsave_finished(Instant::now(), res.is_ok());
+            if let Some(w) = &mut self.aof {
+                w.rewrite_done(bg.target(), res.is_ok());
+            }
             self.bgsave = None;
+            self.aof_pump();
         }
     }
 
-    /// Lance un BGSAVE (commande ou règle de save automatique).
+    /// Lance un BGSAVE (commande ou règle de save automatique). Avec l'AOF,
+    /// c'est une réécriture : coupure du flux à cet instant, nouvelle base
+    /// (DURABILITY_DESIGN.md §8).
     fn start_bgsave(&mut self) -> Result<(), String> {
         let now = Instant::now();
+        let target = match (&mut self.aof, &mut self.journal) {
+            (Some(w), _) if w.rewriting() => return Err("Background append only file rewriting already in progress".into()),
+            (Some(w), Some(j)) => w.begin_rewrite(j),
+            _ => Target::dump(),
+        };
         self.persist.bgsave_started(now);
-        match BgSave::start(&mut self.art, zstd_conf()) {
+        match BgSave::start(&mut self.art, zstd_conf(), target.clone()) {
             Ok(bg) => {
                 self.bgsave = Some(bg);
                 Ok(())
             }
             Err(e) => {
                 self.persist.bgsave_finished(now, false);
+                if let Some(w) = &mut self.aof {
+                    w.rewrite_done(&target, false);
+                }
                 Err(e.to_string())
             }
         }
@@ -591,11 +759,13 @@ impl Core {
         o.recv_cancelled = false;
         o.send_cancelled = false;
         o.out.clear();
+        o.holds.clear();
         o.sending.clear();
         o.sent = 0;
         o.client = Client::new();
         o.last_active = self.now;
         o.job_pending = false;
+        o.aof_wait = false;
         o.channels.clear();
         o.over_soft = None;
         o.dirty = false;
@@ -651,7 +821,7 @@ impl Core {
     fn push_span(&mut self, slot: Slot, span: Span) {
         let s = slot as usize;
         let i = &mut self.ins[s];
-        if self.outs[s].job_pending {
+        if self.outs[s].job_pending || self.outs[s].aof_wait {
             // Parquée : copié tout de suite, l'anneau n'est jamais retenu (§7).
             i.rx.extend_from_slice(self.bufs.slice(span.bid, span.off, span.len));
             i.rx_check = true;
@@ -799,6 +969,7 @@ impl Core {
             let s = slot as usize;
             let keep = ins[s].has_work()
                 && !outs[s].job_pending
+                && !outs[s].aof_wait
                 && matches!(outs[s].mode, Mode::Normal | Mode::Closing);
             outs[s].ready = keep;
             keep
@@ -811,6 +982,7 @@ impl Core {
         let o = &self.outs[slot as usize];
         o.stop_turn != self.turn
             && !o.job_pending
+            && !o.aof_wait
             && matches!(o.mode, Mode::Normal | Mode::Closing)
             && !(o.send_in_flight() && o.out.len() >= self.cfg.out_backpressure)
     }
@@ -913,12 +1085,28 @@ impl Core {
         }
         let mut plans: Window<Plan> = SmallVec::new();
         let mut afters: Window<(Slot, After)> = SmallVec::new();
+        // Écrivains arrêtés par le plafond du flux : (connexion, début dans le
+        // morceau de tête de la frame arrêtée ; `None` : la frame de `rx`).
+        let mut aof_stops: Window<(Slot, Option<u32>)> = SmallVec::new();
         {
             let job_budget = self.cfg.job_budget;
-            let Core { art, ins, outs, bufs, persist, journal, .. } = self;
-            let refuse_writes = persist.refuse_writes();
-            // (connexion, commande, octets de sa frame)
-            let mut frames: Window<(Slot, Cmd<'_>, &[u8])> = SmallVec::new();
+            let Core { art, ins, outs, bufs, persist, journal, aof, cfg, held, .. } = self;
+            // `always` : les réponses attendent le fsync qui couvre leur marque.
+            let release_upto = aof.as_ref().and_then(|w| w.release_upto());
+            // Écritures refusées : BGSAVE en échec, AOF en erreur (§7.7).
+            let refuse_writes = if persist.refuse_writes() {
+                Some(misconf())
+            } else {
+                aof.as_ref().and_then(|w| w.error()).map(aof_misconf)
+            };
+            // Flux trop en retard sur le disque : les écrivains attendent (§7.6).
+            let over_cap = match (aof.as_ref(), journal.as_ref()) {
+                (Some(w), Some(j)) => w.pending(j) > cfg.aof_max_pending,
+                _ => false,
+            };
+            // (connexion, commande, octets de sa frame, fin de la frame dans le
+            // morceau de tête ; `None` : la frame de `rx`)
+            let mut frames: Window<(Slot, Cmd<'_>, &[u8], Option<u32>)> = SmallVec::new();
             for (rank, &slot) in picked.iter().enumerate() {
                 if frames.len() >= width {
                     break;
@@ -936,7 +1124,7 @@ impl Core {
                         unreachable!("rx_ready : frame complète");
                     };
                     barrier = stops_window(&cmd);
-                    frames.push((slot, cmd, raw));
+                    frames.push((slot, cmd, raw, None));
                     plan.from_rx = true;
                 }
                 // Des octets attendent encore dans `rx` après cette frame : les
@@ -954,7 +1142,7 @@ impl Core {
                                 let raw = &data[pos..pos + n];
                                 pos += n;
                                 let b = stops_window(&cmd);
-                                frames.push((slot, cmd, raw));
+                                frames.push((slot, cmd, raw, Some(pos as u32)));
                                 if b {
                                     break;
                                 }
@@ -976,18 +1164,27 @@ impl Core {
                 }
             }
             if frames.len() > 1 {
-                let keys: Window<&[u8]> = frames.iter().filter_map(|(_, c, _)| c.main_key()).collect();
+                let keys: Window<&[u8]> = frames.iter().filter_map(|(_, c, _, _)| c.main_key()).collect();
                 if keys.len() > 1 {
                     art.prefetch_keys(&keys);
                 }
             }
-            for (slot, cmd, raw) in frames {
+            for (slot, cmd, raw, end) in frames {
+                if aof_stops.iter().any(|&(s, _)| s == slot) {
+                    continue;
+                }
                 let o = &mut outs[slot as usize];
                 let weight = cmd.write_weight();
                 if weight > 0 && o.client.authed {
-                    if refuse_writes {
-                        extend_encode(&mut o.out, &misconf());
+                    if let Some(err) = &refuse_writes {
+                        extend_encode(&mut o.out, err);
                         afters.push((slot, After::Continue));
+                        continue;
+                    }
+                    if over_cap {
+                        // Cette frame et les suivantes de la connexion restent à
+                        // lire ; elle reprendra quand le disque aura rattrapé.
+                        aof_stops.push((slot, end.map(|e| e - raw.len() as u32)));
                         continue;
                     }
                     // FLUSHDB : toutes les clés changent (le `dirty` de Redis).
@@ -1003,9 +1200,32 @@ impl Core {
                 let start = o.out.len();
                 afters.push((slot, run_cmd(cmd, art, o, job_budget)));
                 journal::finish(plan, &o.out[start..], raw, art.now, stream);
+                // Écriture ou lecture : elle a pu voir du non-durable (§7.5).
+                if let Some(durable) = release_upto {
+                    let mark = stream.end_mark();
+                    if mark > durable {
+                        o.holds.push_back((start, mark));
+                        if o.holds.len() == 1 {
+                            held.push(slot);
+                        }
+                    }
+                }
             }
         }
         let done = afters.len();
+        // Écrivains arrêtés : rien de consommé à partir de la frame arrêtée.
+        for &(slot, start) in &aof_stops {
+            let plan = plans.iter_mut().find(|p| p.slot == slot).expect("plan de la connexion");
+            match start {
+                None => {
+                    plan.from_rx = false;
+                    plan.consumed = 0;
+                }
+                Some(start) => plan.consumed = start,
+            }
+            plan.tail = false;
+            plan.err = None;
+        }
         // Avancer dans les morceaux, rendre les tampons vidés.
         for plan in &plans {
             let s = plan.slot as usize;
@@ -1041,6 +1261,9 @@ impl Core {
         for (slot, after) in afters {
             self.finish_frame(slot, after);
         }
+        for &(slot, _) in &aof_stops {
+            self.aof_park(slot);
+        }
         // Erreur de protocole : après les réponses des frames d'avant.
         for plan in &plans {
             let s = plan.slot as usize;
@@ -1066,11 +1289,17 @@ impl Core {
                 }
             }
             After::Park(job) => self.park(slot, job),
-            After::BgSave => {
-                let frame = if self.bgsave.is_some() || self.art.is_saving() {
+            After::BgSave | After::BgRewriteAof => {
+                let rewrite = matches!(after, After::BgRewriteAof);
+                let frame = if rewrite && self.aof.is_none() {
+                    Frame::Error("ERR AOF is disabled (RADIXOX_APPENDONLY=yes)".into())
+                } else if self.bgsave.is_some() || self.art.is_saving() {
                     Frame::Error("ERR Background save already in progress".into())
                 } else {
                     match self.start_bgsave() {
+                        Ok(()) if rewrite => {
+                            Frame::SimpleString(SharedByte::from_slice(b"Background append only file rewriting started"))
+                        }
                         Ok(()) => Frame::SimpleString(SharedByte::from_slice(b"Background saving started")),
                         Err(e) => Frame::Error(format!("ERR {e}")),
                     }
@@ -1105,6 +1334,11 @@ impl Core {
                 let mut info = String::new();
                 crate::exec::info_server(&mut info);
                 self.persist.info(self.now, &mut info);
+                match (&self.aof, &self.journal) {
+                    (Some(w), Some(j)) => w.info(j, &mut info),
+                    _ => info.push_str("aof_enabled:0\r\n"),
+                }
+                info.push_str("\r\n");
                 crate::exec::info_stats(&mut info);
                 extend_encode(&mut self.outs[s].out, &Frame::BulkString(SharedByte::from_slice(info.as_bytes())));
             }
@@ -1117,7 +1351,7 @@ impl Core {
         }
         let o = &mut self.outs[s];
         if !o.out.is_empty() {
-            if o.out.len() >= self.cfg.flush_early && !o.send_in_flight() {
+            if o.out.len() >= self.cfg.flush_early && !o.send_in_flight() && o.holds.is_empty() {
                 self.send(slot);
             } else if !o.dirty {
                 o.dirty = true;
@@ -1264,6 +1498,24 @@ impl Core {
         self.conn_jobs.push_back((slot, epoch, job));
     }
 
+    /// Parque un écrivain jusqu'à ce que le flux rattrape le disque (§7.6) :
+    /// ses morceaux sont recopiés dans `rx`, l'anneau n'est pas retenu.
+    fn aof_park(&mut self, slot: Slot) {
+        let s = slot as usize;
+        if self.outs[s].aof_wait {
+            return;
+        }
+        self.outs[s].aof_wait = true;
+        self.aof_waiting.push(slot);
+        let spans = std::mem::take(&mut self.ins[s].spans);
+        for span in spans {
+            self.ins[s].rx.extend_from_slice(self.bufs.slice(span.bid, span.off, span.len));
+            self.bufs.release(span.bid);
+            self.try_recycle(span.bid);
+        }
+        self.ins[s].rx_check = !self.ins[s].rx.is_empty();
+    }
+
     /// Une tranche de travail de fond : un job de connexion parquée (tour à
     /// tour), puis la libération de FLUSHDB.
     pub fn run_jobs(&mut self) {
@@ -1317,7 +1569,17 @@ impl Core {
             return;
         }
         o.job_pending = false;
+        let start = o.out.len();
         job.respond(&mut o.out);
+        if let (Some(durable), Some(j)) = (self.aof.as_ref().and_then(|w| w.release_upto()), &self.journal) {
+            let mark = j.end_mark();
+            if mark > durable {
+                o.holds.push_back((start, mark));
+                if o.holds.len() == 1 {
+                    self.held.push(slot);
+                }
+            }
+        }
         if !o.dirty {
             o.dirty = true;
             self.dirty.push(slot);
@@ -1366,10 +1628,25 @@ impl Core {
         }
     }
 
+    /// Envoie ce qui peut partir de `out` (tout, sauf à partir d'une réponse
+    /// retenue). Rien à envoyer : la connexion attend le fsync (`release_held`).
     fn send(&mut self, slot: Slot) {
+        let upto = self.aof.as_ref().and_then(|w| w.release_upto());
         let o = &mut self.outs[slot as usize];
         debug_assert!(!o.send_in_flight());
-        std::mem::swap(&mut o.out, &mut o.sending);
+        let n = o.sendable(upto);
+        if n == 0 {
+            return;
+        }
+        if n == o.out.len() {
+            std::mem::swap(&mut o.out, &mut o.sending);
+        } else {
+            o.sending.extend_from_slice(&o.out[..n]);
+            o.out.drain(..n);
+            for h in o.holds.iter_mut() {
+                h.0 -= n;
+            }
+        }
         o.sent = 0;
         o.send_cancelled = false;
         o.refs += 1;
@@ -1403,6 +1680,7 @@ impl Core {
         self.release_queue(slot);
         self.ins[s] = ConnIn { broken: true, ..ConnIn::default() };
         self.outs[s].out.clear();
+        self.outs[s].holds.clear();
         self.cancel_recv(slot);
         let o = &mut self.outs[s];
         if o.send_in_flight() && !o.send_cancelled {
@@ -1440,6 +1718,7 @@ impl Core {
         }
         o.mode = Mode::Free;
         o.out = Vec::new();
+        o.holds.clear();
         o.sending = Vec::new();
         self.ins[s] = ConnIn::default();
         self.free.push(slot);
@@ -1474,6 +1753,10 @@ impl Core {
                     "slot {s} abonné hors registre"
                 );
             }
+            if o.aof_wait {
+                assert!(i.spans.is_empty(), "slot {s} parqué (AOF) : l'anneau ne doit pas être retenu");
+                assert!(self.aof_waiting.contains(&(s as Slot)), "slot {s} parqué (AOF) hors liste");
+            }
             if o.job_pending {
                 assert!(i.spans.is_empty(), "slot {s} parqué : l'anneau ne doit pas être retenu");
                 assert!(
@@ -1481,10 +1764,18 @@ impl Core {
                     "slot {s} parqué sans job"
                 );
             }
-            if i.has_work() && !o.job_pending && matches!(o.mode, Mode::Normal | Mode::Closing) {
+            if i.has_work() && !o.job_pending && !o.aof_wait && matches!(o.mode, Mode::Normal | Mode::Closing) {
                 assert!(o.ready && self.ready.contains(&(s as Slot)), "slot {s} a des frames hors de la liste prête");
             }
             assert!(o.sent <= o.sending.len());
+            assert!(
+                o.holds.iter().zip(o.holds.iter().skip(1)).all(|(a, b)| a.0 <= b.0 && a.1 <= b.1)
+                    && o.holds.back().is_none_or(|h| h.0 <= o.out.len()),
+                "slot {s} : réponses retenues désordonnées"
+            );
+            if !o.holds.is_empty() {
+                assert!(self.held.contains(&(s as Slot)), "slot {s} : réponses retenues hors liste");
+            }
         }
         for bid in 0..self.bufs.count() {
             assert_eq!(self.bufs.refs(bid), ring_items[bid as usize], "tampon {bid} : refs");
@@ -1501,6 +1792,11 @@ fn misconf() -> Frame {
          RadixOx logs for details about the error."
             .into(),
     )
+}
+
+/// Écriture refusée après une erreur de l'AOF (texte de Valkey).
+fn aof_misconf(err: &str) -> Frame {
+    Frame::Error(format!("MISCONF Errors writing to the AOF file: {err}"))
 }
 
 /// Exécute une commande d'une connexion.
@@ -1566,6 +1862,7 @@ fn runtime(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) 
         }
         // Dépendent d'une save en cours : traitées par le cœur (`finish_frame`).
         Cmd::BgSave => After::BgSave,
+        Cmd::BgRewriteAof => After::BgRewriteAof,
         Cmd::Save => After::Save,
         Cmd::LastSave => After::LastSave,
         Cmd::Info => After::Info,

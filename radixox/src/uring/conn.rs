@@ -87,6 +87,14 @@ pub struct ConnOut {
     /// Connexion parquée (§7) : un job travaille pour elle ; elle n'est plus
     /// tirée, ce qu'elle reçoit attend dans `rx`, elle reprend à la réponse.
     pub job_pending: bool,
+    /// Écrivain parqué : le flux de l'AOF a trop de retard sur le disque
+    /// (DURABILITY_DESIGN.md §7.6). Comme `job_pending` : plus tirée, ce
+    /// qu'elle reçoit attend dans `rx`.
+    pub aof_wait: bool,
+    /// Réponses retenues jusqu'au fsync qui les couvre (`appendfsync always`,
+    /// DURABILITY_DESIGN.md §7.5) : (début de la réponse dans `out`, marque).
+    /// Rien à partir du premier début retenu ne part (ordre des réponses).
+    pub holds: std::collections::VecDeque<(usize, u64)>,
     /// Canaux abonnés (Pub/Sub) ; non vide = mode abonné.
     pub channels: Vec<SharedByte>,
     /// Depuis quand `out` dépasse la limite souple des abonnés.
@@ -112,6 +120,8 @@ impl ConnOut {
             stop_turn: u64::MAX,
             last_active: Instant::now(),
             job_pending: false,
+            aof_wait: false,
+            holds: Default::default(),
             channels: Vec::new(),
             over_soft: None,
         }
@@ -119,5 +129,17 @@ impl ConnOut {
 
     pub fn send_in_flight(&self) -> bool {
         !self.sending.is_empty()
+    }
+
+    /// Octets de `out` qui peuvent partir : les réponses retenues dont la
+    /// marque est couverte sont libérées. `upto` : offset durable (`None` :
+    /// rien n'est retenu).
+    pub fn sendable(&mut self, upto: Option<u64>) -> usize {
+        if let Some(upto) = upto {
+            while self.holds.front().is_some_and(|&(_, m)| m <= upto) {
+                self.holds.pop_front();
+            }
+        }
+        self.holds.front().map_or(self.out.len(), |&(start, _)| start)
     }
 }

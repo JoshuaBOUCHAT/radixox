@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use io_uring::types::{BufRingEntry, Fd, Fixed, IOU_PBUF_RING_INC, SubmitArgs, Timespec};
 use io_uring::{EnterFlags, IoUring, cqueue, opcode, squeue};
 use oxidart::OxidArt;
-use radixox::exec::autosave;
+use radixox::exec::{aof, autosave};
 use radixox::tsc;
 use radixox::uring::{Bid, Completion, Config, Core, Op, Slot};
 
@@ -39,6 +39,8 @@ const K_CANCEL: u64 = 4;
 const K_CLOSE: u64 = 5;
 const K_SIGNAL: u64 = 6;
 const K_FILE: u64 = 7;
+const K_JWRITE: u64 = 8;
+const K_JSYNC: u64 = 9;
 
 fn ud(kind: u64, slot: Slot) -> u64 {
     kind << 32 | slot as u64
@@ -132,16 +134,19 @@ struct Server {
 struct Signals {
     fd: RawFd,
     buf: Box<libc::signalfd_siginfo>,
+    /// Save à l'arrêt (sinon : seulement le flux de l'AOF sur disque).
+    save: bool,
 }
 
 impl Signals {
     /// Save à l'arrêt : `RADIXOX_SAVE_ON_EXIT`, sinon `default` (des règles de
     /// save automatique sont actives : Redis sauve aussi à l'arrêt dans ce cas).
-    fn install(default: bool) -> io::Result<Option<Self>> {
-        let on = std::env::var("RADIXOX_SAVE_ON_EXIT").map_or(default, |v| {
+    /// Avec l'AOF, toujours installé : le flux en mémoire part sur disque.
+    fn install(default: bool, aof: bool) -> io::Result<Option<Self>> {
+        let save = std::env::var("RADIXOX_SAVE_ON_EXIT").map_or(default, |v| {
             matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
         });
-        if !on {
+        if !save && !aof {
             return Ok(None);
         }
         // SAFETY: masque initialisé, appels libc sur le thread principal.
@@ -157,7 +162,7 @@ impl Signals {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: structure C, tout à zéro est valide.
-        Ok(Some(Self { fd, buf: Box::new(unsafe { std::mem::zeroed() }) }))
+        Ok(Some(Self { fd, buf: Box::new(unsafe { std::mem::zeroed() }), save }))
     }
 
     fn read_sqe(&mut self) -> squeue::Entry {
@@ -172,9 +177,10 @@ extern "C" fn exit_now(_sig: i32) {
     unsafe { libc::_exit(130) }
 }
 
-/// Signal reçu : save puis sortie (second signal : sortie immédiate).
-fn shutdown(core: &mut Core) -> ! {
-    eprintln!("[shutdown] signal reçu : save puis sortie (second signal : sortie immédiate)");
+/// Signal reçu : flux de l'AOF sur disque, save si demandée, puis sortie
+/// (second signal : sortie immédiate).
+fn shutdown(core: &mut Core, save: bool) -> ! {
+    eprintln!("[shutdown] signal reçu : arrêt (second signal : sortie immédiate)");
     // La boucle ne lira plus la signalfd pendant la save : gestionnaire classique.
     // SAFETY: gestionnaire réduit à `_exit` ; masque initialisé.
     unsafe {
@@ -185,6 +191,13 @@ fn shutdown(core: &mut Core) -> ! {
         libc::sigaddset(&mut mask, libc::SIGINT);
         libc::sigaddset(&mut mask, libc::SIGTERM);
         libc::pthread_sigmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut());
+    }
+    if let Err(e) = core.flush_journal_sync() {
+        eprintln!("[shutdown] échec de l'écriture de l'AOF : {e}");
+        std::process::exit(1)
+    }
+    if !save {
+        std::process::exit(0)
     }
     // BGSAVE en cours : abandonné (la save d'arrêt le remplace).
     core.abort_bgsave();
@@ -275,6 +288,23 @@ impl Server {
                     .flags(io_uring::types::FsyncFlags::DATASYNC)
                     .build()
                     .user_data(ud(K_FILE, 0)),
+                // Second canal de fichiers : le segment de l'AOF (DURABILITY_DESIGN.md §7.3).
+                Op::JournalWrite { fd, off } => {
+                    // Le tampon reste intact jusqu'au CQE (invariant de l'écrivain).
+                    let buf = self.core.pending_journal_write();
+                    let sqe = opcode::Write::new(Fd(fd), buf.as_ptr(), buf.len() as u32)
+                        .offset(off)
+                        .build()
+                        .user_data(ud(K_JWRITE, 0));
+                    if self.file_async { sqe.flags(squeue::Flags::ASYNC) } else { sqe }
+                }
+                Op::JournalSync { fd } => {
+                    let sqe = opcode::Fsync::new(Fd(fd))
+                        .flags(io_uring::types::FsyncFlags::DATASYNC)
+                        .build()
+                        .user_data(ud(K_JSYNC, 0));
+                    if self.file_async { sqe.flags(squeue::Flags::ASYNC) } else { sqe }
+                }
                 Op::ProvideBuf { bid } => {
                     self.bufring.push(&mut self.core, bid);
                     provided = true;
@@ -320,8 +350,13 @@ impl Server {
                     more: cqueue::more(flags),
                 },
                 K_SEND => Completion::Send { slot, res },
-                K_SIGNAL => shutdown(&mut self.core),
+                K_SIGNAL => {
+                    let save = self.signals.as_ref().is_some_and(|s| s.save);
+                    shutdown(&mut self.core, save)
+                }
                 K_FILE => Completion::File { res },
+                K_JWRITE => Completion::JournalWrite { res },
+                K_JSYNC => Completion::JournalSync { res },
                 // Annulation d'une op déjà finie, close d'un slot : rien à faire.
                 K_CANCEL | K_CLOSE => {
                     if res < 0 && res != -libc::ENOENT && res != -libc::EALREADY {
@@ -568,6 +603,27 @@ fn setup_iowq(ring: &IoUring) -> io::Result<(bool, bool)> {
     Ok((send, file_cpus.is_some()))
 }
 
+/// Taille : octets, ou suffixe `kb` / `mb` / `gb` (puissances de 1024, comme Valkey).
+fn parse_size(v: &str) -> Option<u64> {
+    let v = v.trim().to_ascii_lowercase();
+    let (num, mul) = match v.strip_suffix("gb").or_else(|| v.strip_suffix('g')) {
+        Some(n) => (n, 1u64 << 30),
+        None => match v.strip_suffix("mb").or_else(|| v.strip_suffix('m')) {
+            Some(n) => (n, 1 << 20),
+            None => match v.strip_suffix("kb").or_else(|| v.strip_suffix('k')) {
+                Some(n) => (n, 1 << 10),
+                None => (v.as_str(), 1),
+            },
+        },
+    };
+    num.trim().parse::<u64>().ok()?.checked_mul(mul)
+}
+
+/// Variable booléenne (`yes`/`no`, `1`/`0`, `true`/`false`, `on`/`off`).
+fn env_yes(name: &str, default: bool) -> bool {
+    std::env::var(name).map_or(default, |v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
 fn build_ring() -> io::Result<IoUring> {
     IoUring::builder()
         .setup_single_issuer()
@@ -601,7 +657,42 @@ fn main() -> io::Result<()> {
 
     let mut art = OxidArt::new();
     art.tick();
-    radixox::exec::persist::load_at_startup(&mut art)?;
+    // AOF (DURABILITY_DESIGN.md §9) : reprise depuis `appendonlydir`, ou premier
+    // démarrage depuis `dump.rxd` suivi de la création de la base.
+    let aof = if env_yes("RADIXOX_APPENDONLY", false) {
+        let fsync = std::env::var("RADIXOX_APPENDFSYNC")
+            .map_or(Ok(aof::Fsync::EverySec), |v| aof::Fsync::parse(&v))
+            .map_err(|e| io::Error::other(format!("RADIXOX_APPENDFSYNC : {e}")))?;
+        let dir = aof::aof_dir();
+        let start = Instant::now();
+        let res = match aof::recover(&mut art, &dir, env_yes("RADIXOX_AOF_LOAD_TRUNCATED", true))? {
+            Some(res) => {
+                println!(
+                    "[aof] {} : base {} + {} segment(s), {} blocs, {:.1} MB de flux, en {:.2?}",
+                    dir.display(),
+                    res.manifest.base,
+                    res.manifest.incrs.len(),
+                    res.cursor.seq,
+                    res.cursor.offset as f64 / 1e6,
+                    start.elapsed()
+                );
+                res
+            }
+            None => {
+                radixox::exec::persist::load_at_startup(&mut art)?;
+                let res = aof::create(&mut art, &dir)?;
+                println!("[aof] {} créé (base.1.rxdb, journal.1.rxj)", dir.display());
+                res
+            }
+        };
+        aof::remove_unlisted(&dir, &res.manifest)?;
+        let writer = aof::AofWriter::open(&dir, &res, fsync)?;
+        art.tick();
+        Some((radixox::exec::journal::Stream::new(res.cursor), writer))
+    } else {
+        radixox::exec::persist::load_at_startup(&mut art)?;
+        None
+    };
 
     let ring = build_ring()?;
     let mut cfg = Config::default();
@@ -631,12 +722,28 @@ fn main() -> io::Result<()> {
     let no_iowait = ring.params().is_feature_no_iowait();
     let (send_async, file_async) = setup_iowq(&ring)?;
     let min_wait = min_wait(&ring);
+    if let Some(mb) = std::env::var("RADIXOX_AOF_MAX_PENDING_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
+        cfg.aof_max_pending = mb.max(1) << 20;
+    }
+    // `auto-aof-rewrite-percentage` (0 = jamais) et `auto-aof-rewrite-min-size`.
+    if let Some(p) = std::env::var("RADIXOX_AUTO_AOF_REWRITE_PERCENTAGE").ok().and_then(|v| v.parse::<u64>().ok()) {
+        cfg.aof_rewrite_percentage = p;
+    }
+    if let Ok(v) = std::env::var("RADIXOX_AUTO_AOF_REWRITE_MIN_SIZE") {
+        cfg.aof_rewrite_min_size =
+            parse_size(&v).ok_or_else(|| io::Error::other(format!("RADIXOX_AUTO_AOF_REWRITE_MIN_SIZE : {v:?}")))?;
+    }
+    let aof_on = aof.is_some();
     let mut core = Core::new(cfg, art);
+    if let Some((stream, writer)) = aof {
+        core.set_aof(stream, writer);
+    }
     let bufring = BufRing::new(&ring, &mut core)?;
     let listener = TcpListener::bind(&addr)?;
     println!("RadixOx RESP Server (io_uring loop) listening on {addr}");
 
-    let signals = Signals::install(core.autosave_on())?;
+    // Avec l'AOF, le flux suffit à l'arrêt : pas de save par défaut.
+    let signals = Signals::install(core.autosave_on() && !aof_on, aof_on)?;
     let mut server = Server { ring, bufring, core, listener, ops: Vec::new(), no_iowait, send_async, file_async, min_wait,
         signals,
     };

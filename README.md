@@ -29,8 +29,10 @@ Good fit today:
 
 Missing for primary data:
 - **no memory limit or eviction** (`maxmemory`, LRU/LFU): a growing dataset ends in OOM;
-- **snapshots only, no AOF**: automatic `BGSAVE` rules as in Valkey and a save on SIGTERM,
-  but a crash loses everything written since the last snapshot;
+- **AOF, no replication yet**: `RADIXOX_APPENDONLY=yes` logs every write (`everysec`, `no`, or
+  `always` with group commit), rewrites the log in the background and replays it at startup; without
+  it, automatic `BGSAVE` rules as in Valkey and a save on SIGTERM, and a crash loses what was
+  written since the last snapshot;
 - no replication, no cluster, no TLS, no ACLs (one password);
 - no lists, `MULTI`/`EXEC` or Lua, which queue and job libraries (Sidekiq, Celery, BullMQ)
   rely on;
@@ -491,7 +493,7 @@ own synchronization.
 
 | Category | Commands |
 |---|---|
-| Connection / server | `PING` `AUTH` `HELLO` (RESP2; `HELLO 3` → `-NOPROTO`) `CLIENT` (`SETNAME` `GETNAME` `ID` `SETINFO`) `COMMAND` `ECHO` `QUIT` `SELECT` `INFO` `DBSIZE` `FLUSHDB` `SAVE` `BGSAVE` `LASTSAVE` |
+| Connection / server | `PING` `AUTH` `HELLO` (RESP2; `HELLO 3` → `-NOPROTO`) `CLIENT` (`SETNAME` `GETNAME` `ID` `SETINFO`) `COMMAND` `ECHO` `QUIT` `SELECT` `INFO` `DBSIZE` `FLUSHDB` `SAVE` `BGSAVE` `BGREWRITEAOF` `LASTSAVE` |
 | Strings | `GET` `SET` (`EX` `PX` `NX` `XX`) `SETNX` `SETEX` `MGET` `MSET` |
 | Counters | `INCR` `DECR` `INCRBY` `DECRBY` |
 | Keys | `DEL` `UNLINK` `EXISTS` `TYPE` `KEYS` `SCAN` (`MATCH` `COUNT` `TYPE`) |
@@ -535,9 +537,31 @@ replication, cluster.
   truncated or corrupted dump prevents startup instead of loading partial data.
 - **Save on SIGINT / SIGTERM** when automatic saves are on, as Valkey does
   (`RADIXOX_SAVE_ON_EXIT=0` / `1` to force).
-- Not yet: AOF, `CONFIG GET` / `CONFIG SET` (settings are environment variables).
+- **Append-only file** (`RADIXOX_APPENDONLY=yes`, in progress): the commands received are
+  logged in blocks, one per loop turn, each carrying the clock of its turn, so that TTLs and
+  lazy expiry replay identically; only non-deterministic commands are rewritten (`SPOP` →
+  `SREM` of the popped members). Files live in `RADIXOX_DIR/appendonlydir/` (a base dump, log
+  segments preallocated by 64 MiB, a manifest); at startup the base is loaded, its content
+  digest checked, and the segments replayed; a block cut by a crash at the end of the last
+  segment is truncated (`RADIXOX_AOF_LOAD_TRUNCATED`), anything else inconsistent prevents
+  startup. `appendfsync everysec` (default), `no`, or `always`: replies — to writes, and to
+  reads that may have seen a write not yet on disk — are held until the `fdatasync` that
+  covers them, one `fdatasync` in flight at a time, everything that arrives meanwhile goes into
+  the next one (group commit; the loop never blocks). Writes are refused with `-MISCONF` while
+  the log cannot be written, and writers wait when the disk falls behind by more than
+  `RADIXOX_AOF_MAX_PENDING_MB`. `INFO` reports `aof_*` fields.
+- **Log rewrite**: with the AOF on, every `BGSAVE` (command, automatic rule, `BGREWRITEAOF`,
+  or the log growing past `RADIXOX_AUTO_AOF_REWRITE_PERCENTAGE` % of the base and
+  `RADIXOX_AUTO_AOF_REWRITE_MIN_SIZE`) writes a new base at an exact cut point in the stream
+  of commands, in slices as any `BGSAVE`, while the log moves on to a new segment; the old
+  files are deleted once the new manifest is on disk. `SAVE` still writes `dump.rxd`.
+- Not yet: replication.
+- Every dump ends with a **content digest** checked at load time, computed by two different
+  traversals (the save's and one of the reloaded tree): a dump that reloads into anything but
+  the saved state is refused.
+- Not yet: `CONFIG GET` / `CONFIG SET` (settings are environment variables).
 
-Design: [`SAVE_DESIGN.md`](SAVE_DESIGN.md).
+Design: [`SAVE_DESIGN.md`](SAVE_DESIGN.md), [`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md).
 
 ---
 
@@ -559,6 +583,11 @@ Environment variables:
 | `RADIXOX_SAVE` | `3600 1 300 100 60 10000` | automatic `BGSAVE` rules, Valkey's `save` syntax: pairs `<seconds> <changes>`; `""` disables |
 | `RADIXOX_STOP_WRITES_ON_BGSAVE_ERROR` | on | refuse writes (`-MISCONF`) after a failed `BGSAVE` while automatic saves are on |
 | `RADIXOX_SAVE_ON_EXIT` | on with automatic saves | save on SIGINT / SIGTERM |
+| `RADIXOX_APPENDONLY` | `no` | append-only file in `RADIXOX_DIR/appendonlydir/` (created from `dump.rxd` the first time) |
+| `RADIXOX_APPENDFSYNC` | `everysec` | `everysec` (one `fdatasync` per second, off the loop), `no` (left to the kernel), or `always` (replies wait for the `fdatasync` covering them, group commit) |
+| `RADIXOX_AOF_LOAD_TRUNCATED` | `yes` | at startup, cut a block left incomplete by a crash at the end of the log instead of refusing to start |
+| `RADIXOX_AOF_MAX_PENDING_MB` | `64` | log bytes not yet written beyond which writers wait (reads go on) |
+| `RADIXOX_AUTO_AOF_REWRITE_PERCENTAGE` / `_MIN_SIZE` | `100` / `64mb` | rewrite the log when it has grown by this percentage of the base and at least this size (`0` = never) |
 | `RADIXOX_SAVE_CPU_SHARE` | `0.1` | share of the server thread a `BGSAVE` is guaranteed while clients are active; whenever no client and no kernel completion is waiting, background work (save, `FLUSHDB` freeing, long `KEYS`) runs uncapped |
 | `RADIXOX_SCAN_IDLE_SECS` | `60` | idle time after which a `SCAN` cursor can be reclaimed |
 | `RADIXOX_SCAN_MAX_CURSORS` | `65536` | active `SCAN` cursors at most; beyond, a new `SCAN` gets an error |
@@ -686,7 +715,7 @@ across cores is meant to come from sharding by namespace, not from shared-state 
 - **Atomic conditional transactions**: `MULTI ATOMIC` where an empty read aborts the whole
   block, `DELPREFIX` (delete a whole namespace in O(prefix length)), durable commits —
   [`TX_DESIGN.md`](TX_DESIGN.md).
-- AOF and replication (sharing one stream of effects).
+- Replication fed by the same stream of blocks as the AOF ([`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md)).
 - Lower memory per key on random keys: long suffixes stored inline on several cells (no
   separate allocation), a smaller node class for nodes with two or three entries.
 - Client compatibility: `CONFIG`, RESP3.

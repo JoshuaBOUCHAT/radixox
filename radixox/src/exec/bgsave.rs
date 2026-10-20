@@ -11,14 +11,13 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use oxidart::compress::ZstdStream;
 use oxidart::save::format;
 use oxidart::{OxidArt, SaveCursor};
 
-use super::persist::{FILE_NAME, TMP_NAME, save_dir};
+use super::persist::Target;
 
 /// Budget d'une tranche de DFS ou de vidage (nœuds).
 const TRANCHE_BUDGET: u32 = 512;
@@ -110,7 +109,8 @@ enum Phase {
 }
 
 pub struct BgSave {
-    dir: PathBuf,
+    /// Fichier visé (`dump.rxd`, ou une base de l'AOF) et position du flux.
+    target: Target,
     file: std::fs::File,
     pos: u64,
     cur: Option<SaveCursor>,
@@ -140,11 +140,10 @@ pub struct BgSave {
 }
 
 impl BgSave {
-    /// Ouvre `dump.rxd.tmp` et la barrière de save.
-    pub fn start(art: &mut OxidArt, zstd: Option<ZstdConf>) -> io::Result<Self> {
+    /// Ouvre le fichier temporaire de `target` et la barrière de save.
+    pub fn start(art: &mut OxidArt, zstd: Option<ZstdConf>, target: Target) -> io::Result<Self> {
         let t0 = Instant::now();
-        let dir = save_dir();
-        let file = std::fs::File::create(dir.join(TMP_NAME))?;
+        let file = std::fs::File::create(target.dir.join(&target.tmp))?;
         let mut comp = zstd.map(|c| Compress {
             z: ZstdStream::new(c.level),
             raw: Vec::with_capacity(CHUNK + CHUNK / 4),
@@ -156,15 +155,15 @@ impl BgSave {
         let mut fill = Vec::with_capacity(CHUNK + CHUNK / 4);
         let cur = match &mut comp {
             Some(c) => {
-                let cur = art.save_start(&mut c.raw);
+                let cur = art.save_start_at(&mut c.raw, &target.pos);
                 c.crc.update(&c.raw);
                 cur
             }
-            None => art.save_start(&mut fill),
+            None => art.save_start_at(&mut fill, &target.pos),
         };
         let start_took = t0.elapsed();
         Ok(Self {
-            dir,
+            target,
             file,
             pos: 0,
             cur: Some(cur),
@@ -355,12 +354,18 @@ impl BgSave {
             return;
         }
         let t = Instant::now();
-        let r = std::fs::rename(self.dir.join(TMP_NAME), self.dir.join(FILE_NAME))
-            .and_then(|_| std::fs::File::open(&self.dir)?.sync_all());
+        let t_ = &self.target;
+        let r = std::fs::rename(t_.dir.join(&t_.tmp), t_.dir.join(&t_.name))
+            .and_then(|_| std::fs::File::open(&t_.dir)?.sync_all());
         self.finalize_took = t.elapsed();
         if let Err(e) = r {
             self.err = Some(e);
         }
+    }
+
+    /// Fichier visé.
+    pub fn target(&self) -> &Target {
+        &self.target
     }
 
     /// Fini (ou en erreur et plus rien en vol) : rend le résultat.
@@ -393,7 +398,7 @@ impl BgSave {
             art.finish_save();
         }
         self.phase = Phase::Done;
-        let _ = std::fs::remove_file(self.dir.join(TMP_NAME));
+        let _ = std::fs::remove_file(self.target.dir.join(&self.target.tmp));
     }
 
     /// Le fsync final est en vol.

@@ -60,6 +60,14 @@ struct Fake {
     idle_work: bool,
     /// Horloge murale du TTL (secondes), posée à chaque tour si définie.
     wall: Option<u64>,
+    /// Écritures du segment de l'AOF partielles (au plus ce nombre d'octets).
+    journal_write_max: Option<usize>,
+    /// Disque bloqué : les écritures de l'AOF restent en vol.
+    journal_stalled: bool,
+    journal_held: Vec<Op>,
+    /// fsync de l'AOF retenus (disque lent à commiter).
+    sync_stalled: bool,
+    sync_held: Vec<Op>,
 }
 
 impl Fake {
@@ -81,6 +89,11 @@ impl Fake {
             clock: Instant::now(),
             idle_work: false,
             wall: None,
+            journal_write_max: None,
+            journal_stalled: false,
+            journal_held: Vec::new(),
+            sync_stalled: false,
+            sync_held: Vec::new(),
         }
     }
 
@@ -90,6 +103,14 @@ impl Fake {
 
     /// Le noyau exécute les opérations soumises au tour précédent.
     fn apply_ops(&mut self) {
+        if !self.journal_stalled {
+            let held = std::mem::take(&mut self.journal_held);
+            self.ops.splice(0..0, held);
+        }
+        if !self.sync_stalled {
+            let held = std::mem::take(&mut self.sync_held);
+            self.ops.splice(0..0, held);
+        }
         for op in std::mem::take(&mut self.ops) {
             match op {
                 Op::AcceptMulti => {}
@@ -151,6 +172,24 @@ impl Fake {
                     // SAFETY: fd ouvert par le BGSAVE.
                     let res = unsafe { libc::fdatasync(fd) };
                     self.completions.push(Completion::File { res });
+                }
+                // Segment de l'AOF : écritures réelles (relues par le test).
+                Op::JournalWrite { .. } if self.journal_stalled => self.journal_held.push(op),
+                Op::JournalSync { .. } if self.sync_stalled => self.sync_held.push(op),
+                Op::JournalWrite { fd, off } => {
+                    let buf = self.core.pending_journal_write();
+                    let n = match self.journal_write_max {
+                        Some(max) => buf.len().min(max),
+                        None => buf.len(),
+                    };
+                    // SAFETY: fd ouvert par l'écrivain, tampon valide.
+                    let res = unsafe { libc::pwrite(fd, buf.as_ptr().cast(), n, off as i64) };
+                    self.completions.push(Completion::JournalWrite { res: res as i32 });
+                }
+                Op::JournalSync { fd } => {
+                    // SAFETY: fd ouvert par l'écrivain.
+                    let res = unsafe { libc::fdatasync(fd) };
+                    self.completions.push(Completion::JournalSync { res });
                 }
             }
         }
@@ -1135,5 +1174,244 @@ fn aof_unlisted_files_are_removed() {
         std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
     names.sort();
     assert_eq!(names, ["base.1.rxdb", "journal.1.rxj", "manifest", "notes.txt"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── AOF pendant le service (DURABILITY_DESIGN.md §7) ────────────────────────
+
+/// Serveur sur le faux noyau avec l'AOF dans `dir` (créé vide).
+fn fake_with_aof(dir: &std::path::Path, cfg: Config) -> Fake {
+    fake_with_aof_fsync(dir, cfg, crate::exec::aof::Fsync::EverySec)
+}
+
+fn fake_with_aof_fsync(dir: &std::path::Path, cfg: Config, fsync: crate::exec::aof::Fsync) -> Fake {
+    use crate::exec::aof;
+    let mut f = Fake::new(cfg);
+    let res = aof::create(&mut f.core.art, dir).unwrap();
+    let w = aof::AofWriter::open(dir, &res, fsync).unwrap();
+    f.core.set_aof(crate::exec::journal::Stream::new(res.cursor), w);
+    f
+}
+
+#[test]
+fn aof_files_replay_to_the_served_state() {
+    let dir = test_dir("aof-serve");
+    for seed in 1..=10u64 {
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut f = fake_with_aof(&dir, Config { max_conn: 8, reserved: 0, ..Config::default() });
+        f.journal_write_max = (seed % 2 == 0).then(|| 1 + rng.below(100) as usize);
+        let mut wall = 1_000u64;
+        f.wall = Some(wall);
+        let conns: Vec<Slot> = (0..1 + rng.below(3)).map(|_| f.connect()).collect();
+        for round in 0..20 {
+            for &c in &conns {
+                for _ in 0..rng.below(10) {
+                    f.send(c, &resp(&random_write(&mut rng, true)));
+                }
+            }
+            f.step();
+            wall += rng.below(3);
+            f.wall = Some(wall);
+            if round % 7 == 0 {
+                // Timer d'une seconde : fsync `everysec`.
+                f.clock += Duration::from_secs(1);
+                f.core.set_now(f.clock);
+                f.core.fire_timers();
+            }
+        }
+        f.settle();
+        assert_eq!(f.core.aof_pending(), 0);
+        let mut back = OxidArt::new();
+        crate::exec::aof::recover(&mut back, &dir, false).unwrap().unwrap();
+        back.set_now(f.core.art.now);
+        assert_eq!(state(&mut back), state(&mut f.core.art), "graine {seed}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Disque bloqué au-delà du plafond : les écritures attendent sans réponse,
+/// les lectures sont servies ; au déblocage, tout s'exécute dans l'ordre.
+#[test]
+fn aof_backlog_parks_writers_not_readers() {
+    let dir = test_dir("aof-cap");
+    let mut f = fake_with_aof(&dir, Config { max_conn: 8, reserved: 0, aof_max_pending: 200, ..Config::default() });
+    let (w, r) = (f.connect(), f.connect());
+    f.journal_stalled = true;
+    // Assez d'écritures pour dépasser 200 octets de flux fermé.
+    for i in 0..20 {
+        f.send(w, format!("SET k{i} {i}\r\n").as_bytes());
+        f.step();
+    }
+    f.settle();
+    let before = f.take(w);
+    assert!(before.matches("+OK").count() < 20, "des écritures attendent : {before:?}");
+    assert!(f.core.aof_pending() > 200);
+    f.send(r, b"GET k0\r\n");
+    f.settle();
+    assert_eq!(f.take(r), "$1\r\n0\r\n");
+    // Disque débloqué : la suite s'exécute.
+    f.journal_stalled = false;
+    f.settle();
+    let after = f.take(w);
+    assert_eq!(before.matches("+OK").count() + after.matches("+OK").count(), 20);
+    f.send(r, b"GET k19\r\n");
+    f.settle();
+    assert_eq!(f.take(r), "$2\r\n19\r\n");
+    let mut back = OxidArt::new();
+    crate::exec::aof::recover(&mut back, &dir, false).unwrap().unwrap();
+    back.set_now(f.core.art.now);
+    assert_eq!(state(&mut back), state(&mut f.core.art));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Réécriture (DURABILITY_DESIGN.md §8, tests 6 et 1 depuis une base) ──────
+
+fn manifest_of(dir: &std::path::Path) -> crate::exec::aof::Manifest {
+    crate::exec::aof::Manifest::read(dir).unwrap().unwrap()
+}
+
+/// `SET a 1`, `BGSAVE`, `SET a 2` dans un même pipeline : la base contient
+/// `a=1`, le segment suivant `SET a 2`, la reprise donne `a=2`.
+#[test]
+fn rewrite_cut_is_exact_inside_a_pipeline() {
+    let dir = test_dir("aof-cut");
+    let mut f = fake_with_aof(&dir, Config { max_conn: 8, reserved: 0, ..Config::default() });
+    f.idle_work = true;
+    f.wall = Some(1_000);
+    let c = f.connect();
+    f.send(c, b"SET a 1\r\nBGSAVE\r\nSET a 2\r\n");
+    f.settle();
+    assert_eq!(f.take(c), "+OK\r\n+Background saving started\r\n+OK\r\n");
+    assert!(!f.core.bgsave_running());
+    let m = manifest_of(&dir);
+    assert_eq!(m.base, "base.2.rxdb");
+    assert_eq!(m.incrs, ["journal.2.rxj"]);
+    // La base : a=1, au bloc CUT.
+    let mut base = OxidArt::new();
+    let stats = base.load_file(std::fs::File::open(dir.join(&m.base)).unwrap()).unwrap();
+    assert_eq!((stats.pos.seq, stats.pos.offset), (m.base_seq, m.base_offset));
+    assert!(matches!(base.get(b"a"), Some(oxidart::value::Value::String(v)) if v.as_slice() == b"1"));
+    // Le segment suivant : SET a 2 seulement.
+    let seg = std::fs::read(dir.join("journal.2.rxj")).unwrap();
+    let mut cur = crate::exec::journal::Cursor { seq: m.base_seq, offset: m.base_offset, now: 0 };
+    let (_, payload) = crate::exec::journal::read_block(&seg, &mut cur).unwrap();
+    assert_eq!(payload, b"SET a 2\r\n");
+    // Anciens fichiers supprimés ; reprise = a=2.
+    assert!(!dir.join("base.1.rxdb").exists() && !dir.join("journal.1.rxj").exists());
+    let (got, _) = recover_state(&dir, 1_000, false).unwrap();
+    assert_eq!(got, ["a str 2 KeyWithoutTtl"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Flux aléatoire avec des BGSAVE (réécritures) intercalés, écritures du
+/// segment partielles : la reprise depuis la dernière base et ses segments
+/// redonne l'état servi.
+#[test]
+fn rewrites_under_random_traffic_replay_to_the_served_state() {
+    let dir = test_dir("aof-rewrite");
+    for seed in 1..=12u64 {
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
+        let mut f = fake_with_aof(&dir, Config { max_conn: 8, reserved: 0, ..Config::default() });
+        f.idle_work = seed % 2 == 0;
+        f.journal_write_max = (seed % 3 == 0).then(|| 1 + rng.below(300) as usize);
+        let mut wall = 1_000u64;
+        f.wall = Some(wall);
+        let conns: Vec<Slot> = (0..1 + rng.below(3)).map(|_| f.connect()).collect();
+        for _ in 0..40 {
+            for &c in &conns {
+                for _ in 0..rng.below(10) {
+                    let cmd = if rng.below(40) == 0 { vec!["BGSAVE".to_string()] } else { random_write(&mut rng, true) };
+                    f.send(c, &resp(&cmd));
+                }
+            }
+            for _ in 0..1 + rng.below(3) {
+                f.step();
+            }
+            wall += rng.below(3);
+            f.wall = Some(wall);
+            if rng.below(5) == 0 {
+                f.clock += Duration::from_secs(1);
+                f.core.set_now(f.clock);
+                f.core.fire_timers();
+            }
+        }
+        f.settle();
+        // Une dernière réécriture menée à son terme.
+        while f.core.bgsave_running() || f.core.aof().unwrap().rewriting() {
+            f.step();
+        }
+        let m = manifest_of(&dir);
+        let files = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(files, 2 + m.incrs.len(), "graine {seed} : fichiers non cités restants");
+        let (got, _) = recover_state(&dir, f.core.art.now, false).unwrap();
+        assert_eq!(got, state(&mut f.core.art), "graine {seed}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── appendfsync always : commit groupé (DURABILITY_DESIGN.md §7.5, test 8) ──
+
+#[test]
+fn always_holds_replies_until_their_fsync() {
+    use crate::exec::aof::Fsync;
+    let dir = test_dir("aof-always");
+    let mut f = fake_with_aof_fsync(&dir, Config { max_conn: 8, reserved: 0, ..Config::default() }, Fsync::Always);
+    f.wall = Some(1_000);
+    let (w, r) = (f.connect(), f.connect());
+    // Rien de non durable : une lecture répond tout de suite.
+    f.send(r, b"GET a\r\n");
+    f.settle();
+    assert_eq!(f.take(r), "$-1\r\n");
+    f.sync_stalled = true;
+    f.send(w, b"SET a 1\r\n");
+    f.settle();
+    assert_eq!(f.take(w), "", "écriture acquittée avant son fsync");
+    // Une lecture qui voit l'écriture non durable attend aussi.
+    f.send(r, b"GET a\r\nPING\r\n");
+    f.settle();
+    assert_eq!(f.take(r), "", "lecture d'une donnée non durable");
+    f.sync_stalled = false;
+    f.settle();
+    assert_eq!(f.take(w), "+OK\r\n");
+    assert_eq!(f.take(r), "$1\r\n1\r\n+PONG\r\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Flux aléatoire en `always`, fsync retenus par moments : toutes les
+/// réponses finissent par partir, dans l'ordre, et les fichiers redonnent
+/// l'état servi.
+#[test]
+fn always_random_traffic_replays_and_answers() {
+    use crate::exec::aof::Fsync;
+    let dir = test_dir("aof-always-rand");
+    for seed in 1..=10u64 {
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut f = fake_with_aof_fsync(&dir, Config { max_conn: 8, reserved: 0, flush_early: 1 + rng.below(100) as usize, ..Config::default() }, Fsync::Always);
+        f.journal_write_max = (seed % 2 == 0).then(|| 1 + rng.below(100) as usize);
+        f.wall = Some(1_000);
+        let conns: Vec<Slot> = (0..1 + rng.below(3)).map(|_| f.connect()).collect();
+        let mut sent = vec![0usize; conns.len()];
+        for _ in 0..30 {
+            f.sync_stalled = rng.below(3) == 0;
+            for (i, &c) in conns.iter().enumerate() {
+                for _ in 0..rng.below(8) {
+                    f.send(c, b"INCR n\r\n");
+                    sent[i] += 1;
+                }
+            }
+            f.step();
+        }
+        f.sync_stalled = false;
+        f.settle();
+        for (i, &c) in conns.iter().enumerate() {
+            let got = f.take(c);
+            assert_eq!(got.matches(':').count(), sent[i], "graine {seed}");
+        }
+        let (got, _) = recover_state(&dir, 1_000, false).unwrap();
+        assert_eq!(got, state(&mut f.core.art), "graine {seed}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

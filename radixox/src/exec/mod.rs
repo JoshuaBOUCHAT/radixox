@@ -71,6 +71,7 @@ pub fn execute_into<'a>(
         | Cmd::Unlink(_)
         | Cmd::FlushDb
         | Cmd::BgSave
+        | Cmd::BgRewriteAof
         | Cmd::Save
         | Cmd::LastSave
         | Cmd::Info => return Executed::Runtime(cmd),
@@ -191,6 +192,7 @@ pub fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         | Cmd::MGet(_)
         | Cmd::Unlink(_)
         | Cmd::BgSave
+        | Cmd::BgRewriteAof
         | Cmd::Save
         | Cmd::LastSave
         | Cmd::Info

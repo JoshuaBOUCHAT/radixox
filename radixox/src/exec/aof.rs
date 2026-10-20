@@ -389,6 +389,461 @@ pub fn remove_unlisted(dir: &Path, m: &Manifest) -> io::Result<()> {
     Ok(())
 }
 
+// ── Écriture pendant le service (§7.3, §7.4, §7.7) ─────────────────────────
+
+/// `RADIXOX_APPENDFSYNC`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fsync {
+    /// Jamais (sauf à la rotation d'un segment) : le noyau écrit quand il veut.
+    No,
+    /// `fdatasync` toutes les secondes, jamais deux en vol.
+    EverySec,
+    /// Commit groupé : fsync dès qu'il y a du non-durable, un seul en vol ;
+    /// les réponses attendent le fsync qui les couvre (§7.5).
+    Always,
+}
+
+impl Fsync {
+    pub fn parse(v: &str) -> Result<Self, String> {
+        match v.to_ascii_lowercase().as_str() {
+            "no" => Ok(Fsync::No),
+            "everysec" => Ok(Fsync::EverySec),
+            "always" => Ok(Fsync::Always),
+            _ => Err(format!("appendfsync inconnu : {v:?} (no, everysec, always)")),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Fsync::No => "no",
+            Fsync::EverySec => "everysec",
+            Fsync::Always => "always",
+        }
+    }
+}
+
+/// Octets écrits par opération au plus (plusieurs blocs fermés à la suite).
+const WRITE_MAX: usize = 4 << 20;
+
+/// Opération de fichier demandée par l'écrivain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AofOp {
+    /// Écrire [`AofWriter::writing`] à `off` dans le fichier `fd`.
+    Write { fd: i32, off: u64 },
+    Sync { fd: i32 },
+}
+
+/// Passage au segment suivant après un `CUT` (§8.1, §8.3).
+#[derive(Debug)]
+struct Rotation {
+    /// Offset du flux après le bloc `CUT` : fin du segment courant.
+    boundary: u64,
+    /// Numéro du segment suivant (et de la base de la réécriture).
+    index: u64,
+    /// fsync couvrant la frontière soumis.
+    sync_sent: bool,
+    /// Frontière écrite et fsyncée : reste à créer le segment suivant.
+    synced: bool,
+}
+
+/// Écrivain du segment courant : machine à états sans I/O, comme le BGSAVE.
+/// Le cœur demande les opérations ([`next_op`](Self::next_op)), les soumet
+/// et rend leurs résultats ; une seule écriture et un seul fsync en vol.
+pub struct AofWriter {
+    pub dir: PathBuf,
+    pub manifest: Manifest,
+    file: File,
+    /// Fin logique du segment : octets écrits avec succès.
+    file_end: u64,
+    /// Taille préallouée du fichier.
+    reserved: u64,
+    /// Octets à écrire (en vol, ou à réessayer après une erreur), à partir de `done`.
+    writing: Vec<u8>,
+    done: usize,
+    in_flight: bool,
+    pub fsync: Fsync,
+    /// Timer d'une seconde passé (`everysec`) : un fsync est dû.
+    sync_due: bool,
+    /// fsync en vol : offset du flux qu'il couvrira.
+    syncing: Option<u64>,
+    /// Offset du flux écrit (cache de pages) / couvert par le dernier fsync réussi.
+    pub written: u64,
+    pub durable: u64,
+    write_err: Option<String>,
+    fsync_err: Option<String>,
+    /// Après une erreur d'écriture : pas de nouvel essai avant.
+    retry_at: Option<std::time::Instant>,
+    base_size: u64,
+    /// fsync dus alors que le précédent était encore en vol.
+    delayed_fsync: u64,
+    rotation: Option<Rotation>,
+    /// Base écrite par une réécriture finie avant la rotation : publiée après.
+    pending_base: Option<(String, JournalPos)>,
+}
+
+impl AofWriter {
+    /// Ouvre le segment courant de la reprise, prêt à écrire à sa fin logique.
+    pub fn open(dir: &Path, res: &Resume, fsync: Fsync) -> io::Result<Self> {
+        let name = res.manifest.incrs.last().ok_or_else(|| invalid("manifeste sans segment".into()))?;
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(dir.join(name))?;
+        let base_size = std::fs::metadata(dir.join(&res.manifest.base)).map(|m| m.len()).unwrap_or(0);
+        let reserved = file.metadata()?.len();
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            manifest: res.manifest.clone(),
+            file,
+            file_end: res.tail_end,
+            reserved,
+            writing: Vec::new(),
+            done: 0,
+            in_flight: false,
+            fsync,
+            sync_due: false,
+            syncing: None,
+            written: res.cursor.offset,
+            durable: res.cursor.offset,
+            write_err: None,
+            fsync_err: None,
+            retry_at: None,
+            base_size,
+            delayed_fsync: 0,
+            rotation: None,
+            pending_base: None,
+        })
+    }
+
+    fn fd(&self) -> i32 {
+        use std::os::fd::AsRawFd;
+        self.file.as_raw_fd()
+    }
+
+    /// Prochaine opération à soumettre, s'il y en a une : fsync de rotation,
+    /// écriture (reprise d'une écriture partielle ou en erreur, sinon blocs
+    /// fermés du flux, jamais au-delà d'une frontière de rotation), fsync
+    /// `everysec`. À rappeler tant qu'elle rend quelque chose.
+    pub fn next_op(&mut self, stream: &mut super::journal::Stream, now: std::time::Instant) -> Option<AofOp> {
+        if let Some(rot) = &mut self.rotation
+            && !rot.sync_sent
+            && self.written == rot.boundary
+            && !self.in_flight
+            && self.syncing.is_none()
+        {
+            rot.sync_sent = true;
+            self.syncing = Some(self.written);
+            return Some(AofOp::Sync { fd: self.fd() });
+        }
+        if self.rotation.as_ref().is_some_and(|r| r.synced) && self.retry_due(now) {
+            self.finish_rotation(now);
+        }
+        if !self.in_flight && !self.retry_at.is_some_and(|t| now < t) && self.prepare_write(stream, now) {
+            self.in_flight = true;
+            return Some(AofOp::Write { fd: self.fd(), off: self.file_end });
+        }
+        let due = self.sync_due || self.fsync == Fsync::Always;
+        if due && self.syncing.is_none() && self.fsync_err.is_none() && self.durable < self.written {
+            self.sync_due = false;
+            self.syncing = Some(self.written);
+            return Some(AofOp::Sync { fd: self.fd() });
+        }
+        None
+    }
+
+    /// Des octets à écrire dans `writing`, la place réservée. `false` : rien
+    /// à écrire, ou préallocation en échec.
+    fn prepare_write(&mut self, stream: &mut super::journal::Stream, now: std::time::Instant) -> bool {
+        if self.done == self.writing.len() {
+            self.writing.clear();
+            self.done = 0;
+            let limit = match &self.rotation {
+                // Le segment courant s'arrête à la frontière ; la suite attend
+                // le segment suivant.
+                Some(r) if r.synced || r.sync_sent => 0,
+                Some(r) => r.boundary - self.written,
+                None => u64::MAX,
+            };
+            stream.take_closed(&mut self.writing, WRITE_MAX, limit);
+            if self.writing.is_empty() {
+                return false;
+            }
+        }
+        let end = self.file_end + (self.writing.len() - self.done) as u64;
+        while self.reserved < end {
+            if let Err(e) = preallocate(&self.file, self.reserved) {
+                self.fail_write(format!("préallocation : {e}"), now);
+                return false;
+            }
+            self.reserved += PREALLOC;
+        }
+        true
+    }
+
+    /// Octets de l'écriture en vol.
+    pub fn writing(&self) -> &[u8] {
+        &self.writing[self.done..]
+    }
+
+    fn fail_write(&mut self, msg: String, now: std::time::Instant) {
+        if self.fsync == Fsync::Always {
+            // Des réponses retenues ne peuvent plus être garanties (§7.7).
+            eprintln!("[aof] erreur d'écriture en appendfsync always : {msg} ; arrêt");
+            std::process::exit(1);
+        }
+        if self.write_err.is_none() {
+            eprintln!("[aof] erreur d'écriture : {msg} ; écritures refusées, nouvel essai chaque seconde");
+        }
+        self.write_err = Some(msg);
+        self.retry_at = Some(now + std::time::Duration::from_secs(1));
+    }
+
+    /// CQE de l'écriture : octets écrits ou `-errno`.
+    pub fn write_done(&mut self, res: i32, now: std::time::Instant) {
+        debug_assert!(self.in_flight);
+        self.in_flight = false;
+        if res < 0 {
+            self.fail_write(io::Error::from_raw_os_error(-res).to_string(), now);
+            return;
+        }
+        let n = res as usize;
+        if n == 0 && self.done < self.writing.len() {
+            self.fail_write("écriture de 0 octet".into(), now);
+            return;
+        }
+        self.done += n;
+        self.file_end += n as u64;
+        self.written += n as u64;
+        if self.write_err.take().is_some() {
+            eprintln!("[aof] écriture rétablie");
+            self.retry_at = None;
+        }
+    }
+
+    /// Fin du délai d'attente après une erreur.
+    pub fn retry_due(&self, now: std::time::Instant) -> bool {
+        self.retry_at.is_none_or(|t| now >= t)
+    }
+
+    /// Timer d'une seconde : un fsync `everysec` est dû.
+    pub fn tick(&mut self) {
+        if self.fsync != Fsync::EverySec {
+            return;
+        }
+        if self.syncing.is_some() && self.durable < self.written {
+            self.delayed_fsync += 1;
+        }
+        self.sync_due = true;
+    }
+
+    /// CQE d'un fsync. Un fsync en échec n'est jamais réessayé (l'état du
+    /// cache de pages est inconnu) : écritures refusées jusqu'à la prochaine
+    /// base réussie.
+    pub fn sync_done(&mut self, res: i32, now: std::time::Instant) {
+        let Some(upto) = self.syncing.take() else { return };
+        if res < 0 {
+            let e = io::Error::from_raw_os_error(-res);
+            if self.fsync == Fsync::Always {
+                eprintln!("[aof] fsync en échec en appendfsync always : {e} ; arrêt");
+                std::process::exit(1);
+            }
+            eprintln!("[aof] fsync en échec : {e} ; écritures refusées jusqu'à la prochaine réécriture réussie");
+            self.fsync_err = Some(format!("fsync : {e}"));
+            if let Some(rot) = &mut self.rotation {
+                // La rotation réessaiera son fsync au prochain tour.
+                rot.sync_sent = false;
+            }
+            return;
+        }
+        self.durable = self.durable.max(upto);
+        if let Some(rot) = &mut self.rotation
+            && rot.sync_sent
+            && upto >= rot.boundary
+        {
+            rot.synced = true;
+            self.finish_rotation(now);
+        }
+    }
+
+    /// Segment courant écrit et fsyncé jusqu'à la frontière : ramené à sa fin
+    /// logique, segment suivant créé et cité par le manifeste **avant** d'y
+    /// écrire (§8.3). Appels système synchrones : une fois par réécriture.
+    fn finish_rotation(&mut self, now: std::time::Instant) {
+        let Some(rot) = &self.rotation else { return };
+        let (boundary, index) = (rot.boundary, rot.index);
+        let name = segment_name(index);
+        let r = (|| -> io::Result<File> {
+            self.file.set_len(self.file_end)?;
+            let _ = std::fs::remove_file(self.dir.join(&name));
+            let f = create_segment(&self.dir, &name)?;
+            let mut m = self.manifest.clone();
+            m.incrs.push(name.clone());
+            m.write(&self.dir)?;
+            self.manifest = m;
+            Ok(f)
+        })();
+        match r {
+            Ok(f) => {
+                self.file = f;
+                self.file_end = 0;
+                self.reserved = PREALLOC;
+                debug_assert_eq!(self.written, boundary);
+                self.rotation = None;
+                if let Some((base, pos)) = self.pending_base.take() {
+                    self.publish_base(base, pos);
+                }
+            }
+            Err(e) => self.fail_write(format!("rotation vers {name} : {e}"), now),
+        }
+    }
+
+    // ── Réécriture (§8) ──────────────────────────────────────────────────
+
+    /// Une réécriture ou une rotation est en cours.
+    pub fn rewriting(&self) -> bool {
+        self.rotation.is_some() || self.pending_base.is_some()
+    }
+
+    /// Point de coupure d'une réécriture (§8.1) : le bloc en cours est fermé
+    /// avec `CUT` (même vide), le segment courant s'arrêtera après lui. Rend
+    /// la cible de la nouvelle base, qui contient exactement les blocs
+    /// jusqu'au `CUT`. À appeler au T0 du BGSAVE.
+    pub fn begin_rewrite(&mut self, stream: &mut super::journal::Stream) -> Target {
+        debug_assert!(!self.rewriting());
+        let cut = stream.cut();
+        let index = self.manifest.last_index() + 1;
+        self.rotation = Some(Rotation { boundary: cut.offset, index, sync_sent: false, synced: false });
+        let name = base_name(index);
+        Target {
+            dir: self.dir.clone(),
+            tmp: format!("{name}.tmp"),
+            name,
+            pos: JournalPos { seq: cut.seq, offset: cut.offset, replid: self.manifest.replid },
+        }
+    }
+
+    /// Fin du BGSAVE de la réécriture. Réussi : la base est publiée dès que
+    /// la rotation est finie (manifeste, puis suppression des anciens
+    /// fichiers, §8.2). En échec : l'ancien manifeste reste valide (il cite
+    /// le nouveau segment).
+    pub fn rewrite_done(&mut self, target: &Target, ok: bool) {
+        if !ok {
+            return;
+        }
+        if self.rotation.is_some() {
+            self.pending_base = Some((target.name.clone(), target.pos));
+        } else {
+            self.publish_base(target.name.clone(), target.pos);
+        }
+    }
+
+    fn publish_base(&mut self, base: String, pos: JournalPos) {
+        let Some(from) = file_index(&base) else { return };
+        let m = Manifest {
+            replid: self.manifest.replid,
+            base: base.clone(),
+            base_seq: pos.seq,
+            base_offset: pos.offset,
+            incrs: self.manifest.incrs.iter().filter(|n| file_index(n).is_some_and(|i| i >= from)).cloned().collect(),
+        };
+        if let Err(e) = m.write(&self.dir) {
+            // L'ancien manifeste reste valide ; la prochaine réécriture réessaiera.
+            eprintln!("[aof] manifeste de la base {base} : {e} ; ancienne base gardée");
+            return;
+        }
+        self.manifest = m;
+        self.base_size = std::fs::metadata(self.dir.join(&base)).map(|m| m.len()).unwrap_or(0);
+        if let Err(e) = remove_unlisted(&self.dir, &self.manifest) {
+            eprintln!("[aof] suppression des anciens fichiers : {e}");
+        }
+        // Tout ce qui précède la base est dans un fichier neuf, fsyncé : un
+        // fsync raté plus tôt ne compte plus que pour les blocs d'après.
+        if self.fsync_err.take().is_some() {
+            eprintln!("[aof] nouvelle base publiée : écritures de nouveau acceptées");
+        }
+        eprintln!("[aof] réécriture publiée : {base} (seq {}), {} segment(s)", pos.seq, self.manifest.incrs.len());
+    }
+
+    /// Réécriture automatique due (§8.4) : le journal depuis la base dépasse
+    /// `min_size` et `percentage` % de la base.
+    pub fn rewrite_due(&self, percentage: u64, min_size: u64) -> bool {
+        if percentage == 0 || self.rewriting() {
+            return false;
+        }
+        let incr = self.written.saturating_sub(self.manifest.base_offset);
+        incr >= min_size && incr.saturating_mul(100) >= self.base_size.saturating_mul(percentage)
+    }
+
+    // ── État ─────────────────────────────────────────────────────────────
+
+    /// Offset du flux jusqu'où les réponses peuvent partir (`always` : le
+    /// durable) ; `None` : les réponses ne sont pas retenues.
+    pub fn release_upto(&self) -> Option<u64> {
+        (self.fsync == Fsync::Always).then_some(self.durable)
+    }
+
+    /// Octets du flux pas encore écrits (blocs fermés compris) : plafond §7.6.
+    pub fn pending(&self, stream: &super::journal::Stream) -> u64 {
+        stream.closed_bytes() + (self.writing.len() - self.done) as u64
+    }
+
+    /// Erreur qui refuse les écritures des clients (§7.7).
+    pub fn error(&self) -> Option<&str> {
+        self.write_err.as_deref().or(self.fsync_err.as_deref())
+    }
+
+    /// Champs `aof_*` de la section `# Persistence`.
+    pub fn info(&self, stream: &super::journal::Stream, out: &mut String) {
+        use std::fmt::Write as _;
+        let incr = self.written.saturating_sub(self.manifest.base_offset);
+        let _ = write!(
+            out,
+            "aof_enabled:1\r\naof_rewrite_in_progress:{}\r\naof_last_write_status:{}\r\naof_last_fsync_status:{}\r\n\
+             aof_fsync:{}\r\naof_current_size:{}\r\naof_base_size:{}\r\naof_pending_bytes:{}\r\naof_delayed_fsync:{}\r\n",
+            u8::from(self.rewriting()),
+            if self.write_err.is_some() { "err" } else { "ok" },
+            if self.fsync_err.is_some() { "err" } else { "ok" },
+            self.fsync.name(),
+            self.base_size + incr,
+            self.base_size,
+            self.pending(stream),
+            self.delayed_fsync,
+        );
+    }
+
+    /// Arrêt : ferme le bloc en cours, écrit tout ce qui reste (l'écriture en
+    /// vol comprise : mêmes octets au même endroit) et fsync, d'une traite.
+    /// Une rotation en cours est menée à son terme d'abord.
+    pub fn flush_sync(&mut self, stream: &mut super::journal::Stream) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        stream.end_turn();
+        let rest = self.writing[self.done..].to_vec();
+        self.writing.clear();
+        self.done = 0;
+        self.file.write_all_at(&rest, self.file_end)?;
+        self.file_end += rest.len() as u64;
+        self.written += rest.len() as u64;
+        if let Some(rot) = &self.rotation {
+            let mut before = Vec::new();
+            stream.take_closed(&mut before, usize::MAX, rot.boundary - self.written);
+            self.file.write_all_at(&before, self.file_end)?;
+            self.file_end += before.len() as u64;
+            self.written += before.len() as u64;
+            self.file.sync_data()?;
+            self.rotation.as_mut().unwrap().synced = true;
+            self.finish_rotation(std::time::Instant::now());
+            if self.rotation.is_some() {
+                return Err(io::Error::other(self.write_err.clone().unwrap_or_default()));
+            }
+        }
+        let mut after = Vec::new();
+        stream.take_closed(&mut after, usize::MAX, u64::MAX);
+        self.file.write_all_at(&after, self.file_end)?;
+        self.file_end += after.len() as u64;
+        self.written += after.len() as u64;
+        self.file.sync_data()?;
+        self.durable = self.written;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

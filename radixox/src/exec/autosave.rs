@@ -147,14 +147,15 @@ impl Persistence {
         self.last_save_unix
     }
 
-    /// Section `# Persistence` d'`INFO`, champs de Valkey.
+    /// Section `# Persistence` d'`INFO`, champs de Valkey (sans ceux de l'AOF ni
+    /// la ligne vide de fin, ajoutés par le cœur).
     pub fn info(&self, now: Instant, out: &mut String) {
         let secs = |d: Duration| d.as_secs() as i64;
         let _ = write!(
             out,
             "# Persistence\r\nloading:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\n\
              rdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\nrdb_last_bgsave_time_sec:{}\r\n\
-             rdb_current_bgsave_time_sec:{}\r\nrdb_saves:{}\r\naof_enabled:0\r\n\r\n",
+             rdb_current_bgsave_time_sec:{}\r\nrdb_saves:{}\r\n",
             self.dirty,
             u8::from(self.current.is_some()),
             self.last_save_unix,

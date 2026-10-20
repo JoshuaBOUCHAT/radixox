@@ -272,6 +272,8 @@ pub struct Stream {
     cur_flags: u16,
     /// Blocs fermés, encodés (en-tête + charge), dans l'ordre.
     pub closed: VecDeque<Vec<u8>>,
+    /// Octets de `closed` (tenu par `close` et `take_closed`).
+    closed_bytes: u64,
     /// Prochain `seq` (le premier bloc d'une histoire porte 1).
     next_seq: u64,
     /// Octets du flux avant le bloc en cours.
@@ -294,6 +296,7 @@ impl Stream {
             cur_now: 0,
             cur_flags: 0,
             closed: VecDeque::new(),
+            closed_bytes: 0,
             next_seq: at.seq + 1,
             offset: at.offset,
             last_now: at.now,
@@ -331,6 +334,46 @@ impl Stream {
         }
     }
 
+    /// Marque d'une réponse (DURABILITY_DESIGN.md §7.5) : un offset que le
+    /// bloc de la dernière commande journalisée atteindra une fois fermé
+    /// (fin des blocs fermés, ou dans le bloc en cours). Un fsync couvre des
+    /// blocs entiers : `durable ≥ marque` ⇔ tout ce qui précède est durable.
+    pub fn end_mark(&self) -> u64 {
+        if self.is_empty() { self.offset } else { self.offset + self.cur.len() as u64 }
+    }
+
+    /// Octets des blocs fermés pas encore pris.
+    pub fn closed_bytes(&self) -> u64 {
+        self.closed_bytes
+    }
+
+    /// Prend des blocs fermés, dans l'ordre, en les recopiant à la suite de
+    /// `out` tant qu'il reste sous `max` octets (au moins un bloc), sans
+    /// dépasser `limit` octets pris en tout (frontière de segment).
+    pub fn take_closed(&mut self, out: &mut Vec<u8>, max: usize, limit: u64) {
+        let mut taken = 0u64;
+        while let Some(b) = self.closed.front()
+            && (out.is_empty() || out.len() + b.len() <= max)
+            && taken + b.len() as u64 <= limit
+        {
+            let b = self.closed.pop_front().unwrap();
+            self.closed_bytes -= b.len() as u64;
+            taken += b.len() as u64;
+            out.extend_from_slice(&b);
+        }
+    }
+
+    /// Point de coupure (DURABILITY_DESIGN.md §8.1) : ferme le bloc en cours
+    /// avec `CUT`, même vide, au `now` du tour. Rend la position après lui :
+    /// tout ce qui a été exécuté avant y est, rien de ce qui suit.
+    pub fn cut(&mut self) -> Cursor {
+        if self.is_empty() {
+            self.cur_now = self.last_now;
+        }
+        self.close(F_CUT);
+        self.cursor()
+    }
+
     /// Le bloc en cours n'a pas de commande.
     pub fn is_empty(&self) -> bool {
         self.cur.len() == HEADER
@@ -356,6 +399,7 @@ impl Stream {
         let mut blk = std::mem::replace(&mut self.cur, vec![0; HEADER]);
         let (head, payload) = blk.split_at_mut(HEADER);
         write_header(head, &b, payload);
+        self.closed_bytes += blk.len() as u64;
         self.closed.push_back(blk);
         self.next_seq += 1;
         self.offset += b.size();
