@@ -42,12 +42,13 @@ pub fn load_at_startup(art: &mut OxidArt) -> io::Result<()> {
         io::Error::new(kind, format!("{}: {e}", path.display()))
     })?;
     println!(
-        "[load] {} : {} clés ({} expirées sautées), {:.1} MB en {:?}",
+        "[load] {} : {} clés ({} expirées sautées), {:.1} MB en {:?}{}",
         path.display(),
         stats.keys,
         stats.expired,
         size as f64 / 1e6,
-        start.elapsed()
+        start.elapsed(),
+        if stats.digest_checked { ", condensé vérifié" } else { "" }
     );
     Ok(())
 }
@@ -87,11 +88,13 @@ pub fn save_sync(art: &mut OxidArt, level: Option<i32>) -> io::Result<SyncStats>
         let mut packed = Vec::new();
         let mut crc = crc32fast::Hasher::new();
         let (mut raw, mut written) = (0u64, 0u64);
-        let mut flush = |buf: &mut Vec<u8>, last: bool, file: &mut std::fs::File| -> io::Result<()> {
+        // `digest` : à la dernière écriture, le condensé du pied.
+        let mut flush = |buf: &mut Vec<u8>, digest: Option<u32>, file: &mut std::fs::File| -> io::Result<()> {
             crc.update(buf);
             raw += buf.len() as u64;
-            if last {
-                let foot = format::footer(crc.clone().finalize());
+            let last = digest.is_some();
+            if let Some(digest) = digest {
+                let foot = format::footer(crc.clone().finalize(), digest);
                 buf.extend_from_slice(&foot);
                 raw += foot.len() as u64;
             }
@@ -121,13 +124,14 @@ pub fn save_sync(art: &mut OxidArt, level: Option<i32>) -> io::Result<SyncStats>
             if done {
                 walk = walk_start.elapsed();
                 // Rien n'a muté pendant la save : la liste différée est vide.
+                let digest = cur.digest().value();
                 drop(cur);
                 art.finish_save();
-                flush(&mut buf, true, &mut file)?;
+                flush(&mut buf, Some(digest), &mut file)?;
                 break;
             }
             if buf.len() >= SYNC_CHUNK {
-                flush(&mut buf, false, &mut file)?;
+                flush(&mut buf, None, &mut file)?;
             }
         }
         drop(flush);

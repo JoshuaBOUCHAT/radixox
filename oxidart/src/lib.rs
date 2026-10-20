@@ -47,6 +47,7 @@
 
 pub mod compact_path;
 pub mod compress;
+pub mod digest;
 pub mod error;
 pub mod new_node;
 
@@ -99,7 +100,7 @@ use crate::node::{Entry, EntryRef, Leaf, Node};
 use crate::save::{NodeImage, OxidSave};
 
 pub use crate::load::{LoadError, LoadStats};
-pub use crate::save::{Dump, DumpEntry, DumpError, SaveCursor, check_footer, parse_dump};
+pub use crate::save::{Dump, DumpEntry, DumpError, JournalPos, SaveCursor, check_footer, parse_dump};
 pub use crate::value::Value;
 use crate::value::{
     NodeValMut, NodeValRef, RawVal, Tag, ValUnion, init_slabs, valart, value_from_raw_ref,

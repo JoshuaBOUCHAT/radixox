@@ -50,7 +50,8 @@ use radixox_lib::varint::{get_bytes, get_varint, unzigzag};
 
 use crate::compact_path::CompactPath;
 use crate::node::{Entry, Leaf, Node};
-use crate::save::{DumpError, format};
+use crate::digest::{Digest, value_terms};
+use crate::save::{DumpError, JournalPos, format};
 use crate::small::{self, SMALL_MAX};
 use crate::value::{RawVal, Tag, ValUnion, alloc_list, alloc_zset, valart};
 use crate::zcommand::InnerZCommand;
@@ -130,6 +131,11 @@ pub(crate) struct DumpReader<R> {
     crc: crc32fast::Hasher,
     pub(crate) t0: u64,
     pub(crate) seed: u64,
+    pub(crate) version: u8,
+    /// Position du flux de commandes (v2 ; défaut en v1).
+    pub(crate) jpos: JournalPos,
+    /// Condensé du pied (v2, mode `Footer::Crc`), lu après `T_END`.
+    pub(crate) footer_digest: Option<u32>,
     zsets: HashMap<u32, InnerZCommand>,
     lists: HashMap<u32, VecDeque<SharedByte>>,
     key: Vec<u8>,
@@ -148,6 +154,9 @@ impl<R: Read> DumpReader<R> {
             crc: crc32fast::Hasher::new(),
             t0: 0,
             seed: 0,
+            version: 0,
+            jpos: JournalPos::default(),
+            footer_digest: None,
             zsets: HashMap::new(),
             lists: HashMap::new(),
             key: Vec::new(),
@@ -155,7 +164,8 @@ impl<R: Read> DumpReader<R> {
         if rd.fixed(4)? != format::MAGIC {
             return Err(DumpError("magic invalide").into());
         }
-        if rd.byte()? != format::VERSION {
+        rd.version = rd.byte()?;
+        if !matches!(rd.version, format::VERSION_1 | format::VERSION) {
             return Err(DumpError("version inconnue").into());
         }
         if rd.byte()? != format::TTL_UNIT_SECONDS {
@@ -163,6 +173,11 @@ impl<R: Read> DumpReader<R> {
         }
         rd.t0 = rd.u64_le()?;
         rd.seed = rd.u64_le()?;
+        if rd.version >= 2 {
+            rd.jpos.seq = rd.u64_le()?;
+            rd.jpos.replid = rd.fixed(20)?.try_into().unwrap();
+            rd.jpos.offset = rd.u64_le()?;
+        }
 
         for _ in 0..rd.varint()? {
             let idx = rd.varint()? as u32;
@@ -301,14 +316,17 @@ impl<R: Read> DumpReader<R> {
             let crc = self.crc.clone().finalize();
             // Le pied lui-même n'entre pas dans le crc.
             self.footer = Footer::None;
-            self.ensure(format::FOOTER_LEN)
-                .map_err(|_| DumpError("fichier tronqué (pied absent)"))?;
-            let foot = self.fixed(format::FOOTER_LEN)?;
-            if foot[4..] != format::FOOTER_MAGIC {
+            let len = format::footer_len(self.version);
+            self.ensure(len).map_err(|_| DumpError("fichier tronqué (pied absent)"))?;
+            let foot = self.fixed(len)?;
+            if foot[len - 4..] != format::FOOTER_MAGIC {
                 return Err(DumpError("fichier tronqué (pied absent)").into());
             }
             if crc != u32::from_le_bytes(foot[..4].try_into().unwrap()) {
                 return Err(DumpError("crc invalide").into());
+            }
+            if len == format::FOOTER_LEN {
+                self.footer_digest = Some(u32::from_le_bytes(foot[4..8].try_into().unwrap()));
             }
         }
         if self.pos != self.end {
@@ -431,6 +449,12 @@ pub struct LoadStats {
     pub keys: u64,
     /// Clés expirées entre la save et le reload, sautées.
     pub expired: u64,
+    /// T0 du dump.
+    pub t0: u64,
+    /// Position du flux de commandes contenue (v2 ; défaut en v1).
+    pub pos: JournalPos,
+    /// Le condensé du pied (v2) a été vérifié sur l'arbre rechargé.
+    pub digest_checked: bool,
 }
 
 /// Nœud ouvert : chemin `kept[..end]`, entrées dans `childs[childs_start..]`.
@@ -493,6 +517,8 @@ impl OxidArt {
     fn load_from<R: Read>(&mut self, mut rd: DumpReader<R>) -> Result<LoadStats, LoadError> {
         let now = self.now;
         let mut stats = LoadStats::default();
+        // Termes des clés sautées (expirées depuis la save), pour le condensé.
+        let mut skipped = Digest::default();
 
         let mut kept: Vec<u8> = Vec::new();
         let mut stack = vec![Open { end: 0, val: None, childs_start: 0 }];
@@ -506,7 +532,8 @@ impl OxidArt {
                 Some(ttl) => {
                     let exp = rd.t0.saturating_add(ttl);
                     if exp < now {
-                        drop(rd.value(head.ty)?);
+                        let v = rd.value(head.ty)?;
+                        value_terms(&mut skipped, rd.key(), Some(exp), &v);
                         stats.expired += 1;
                         continue;
                     }
@@ -568,6 +595,18 @@ impl OxidArt {
             self.map.tag(root_idx);
         }
         self.key_count += stats.keys as usize;
+        stats.t0 = rd.t0;
+        stats.pos = rd.jpos;
+        // Condensé (DURABILITY_DESIGN.md §6.4) : parcours de l'arbre construit,
+        // un autre code que le DFS de la save qui l'a calculé.
+        if let Some(want) = rd.footer_digest {
+            let mut got = self.content_digest(0);
+            got.merge(skipped);
+            if got.value() != want {
+                return Err(DumpError("condensé du contenu invalide : l'arbre rechargé diffère de l'arbre sauvé").into());
+            }
+            stats.digest_checked = true;
+        }
         Ok(stats)
     }
 

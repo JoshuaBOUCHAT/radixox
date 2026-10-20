@@ -1,9 +1,10 @@
 # Durabilité — AOF et réplication par un seul flux de commandes
 
-> **État : étape 1 faite (2026-10-20)** : `exec/journal.rs` (plan / finish, format de bloc,
-> `Stream` en mémoire, rejeu `apply`), plomberie dans `Core::exec_window`, tests 1 et 2 ; le
-> flux n'est pas encore écrit sur disque (`Config::journal`, désactivé dans le binaire).
-> Suite : étape 2 (§13). Ce document doit suffire à
+> **État : étapes 1–2 faites (2026-10-20)** : `exec/journal.rs` (plan / finish, format de
+> bloc, `Stream` en mémoire, rejeu `apply`), plomberie dans `Core::exec_window`, tests 1 et 2 ;
+> dump v2 (position du journal, condensé `oxidart/src/digest.rs` vérifié au reload), test 3.
+> Le flux n'est pas encore écrit sur disque (`Config::journal`, désactivé dans le binaire).
+> Suite : étape 3 (§13). Ce document doit suffire à
 > un agent qui ne connaît pas le projet : §1 donne le contexte du code, §2–§11 la conception,
 > §12 les tests, §13 l'ordre de travail avec ses critères d'acceptation. Il remplace le
 > « collecteur d'effets » de RUNTIME_ARCH.md §18 et complète ARCHITECTURE.md §3.
@@ -317,9 +318,15 @@ pied v2    : u32 crc32 (tout ce qui précède) | u32 condensé | "RXDE"
 ```
 
 - `base_seq` / `base_offset` : la base contient exactement les blocs `≤ base_seq`.
-- Le lecteur accepte v1 (sans journal) et v2. `dump.rxd` sans AOF peut rester en v1 ou passer
-  en v2 avec `base_seq = 0` : à décider à l'implémentation, en gardant la lecture de v1.
+- **Fait** : tout dump est écrit en v2 (`dump.rxd` sans AOF : `base_seq = 0`, `replid` nul) ;
+  le lecteur accepte v1 et v2 (pied de 8 octets en v1, 12 en v2). Côté oxidart :
+  `JournalPos` (opaque), `save_start_at(out, &pos)`, `LoadStats { t0, pos, digest_checked }`.
+  L'oracle `oxidart-legacy` lit l'en-tête v2 (il ignore la position).
 - **Condensé** (§6.4) : vérifie que l'état rechargé est l'état sauvé.
+- **Rejeu** : la base doit être chargée **sans sauter les clés expirées depuis la save**
+  (`art.set_now(0)` avant `load_file`, puis l'horloge des blocs) : une clé vivante au T0 et
+  expirée au moment du redémarrage l'était peut-être encore quand une commande du journal
+  l'a vue (`SETNX` rejoué à `t0+2` réussirait sinon). Étape 3.
 
 ### 6.4 Condensé du contenu
 
@@ -327,13 +334,30 @@ Indépendant de l'ordre et de l'encodage du fichier, calculé deux fois par des 
 **différents** (le DFS de save, puis un parcours de l'arbre rechargé) :
 
 ```
-pour chaque élément métier :
-  chaîne / entier : crc32(clé ‖ type ‖ échéance absolue u64 (0 = sans) ‖ valeur canonique)
-  hash            : un terme par champ : crc32(clé ‖ type ‖ échéance ‖ champ ‖ valeur)
-                    + un terme pour la clé elle-même : crc32(clé ‖ type ‖ échéance ‖ cardinal)
-  set             : idem par membre ; zset : membre ‖ score (f64 LE)
+préfixe(clé, type, échéance) = part(clé) ‖ u8 type ‖ u64 échéance absolue (0 = sans)
+part(x) = u32 len ‖ x       (longueurs : « ab‖c » ≠ « a‖bc »)
+chaîne / entier : crc32(préfixe ‖ part(valeur canonique))
+hash            : un terme par champ : crc32(préfixe ‖ part(champ) ‖ part(valeur))
+                  + un terme de tête : crc32(préfixe(type | 0x40) ‖ part(cardinal u64))
+set             : idem par membre, + terme de tête
+zset / list     : un terme par clé : crc32(préfixe ‖ part(cardinal) ‖ part(Σ éléments)),
+                  élément zset = crc32(part(membre) ‖ part(score f64)),
+                  élément list = crc32(part(rang u64) ‖ part(élément))
 condensé = somme (wrapping, u64) des termes, tronquée à u32 dans le pied
 ```
+
+Fait (`oxidart/src/digest.rs`) : côté save, le DFS calcule les termes à la visite de la clé
+(`SaveCursor::record` : chemin, type, échéance ; valeurs inline et petits conteneurs) et, pour
+un conteneur valart, relit les entrées que chaque étape du sérialiseur vient d'écrire (des
+entrées entières) ; ZSet / List : sommes calculées dans la section du T0. Côté reload :
+`OxidArt::content_digest`, parcours de l'arbre construit, valeurs lues en place ; les clés
+sautées (expirées depuis la save) ajoutent leurs termes depuis le décodage.
+
+**Coût mesuré** (`examples/save_bench`, 2026-10-20) : reload de 885 k chaînes 111 ms dont
+51 ms de condensé (57 ns/clé) ; 442 k hash d'un champ 91 ms dont 52 ms. Le parcours après
+coup coûte des défauts de cache : ≈ +80 % sur le temps de reload. Arbitrage possible si c'est
+trop : vérification optionnelle, ou condensé calculé pendant la construction (moins
+indépendant du décodage).
 
 - Valeur canonique : octets pour une chaîne, `i64 LE` pour un entier (**le type compte** :
   `Int` et `String "10"` ne donnent pas le même terme, DET1 en dépend pour `INCR`).
@@ -679,7 +703,7 @@ Commandes : `BGREWRITEAOF`, `WAIT`, `REPLICATE`, `REPLICAOF NO ONE`, et les comm
 | # | Étape | Fini quand |
 |---|---|---|
 | 1 ✅ | `exec/journal.rs` (`plan`, `finish`, `Stream` en mémoire), plomberie `raw` + réponse | test 1 (oracle depuis vide) et test 2 verts — `uring/tests.rs` : `journal_replay_matches_state`, `expired_keys_are_absent_for_writes` (1000 graines vertes) |
-| 2 | Dump v2 : `base_seq`, `replid`, `base_offset`, condensé ; vérification au rechargement | test 3 ; tous les tests de save existants verts ; v1 toujours lisible |
+| 2 ✅ | Dump v2 : `base_seq`, `replid`, `base_offset`, condensé ; vérification au rechargement | test 3 ; tous les tests de save existants verts ; v1 toujours lisible — `oxidart/src/test_save.rs` : `save_digest_is_the_t0_state_under_mutations`, `reload_checks_digest_even_with_expired_keys`, `reload_refuses_altered_content_with_valid_crc`, `reload_reads_version_1`, `journal_position_roundtrip` |
 | 3 | Format de bloc, segments préalloués, manifeste, rejeu au démarrage, troncature | tests 4 et 6 |
 | 4 | `appendfsync no` / `everysec`, deux canaux de fichiers, plafond §7.6, erreurs §7.7, `INFO aof_*` | test 5 en `everysec` et `no` |
 | 5 | Réécriture : coupure `CUT`, rotation, ordre §8.2–8.3, automatique, `BGREWRITEAOF` | test 5 avec rotations ; test 1 depuis un dump |
@@ -732,8 +756,6 @@ Configuration, commandes supportées).
 
 ## 16. Questions ouvertes
 
-- `dump.rxd` sans AOF : passer au format v2 (`base_seq = 0`) ou rester v1 ? (lecture de v1
-  gardée dans tous les cas).
 - `PX` / `PEXPIRE` arrondis à la seconde aujourd'hui (§1.2) : incompatibilité Redis à corriger
   un jour ; le `now` des blocs passera alors en millisecondes (nouvelle `version`).
 - Reprise partielle après basculement (second identifiant, §10.8).

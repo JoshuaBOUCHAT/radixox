@@ -154,7 +154,10 @@ impl<R: Read> DumpReader<R> {
         if rd.fixed(4)? != format::MAGIC {
             return Err(DumpError("magic invalide").into());
         }
-        if rd.byte()? != format::VERSION {
+        // v2 (oxidart, DURABILITY_DESIGN.md §6.3) : position du journal en plus
+        // dans l'en-tête, ignorée par l'oracle (flux brut seulement, sans pied).
+        let version = rd.byte()?;
+        if version != format::VERSION && version != 2 {
             return Err(DumpError("version inconnue").into());
         }
         if rd.byte()? != format::TTL_UNIT_SECONDS {
@@ -162,6 +165,9 @@ impl<R: Read> DumpReader<R> {
         }
         rd.t0 = rd.u64_le()?;
         rd.seed = rd.u64_le()?;
+        if version == 2 {
+            rd.fixed(8 + 20 + 8)?;
+        }
 
         for _ in 0..rd.varint()? {
             let idx = rd.varint()? as u32;

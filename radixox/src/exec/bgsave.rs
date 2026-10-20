@@ -124,6 +124,8 @@ pub struct BgSave {
     crc: crc32fast::Hasher,
     /// Pied du dump brut ajouté.
     footer: bool,
+    /// Condensé du contenu, connu à la fin du DFS (pied, DURABILITY_DESIGN.md §6.4).
+    digest: u32,
     phase: Phase,
     err: Option<io::Error>,
     /// Temps passé dans les tranches, au repos compris (plancher de CPU).
@@ -172,6 +174,7 @@ impl BgSave {
             writing: Vec::new(),
             crc: crc32fast::Hasher::new(),
             footer: false,
+            digest: 0,
             phase: Phase::Walk,
             err: None,
             work: Duration::ZERO,
@@ -233,11 +236,12 @@ impl BgSave {
                     if done {
                         // Le curseur ne contient que des idx et des valeurs
                         // possédées : libéré avant de fermer la barrière.
+                        self.digest = cur.digest().value();
                         self.cur = None;
                         art.end_save();
                         self.walk = self.start.elapsed();
                         if let Some(c) = &mut self.comp {
-                            let foot = format::footer(c.crc.clone().finalize());
+                            let foot = format::footer(c.crc.clone().finalize(), self.digest);
                             c.raw.extend_from_slice(&foot);
                         }
                         self.phase = Phase::Drain;
@@ -297,7 +301,7 @@ impl BgSave {
             // ferme le fichier. En mode zstd, il est dans la frame compressée.
             let mut h = self.crc.clone();
             h.update(&self.fill);
-            let foot = format::footer(h.finalize());
+            let foot = format::footer(h.finalize(), self.digest);
             self.fill.extend_from_slice(&foot);
             self.footer = true;
         }

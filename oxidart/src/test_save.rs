@@ -258,11 +258,12 @@ fn file_footer_detects_truncation_and_corruption() {
     let mut body = Vec::new();
     let mut cur = art.save_start(&mut body);
     while !art.save_step(&mut cur, &mut body, 64) {}
+    let digest = cur.digest().value();
     drop(cur);
     art.finish_save();
 
     let mut file = body.clone();
-    file.extend_from_slice(&format::footer(crc32fast::hash(&body)));
+    file.extend_from_slice(&format::footer(crc32fast::hash(&body), digest));
     assert_eq!(check_footer(&file).unwrap(), &body[..]);
     assert_eq!(parse_dump(check_footer(&file).unwrap()).unwrap().entries.len(), 500);
 
@@ -279,12 +280,18 @@ fn file_footer_detects_truncation_and_corruption() {
 // ─── Reload (SAVE_DESIGN.md §5, étape 8) ─────────────────────────────────────
 
 fn dump_of(art: &mut OxidArt) -> Vec<u8> {
+    dump_digest_of(art).0
+}
+
+/// Dump brut et son condensé (pied).
+fn dump_digest_of(art: &mut OxidArt) -> (Vec<u8>, u32) {
     let mut out = Vec::new();
     let mut cur = art.save_start(&mut out);
     while !art.save_step(&mut cur, &mut out, 1024) {}
+    let digest = cur.digest().value();
     drop(cur);
     art.finish_save();
-    out
+    (out, digest)
 }
 
 fn reload(buf: &[u8], now: u64) -> (OxidArt, crate::LoadStats) {
@@ -415,9 +422,9 @@ impl std::io::Read for Dribble<'_> {
 }
 
 fn file_of(art: &mut OxidArt) -> Vec<u8> {
-    let mut file = dump_of(art);
+    let (mut file, digest) = dump_digest_of(art);
     let crc = crc32fast::hash(&file);
-    file.extend_from_slice(&crate::save::format::footer(crc));
+    file.extend_from_slice(&crate::save::format::footer(crc, digest));
     file
 }
 
@@ -552,4 +559,122 @@ fn image_leaves_are_freed_by_slices() {
     assert!(art.save.leftover.is_empty());
     assert_eq!(decoded(&out), expect, "vue T0 intacte");
     assert_eq!(art.get(b"k:0007"), Some(Value::from_str("w")));
+}
+
+// ─── Condensé du contenu (DURABILITY_DESIGN.md §6.4, test 3) ─────────────────
+
+/// Le condensé calculé par le DFS de la save (tranches minimales, mutations
+/// entre chaque tranche) est celui de l'état au T0, calculé par le parcours
+/// de l'arbre : deux codes différents, même valeur.
+#[test]
+fn save_digest_is_the_t0_state_under_mutations() {
+    let mut rng = Rng(0xD16E_57AA_0001_0001);
+    let mut art = OxidArt::new();
+    art.set_now(1_000);
+    for round in 0..40 {
+        for _ in 0..400 {
+            random_op(&mut art, &mut rng);
+        }
+        let want = art.content_digest(art.now);
+        let mut ops = Rng(rng.next() | 1);
+        let mut out = Vec::new();
+        let mut cur = art.save_start(&mut out);
+        while !art.save_step(&mut cur, &mut out, 1 + ops.below(4) as u32) {
+            for _ in 0..ops.below(6) {
+                random_op(&mut art, &mut ops);
+            }
+        }
+        let got = cur.digest();
+        drop(cur);
+        art.finish_save();
+        assert_eq!(got, want, "round {round}");
+    }
+}
+
+/// Reload d'un fichier v2 : condensé vérifié, y compris quand des clés ont
+/// expiré entre la save et le reload (leurs termes viennent du décodage).
+#[test]
+fn reload_checks_digest_even_with_expired_keys() {
+    let mut rng = Rng(0xD16E_57AA_0002_0001);
+    let mut art = OxidArt::new();
+    art.set_now(1_000);
+    for _ in 0..3_000 {
+        random_op(&mut art, &mut rng);
+    }
+    // Conteneurs valart (> 8 entrées), dont un qui expire.
+    let fields: Vec<_> = (0..50).map(|i| (sb(&format!("f{i}")), sb(&format!("v{i}")))).collect();
+    let members: Vec<_> = (0..50).map(|i| sb(&format!("m{i}"))).collect();
+    art.cmd_hset(b"gros-hash", &fields, None).unwrap();
+    art.cmd_sadd(b"gros-set", &members, Some(art.now + 1)).unwrap();
+    let file = file_of(&mut art);
+    for later in [0, 2, 10] {
+        let mut back = OxidArt::new();
+        back.set_now(art.now + later);
+        let stats = back.load_file(&file[..]).expect("reload");
+        assert!(stats.digest_checked);
+        assert_eq!(stats.expired > 0, later > 0, "plus tard de {later} s");
+    }
+}
+
+/// Une valeur altérée dans un dump dont le crc est recalculé : le flux reste
+/// lisible, le crc ne voit rien, le condensé refuse.
+#[test]
+fn reload_refuses_altered_content_with_valid_crc() {
+    use crate::save::format;
+    let mut art = OxidArt::new();
+    for i in 0..2_000 {
+        art.set(sb(&format!("k{i}")), Value::String(sb(&format!("valeur-{i}"))));
+    }
+    let (mut body, digest) = dump_digest_of(&mut art);
+    let at = body.windows(10).position(|w| w == b"valeur-100").unwrap() + 7;
+    body[at] ^= 0x01;
+    let mut file = body.clone();
+    file.extend_from_slice(&format::footer(crc32fast::hash(&body), digest));
+    match OxidArt::new().load_file(&file[..]) {
+        Err(crate::LoadError::Dump(e)) => assert!(e.0.starts_with("condensé"), "{}", e.0),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Un dump v1 (sans position du journal ni condensé) reste lisible.
+#[test]
+fn reload_reads_version_1() {
+    use crate::save::format;
+    let mut rng = Rng(0xD16E_57AA_0003_0001);
+    let mut art = OxidArt::new();
+    art.set_now(1_000);
+    for _ in 0..2_000 {
+        random_op(&mut art, &mut rng);
+    }
+    let (v2, _) = dump_digest_of(&mut art);
+    // En-tête v2 = v1 + 36 octets (seq, replid, offset) après la graine.
+    const AFTER_SEED: usize = 4 + 1 + 1 + 8 + 8;
+    let mut v1 = v2[..AFTER_SEED].to_vec();
+    v1[4] = format::VERSION_1;
+    v1.extend_from_slice(&v2[AFTER_SEED + 36..]);
+    let mut file = v1.clone();
+    file.extend_from_slice(&crc32fast::hash(&v1).to_le_bytes());
+    file.extend_from_slice(&format::FOOTER_MAGIC);
+    let mut back = OxidArt::new();
+    back.set_now(art.now);
+    let stats = back.load_file(&file[..]).expect("reload v1");
+    assert!(!stats.digest_checked);
+    assert_eq!(expected(&back), expected(&art));
+    assert_eq!(crate::check_footer(&file).unwrap(), &v1[..]);
+}
+
+/// La position du journal fait l'aller-retour par l'en-tête.
+#[test]
+fn journal_position_roundtrip() {
+    let mut art = OxidArt::new();
+    art.set(sb("a"), Value::String(sb("1")));
+    let pos = crate::JournalPos { seq: 42, offset: 9_876_543, replid: [7; 20] };
+    let mut out = Vec::new();
+    let mut cur = art.save_start_at(&mut out, &pos);
+    while !art.save_step(&mut cur, &mut out, 64) {}
+    drop(cur);
+    art.finish_save();
+    assert_eq!(parse_dump(&out).unwrap().pos, pos);
+    let mut back = OxidArt::new();
+    assert_eq!(back.load_dump(&out).unwrap().pos, pos);
 }

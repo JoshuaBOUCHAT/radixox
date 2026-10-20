@@ -217,6 +217,8 @@ enregistrement :
 ```
 dump.rxd      en-tête | section ZSet/List | enregistrements | T_END | pied
 pied          u32 LE crc32 (IEEE, crc32fast) de tout ce qui précède | "RXDE"
+              (v2, 2026-10-20 : u32 crc | u32 condensé du contenu | "RXDE", et position du
+              journal dans l'en-tête : DURABILITY_DESIGN.md §6.3–6.4)
 ```
 - Un seul fichier, puisque depuis l'étape 5 tout est dans un seul flux : plus de `zl.rxd` ni de `MANIFEST`. Le pied remplace le MANIFEST : `check_footer` détecte la troncature (pied absent) et la corruption (crc). `parse_dump` s'arrête à `T_END` et ignore le pied.
 - Écrit dans `dump.rxd.tmp`, puis fsync du fichier, `rename` sur `dump.rxd` (atomique, remplace l'ancien), fsync du dossier. **Le dump est valide à partir du rename.** Dossier : `RADIXOX_DIR` (défaut `.`).

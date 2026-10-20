@@ -58,6 +58,8 @@ fn main() {
         }
     }
     let dt = t.elapsed();
+    let digest = cur.digest().value();
+    drop(cur);
     art.finish_save();
     println!(
         "save : {keys} clés, {:.1} MB, {:.2?} → {:.1} ns/clé, {:.0} MB/s, {steps} tranches (budget {budget})",
@@ -92,7 +94,7 @@ fn main() {
     // Même chose depuis un fichier (pied compris), lu par fragments.
     let path = std::env::temp_dir().join(format!("save_bench-{}.rxd", std::process::id()));
     let mut file = out.clone();
-    file.extend_from_slice(&oxidart::save::format::footer(crc32fast::hash(&out)));
+    file.extend_from_slice(&oxidart::save::format::footer(crc32fast::hash(&out), digest));
     std::fs::write(&path, &file).unwrap();
     drop(file);
     let mut back = OxidArt::new();
@@ -102,10 +104,16 @@ fn main() {
     let dt = t.elapsed();
     let _ = std::fs::remove_file(&path);
     println!(
-        "reload fichier : {} clés en {dt:.2?} → {:.1} ns/clé (crc compris)",
+        "reload fichier : {} clés en {dt:.2?} → {:.1} ns/clé (crc et condensé compris)",
         stats.keys,
         dt.as_nanos() as f64 / stats.keys as f64
     );
+    assert!(stats.digest_checked);
+    // Part du condensé (parcours de l'arbre rechargé, DURABILITY_DESIGN.md §6.4).
+    let t = Instant::now();
+    std::hint::black_box(back.content_digest(0));
+    let dd = t.elapsed();
+    println!("  dont condensé : {dd:.2?} → {:.1} ns/clé", dd.as_nanos() as f64 / stats.keys as f64);
     // Vérification complète seulement sur les petits dumps.
     if n <= 200_000 {
         let dump = parse_dump(&out).expect("dump illisible");

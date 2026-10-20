@@ -258,10 +258,23 @@ pub(crate) mod reference {
 
 // ─── Format (SAVE_DESIGN.md §5) ──────────────────────────────────────────────
 
+/// Position du flux de commandes que contient un dump (DURABILITY_DESIGN.md
+/// §6.3) : opaque pour oxidart, écrite dans l'en-tête v2 et rendue au reload.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JournalPos {
+    /// Le dump contient exactement les blocs `≤ seq` (0 : aucun flux).
+    pub seq: u64,
+    /// Octets du flux jusqu'à la fin du bloc `seq`.
+    pub offset: u64,
+    /// Identifiant d'histoire.
+    pub replid: [u8; 20],
+}
+
 /// Constantes du format de dump.
 ///
 /// ```text
 /// en-tête  : "RXDB" | u8 version | u8 unité TTL | u64 LE t0 | u64 LE seed valart
+///            | v2 : u64 LE seq | [u8; 20] replid | u64 LE offset (`JournalPos`)
 /// section  : varint nb_zsets | (varint idx | varint n | (f64 LE | bytes membre)*)*
 ///            varint nb_lists | (varint idx | varint n | bytes élément*)*
 /// records  : u8 tag | varint lcp | varint len_suffixe | [varint ttl] | suffixe | valeur
@@ -270,13 +283,17 @@ pub(crate) mod reference {
 ///            Hash → varint nb | (bytes champ | bytes valeur)* ;
 ///            Set → varint nb | bytes membre* ; ZSet/List → varint idx (section)
 /// fin      : u8 T_END
-/// pied     : u32 LE crc32 (IEEE) de tout ce qui précède | "RXDE"   (fichier seulement)
+/// pied     : u32 LE crc32 (IEEE) de tout ce qui précède | v2 : u32 LE condensé
+///            (`digest.rs`) | "RXDE"   (fichier seulement)
 /// ```
 /// `bytes` = varint len | octets. `lcp` = préfixe commun avec la clé
 /// précédente (le DFS écrit chaque sous-arbre d'un bloc).
 pub mod format {
     pub const MAGIC: [u8; 4] = *b"RXDB";
-    pub const VERSION: u8 = 1;
+    /// Écrite : 2 (position du journal dans l'en-tête, condensé dans le pied,
+    /// DURABILITY_DESIGN.md §6.3). Lues : 1 et 2.
+    pub const VERSION: u8 = 2;
+    pub const VERSION_1: u8 = 1;
     pub const TTL_UNIT_SECONDS: u8 = 0;
     pub const T_STRING: u8 = 1;
     pub const T_INT: u8 = 2;
@@ -290,12 +307,21 @@ pub mod format {
     /// Pied du fichier, ajouté par l'écrivain après `T_END` : détecte un
     /// fichier tronqué ou corrompu (`check_footer`).
     pub const FOOTER_MAGIC: [u8; 4] = *b"RXDE";
-    pub const FOOTER_LEN: usize = 8;
+    /// v2 : `u32 crc | u32 condensé | "RXDE"`.
+    pub const FOOTER_LEN: usize = 12;
+    /// v1 : `u32 crc | "RXDE"`.
+    pub const FOOTER_LEN_V1: usize = 8;
 
-    pub fn footer(crc: u32) -> [u8; FOOTER_LEN] {
+    pub fn footer_len(version: u8) -> usize {
+        if version == VERSION_1 { FOOTER_LEN_V1 } else { FOOTER_LEN }
+    }
+
+    /// `crc` : de tout ce qui précède ; `digest` : [`SaveCursor::digest`](super::SaveCursor::digest).
+    pub fn footer(crc: u32, digest: u32) -> [u8; FOOTER_LEN] {
         let mut f = [0u8; FOOTER_LEN];
         f[..4].copy_from_slice(&crc.to_le_bytes());
-        f[4..].copy_from_slice(&FOOTER_MAGIC);
+        f[4..8].copy_from_slice(&digest.to_le_bytes());
+        f[8..].copy_from_slice(&FOOTER_MAGIC);
         f
     }
 }
@@ -308,7 +334,10 @@ use radixox_lib::save_barrier::T0;
 use radixox_lib::varint::{put_bytes, put_varint, zigzag};
 use valart::ValSer;
 
+use std::collections::HashMap;
+
 use crate::OxidArt;
+use crate::digest::{self, Digest};
 use crate::value::{for_each_list, for_each_zset, valart};
 
 const ROOT_RADIX: u16 = u16::MAX;
@@ -350,11 +379,51 @@ pub struct SaveCursor {
     /// Buffers d'en-tête recyclés.
     spare: Vec<Vec<u8>>,
     done: bool,
+    /// Condensé du contenu écrit (DURABILITY_DESIGN.md §6.4).
+    digest: Digest,
+    /// Préfixe des termes du conteneur valart en cours.
+    ctr_prefix: Option<crc32fast::Hasher>,
+    /// Sommes des éléments des ZSet / List de la section, par idx.
+    zset_sums: HashMap<u32, (u64, u64)>,
+    list_sums: HashMap<u32, (u64, u64)>,
 }
 
 impl SaveCursor {
     pub fn is_done(&self) -> bool {
         self.done
+    }
+
+    /// Condensé de ce qui a été écrit ; complet quand la save est finie.
+    pub fn digest(&self) -> Digest {
+        self.digest
+    }
+
+    /// Début d'un conteneur valart : terme de tête (cardinal, lu dans `card`,
+    /// écrit par `*_ser_begin`), préfixe gardé pour ses entrées.
+    fn begin_container_digest(&mut self, key: Option<(crc32fast::Hasher, Vec<u8>, Option<u64>)>, card: &[u8], ty: u8) {
+        let (pre, key, exp) = key.expect("clé d'un conteneur valart");
+        let mut pos = 0;
+        let card = radixox_lib::varint::get_varint(card, &mut pos).expect("cardinal écrit");
+        self.digest.add(digest::head_term(&key, ty, exp, card));
+        self.ctr_prefix = Some(pre);
+    }
+
+    /// Termes des entrées d'un conteneur valart que la dernière étape du
+    /// sérialiseur a écrites dans `out[from..]` (des entrées entières).
+    fn digest_entries(&mut self, out: &[u8], hash: bool) {
+        use radixox_lib::varint::get_bytes;
+        let Some(p) = &self.ctr_prefix else { return };
+        let mut pos = 0;
+        while pos < out.len() {
+            let mut h = p.clone();
+            let f = get_bytes(out, &mut pos).expect("entrée écrite par le sérialiseur");
+            digest::part(&mut h, f);
+            if hash {
+                let v = get_bytes(out, &mut pos).expect("entrée écrite par le sérialiseur");
+                digest::part(&mut h, v);
+            }
+            self.digest.add(h);
+        }
     }
 
     /// Avant de rendre la main : plus aucun pointeur emprunté au slab dans
@@ -414,6 +483,8 @@ impl Drop for PVal {
 struct Pending {
     head: Vec<u8>,
     val: PVal,
+    /// Hash / Set valart : clé, type et échéance des termes de ses entrées.
+    key: Option<(crc32fast::Hasher, Vec<u8>, Option<u64>)>,
 }
 
 /// Visite k+1 d'un conteneur : sa racine est en cache, prefetch des entrées.
@@ -450,13 +521,23 @@ impl OxidArt {
     /// ZSet/List (bloquant, v1) dans `out`. Avancer ensuite avec
     /// [`OxidArt::save_step`] puis terminer par [`OxidArt::finish_save`].
     pub fn save_start(&mut self, out: &mut Vec<u8>) -> SaveCursor {
+        self.save_start_at(out, &JournalPos::default())
+    }
+
+    /// [`save_start`](Self::save_start), le dump contenant le flux de
+    /// commandes jusqu'à `pos` (écrit dans l'en-tête).
+    pub fn save_start_at(&mut self, out: &mut Vec<u8>, pos: &JournalPos) -> SaveCursor {
         self.begin_save();
         out.extend_from_slice(&format::MAGIC);
         out.push(format::VERSION);
         out.push(format::TTL_UNIT_SECONDS);
         out.extend_from_slice(&self.save.t0.to_le_bytes());
         out.extend_from_slice(&valart().seed().to_le_bytes());
+        out.extend_from_slice(&pos.seq.to_le_bytes());
+        out.extend_from_slice(&pos.replid);
+        out.extend_from_slice(&pos.offset.to_le_bytes());
 
+        let mut zset_sums = HashMap::new();
         let mut n = 0u64;
         for_each_zset(|_, _| n += 1);
         put_varint(out, n);
@@ -467,7 +548,9 @@ impl OxidArt {
                 out.extend_from_slice(&score.into_inner().to_le_bytes());
                 put_bytes(out, member);
             }
+            zset_sums.insert(idx, digest::zset_inner(z.iter().map(|(s, m)| (s.into_inner(), m.as_slice()))));
         });
+        let mut list_sums = HashMap::new();
         let mut n = 0u64;
         for_each_list(|_, _| n += 1);
         put_varint(out, n);
@@ -477,6 +560,7 @@ impl OxidArt {
             for item in l {
                 put_bytes(out, item);
             }
+            list_sums.insert(idx, digest::list_inner(l.iter().map(|b| b.as_slice())));
         });
 
         SaveCursor {
@@ -493,6 +577,10 @@ impl OxidArt {
             pending: VecDeque::with_capacity(PIPE_DEPTH + 1),
             spare: Vec::new(),
             done: false,
+            digest: Digest::default(),
+            ctr_prefix: None,
+            zset_sums,
+            list_sums,
         }
     }
 
@@ -505,11 +593,15 @@ impl OxidArt {
             return true;
         }
         loop {
+            let mark = out.len();
             let finished = match cur.container {
                 Container::None => true,
                 Container::Hash => valart().hash_ser_step(&mut cur.ser, out, &mut budget),
                 Container::Set => valart().set_ser_step(&mut cur.ser, out, &mut budget),
             };
+            if cur.container != Container::None {
+                cur.digest_entries(&out[mark..], cur.container == Container::Hash);
+            }
             if !finished {
                 cur.own_pending(); // I5
                 return false;
@@ -648,6 +740,55 @@ impl SaveCursor {
             put_varint(&mut head, ttl);
         }
         head.extend_from_slice(&self.path[lcp..]);
+        // Condensé : termes de la clé tant que son chemin est là (§6.4) ;
+        // ceux des entrées d'un conteneur valart, à son écriture.
+        let mut key = None;
+        unsafe {
+            let p = || digest::prefix(&self.path, ty, exp);
+            match tag {
+                Tag::Bytes => {
+                    let mut h = p();
+                    digest::part(&mut h, &val.bytes);
+                    self.digest.add(h);
+                }
+                Tag::Int => {
+                    let mut h = p();
+                    digest::part(&mut h, &val.integer.to_le_bytes());
+                    self.digest.add(h);
+                }
+                Tag::HashSmall => {
+                    let pairs = crate::small::entries::<2>(val.ptr);
+                    let pre = p();
+                    for [f, v] in pairs {
+                        let mut h = pre.clone();
+                        digest::part(&mut h, f);
+                        digest::part(&mut h, v);
+                        self.digest.add(h);
+                    }
+                    self.digest.add(digest::head_term(&self.path, ty, exp, pairs.len() as u64));
+                }
+                Tag::SetSmall => {
+                    let members = crate::small::entries::<1>(val.ptr);
+                    let pre = p();
+                    for [m] in members {
+                        let mut h = pre.clone();
+                        digest::part(&mut h, m);
+                        self.digest.add(h);
+                    }
+                    self.digest.add(digest::head_term(&self.path, ty, exp, members.len() as u64));
+                }
+                Tag::Hash | Tag::Set => key = Some((p(), self.path.clone(), exp)),
+                Tag::ZSet => {
+                    let sums = self.zset_sums.get(&val.idx).copied().unwrap_or_default();
+                    self.digest.add(digest::seq_term(&self.path, ty, exp, sums));
+                }
+                Tag::List => {
+                    let sums = self.list_sums.get(&val.idx).copied().unwrap_or_default();
+                    self.digest.add(digest::seq_term(&self.path, ty, exp, sums));
+                }
+                Tag::None => unreachable!(),
+            }
+        }
         let val = unsafe {
             match tag {
                 // I4 : l'image est droppée au prochain `take` : clone possédé.
@@ -686,7 +827,7 @@ impl SaveCursor {
                 Tag::None => unreachable!(),
             }
         };
-        self.pending.push_back(Pending { head, val });
+        self.pending.push_back(Pending { head, val, key });
         self.prev_len = self.path.len();
         self.min_trunc = usize::MAX;
     }
@@ -704,11 +845,15 @@ fn emit_oldest(cur: &mut SaveCursor, out: &mut Vec<u8>, budget: &mut u32) {
         }
         PVal::Int(n) => put_varint(out, zigzag(*n)),
         PVal::Hash(root) => {
+            let mark = out.len();
             valart().hash_ser_begin(*root, &mut cur.ser, out);
+            cur.begin_container_digest(p.key.take(), &out[mark..], format::T_HASH);
             cur.container = Container::Hash;
         }
         PVal::Set(root) => {
+            let mark = out.len();
             valart().set_ser_begin(*root, &mut cur.ser, out);
+            cur.begin_container_digest(p.key.take(), &out[mark..], format::T_SET);
             cur.container = Container::Set;
         }
         PVal::Idx(idx) => put_varint(out, *idx as u64),
@@ -735,6 +880,7 @@ pub struct DumpEntry {
 pub struct Dump {
     pub t0: u64,
     pub seed: u64,
+    pub pos: JournalPos,
     pub entries: Vec<DumpEntry>,
 }
 
@@ -744,11 +890,12 @@ pub struct DumpError(pub &'static str);
 /// Vérifie le pied d'un fichier de dump et renvoie le flux qui le précède,
 /// à passer à `parse_dump`.
 pub fn check_footer(file: &[u8]) -> Result<&[u8], DumpError> {
-    let Some(body_len) = file.len().checked_sub(format::FOOTER_LEN) else {
+    let len = format::footer_len(file.get(4).copied().unwrap_or(format::VERSION));
+    let Some(body_len) = file.len().checked_sub(len) else {
         return Err(DumpError("fichier tronqué (pas de pied)"));
     };
     let (body, foot) = file.split_at(body_len);
-    if foot[4..] != format::FOOTER_MAGIC {
+    if foot[len - 4..] != format::FOOTER_MAGIC {
         return Err(DumpError("fichier tronqué (pied absent)"));
     }
     if crc32fast::hash(body) != u32::from_le_bytes(foot[..4].try_into().unwrap()) {
@@ -771,7 +918,7 @@ pub fn parse_dump(buf: &[u8]) -> Result<Dump, DumpError> {
             let value = rd.value(head.ty)?;
             entries.push(DumpEntry { key: rd.key().to_vec(), ttl: head.ttl, value });
         }
-        Ok(Dump { t0: rd.t0, seed: rd.seed, entries })
+        Ok(Dump { t0: rd.t0, seed: rd.seed, pos: rd.jpos, entries })
     };
     parse().map_err(|e| match e {
         LoadError::Dump(e) => e,
