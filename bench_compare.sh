@@ -1,5 +1,7 @@
 #!/bin/bash
 set -euo pipefail
+# Pas de save automatique pendant un bench (Valkey y tourne avec --save "").
+export RADIXOX_SAVE="${RADIXOX_SAVE-}"
 
 # Usage:
 #   ./bench_compare.sh                    # RadixOx vs Valkey (starts/stops both, as before)

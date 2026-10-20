@@ -10,6 +10,8 @@
 #   VALKEY_IO_THREADS=4 ./bench_memtier.sh   # Valkey multi-thread
 #   KEY_MAX=200000 TEST_TIME=30 ./bench_memtier.sh
 set -euo pipefail
+# Pas de save automatique pendant un bench (Valkey y tourne avec --save "").
+export RADIXOX_SAVE="${RADIXOX_SAVE-}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PORT=6379

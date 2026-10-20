@@ -14,7 +14,7 @@
 
 **Ensuite, pour clore la save** : ~~commande `SAVE` synchrone~~ (fait, §5bis) ; ~~vidage par tranches de la liste différée valart~~ (fait, §2.B) ; ~~reload en flux~~ (fait, §5quater « Reload par fragments ») ; `rename` final via `std::fs` sur le thread de service (bloquant, à passer en io_uring) ; mémoire des images et de la liste différée dans `INFO` ; `hislab` en dépendance `path` (`oxidart/Cargo.toml`) à repasser sur une version publiée. Compression zstd par tranches faite (§5 « Compression », `RADIXOX_SAVE_ZSTD`) ; reste à la mesurer sur des valeurs réalistes.
 
-**Reporté jusqu'à la boucle io_uring maison (décision 2026-10-11)** : saves automatiques (BGSAVE toutes les N s si ≥ M changements) et AOF (optionnel, fsync chaque seconde, base = snapshot + fin de journal ; voir l'analyse coût snapshot ∝ taille de la base / AOF ∝ débit d'écriture). Raison : sous monoio, ça ajouterait encore des tâches minuterie et des boucles d'attente, de la dette pour la migration. À porter vers la boucle maison, déjà dépendant de monoio : la tâche BGSAVE (`yield_now` entre tranches de DFS, de compression et de vidage), `write_loop` (écritures `write_all_at` en vol), la surveillance du signal d'arrêt (`resp_cmd/shutdown.rs`, sondage toutes les 20 ms), l'attente de fin de BGSAVE avant la save d'arrêt, le `SaveDone` d'UNLINK. Dans la boucle maison, tout ça devient des travaux avancés d'une tranche par tour (save, compression, vidage, évicteur), le signal via `signalfd` lu par io_uring.
+**Saves automatiques : faites le 2026-10-20** (`exec/autosave.rs`, voir « Saves automatiques » plus bas). **Reporté jusqu'à la boucle io_uring maison (décision 2026-10-11)** : AOF (optionnel, fsync chaque seconde, base = snapshot + fin de journal ; voir l'analyse coût snapshot ∝ taille de la base / AOF ∝ débit d'écriture). Raison : sous monoio, ça ajouterait encore des tâches minuterie et des boucles d'attente, de la dette pour la migration. À porter vers la boucle maison, déjà dépendant de monoio : la tâche BGSAVE (`yield_now` entre tranches de DFS, de compression et de vidage), `write_loop` (écritures `write_all_at` en vol), la surveillance du signal d'arrêt (`resp_cmd/shutdown.rs`, sondage toutes les 20 ms), l'attente de fin de BGSAVE avant la save d'arrêt, le `SaveDone` d'UNLINK. Dans la boucle maison, tout ça devient des travaux avancés d'une tranche par tour (save, compression, vidage, évicteur), le signal via `signalfd` lu par io_uring.
 
 **Pièges connus**
 - **Yield sous monoio** : ne jamais écrire un `yield` à base de `cx.waker().wake_by_ref()` ; monoio remet alors la tâche en tête de file et elle affame les connexions. Utiliser `oxidart::async_command::yield_now` (réveil par micro-tâche). Détail et mesures : §5quater « BGSAVE minimal ».
@@ -256,7 +256,7 @@ pied          u32 LE crc32 (IEEE, crc32fast) de tout ce qui précède | "RXDE"
 
 - **`SAVE`** (implémentée 2026-10-11, `resp_cmd/bgsave.rs::save_sync`) : **complètement bloquante**, la plus rapide possible : ni tranche ni `yield`, le DFS tourne d'une traite (`save_step` par pas de 65 536 nœuds, seulement pour borner le buffer), écriture par `write` bloquants de 8 MB (copie dans le cache du noyau, qui écrit sur disque en parallèle du DFS), puis fsync + rename + fsync du dossier. Aucune mutation possible pendant la save, donc ni image ni liste différée. Brut par défaut (`RADIXOX_SAVE_SYNC_ZSTD=<niveau>` pour compresser). Refusée pendant un BGSAVE. Mesure 10M clés (JSON ~85 B, SSD SATA) : brut 2,03 s dont DFS 0,36 s (le reste = disque, ~520 MB/s), 831 MB ; zstd 1 2,38 s, 171 MB ; zstd 3 2,56 s, 177 MB ; Valkey `SAVE` 20,4 s, 934 MB. Sur ce disque le brut gagne de peu ; sur un disque plus lent, zstd 1 gagnerait (5× moins d'octets).
 - **Arrêt avec save** (`resp_cmd/shutdown.rs`, opt-in `RADIXOX_SAVE_ON_EXIT=1`) : SIGINT/SIGTERM lèvent un drapeau (seule chose faite dans le gestionnaire), une tâche le vérifie toutes les 20 ms, attend la fin d'un BGSAVE en cours, fait une `SAVE` puis `exit(0)` (`exit(1)` si la save échoue). Un second signal quitte immédiatement (`_exit(130)`), sans save. Opt-in pour qu'un Ctrl-C en développement ne laisse pas un dump rechargé au démarrage suivant.
-- **`BGSAVE`** répond tout de suite. Une seconde demande pendant une save → erreur `Background save already in progress`. Saves automatiques : plus tard, avec l'AOF.
+- **`BGSAVE`** répond tout de suite. Une seconde demande pendant une save → erreur `Background save already in progress`. Saves automatiques : voir plus bas.
 - **Fichier** : `RADIXOX_DIR/dump.rxd` (nom fixe en v1). Au démarrage, on recharge le dump existant **avant** d'accepter des connexions.
 - **FLUSHDB et `deln` synchrones pendant une save** : correct sans règle spéciale (chaque libération passe par la barrière), mais capture tout le sous-arbre. Pour éviter cette dérive mémoire, les faire passer par le chemin async (waker).
 - **Mémoire** : images + liste différée exposées dans `INFO`, sans limite en v1.
@@ -457,4 +457,31 @@ clients et que le noyau n'a rien pour nous, la save avance sans plafond
 save pour atteindre sa part, repos compris. Sous charge p1 avec 2 workers
 io-wq (la boucle a ~20 % de temps libre) : 877–896 ms → 158–159 ms, latence
 inchangée.
+
+## Saves automatiques (2026-10-20)
+
+Calquées sur Valkey (`save`, `stop-writes-on-bgsave-error`, `LASTSAVE`, `INFO persistence`),
+`radixox/src/exec/autosave.rs` (sans I/O, testé seul) branché dans le cœur :
+
+- **Règles** : `RADIXOX_SAVE`, syntaxe de `save` (paires `<secondes> <changements>`), défaut de
+  Valkey `3600 1 300 100 60 10000`, `""` = désactivé. Invalide → refus de démarrer.
+- **Déclenchement** (timer toutes les 100 ms, le `serverCron` de Redis) : une règle est atteinte
+  si `dirty ≥ changements` et plus de `secondes` depuis la dernière save réussie (au départ : le
+  démarrage) ; pas de BGSAVE en cours ; après un échec, 5 s avant de réessayer.
+- **`dirty`** : compté avant l'exécution, par élément (`Cmd::write_weight` : MSET ses paires, DEL
+  ses clés, HSET ses champs, FLUSHDB la taille de la base). Majorant : une écriture sans effet
+  compte aussi (Redis ne compte que les changements réels). Fin de BGSAVE réussi : `dirty -=
+  dirty au début` (les écritures pendant la save ne sont pas dans le dump) ; SAVE : `dirty = 0`.
+- **Échec** (démarrage ou écriture) : `rdb_last_bgsave_status:err` ; avec des règles actives et
+  `RADIXOX_STOP_WRITES_ON_BGSAVE_ERROR` (oui par défaut), les écritures des clients
+  authentifiés reçoivent `-MISCONF …` jusqu'à une save réussie ; les lectures passent.
+- **Arrêt** : règles actives ⇒ save sur SIGINT / SIGTERM, comme Redis (`RADIXOX_SAVE_ON_EXIT`
+  force l'un ou l'autre).
+- **`INFO`** passe par le cœur (`After::Info`) : `# Server`, `# Persistence` (`loading`,
+  `rdb_changes_since_last_save`, `rdb_bgsave_in_progress`, `rdb_last_save_time`,
+  `rdb_last_bgsave_status`, `rdb_last_bgsave_time_sec`, `rdb_current_bgsave_time_sec`,
+  `rdb_saves`, `aof_enabled:0`), `# Stats`.
+- Tests et scripts de bench : `RADIXOX_SAVE=""` (Valkey y tourne avec `--save ""`).
+- Pas fait : `CONFIG GET/SET save` (pas de commande CONFIG), `BGSAVE SCHEDULE`, `rdb_last_cow_size`
+  (toujours 0 ici).
 

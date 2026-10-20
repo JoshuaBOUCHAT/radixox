@@ -21,6 +21,8 @@
 # Les deux écoutent sur 0.0.0.0:$PORT sans mot de passe et sans persistance :
 # n'ouvrir le port qu'à la machine cliente.
 set -euo pipefail
+# Pas de save automatique pendant un bench (Valkey y tourne avec --save "").
+export RADIXOX_SAVE="${RADIXOX_SAVE-}"
 
 # Session ssh non interactive : cargo n'est pas forcément dans le PATH.
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"

@@ -1,6 +1,8 @@
 #!/bin/bash
 # Test de stress : load 1M clés puis 80% GET / 20% SET, avec ou sans BGSAVE.
 set -uo pipefail
+# Pas de save automatique pendant un bench (Valkey y tourne avec --save "").
+export RADIXOX_SAVE="${RADIXOX_SAVE-}"
 cd /home/joshua/rust/radixox
 S=${OUT_DIR:-/tmp/stress_save}; mkdir -p "$S"
 BIN=target/release/radixox; PORT=6390

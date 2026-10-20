@@ -140,8 +140,10 @@ commandes inline acceptées ; dispatch sur le nom complet, erreurs d'arguments t
 - **Pas de `fork()`** : le COW du noyau copie 2 Mo par écriture d'un octet avec les huge
   pages (pic de latence corrélé à la charge), et oxidart est aussi une bibliothèque
   embarquée : forker le processus hôte n'est pas légitime.
-- **Pas encore fait** (reporté à la boucle maison) : saves automatiques (toutes les N s si
-  ≥ M écritures) et AOF. Principes retenus pour l'AOF :
+- **Saves automatiques** (2026-10-20) : règles `save` de Valkey (`RADIXOX_SAVE`), `MISCONF`
+  après un échec, save à l'arrêt, `LASTSAVE` et `INFO persistence` (SAVE_DESIGN.md, « Saves
+  automatiques »).
+- **Pas encore fait** : AOF. Principes retenus :
   - `everysec` par défaut (fsync groupé par tour), `always` en option seulement ; un client
     n'est « durable » que si l'ack part après le fsync ;
   - un seul flux d'effets partagé avec la réplication (collecteur d'effets,

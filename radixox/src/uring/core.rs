@@ -24,6 +24,7 @@ use radixox_lib::shared_frame::{SharedFrame as Frame, extend_encode};
 
 use crate::exec::client::Client;
 use crate::exec::jobs::{FREE_BUDGET, FlushJob, KEYS_BUDGET, KeysJob, Step, UnlinkJob};
+use crate::exec::autosave::{Persistence, Rule};
 use crate::exec::bgsave::{BgSave, FileOp, cpu_share, zstd_conf};
 use crate::exec::persist::{save_sync, sync_level};
 use crate::exec::{Executed, execute_into, resp_ok};
@@ -63,6 +64,11 @@ pub struct Config {
     pub idle_timeout: Option<Duration>,
     /// Clés examinées ou nœuds libérés par tranche de job (KEYS, UNLINK).
     pub job_budget: usize,
+    /// Saves automatiques (`save` de Redis ; `RADIXOX_SAVE`, vide par défaut
+    /// ici, les règles de Valkey par défaut dans le binaire).
+    pub save_rules: Vec<Rule>,
+    /// Écritures refusées après un BGSAVE en échec (`stop-writes-on-bgsave-error`).
+    pub stop_writes_on_bgsave_error: bool,
 }
 
 impl Default for Config {
@@ -84,6 +90,8 @@ impl Default for Config {
             prefetch: 8,
             idle_timeout: None,
             job_budget: KEYS_BUDGET.min(FREE_BUDGET),
+            save_rules: Vec::new(),
+            stop_writes_on_bgsave_error: true,
         }
     }
 }
@@ -132,6 +140,8 @@ type Window<T> = SmallVec<[T; 16]>;
 const EVICT_EVERY: Duration = Duration::from_secs(1);
 /// Balayage d'inactivité : une tranche de connexions toutes les 100 ms.
 const SWEEP_EVERY: Duration = Duration::from_millis(100);
+/// Vérification des règles de save automatique (`serverCron` de Redis, hz 10).
+const AUTOSAVE_EVERY: Duration = Duration::from_millis(100);
 const SWEEP_SLOTS: usize = 1024;
 
 /// Échéances du tas de timers (RUNTIME_ARCH.md §9).
@@ -139,6 +149,7 @@ const SWEEP_SLOTS: usize = 1024;
 enum Timer {
     Evict,
     Sweep,
+    AutoSave,
 }
 
 /// Suite à donner après l'exécution d'une frame.
@@ -151,9 +162,12 @@ enum After {
     Background(FlushJob),
     /// Commande longue : la connexion est parquée, le job répondra (§7).
     Park(ConnJob),
-    /// BGSAVE / SAVE : dépendent de l'état du serveur (save en cours).
+    /// BGSAVE / SAVE / LASTSAVE / INFO : dépendent de l'état du serveur (save
+    /// en cours, dernière save).
     BgSave,
     Save,
+    LastSave,
+    Info,
     /// Pub/Sub : touchent le registre et l'`out` d'autres connexions (§10).
     Subscribe(SmallVec<[SharedByte; 4]>),
     Unsubscribe(SmallVec<[SharedByte; 4]>),
@@ -244,6 +258,8 @@ pub struct Core {
     /// Dernière réception, toutes connexions : sans réception depuis 1 ms, le
     /// BGSAVE n'est plus plafonné (le thread est libre).
     last_rx: Instant,
+    /// Saves automatiques, dernière save, écritures depuis.
+    persist: Persistence,
 }
 
 impl Core {
@@ -254,6 +270,9 @@ impl Core {
         timers.push(Reverse((now + EVICT_EVERY, Timer::Evict)));
         if cfg.idle_timeout.is_some() {
             timers.push(Reverse((now + SWEEP_EVERY, Timer::Sweep)));
+        }
+        if !cfg.save_rules.is_empty() {
+            timers.push(Reverse((now + AUTOSAVE_EVERY, Timer::AutoSave)));
         }
         Self {
             art,
@@ -277,6 +296,7 @@ impl Core {
             subs: HashMap::new(),
             save_share: cpu_share(),
             last_rx: now,
+            persist: Persistence::new(cfg.save_rules.clone(), cfg.stop_writes_on_bgsave_error, now),
             cfg,
         }
     }
@@ -311,6 +331,18 @@ impl Core {
                 Timer::Sweep => {
                     self.sweep_idle();
                     self.timers.push(Reverse((self.now + SWEEP_EVERY, Timer::Sweep)));
+                }
+                Timer::AutoSave => {
+                    if self.bgsave.is_none()
+                        && !self.art.is_saving()
+                        && let Some(rule) = self.persist.due(self.now)
+                    {
+                        eprintln!("[autosave] règle « save {} {} » atteinte : BGSAVE", rule.secs, rule.changes);
+                        if let Err(e) = self.start_bgsave() {
+                            eprintln!("[autosave] échec du démarrage : {e}");
+                        }
+                    }
+                    self.timers.push(Reverse((self.now + AUTOSAVE_EVERY, Timer::AutoSave)));
                 }
             }
         }
@@ -462,11 +494,33 @@ impl Core {
             return;
         }
         if let Some(res) = bg.finished(&mut self.art) {
-            if let Err(e) = res {
+            if let Err(e) = &res {
                 eprintln!("[bgsave] échec : {e}");
             }
+            self.persist.bgsave_finished(Instant::now(), res.is_ok());
             self.bgsave = None;
         }
+    }
+
+    /// Lance un BGSAVE (commande ou règle de save automatique).
+    fn start_bgsave(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        self.persist.bgsave_started(now);
+        match BgSave::start(&mut self.art, zstd_conf()) {
+            Ok(bg) => {
+                self.bgsave = Some(bg);
+                Ok(())
+            }
+            Err(e) => {
+                self.persist.bgsave_finished(now, false);
+                Err(e.to_string())
+            }
+        }
+    }
+
+    /// Les règles de save automatique sont actives (save à l'arrêt, comme Redis).
+    pub fn autosave_on(&self) -> bool {
+        self.persist.has_rules()
     }
 
     /// Une tranche de BGSAVE, sous le plafond de CPU quand des clients sont
@@ -828,7 +882,8 @@ impl Core {
         let mut afters: Window<(Slot, After)> = SmallVec::new();
         {
             let job_budget = self.cfg.job_budget;
-            let Core { art, ins, outs, bufs, .. } = self;
+            let Core { art, ins, outs, bufs, persist, .. } = self;
+            let refuse_writes = persist.refuse_writes();
             let mut frames: Window<(Slot, Cmd<'_>)> = SmallVec::new();
             for (rank, &slot) in picked.iter().enumerate() {
                 if frames.len() >= width {
@@ -891,7 +946,18 @@ impl Core {
                 }
             }
             for (slot, cmd) in frames {
-                afters.push((slot, run_cmd(cmd, art, &mut outs[slot as usize], job_budget)));
+                let o = &mut outs[slot as usize];
+                let weight = cmd.write_weight();
+                if weight > 0 && o.client.authed {
+                    if refuse_writes {
+                        extend_encode(&mut o.out, &misconf());
+                        afters.push((slot, After::Continue));
+                        continue;
+                    }
+                    // FLUSHDB : toutes les clés changent (le `dirty` de Redis).
+                    persist.note_writes(if matches!(cmd, Cmd::FlushDb) { art.len() as u64 } else { weight });
+                }
+                afters.push((slot, run_cmd(cmd, art, o, job_budget)));
             }
         }
         let done = afters.len();
@@ -959,11 +1025,8 @@ impl Core {
                 let frame = if self.bgsave.is_some() || self.art.is_saving() {
                     Frame::Error("ERR Background save already in progress".into())
                 } else {
-                    match BgSave::start(&mut self.art, zstd_conf()) {
-                        Ok(bg) => {
-                            self.bgsave = Some(bg);
-                            Frame::SimpleString(SharedByte::from_slice(b"Background saving started"))
-                        }
+                    match self.start_bgsave() {
+                        Ok(()) => Frame::SimpleString(SharedByte::from_slice(b"Background saving started")),
                         Err(e) => Frame::Error(format!("ERR {e}")),
                     }
                 };
@@ -982,12 +1045,23 @@ impl Core {
                                 st.total,
                                 st.walk
                             );
+                            self.persist.save_done(Instant::now());
                             resp_ok()
                         }
                         Err(e) => Frame::Error(format!("ERR {e}")),
                     }
                 };
                 extend_encode(&mut self.outs[s].out, &frame);
+            }
+            After::LastSave => {
+                extend_encode(&mut self.outs[s].out, &Frame::Integer(self.persist.last_save_unix() as i64));
+            }
+            After::Info => {
+                let mut info = String::new();
+                crate::exec::info_server(&mut info);
+                self.persist.info(self.now, &mut info);
+                crate::exec::info_stats(&mut info);
+                extend_encode(&mut self.outs[s].out, &Frame::BulkString(SharedByte::from_slice(info.as_bytes())));
             }
             After::Subscribe(channels) => self.subscribe(slot, &channels),
             After::Unsubscribe(channels) => self.unsubscribe(slot, &channels),
@@ -1373,6 +1447,17 @@ impl Core {
     }
 }
 
+/// Écriture refusée après un BGSAVE en échec (texte de Redis / Valkey).
+fn misconf() -> Frame {
+    Frame::Error(
+        "MISCONF RadixOx is configured to save snapshots, but it's currently unable to persist to disk. \
+         Commands that may modify the data set are disabled, because this instance is configured to report \
+         errors during writes if snapshotting fails (stop-writes-on-bgsave-error option). Please check the \
+         RadixOx logs for details about the error."
+            .into(),
+    )
+}
+
 /// Exécute une commande d'une connexion.
 fn run_cmd(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) -> After {
     // Mode abonné : seules les commandes Pub/Sub, PING et QUIT passent.
@@ -1437,6 +1522,8 @@ fn runtime(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) 
         // Dépendent d'une save en cours : traitées par le cœur (`finish_frame`).
         Cmd::BgSave => After::BgSave,
         Cmd::Save => After::Save,
+        Cmd::LastSave => After::LastSave,
+        Cmd::Info => After::Info,
         Cmd::Subscribe(ch) => After::Subscribe(ch.into_iter().collect()),
         Cmd::Unsubscribe(ch) => After::Unsubscribe(ch.into_iter().collect()),
         Cmd::Publish { channel, message } => After::Publish { channel, message },

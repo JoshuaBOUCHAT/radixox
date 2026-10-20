@@ -4,6 +4,8 @@
 # Usage: ./profile_run.sh
 # Output: /tmp/radixox_profile_run_<timestamp>.json  (opened in browser by samply)
 set -euo pipefail
+# Pas de save automatique pendant un bench (Valkey y tourne avec --save "").
+export RADIXOX_SAVE="${RADIXOX_SAVE-}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 YCSB_DIR="$(cd "$SCRIPT_DIR/../ycsb-redis-binding-0.18.0-SNAPSHOT" && pwd)"

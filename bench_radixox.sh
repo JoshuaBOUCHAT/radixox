@@ -1,5 +1,7 @@
 #!/bin/bash
 set -euo pipefail
+# Pas de save automatique pendant un bench (Valkey y tourne avec --save "").
+export RADIXOX_SAVE="${RADIXOX_SAVE-}"
 export LC_ALL=C   # printf %f / awk : point décimal quelle que soit la locale
 
 # YCSB workload A (même config que bench_compare.sh) sur RadixOx uniquement,

@@ -40,6 +40,7 @@ fn start_with(port: u16, dir: &PathBuf, env: &[(&str, &str)]) -> Server {
     let child = Command::new(common::server_bin())
         .env("RADIXOX_PORT", port.to_string())
         .env("RADIXOX_DIR", dir)
+        .env("RADIXOX_SAVE", "")
         .envs(env.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -336,5 +337,69 @@ fn sigterm_saves_before_exit() {
     assert_eq!(v, "1");
     let f: String = redis::cmd("HGET").arg("h").arg("f").query(&mut c).unwrap();
     assert_eq!(f, "v");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const PORT_AUTO: u16 = 6419;
+const PORT_MISCONF: u16 = 6420;
+
+fn info_field(c: &mut redis::Connection, name: &str) -> String {
+    let info: String = redis::cmd("INFO").query(c).unwrap();
+    info.lines()
+        .find_map(|l| l.strip_prefix(name).and_then(|r| r.strip_prefix(':')))
+        .unwrap_or_else(|| panic!("{name} absent d'INFO"))
+        .trim()
+        .to_string()
+}
+
+/// `RADIXOX_SAVE="1 2"` : deux écritures et plus d'une seconde depuis le
+/// démarrage déclenchent un BGSAVE ; INFO persistence et LASTSAVE suivent.
+#[test]
+fn autosave_rule_triggers_bgsave() {
+    let dir = std::env::temp_dir().join(format!("radixox-autosave-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _server = start_with(PORT_AUTO, &dir, &[("RADIXOX_SAVE", "1 2")]);
+    let mut c = redis::Client::open(format!("redis://127.0.0.1:{PORT_AUTO}")).unwrap().get_connection().unwrap();
+    let boot: i64 = redis::cmd("LASTSAVE").query(&mut c).unwrap();
+    redis::cmd("SET").arg("a").arg("1").query::<()>(&mut c).unwrap();
+    assert_eq!(info_field(&mut c, "rdb_changes_since_last_save"), "1");
+    std::thread::sleep(Duration::from_millis(1300));
+    assert_eq!(info_field(&mut c, "rdb_saves"), "0", "une seule écriture : la règle en demande deux");
+    redis::cmd("MSET").arg("b").arg("2").arg("c").arg("3").query::<()>(&mut c).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while info_field(&mut c, "rdb_saves") != "1" {
+        assert!(Instant::now() < deadline, "pas de save automatique");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(info_field(&mut c, "rdb_last_bgsave_status"), "ok");
+    assert_eq!(info_field(&mut c, "rdb_changes_since_last_save"), "0");
+    assert_eq!(info_field(&mut c, "rdb_bgsave_in_progress"), "0");
+    let last: i64 = redis::cmd("LASTSAVE").query(&mut c).unwrap();
+    assert!(last >= boot);
+    assert!(dir.join("dump.rxd").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Dossier sans droit d'écriture : le BGSAVE échoue, les écritures sont
+/// refusées (`stop-writes-on-bgsave-error`), les lectures passent.
+#[test]
+fn failed_bgsave_refuses_writes() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("radixox-misconf-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _server = start_with(PORT_MISCONF, &dir, &[("RADIXOX_SAVE", "3600 1")]);
+    let mut c = redis::Client::open(format!("redis://127.0.0.1:{PORT_MISCONF}")).unwrap().get_connection().unwrap();
+    redis::cmd("SET").arg("a").arg("1").query::<()>(&mut c).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let r: redis::RedisResult<String> = redis::cmd("BGSAVE").query(&mut c);
+    assert!(r.is_err(), "BGSAVE dans un dossier en lecture seule");
+    assert_eq!(info_field(&mut c, "rdb_last_bgsave_status"), "err");
+    let w: redis::RedisResult<()> = redis::cmd("SET").arg("b").arg("2").query(&mut c);
+    assert!(w.unwrap_err().to_string().contains("MISCONF"));
+    let v: String = redis::cmd("GET").arg("a").query(&mut c).unwrap();
+    assert_eq!(v, "1");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

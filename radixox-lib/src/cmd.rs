@@ -87,6 +87,8 @@ pub enum Cmd<'a> {
     BgSave,
     /// SAVE (bloquante)
     Save,
+    /// LASTSAVE : date (Unix) de la dernière save réussie
+    LastSave,
 
     // --- String / clés -----------------------------------------------
     /// GET key
@@ -815,6 +817,7 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
         }
         b"bgsave" => { at_most!(1); Cmd::BgSave }
         b"save" => { exact!(0); Cmd::Save }
+        b"lastsave" => { exact!(0); Cmd::LastSave }
 
         _ => return Err(CmdError::Unknown),
     })
@@ -902,31 +905,38 @@ impl<'a> Cmd<'a> {
 
     /// Modifie la base (pour le futur collecteur d'effets, RUNTIME_ARCH.md §18).
     pub fn is_write(&self) -> bool {
-        matches!(
-            self,
+        self.write_weight() > 0
+    }
+
+    /// Changements que la commande peut faire, compté par élément comme le
+    /// `dirty` de Redis (MSET : ses paires, DEL : ses clés, HSET : ses champs) ;
+    /// 0 pour une lecture. Majorant : une écriture sans effet compte aussi.
+    /// FLUSHDB compte 1 ici, l'appelant ajoute la taille de la base.
+    pub fn write_weight(&self) -> u64 {
+        let n = match self {
             Cmd::Set { .. }
-                | Cmd::SetNx { .. }
-                | Cmd::MSet(_)
-                | Cmd::Del(_)
-                | Cmd::Unlink(_)
-                | Cmd::Expire { .. }
-                | Cmd::Persist(_)
-                | Cmd::Incr(_)
-                | Cmd::Decr(_)
-                | Cmd::IncrBy { .. }
-                | Cmd::DecrBy { .. }
-                | Cmd::HSet { .. }
-                | Cmd::HMSet { .. }
-                | Cmd::HDel { .. }
-                | Cmd::HIncrBy { .. }
-                | Cmd::SAdd { .. }
-                | Cmd::SRem { .. }
-                | Cmd::SPop { .. }
-                | Cmd::ZAdd { .. }
-                | Cmd::ZRem { .. }
-                | Cmd::ZIncrBy { .. }
-                | Cmd::FlushDb
-        )
+            | Cmd::SetNx { .. }
+            | Cmd::Expire { .. }
+            | Cmd::Persist(_)
+            | Cmd::Incr(_)
+            | Cmd::Decr(_)
+            | Cmd::IncrBy { .. }
+            | Cmd::DecrBy { .. }
+            | Cmd::HIncrBy { .. }
+            | Cmd::ZIncrBy { .. }
+            | Cmd::FlushDb => 1,
+            Cmd::MSet(pairs) => pairs.len(),
+            Cmd::Del(keys) => keys.len(),
+            Cmd::Unlink(keys) => keys.len(),
+            Cmd::HSet { fields, .. } | Cmd::HMSet { fields, .. } => fields.len(),
+            Cmd::HDel { fields, .. } => fields.len(),
+            Cmd::SAdd { members, .. } | Cmd::SRem { members, .. } => members.len(),
+            Cmd::SPop { count, .. } => count.unwrap_or(1) as usize,
+            Cmd::ZAdd { members, .. } => members.len(),
+            Cmd::ZRem { members, .. } => members.len(),
+            _ => 0,
+        };
+        n as u64
     }
 
     /// Clé unique de la commande, pour le préchargement par lots

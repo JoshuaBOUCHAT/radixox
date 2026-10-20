@@ -7,6 +7,8 @@
 # Usage: ./profile_memtier.sh
 #   KEY_MAX=200000 TEST_TIME=30 ./profile_memtier.sh
 set -euo pipefail
+# Pas de save automatique pendant un bench (Valkey y tourne avec --save "").
+export RADIXOX_SAVE="${RADIXOX_SAVE-}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PORT=6379

@@ -25,6 +25,8 @@ pub fn start_server_env(port: u16, envs: &[(&str, &str)]) {
     let bin = server_bin();
     let child = Command::new(bin)
         .env("RADIXOX_PORT", port.to_string())
+        // Pas de save automatique ni de dump dans le dossier courant.
+        .env("RADIXOX_SAVE", "")
         .envs(envs.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

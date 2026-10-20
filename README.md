@@ -29,8 +29,8 @@ Good fit today:
 
 Missing for primary data:
 - **no memory limit or eviction** (`maxmemory`, LRU/LFU): a growing dataset ends in OOM;
-- **durability is manual**: `SAVE` / `BGSAVE` and a save on SIGTERM, no AOF, no periodic
-  saves; a crash loses everything since the last save;
+- **snapshots only, no AOF**: automatic `BGSAVE` rules as in Valkey and a save on SIGTERM,
+  but a crash loses everything written since the last snapshot;
 - no replication, no cluster, no TLS, no ACLs (one password);
 - no lists, `MULTI`/`EXEC` or Lua, which queue and job libraries (Sidekiq, Celery, BullMQ)
   rely on;
@@ -491,7 +491,7 @@ own synchronization.
 
 | Category | Commands |
 |---|---|
-| Connection / server | `PING` `AUTH` `HELLO` (RESP2; `HELLO 3` → `-NOPROTO`) `CLIENT` (`SETNAME` `GETNAME` `ID` `SETINFO`) `COMMAND` `ECHO` `QUIT` `SELECT` `INFO` `DBSIZE` `FLUSHDB` `SAVE` `BGSAVE` |
+| Connection / server | `PING` `AUTH` `HELLO` (RESP2; `HELLO 3` → `-NOPROTO`) `CLIENT` (`SETNAME` `GETNAME` `ID` `SETINFO`) `COMMAND` `ECHO` `QUIT` `SELECT` `INFO` `DBSIZE` `FLUSHDB` `SAVE` `BGSAVE` `LASTSAVE` |
 | Strings | `GET` `SET` (`EX` `PX` `NX` `XX`) `SETNX` `SETEX` `MGET` `MSET` |
 | Counters | `INCR` `DECR` `INCRBY` `DECRBY` |
 | Keys | `DEL` `UNLINK` `EXISTS` `TYPE` `KEYS` `SCAN` (`MATCH` `COUNT` `TYPE`) |
@@ -516,16 +516,26 @@ replication, cluster.
 ## Persistence
 
 - **`SAVE`** (blocking) and **`BGSAVE`** (incremental, in slices between client requests)
-  write `RADIXOX_DIR/dump.rxd`. The dump is reloaded at startup. While clients are active,
-  `BGSAVE` uses at most 10 % of the server thread (`RADIXOX_SAVE_CPU_SHARE`), so it does not
-  raise their tail latency.
+  write `RADIXOX_DIR/dump.rxd`. The dump is reloaded at startup. `BGSAVE` works whenever no
+  client and no kernel completion is waiting, and is guaranteed 10 % of the server thread
+  under load (`RADIXOX_SAVE_CPU_SHARE`).
+- **Automatic saves, as in Valkey**: `RADIXOX_SAVE` takes Valkey's `save` syntax and
+  defaults — `"3600 1 300 100 60 10000"`: a `BGSAVE` after 3600 s if at least 1 key changed,
+  after 300 s if 100 changed, after 60 s if 10,000 changed (counted per element, like Redis's
+  `dirty`). `RADIXOX_SAVE=""` disables them. After a failed `BGSAVE`, the next automatic try
+  waits 5 s, and writes are refused with `-MISCONF` until a save succeeds
+  (`RADIXOX_STOP_WRITES_ON_BGSAVE_ERROR`, on by default). `LASTSAVE` and the
+  `# Persistence` section of `INFO` (`rdb_changes_since_last_save`, `rdb_bgsave_in_progress`,
+  `rdb_last_save_time`, `rdb_last_bgsave_status`, `rdb_last_bgsave_time_sec`, …) report
+  them.
 - Snapshots use an **application-level copy-on-write barrier** instead of `fork`: a node is
   copied only if it is modified before the snapshot reaches it. No memory doubling, no fork
   latency on a large heap.
 - `BGSAVE` compresses with zstd (level 3 by default); the file ends with a CRC footer, and a
   truncated or corrupted dump prevents startup instead of loading partial data.
-- `RADIXOX_SAVE_ON_EXIT=1`: save on SIGINT / SIGTERM.
-- Not yet: AOF, automatic periodic saves.
+- **Save on SIGINT / SIGTERM** when automatic saves are on, as Valkey does
+  (`RADIXOX_SAVE_ON_EXIT=0` / `1` to force).
+- Not yet: AOF, `CONFIG GET` / `CONFIG SET` (settings are environment variables).
 
 Design: [`SAVE_DESIGN.md`](SAVE_DESIGN.md).
 
@@ -546,7 +556,9 @@ Environment variables:
 | `RADIXOX_SAVE_ZSTD` | `3` | `BGSAVE` zstd level (`0` = raw) |
 | `RADIXOX_SAVE_SYNC_ZSTD` | raw | zstd level of `SAVE` and of the exit save |
 | `RADIXOX_SAVE_BACKLOG_MB` | `64` | compression backlog of `BGSAVE` |
-| `RADIXOX_SAVE_ON_EXIT` | off | save on SIGINT / SIGTERM |
+| `RADIXOX_SAVE` | `3600 1 300 100 60 10000` | automatic `BGSAVE` rules, Valkey's `save` syntax: pairs `<seconds> <changes>`; `""` disables |
+| `RADIXOX_STOP_WRITES_ON_BGSAVE_ERROR` | on | refuse writes (`-MISCONF`) after a failed `BGSAVE` while automatic saves are on |
+| `RADIXOX_SAVE_ON_EXIT` | on with automatic saves | save on SIGINT / SIGTERM |
 | `RADIXOX_SAVE_CPU_SHARE` | `0.1` | share of the server thread a `BGSAVE` is guaranteed while clients are active; whenever no client and no kernel completion is waiting, background work (save, `FLUSHDB` freeing, long `KEYS`) runs uncapped |
 | `RADIXOX_SCAN_IDLE_SECS` | `60` | idle time after which a `SCAN` cursor can be reclaimed |
 | `RADIXOX_SCAN_MAX_CURSORS` | `65536` | active `SCAN` cursors at most; beyond, a new `SCAN` gets an error |

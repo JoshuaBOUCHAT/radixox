@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use io_uring::types::{BufRingEntry, Fd, Fixed, IOU_PBUF_RING_INC, SubmitArgs, Timespec};
 use io_uring::{EnterFlags, IoUring, cqueue, opcode, squeue};
 use oxidart::OxidArt;
+use radixox::exec::autosave;
 use radixox::tsc;
 use radixox::uring::{Bid, Completion, Config, Core, Op, Slot};
 
@@ -121,7 +122,7 @@ struct Server {
     /// Attente groupée (expérimental) : `(want, µs)`, le noyau attend `want`
     /// complétions pendant au plus `µs` avant de rendre la main pour une seule.
     min_wait: Option<(u32, u32)>,
-    /// `signalfd` de SIGINT / SIGTERM (`RADIXOX_SAVE_ON_EXIT`).
+    /// `signalfd` de SIGINT / SIGTERM (save à l'arrêt).
     signals: Option<Signals>,
 }
 
@@ -134,9 +135,12 @@ struct Signals {
 }
 
 impl Signals {
-    fn install() -> io::Result<Option<Self>> {
-        let on = std::env::var("RADIXOX_SAVE_ON_EXIT")
-            .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    /// Save à l'arrêt : `RADIXOX_SAVE_ON_EXIT`, sinon `default` (des règles de
+    /// save automatique sont actives : Redis sauve aussi à l'arrêt dans ce cas).
+    fn install(default: bool) -> io::Result<Option<Self>> {
+        let on = std::env::var("RADIXOX_SAVE_ON_EXIT").map_or(default, |v| {
+            matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        });
         if !on {
             return Ok(None);
         }
@@ -617,6 +621,9 @@ fn main() -> io::Result<()> {
     if let Some(secs) = std::env::var("RADIXOX_TIMEOUT").ok().and_then(|v| v.parse::<u64>().ok()) {
         cfg.idle_timeout = (secs > 0).then(|| Duration::from_secs(secs));
     }
+    // `save` de Valkey : mêmes règles par défaut, `RADIXOX_SAVE=""` désactive.
+    cfg.save_rules = autosave::rules_from_env().map_err(|e| io::Error::other(format!("RADIXOX_SAVE : {e}")))?;
+    cfg.stop_writes_on_bgsave_error = autosave::stop_writes_from_env();
     cfg.max_conn = raise_nofile(cfg.max_conn);
     ring.submitter().register_files_sparse(cfg.max_conn)?;
     let no_iowait = ring.params().is_feature_no_iowait();
@@ -627,7 +634,7 @@ fn main() -> io::Result<()> {
     let listener = TcpListener::bind(&addr)?;
     println!("RadixOx RESP Server (io_uring loop) listening on {addr}");
 
-    let signals = Signals::install()?;
+    let signals = Signals::install(core.autosave_on())?;
     let mut server = Server { ring, bufring, core, listener, ops: Vec::new(), no_iowait, send_async, file_async, min_wait,
         signals,
     };

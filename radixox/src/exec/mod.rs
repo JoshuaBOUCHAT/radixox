@@ -4,6 +4,7 @@
 //! Utilisé par le cœur de la boucle io_uring (`radixox::uring`).
 
 pub mod auth;
+pub mod autosave;
 pub mod bgsave;
 pub mod client;
 pub mod jobs;
@@ -43,7 +44,8 @@ pub enum Executed<'a> {
 
 /// Exécute `cmd` et écrit sa réponse dans `out`, ou la rend à l'appelant si
 /// elle dépend du runtime (`QUIT`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`,
-/// `KEYS`, `UNLINK`, `FLUSHDB`, `BGSAVE`, `SAVE`). Contrôle d'AUTH compris.
+/// `KEYS`, `UNLINK`, `FLUSHDB`, `BGSAVE`, `SAVE`, `LASTSAVE`, `INFO`). Contrôle
+/// d'AUTH compris.
 pub fn execute_into<'a>(
     cmd: Cmd<'a>,
     art: &mut OxidArt,
@@ -67,15 +69,9 @@ pub fn execute_into<'a>(
         | Cmd::Unlink(_)
         | Cmd::FlushDb
         | Cmd::BgSave
-        | Cmd::Save => return Executed::Runtime(cmd),
-        Cmd::Info => {
-            let info = format!(
-                "# Server\r\nredis_version:7.0.0\r\nradixox_version:{}\r\n\r\n# Stats\r\nscan_cursors:{}\r\n",
-                env!("CARGO_PKG_VERSION"),
-                scan::active_cursors()
-            );
-            Frame::BulkString(SharedByte::from_slice(info.as_bytes()))
-        }
+        | Cmd::Save
+        | Cmd::LastSave
+        | Cmd::Info => return Executed::Runtime(cmd),
         Cmd::Ping(msg) => resp_pong(msg),
         Cmd::Auth { user, pass } => auth::cmd_auth(user, pass, &mut client.authed),
         Cmd::Hello(args) => client::cmd_hello(&args, client),
@@ -194,6 +190,7 @@ pub fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         | Cmd::Unlink(_)
         | Cmd::BgSave
         | Cmd::Save
+        | Cmd::LastSave
         | Cmd::Info
         | Cmd::Auth { .. }
         | Cmd::Hello(_)
@@ -206,6 +203,21 @@ pub fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Sections `# Server` et `# Stats` d'`INFO` (la persistance vient du cœur).
+pub fn info_server(out: &mut String) {
+    use std::fmt::Write as _;
+    let _ = write!(
+        out,
+        "# Server\r\nredis_version:7.0.0\r\nradixox_version:{}\r\n\r\n",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+pub fn info_stats(out: &mut String) {
+    use std::fmt::Write as _;
+    let _ = write!(out, "# Stats\r\nscan_cursors:{}\r\n", scan::active_cursors());
+}
 
 pub fn encode_krange(buf: &mut Vec<u8>, range: &oxidart::krange::RangeOut<'_>) {
     use oxidart::krange::RangeVal;

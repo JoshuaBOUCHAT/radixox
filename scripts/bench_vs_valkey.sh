@@ -19,6 +19,8 @@
 #   général : coût du disque exclu).
 # - Résultats : médiane des rounds (et min–max) dans $OUT/summary.txt.
 set -euo pipefail
+# Pas de save automatique pendant un bench (Valkey y tourne avec --save "").
+export RADIXOX_SAVE="${RADIXOX_SAVE-}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 YCSB_DIR="$(cd "$ROOT/../ycsb-redis-binding-0.18.0-SNAPSHOT" && pwd)"
