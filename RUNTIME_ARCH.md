@@ -681,6 +681,17 @@ Le coût suit donc la charge dans le bon sens : argument pour une règle simple.
 vraie carte, le gros de la réception (softirq) tourne sur le cœur de l'interruption, pas
 forcément le nôtre (§16, IRQ).
 
+**Le recv multishot ne peut pas aller sur io-wq (vérifié, source 7.3-rc, 2026-10-20).**
+`io_wq_submit_work` (`io_uring.c`) : « Don't allow any multishot execution from io-wq » —
+avec `DEFER_TASKRUN`, seuls nous pouvons poster ses CQE ; sur un socket non bloquant, le
+worker arme un poll et rend la main, chaque arrivée s'exécute ensuite dans notre
+`task_work` (`io_poll_issue`). Un recv **simple** en ASYNC part bien sur io-wq (réveil du
+poll → `io_req_task_submit` → `io_queue_iowq`), mais chaque lecture repasse par nous
+(relais, mise en file, CQE) et coûte un SQE : contre ~1 500–1 700 cycles/cmd de recv
+économisés, gain net probable faible. Non retenu. Ce qui reste à notre thread dans la
+réception : la copie socket → tampon de l'anneau et le CQE, au moment où **nous** entrons
+(le softirq TCP tourne ailleurs).
+
 **Ordre de mise en place, sans optimisation prématurée :**
 1. `RADIXOX_SEND_ASYNC=off|on`, statique. Mesures à charge faible, moyenne et saturée,
    sur 2 vCPU, en loopback puis en cloud.
@@ -1182,6 +1193,64 @@ mesure du délai soumission → CQE des sends délégués.
 Pendant qu'on exécute la fenêtre N, précharger déjà les octets des frames et les clés de
 la fenêtre N+1 (distance réglable, comme le préchargement des frères de KRANGE) : les
 données reçues reviennent en cache juste avant leur parse.
+
+### 12.5 Coût de la délégation, attente groupée (2026-10-20, loopback, p1)
+
+1:4, 1 M clés de 100 o, graines distinctes, 10 s, profil `performance`, un run par point.
+Boucle sur CPU 0 ; `perf stat -t` sur le thread principal seul ; occupation par CPU lue
+dans `/proc/stat` (softirq compris).
+
+**Part user / noyau.** 1 cœur, 80 conns : 266 K ; CPU 0 = user 7, sys 50, softirq 40.
+Par commande : 4 785 instr. et 2 223 cycles user, ~18 200 cycles noyau (~3,8 µs).
+
+| boucle + workers (CPU) | débit | boucle occupée | cycles user/cmd | cycles noyau/cmd |
+|---|---|---|---|---|
+| 1 cœur | 266 K | 100 % | 2 223 | 18 165 |
+| + 1 worker (1) | 279–304 K | ~70 % | 3 540–4 140 | 6 965–7 590 |
+| + 2 workers frères SMT (1, 7) | 450–474 K | 72–77 % | 3 060–3 574 | 5 295–5 505 |
+| + 2 workers, cœurs distincts (1, 2) | **540–562 K** | 81–84 % | 2 887–3 065 | 4 710–4 737 |
+
+- Un worker sur un cœur physique coûte **~3,6 µs/cmd** (sys 58, softirq 41 : il paie aussi
+  la réception TCP du client, biais du loopback). Les workers saturent dans toutes les
+  configs ; client sur 3-5,9-11 à ~88 % : sur le 7600X, impossible de saturer la boucle.
+- CPU total : 281 % pour 556 K (5,05 µs/cmd) contre 100 % pour 266 K (3,76 µs/cmd) ;
+  délégation = +34 % de CPU par commande pour ×2,1 de débit sur 3 cœurs.
+- **Le surcoût user vient des petits lots, pas d'un partage de lignes entre cœurs.** Mêmes
+  instructions par commande, ×1,4–1,6 de cycles, ×2,5 de défauts L1, diffus dans tout le
+  code (pas concentrés sur les tampons d'envoi). La boucle a de la marge, dort
+  (~0,26 changement de contexte/cmd) et sert des tours de quelques commandes :
+  `descend_batch` −102 cycles/cmd, chemin unitaire (`get`, `find_value`) +400. Écarté par
+  mesure : CC6 (boucle `SCHED_IDLE` sur CPU 0, idle à 0 % : aucun changement).
+- **Plus de connexions ne grossit pas les lots** tant que les workers sont le goulot : la
+  boucle reçoit au rythme où ils envoient (boucle fermée). 80 → 800 conns : débit plat,
+  latence ∝ conns (Little), coût user/cmd inchangé.
+- **Horloges** (micro-bench, CPU 0) : `SystemTime::now` 23 ns, `Instant::now` 17 ns,
+  `rdtsc` 7 ns, `*_COARSE` 3 ns (résolution 1 tick : 1 ms ici, 4 ms à HZ=250). Une seule
+  lecture par tour : −1 %, bruit. Les ~800 cycles/cmd « clock_gettime » du profil sont un
+  artefact d'attribution (bord user/noyau) : ce profil exagère tout ce qui touche la
+  frontière.
+
+**Attente groupée** (`RADIXOX_MIN_WAIT_US`, `RADIXOX_WAIT_NR`, `min_wait_usec` de
+`io_uring_getevents_arg`, noyau 6.12) : au repos, le noyau attend `WAIT_NR` complétions
+pendant au plus ce délai avant de nous rendre la main pour une seule.
+
+| cœurs distincts, 2 workers | débit | moy. / p99 / p99.9 | boucle | user/cmd | noyau/cmd |
+|---|---|---|---|---|---|
+| 78 conns, classique | 556 K | 0,14 / 0,21 / 0,26 ms | 81 % | 2 887 | 4 737 |
+| 78 conns, 10 µs / 16 | 540 K | 0,15 / 0,21 / 0,24 | 53 % | 2 285 | 4 130 |
+| 318 conns, classique | 562 K | 0,57 / 0,68 / 1,14 | 84 % | 2 973 | 4 710 |
+| 318 conns, 10 µs / 16 | 532 K | 0,60 / 0,71 / 1,18 | 56 % | 2 377 | 4 127 |
+| 798 conns, classique | 540 K | 1,48 / 1,99 / 5,63 | 82 % | 3 065 | 4 731 |
+| 798 conns, 10 µs / 16 | 524 K | 1,52 / 1,85 / 5,66 | 59 % | 2 490 | 4 189 |
+
+- −20 % de cycles user, −12 % de noyau par commande : le coût user revient près du mono-
+  thread (lots plus gros par réveil, les changements de contexte ne baissent pas).
+- Débit −3 à −5 % (workers saturés ; bruit d'un run), latence égale : inutile pour le
+  débit tant que la boucle n'est pas le goulot ; libère ~30 % du cœur (travail de fond).
+  À saturation de la boucle, les lots grossissent seuls. Désactivé par défaut.
+- Plafond de la boucle, en cycles : ~7 600/cmd classique → **~680 K** ; ~6 400 avec
+  `min_wait` → **~810 K** (l'occupation `/proc/stat` en mode `min_wait` est incohérente
+  avec les cycles : ~6,5 GHz implicites ; se fier aux cycles). À mesurer sur deux machines.
 
 ---
 

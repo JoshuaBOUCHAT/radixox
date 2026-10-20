@@ -115,6 +115,9 @@ struct Server {
     no_iowait: bool,
     /// Sends délégués aux workers io-wq (`IOSQE_ASYNC`, RUNTIME_ARCH.md §6.4).
     send_async: bool,
+    /// Attente groupée (expérimental) : `(want, µs)`, le noyau attend `want`
+    /// complétions pendant au plus `µs` avant de rendre la main pour une seule.
+    min_wait: Option<(u32, u32)>,
     /// `signalfd` de SIGINT / SIGTERM (`RADIXOX_SAVE_ON_EXIT`).
     signals: Option<Signals>,
 }
@@ -377,14 +380,15 @@ impl Server {
             .next_deadline()
             .map_or(Duration::from_secs(1), |t| t.saturating_duration_since(Instant::now()));
         let ts = Timespec::from(timeout);
-        let args = SubmitArgs::new().timespec(&ts);
+        let (want, usec) = self.min_wait.unwrap_or((1, 0));
+        let args = SubmitArgs::new().timespec(&ts).min_wait_usec(usec);
         let mut flags = EnterFlags::GETEVENTS | EnterFlags::EXT_ARG;
         if self.no_iowait {
             flags |= EnterFlags::NO_IOWAIT;
         }
         let to_submit = self.ring.submission().len() as u32;
         // SAFETY: `args` vit pendant l'appel.
-        unsafe { self.ring.submitter().enter(to_submit, 1, flags.bits(), Some(&args)) }
+        unsafe { self.ring.submitter().enter(to_submit, want, flags.bits(), Some(&args)) }
     }
 }
 
@@ -464,6 +468,19 @@ fn raise_nofile(wanted: u32) -> u32 {
         }
         max
     }
+}
+
+/// `RADIXOX_MIN_WAIT_US=<µs>` (expérimental) : au repos, attendre jusqu'à
+/// `RADIXOX_WAIT_NR` complétions (défaut 32) pendant au plus ce délai, pour
+/// regrouper le travail en lots au lieu de se réveiller pour une seule.
+fn min_wait(ring: &IoUring) -> Option<(u32, u32)> {
+    let usec: u32 = std::env::var("RADIXOX_MIN_WAIT_US").ok()?.parse().ok().filter(|&u| u > 0)?;
+    if !ring.params().is_feature_min_timeout() {
+        eprintln!("[uring] RADIXOX_MIN_WAIT_US ignoré : noyau sans IORING_FEAT_MIN_TIMEOUT");
+        return None;
+    }
+    let want = std::env::var("RADIXOX_WAIT_NR").ok().and_then(|v| v.parse().ok()).unwrap_or(32u32).max(1);
+    Some((want, usec))
 }
 
 /// Délégation des sends (RUNTIME_ARCH.md §6.4), version statique :
@@ -552,12 +569,13 @@ fn main() -> io::Result<()> {
     ring.submitter().register_files_sparse(cfg.max_conn)?;
     let no_iowait = ring.params().is_feature_no_iowait();
     let send_async = setup_iowq(&ring)?;
+    let min_wait = min_wait(&ring);
     let mut core = Core::new(cfg, art);
     let bufring = BufRing::new(&ring, &mut core)?;
     let listener = TcpListener::bind(&addr)?;
     println!("RadixOx RESP Server (io_uring loop) listening on {addr}");
 
     let signals = Signals::install()?;
-    let mut server = Server { ring, bufring, core, listener, ops: Vec::new(), no_iowait, send_async, signals };
+    let mut server = Server { ring, bufring, core, listener, ops: Vec::new(), no_iowait, send_async, min_wait, signals };
     server.run()
 }
