@@ -11,7 +11,8 @@
 > retenues, §7.5), test 8 ; **réplication de base (étape 7, 2026-10-21)** : liens sortants du
 > cœur (`Op::Connect`), `REPLICATE`, `RXHELLO` / `RXLOAD` / `RXBLOCK` / `RXTICK`, backlog,
 > synchronisation complète par un BGSAVE coupé, mode suivi, `REPLICAOF NO ONE`, `INFO
-> # Replication`, test 7 (§10.9, avec les écarts). Suite : étape 8. Ce document doit suffire à
+> # Replication`, test 7 (§10.9, avec les écarts) ; `WAIT` (étape 8, §10.9). Suite : reste de
+> l'étape 8 (zéro copie, `min-replicas-to-write`). Ce document doit suffire à
 > un agent qui ne connaît pas le projet : §1 donne le contexte du code, §2–§11 la conception,
 > §12 les tests, §13 l'ordre de travail avec ses critères d'acceptation. Il remplace le
 > « collecteur d'effets » de RUNTIME_ARCH.md §18 et complète ARCHITECTURE.md §3.
@@ -766,6 +767,18 @@ l'écrivain de l'AOF et la réplication), `journal::apply_into`.
 - Un bloc de plus de 512 Mio (une seule commande énorme) ne passe pas en `RXBLOCK`.
 - `DEBUG DIGEST [at]` (nouveau) : condensé du contenu (§6.4) des clés vivantes à `at` ; sert
   aux tests à comparer deux serveurs.
+
+**`WAIT` (étape 8)** : chaque connexion retient la marque (§7.5) de sa dernière écriture
+journalisée (`ConnOut::write_mark`). `WAIT n timeout` répond tout de suite si `n` cibles en
+ligne ont acquitté jusqu'à cette marque (offset de fin du bloc acquitté, ou de la coupure
+d'un dump une fois `RXLOAD END` acquitté) ; sinon la connexion est parquée (`repl_wait`, comme
+`aof_wait` : ses octets attendent dans `rx`) et réveillée à chaque acquittement ou à son
+échéance (`Timer::Wait`), avec le nombre de cibles qui ont la marque. `WAIT 1 0` sans réplica
+attend sans fin, comme Valkey ; sur un réplica : refusé. Une connexion parquée (job, AOF,
+`WAIT`) envoie maintenant ses réponses déjà prêtes au lieu d'attendre la fin du parquage.
+Test : `wait_counts_acknowledged_replicas` (fil bloqué : réponse au délai), `WAIT` mêlé au flux
+aléatoire de `replica_follows_random_traffic_across_cuts`, et dans
+`replica_survives_kill9_and_converges`.
 
 Bugs d'oxidart trouvés par le test 7 (corrigés à part : e46b808, 143f5a2) : l'évicteur pouvait
 tirer un nœud d'un sous-arbre détaché pas encore libéré, et FLUSHDB pendant la libération d'un

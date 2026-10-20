@@ -81,6 +81,7 @@ pub fn execute_into<'a>(
         | Cmd::RxLoad(_)
         | Cmd::RxBlock(_)
         | Cmd::RxTick(_)
+        | Cmd::Wait { .. }
         | Cmd::Info => return Executed::Runtime(cmd),
         Cmd::Ping(msg) => resp_pong(msg),
         Cmd::Auth { user, pass } => auth::cmd_auth(user, pass, &mut client.authed),
@@ -209,6 +210,7 @@ pub fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         | Cmd::RxLoad(_)
         | Cmd::RxBlock(_)
         | Cmd::RxTick(_)
+        | Cmd::Wait { .. }
         | Cmd::Info
         | Cmd::Auth { .. }
         | Cmd::Hello(_)

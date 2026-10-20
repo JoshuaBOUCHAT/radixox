@@ -91,6 +91,12 @@ pub struct ConnOut {
     /// (DURABILITY_DESIGN.md §7.6). Comme `job_pending` : plus tirée, ce
     /// qu'elle reçoit attend dans `rx`.
     pub aof_wait: bool,
+    /// `WAIT` : parquée jusqu'à ce que assez de réplicas aient acquitté sa
+    /// dernière écriture (DURABILITY_DESIGN.md §10.6), comme `aof_wait`.
+    pub repl_wait: bool,
+    /// Offset du flux atteint par la dernière écriture journalisée de la
+    /// connexion (marque du §7.5) : ce que `WAIT` attend des réplicas.
+    pub write_mark: u64,
     /// Réponses retenues jusqu'au fsync qui les couvre (`appendfsync always`,
     /// DURABILITY_DESIGN.md §7.5) : (début de la réponse dans `out`, marque).
     /// Rien à partir du premier début retenu ne part (ordre des réponses).
@@ -126,12 +132,20 @@ impl ConnOut {
             last_active: Instant::now(),
             job_pending: false,
             aof_wait: false,
+            repl_wait: false,
+            write_mark: 0,
             holds: Default::default(),
             channels: Vec::new(),
             over_soft: None,
             link: false,
             connecting: false,
         }
+    }
+
+    /// Parquée : plus tirée, ce qu'elle reçoit attend dans `rx` (job, AOF
+    /// en retard, `WAIT`).
+    pub fn parked(&self) -> bool {
+        self.job_pending || self.aof_wait || self.repl_wait
     }
 
     pub fn send_in_flight(&self) -> bool {

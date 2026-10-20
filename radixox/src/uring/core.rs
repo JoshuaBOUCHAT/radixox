@@ -193,6 +193,8 @@ enum Timer {
     AutoSave,
     Aof,
     Repl,
+    /// Échéance d'un `WAIT`.
+    Wait,
 }
 
 /// Suite à donner après l'exécution d'une frame.
@@ -227,6 +229,7 @@ enum After {
     RxLoadEnd,
     RxBlock(Vec<u8>),
     RxTick(u64),
+    Wait { replicas: u64, timeout_ms: u64 },
 }
 
 /// Limites de sortie des abonnés Pub/Sub (`client-output-buffer-limit pubsub`
@@ -293,6 +296,7 @@ fn stops_window(cmd: &Cmd<'_>) -> bool {
                 | Cmd::RxLoad(_)
                 | Cmd::RxBlock(_)
                 | Cmd::RxTick(_)
+                | Cmd::Wait { .. }
         )
 }
 
@@ -354,6 +358,8 @@ pub struct Core {
     /// Promu par `REPLICAOF NO ONE` : refuse de redevenir réplica (une
     /// ancienne source encore vivante l'écraserait).
     promoted: bool,
+    /// Connexions en `WAIT`.
+    waiters: Vec<repl::Waiter>,
 }
 
 impl Core {
@@ -402,6 +408,7 @@ impl Core {
             upstream: None,
             loading: None,
             promoted: false,
+            waiters: Vec::new(),
             cfg,
         }
     }
@@ -594,6 +601,7 @@ impl Core {
                     self.repl_timer();
                     self.timers.push(Reverse((self.now + REPL_EVERY, Timer::Repl)));
                 }
+                Timer::Wait => self.wait_wake(),
             }
         }
     }
@@ -863,6 +871,8 @@ impl Core {
         o.last_active = self.now;
         o.job_pending = false;
         o.aof_wait = false;
+        o.repl_wait = false;
+        o.write_mark = 0;
         o.channels.clear();
         o.over_soft = None;
         o.dirty = false;
@@ -922,7 +932,7 @@ impl Core {
     fn push_span(&mut self, slot: Slot, span: Span) {
         let s = slot as usize;
         let i = &mut self.ins[s];
-        if self.outs[s].job_pending || self.outs[s].aof_wait {
+        if self.outs[s].parked() {
             // Parquée : copié tout de suite, l'anneau n'est jamais retenu (§7).
             i.rx.extend_from_slice(self.bufs.slice(span.bid, span.off, span.len));
             i.rx_check = true;
@@ -1069,8 +1079,7 @@ impl Core {
         self.ready.retain(|&slot| {
             let s = slot as usize;
             let keep = ins[s].has_work()
-                && !outs[s].job_pending
-                && !outs[s].aof_wait
+                && !outs[s].parked()
                 && matches!(outs[s].mode, Mode::Normal | Mode::Closing);
             outs[s].ready = keep;
             keep
@@ -1082,8 +1091,7 @@ impl Core {
     fn drawable(&self, slot: Slot) -> bool {
         let o = &self.outs[slot as usize];
         o.stop_turn != self.turn
-            && !o.job_pending
-            && !o.aof_wait
+            && !o.parked()
             && matches!(o.mode, Mode::Normal | Mode::Closing)
             && !(o.send_in_flight() && o.out.len() >= self.cfg.out_backpressure)
     }
@@ -1307,7 +1315,11 @@ impl Core {
                 let plan = journal::plan(&cmd);
                 let start = o.out.len();
                 afters.push((slot, run_cmd(cmd, art, o, job_budget)));
+                let mark = stream.end_mark();
                 journal::finish(plan, &o.out[start..], raw, art.now, stream);
+                if stream.end_mark() != mark {
+                    o.write_mark = stream.end_mark();
+                }
                 // Écriture ou lecture : elle a pu voir du non-durable (§7.5).
                 if let Some(durable) = release_upto {
                     let mark = stream.end_mark();
@@ -1466,7 +1478,8 @@ impl Core {
             | After::RxLoadData(_)
             | After::RxLoadEnd
             | After::RxBlock(_)
-            | After::RxTick(_) => {
+            | After::RxTick(_)
+            | After::Wait { .. } => {
                 if let Err(e) = self.repl_command(slot, after) {
                     extend_encode(&mut self.outs[s].out, &Frame::Error(e.text));
                     if e.close {
@@ -1614,13 +1627,7 @@ impl Core {
         o.job_pending = true;
         o.epoch = o.epoch.wrapping_add(1);
         let epoch = o.epoch;
-        let spans = std::mem::take(&mut self.ins[s].spans);
-        for span in spans {
-            self.ins[s].rx.extend_from_slice(self.bufs.slice(span.bid, span.off, span.len));
-            self.bufs.release(span.bid);
-            self.try_recycle(span.bid);
-        }
-        self.ins[s].rx_check = !self.ins[s].rx.is_empty();
+        self.spans_to_rx(slot);
         self.conn_jobs.push_back((slot, epoch, job));
     }
 
@@ -1633,6 +1640,13 @@ impl Core {
         }
         self.outs[s].aof_wait = true;
         self.aof_waiting.push(slot);
+        self.spans_to_rx(slot);
+    }
+
+    /// Connexion qui se parque : ses morceaux en attente sont recopiés dans
+    /// `rx`, l'anneau n'est pas retenu pendant l'attente.
+    fn spans_to_rx(&mut self, slot: Slot) {
+        let s = slot as usize;
         let spans = std::mem::take(&mut self.ins[s].spans);
         for span in spans {
             self.ins[s].rx.extend_from_slice(self.bufs.slice(span.bid, span.off, span.len));
@@ -1732,7 +1746,8 @@ impl Core {
                 o.dirty = false;
                 continue;
             }
-            let more_coming = o.mode == Mode::Normal && self.ins[s].has_work();
+            // Parquée : la suite attend, ce qui est prêt part.
+            let more_coming = o.mode == Mode::Normal && self.ins[s].has_work() && !o.parked();
             if o.send_in_flight() || more_coming {
                 // Repart au CQE du send, ou au tour suivant.
                 self.dirty.push(slot);
@@ -1746,7 +1761,7 @@ impl Core {
             if o.mode != Mode::Closing {
                 continue;
             }
-            if !i.has_work() && !o.job_pending && o.out.is_empty() && !o.send_in_flight() {
+            if !i.has_work() && !o.job_pending && !o.repl_wait && o.out.is_empty() && !o.send_in_flight() {
                 self.drain(slot);
             } else {
                 self.closing.push(slot);
@@ -1810,6 +1825,10 @@ impl Core {
         self.ins[s] = ConnIn { broken: true, ..ConnIn::default() };
         self.outs[s].out.clear();
         self.outs[s].holds.clear();
+        if self.outs[s].repl_wait {
+            self.outs[s].repl_wait = false;
+            self.waiters.retain(|w| w.slot != slot);
+        }
         self.cancel_recv(slot);
         let o = &mut self.outs[s];
         if o.send_in_flight() && !o.send_cancelled {
@@ -1895,7 +1914,11 @@ impl Core {
                     "slot {s} parqué sans job"
                 );
             }
-            if i.has_work() && !o.job_pending && !o.aof_wait && matches!(o.mode, Mode::Normal | Mode::Closing) {
+            if o.repl_wait {
+                assert!(i.spans.is_empty(), "slot {s} en WAIT : l'anneau ne doit pas être retenu");
+                assert!(self.waiters.iter().any(|w| w.slot == s as Slot && w.epoch == o.epoch), "slot {s} en WAIT hors liste");
+            }
+            if i.has_work() && !o.parked() && matches!(o.mode, Mode::Normal | Mode::Closing) {
                 assert!(o.ready && self.ready.contains(&(s as Slot)), "slot {s} a des frames hors de la liste prête");
             }
             assert!(o.sent <= o.sending.len());
@@ -2036,6 +2059,7 @@ fn runtime(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) 
         Cmd::RxLoad(radixox_lib::cmd::RxLoad::End) => After::RxLoadEnd,
         Cmd::RxBlock(b) => After::RxBlock(b.to_vec()),
         Cmd::RxTick(now) => After::RxTick(now),
+        Cmd::Wait { replicas, timeout_ms } => After::Wait { replicas, timeout_ms },
         _ => unreachable!("commande sans dépendance au runtime"),
     }
 }

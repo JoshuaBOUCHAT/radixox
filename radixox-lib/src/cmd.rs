@@ -125,6 +125,8 @@ pub enum Cmd<'a> {
     RxBlock(&'a [u8]),
     /// RXTICK now : horloge du primaire, entre deux blocs.
     RxTick(u64),
+    /// WAIT numreplicas timeout(ms)
+    Wait { replicas: u64, timeout_ms: u64 },
 
     // --- String / clés -----------------------------------------------
     /// GET key
@@ -893,6 +895,7 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
         },
         b"rxblock" => { exact!(1); Cmd::RxBlock(args[0]) }
         b"rxtick" => { exact!(1); Cmd::RxTick(uint(args[0])?) }
+        b"wait" => { exact!(2); Cmd::Wait { replicas: uint(args[0])?, timeout_ms: uint(args[1])? } }
 
         _ => return Err(CmdError::Unknown),
     })

@@ -33,7 +33,7 @@ Missing for primary data:
   or `always` with group commit), rewrites the log in the background and replays it at startup;
   without it, automatic `BGSAVE` rules as in Valkey and a save on SIGTERM, and a crash loses
   what was written since the last snapshot. Replication is asynchronous and pushed by the
-  primary (`REPLICATE host port`); no `WAIT` yet, no AOF on a replica, no chaining (see
+  primary (`REPLICATE host port`), with `WAIT`; no AOF on a replica, no chaining yet (see
   [Replication](#replication));
 - no cluster, no TLS, no ACLs (one password);
 - no lists, `MULTI`/`EXEC` or Lua, which queue and job libraries (Sidekiq, Celery, BullMQ)
@@ -505,7 +505,7 @@ own synchronization.
 | Set | `SADD` `SREM` `SISMEMBER` `SCARD` `SMEMBERS` `SPOP` |
 | Sorted set | `ZADD` `ZREM` `ZSCORE` `ZCARD` `ZRANGE` (`WITHSCORES`) `ZINCRBY` |
 | Pub/Sub | `SUBSCRIBE` `UNSUBSCRIBE` `PUBLISH` |
-| Replication | `REPLICATE` (`host port [AUTH pass]`, `STOP host port`) `REPLICAOF NO ONE` `DEBUG DIGEST` (internal: `RXHELLO` `RXLOAD` `RXBLOCK` `RXTICK`) |
+| Replication | `REPLICATE` (`host port [AUTH pass]`, `STOP host port`) `REPLICAOF NO ONE` `WAIT` `DEBUG DIGEST` (internal: `RXHELLO` `RXLOAD` `RXBLOCK` `RXTICK`) |
 
 - `UNLINK key` deletes that key only; `UNLINK prefix*` deletes every key under `prefix`.
 - `KEYS`, `UNLINK prefix*` and `FLUSHDB` never block other clients: the work is done in
@@ -513,7 +513,7 @@ own synchronization.
   frees the memory in the background.
 - Commands can also be sent inline, as with Redis (`SET k "a b"` from telnet or `nc`).
 
-Not yet: list commands, `MULTI`/`EXEC`, `CONFIG`, RESP3, Lua, `WAIT`, cluster.
+Not yet: list commands, `MULTI`/`EXEC`, `CONFIG`, RESP3, Lua, cluster.
 
 ---
 
@@ -590,11 +590,14 @@ server: it follows the first source that connects, refuses writes from other cli
   cannot overwrite it.
 - A primary restart always leads to a full resync (new history id at each start: a primary that
   lost the end of its log in a crash cannot be mistaken for the same history).
+- `WAIT <replicas> <timeout ms>` blocks the connection until that many replicas have
+  acknowledged its last write (or the timeout; `0` = no timeout), and returns how many have,
+  as in Valkey. Other connections are served meanwhile.
 - `INFO` has a `# Replication` section (`role`, `connected_replicas`, one `replicaN:` line per
   target with its state and lag, `sync_full`, `sync_partial_ok`); `DEBUG DIGEST [at]` returns
   the content digest, to compare two servers.
-- Not yet: `WAIT` / `min-replicas-to-write`, AOF on a replica, chained replicas, zero-copy
-  sends, TLS. The replica blocks while loading a full sync.
+- Not yet: `min-replicas-to-write`, AOF on a replica, chained replicas, zero-copy sends, TLS.
+  The replica blocks while loading a full sync.
 
 Design and deviations: [`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md) §10.
 
@@ -755,8 +758,8 @@ across cores is meant to come from sharding by namespace, not from shared-state 
   block, `DELPREFIX` (delete a whole namespace in O(prefix length)), durable commits —
   [`TX_DESIGN.md`](TX_DESIGN.md).
 - Replication, next steps ([`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md)): zero-copy sends
-  of the shared blocks (`SEND_ZC`, `splice` of the dump), `WAIT` and `min-replicas-to-write`
-  on the same group-commit mechanism as `appendfsync always`, AOF on replicas, chaining.
+  of the shared blocks (`SEND_ZC`, `splice` of the dump), `min-replicas-to-write`, AOF on
+  replicas, chaining.
 - Lower memory per key on random keys: long suffixes stored inline on several cells (no
   separate allocation), a smaller node class for nodes with two or three entries.
 - Client compatibility: `CONFIG`, RESP3.

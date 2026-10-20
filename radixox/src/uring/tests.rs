@@ -1445,13 +1445,15 @@ struct Pair {
     wire: Option<(Slot, Result<Slot, i32>)>,
     /// Réseau coupé : les `connect` échouent.
     down: bool,
+    /// Fil bloqué : les octets attendent (connexion vivante, rien ne passe).
+    hold: bool,
 }
 
 const REPLICA_PORT: u16 = 7001;
 
 impl Pair {
     fn new(cfg: Config) -> Self {
-        Self { p: Fake::new(cfg.clone()), r: Fake::new(cfg), wire: None, down: false }
+        Self { p: Fake::new(cfg.clone()), r: Fake::new(cfg), wire: None, down: false, hold: false }
     }
 
     /// Le fil : connexions sortantes acceptées (ou refusées), octets passés.
@@ -1492,6 +1494,9 @@ impl Pair {
             }
             return;
         }
+        if self.hold {
+            return;
+        }
         let out = std::mem::take(&mut self.p.peers.get_mut(&l).unwrap().received);
         self.r.peers.get_mut(&c).unwrap().inbound.extend(out);
         let back = std::mem::take(&mut self.r.peers.get_mut(&c).unwrap().received);
@@ -1503,7 +1508,7 @@ impl Pair {
         self.pump();
         let b = self.r.step();
         self.pump();
-        let in_flight = self.wire.is_some_and(|(l, c)| {
+        let in_flight = !self.hold && self.wire.is_some_and(|(l, c)| {
             self.p.peers.get(&l).is_some_and(|p| !p.received.is_empty() || !p.inbound.is_empty())
                 || c.is_ok_and(|c| self.r.peers.get(&c).is_some_and(|p| !p.received.is_empty() || !p.inbound.is_empty()))
         });
@@ -1602,7 +1607,11 @@ fn replica_follows_random_traffic_across_cuts() {
             }
             for &c in &conns {
                 for _ in 0..rng.below(10) {
-                    let cmd = if rng.below(60) == 0 { vec!["BGSAVE".to_string()] } else { random_write(&mut rng, true) };
+                    let cmd = match rng.below(80) {
+                        0 => vec!["BGSAVE".to_string()],
+                        1 => vec!["WAIT".to_string(), "1".to_string(), "100".to_string()],
+                        _ => random_write(&mut rng, true),
+                    };
                     pair.p.send(c, &resp(&cmd));
                 }
             }
@@ -1775,6 +1784,51 @@ fn replica_bgsave_during_flush_blocks() {
     assert!(!pair.r.core.bgsave_running());
     pair.assert_same("après la save");
     assert_eq!(pair.r.core.art.len(), 1);
+    unsafe { std::env::remove_var("RADIXOX_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// WAIT : répond quand le réplica a acquitté la dernière écriture de la
+/// connexion ; réseau bloqué : au délai, avec le nombre qui l'a.
+#[test]
+fn wait_counts_acknowledged_replicas() {
+    let dir = test_dir("repl-wait");
+    unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
+    let mut pair = Pair::new(Config { max_conn: 16, reserved: 1, ..Config::default() });
+    pair.p.wall = Some(1_000);
+    let c = pair.p.connect();
+    // Sans réplica : 0 tout de suite si on n'en demande aucun (WAIT 1 0
+    // attendrait sans fin, comme Valkey).
+    assert_eq!(Pair::cmd(&mut pair.p, c, b"SET a 1\r\nWAIT 0 0\r\n"), "+OK\r\n:0\r\n");
+    Pair::cmd(&mut pair.p, c, format!("REPLICATE 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes());
+    pair.settle();
+    while pair.p.core.bgsave_running() {
+        pair.step();
+    }
+    pair.settle();
+    pair.p.send(c, b"SET b 2\r\nWAIT 1 0\r\nGET b\r\n");
+    pair.settle();
+    assert_eq!(pair.p.take(c), "+OK\r\n:1\r\n$1\r\n2\r\n");
+    // Fil bloqué : rien n'arrive au réplica, WAIT attend son délai.
+    pair.hold = true;
+    pair.p.send(c, b"SET c 3\r\nWAIT 1 500\r\nPING\r\n");
+    for _ in 0..50 {
+        pair.step();
+    }
+    assert_eq!(pair.p.take(c), "+OK\r\n", "WAIT attend, la suite aussi");
+    pair.p.clock += Duration::from_millis(600);
+    pair.p.core.set_now(pair.p.clock);
+    pair.p.core.fire_timers();
+    pair.settle();
+    assert_eq!(pair.p.take(c), ":0\r\n+PONG\r\n");
+    // Fil rétabli : le WAIT suivant compte le réplica.
+    pair.hold = false;
+    pair.p.send(c, b"WAIT 1 0\r\n");
+    pair.settle();
+    assert_eq!(pair.p.take(c), ":1\r\n");
+    // Sur le réplica : refusé.
+    let rc = pair.r.connect();
+    assert!(Pair::cmd(&mut pair.r, rc, b"WAIT 1 0\r\n").starts_with("-ERR WAIT cannot be used with replica"));
     unsafe { std::env::remove_var("RADIXOX_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }

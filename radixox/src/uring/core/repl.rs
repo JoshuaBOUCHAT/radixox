@@ -74,7 +74,8 @@ enum Expect {
     Auth,
     Hello,
     Load,
-    LoadEnd,
+    /// Fin du dump : la cible est à la coupure `seq`, offset `end`.
+    LoadEnd { seq: u64, end: u64 },
     /// `:seq` ; `end` : offset du flux après ce bloc.
     Block { seq: u64, end: u64 },
     Tick,
@@ -174,6 +175,16 @@ pub(in super::super) struct Upstream {
     pub epoch: u32,
     /// L'histoire annoncée par son `RXHELLO` (adoptée au `RXLOAD END`).
     replid: ReplId,
+}
+
+/// Connexion en `WAIT` : réveillée quand `replicas` cibles ont acquitté
+/// `mark`, ou à `deadline`.
+pub(in super::super) struct Waiter {
+    pub slot: Slot,
+    pub epoch: u32,
+    mark: u64,
+    replicas: u64,
+    deadline: Option<Instant>,
 }
 
 /// Dump d'une synchronisation complète en cours de réception.
@@ -460,6 +471,7 @@ impl Core {
         {
             self.link_drop(i, why);
         }
+        self.wait_wake();
     }
 
     fn link_reply(&mut self, slot: Slot, line: &[u8]) -> Result<(), String> {
@@ -477,8 +489,10 @@ impl Core {
         match (exp, reply) {
             (_, Reply::Err(e)) => Err(format!("refusé : {}", String::from_utf8_lossy(e))),
             (Expect::Auth | Expect::Load | Expect::Tick, Reply::Ok) => Ok(()),
-            (Expect::LoadEnd, Reply::Ok) => {
+            (Expect::LoadEnd { seq, end }, Reply::Ok) => {
                 eprintln!("[repl] {}:{} : dump chargé par la cible", l.host, l.port);
+                l.acked_seq = seq;
+                l.acked_offset = end;
                 Ok(())
             }
             (Expect::Block { seq, end }, Reply::Int(n)) if n >= 0 && n as u64 == seq => {
@@ -677,11 +691,9 @@ impl Core {
             }
             if *off == *len {
                 command(&mut o.out, &[b"RXLOAD", b"END"]);
-                l.expect.push_back(Expect::LoadEnd);
                 let (base, base_offset) = l.base.expect("chargement sans base");
+                l.expect.push_back(Expect::LoadEnd { seq: base, end: base_offset });
                 l.next_seq = base + 1;
-                l.acked_seq = base;
-                l.acked_offset = base_offset;
                 for b in std::mem::take(&mut l.queue) {
                     l.push_block(o, &b);
                 }
@@ -720,6 +732,70 @@ impl Core {
             }
         }
         self.repl_start_sync();
+    }
+
+    // ── WAIT (§10.6) ─────────────────────────────────────────────────────
+
+    /// Cibles en ligne qui ont acquitté le flux jusqu'à `mark`.
+    fn acked_count(&self, mark: u64) -> u64 {
+        self.src.as_ref().map_or(0, |src| {
+            src.links.iter().filter(|l| matches!(l.state, State::Online) && l.acked_offset >= mark).count() as u64
+        })
+    }
+
+    /// `WAIT n timeout` : tout de suite si `n` cibles ont acquitté la dernière
+    /// écriture de la connexion, sinon la connexion attend (acquittements ou
+    /// délai, `0` = sans fin). Réponse : le nombre de cibles qui l'ont.
+    fn wait(&mut self, slot: Slot, replicas: u64, timeout_ms: u64) -> Result<(), ReplError> {
+        if self.follow.is_some() {
+            return Err(refuse("ERR WAIT cannot be used with replica instances"));
+        }
+        let s = slot as usize;
+        let mark = self.outs[s].write_mark;
+        let n = self.acked_count(mark);
+        if n >= replicas {
+            extend_encode(&mut self.outs[s].out, &Frame::Integer(n as i64));
+            return Ok(());
+        }
+        let deadline = (timeout_ms > 0).then(|| self.now + Duration::from_millis(timeout_ms));
+        if let Some(d) = deadline {
+            self.timers.push(Reverse((d, Timer::Wait)));
+        }
+        let epoch = self.outs[s].epoch;
+        self.outs[s].repl_wait = true;
+        self.spans_to_rx(slot);
+        self.waiters.push(Waiter { slot, epoch, mark, replicas, deadline });
+        Ok(())
+    }
+
+    /// Réveille les `WAIT` satisfaits ou échus (acquittement reçu, timer).
+    pub(super) fn wait_wake(&mut self) {
+        if self.waiters.is_empty() {
+            return;
+        }
+        let now = self.now;
+        for w in std::mem::take(&mut self.waiters) {
+            let n = self.acked_count(w.mark);
+            let o = &self.outs[w.slot as usize];
+            if o.epoch != w.epoch || !o.repl_wait {
+                continue;
+            }
+            if n < w.replicas && w.deadline.is_none_or(|d| now < d) {
+                self.waiters.push(w);
+                continue;
+            }
+            let o = &mut self.outs[w.slot as usize];
+            o.repl_wait = false;
+            extend_encode(&mut o.out, &Frame::Integer(n as i64));
+            if !o.dirty {
+                o.dirty = true;
+                self.dirty.push(w.slot);
+            }
+            if self.ins[w.slot as usize].has_work() && !o.ready {
+                o.ready = true;
+                self.ready.push(w.slot);
+            }
+        }
     }
 
     // ── Cible ────────────────────────────────────────────────────────────
@@ -834,6 +910,7 @@ impl Core {
                 f.cur = cur;
                 reply(self, Frame::Integer(blk.seq as i64));
             }
+            After::Wait { replicas, timeout_ms } => self.wait(slot, replicas, timeout_ms)?,
             After::RxTick(now) => {
                 self.check_upstream(slot)?;
                 if self.follow.is_some() && now > self.art.now {

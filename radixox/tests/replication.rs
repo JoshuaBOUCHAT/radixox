@@ -167,6 +167,11 @@ fn replica_survives_kill9_and_converges() {
     wait_caught_up(PRIMARY, REPLICA, Duration::from_secs(20));
     let at = unix_now();
     assert_eq!(digest(PRIMARY, at), digest(REPLICA, at));
+    // WAIT : la dernière écriture de la connexion est acquittée par le réplica.
+    let mut p = common::conn(PRIMARY);
+    redis::cmd("SET").arg("waited").arg(1).query::<()>(&mut p).unwrap();
+    let n: u64 = redis::cmd("WAIT").arg(1).arg(2000).query(&mut p).unwrap();
+    assert_eq!(n, 1);
     // Le réplica refuse les écritures, sert les lectures.
     let mut r = common::conn(REPLICA);
     let err = redis::cmd("SET").arg("x").arg(1).query::<()>(&mut r).unwrap_err();
