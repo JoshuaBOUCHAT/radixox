@@ -18,8 +18,9 @@
 | **ARCHITECTURE.md** (ici) | vue d'ensemble, invariants, checklist de revue | à jour |
 | [`README.md`](README.md) | présentation, commandes supportées, configuration (`RADIXOX_*`), benchs de référence, layout du dépôt | à jour (public, en anglais) |
 | [`RUNTIME_ARCH.md`](RUNTIME_ARCH.md) | boucle io_uring maison : connexions, réception, émission, lot, équité, jobs, jamais bloquant, déploiement, migration, mesures | **implémentée** (étapes 0–6, 2026-10-19) ; reste l'étape 7+ (optimisations) |
-| [`SAVE_DESIGN.md`](SAVE_DESIGN.md) | save progressive : COW applicatif par nœud, format du dump, BGSAVE / SAVE / reload | **implémenté** (étapes 1–8) ; restent saves auto + AOF, reportés à la boucle maison |
+| [`SAVE_DESIGN.md`](SAVE_DESIGN.md) | save progressive : COW applicatif par nœud, format du dump, BGSAVE / SAVE / reload | **implémenté** (étapes 1–8) et saves automatiques ; AOF : DURABILITY_DESIGN.md |
 | [`SCAN_DESIGN.md`](SCAN_DESIGN.md) | SCAN à curseur côté serveur (table de curseurs, LRU, COUNT exact) | **implémenté** |
+| [`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md) | AOF et réplication par un seul flux : commandes journalisées par blocs de tour (avec `now`), exceptions non déterministes, point de linéarisation des commandes longues, snapshot exact, commit groupé `always` | conception, rien d'implémenté |
 | [`TX_DESIGN.md`](TX_DESIGN.md) | transactions atomiques à conditions (`MULTI ATOMIC`, `DELPREFIX`, `EXEC DURABLE`) | conception, rien d'implémenté ; dépend de la boucle maison |
 | [`ANALYSE_ART_UNIFIE.md`](ANALYSE_ART_UNIFIE.md) | journal de décisions « tout dans l'ART » : TTL par champ (abandonné), valart (§11–12), design ZSet retenu (§13) | journal ; §13 = référence du futur ZSet |
 | [`protocol-spec.md`](protocol-spec.md) | spécification RESP de Redis (copie de référence) | référence externe |
@@ -143,7 +144,8 @@ commandes inline acceptées ; dispatch sur le nom complet, erreurs d'arguments t
 - **Saves automatiques** (2026-10-20) : règles `save` de Valkey (`RADIXOX_SAVE`), `MISCONF`
   après un échec, save à l'arrêt, `LASTSAVE` et `INFO persistence` (SAVE_DESIGN.md, « Saves
   automatiques »).
-- **Pas encore fait** : AOF. Principes retenus :
+- **Pas encore fait** : AOF et réplication, conçus dans DURABILITY_DESIGN.md (un seul flux de
+  commandes pour les deux). Principes de départ, toujours valables :
   - `everysec` par défaut (fsync groupé par tour), `always` en option seulement ; un client
     n'est « durable » que si l'ack part après le fsync ;
   - un seul flux d'effets partagé avec la réplication (collecteur d'effets,

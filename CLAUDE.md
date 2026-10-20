@@ -9,6 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > - persistance, mutations d'`oxidart/src/lib.rs`, `valart/`,
 >   `radixox-lib/src/save_barrier.rs` → [`SAVE_DESIGN.md`](SAVE_DESIGN.md) ;
 > - SCAN → [`SCAN_DESIGN.md`](SCAN_DESIGN.md) ; transactions → [`TX_DESIGN.md`](TX_DESIGN.md) ;
+> - AOF, réplication, journal des commandes → [`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md) ;
 >   ZSet → [`ANALYSE_ART_UNIFIE.md`](ANALYSE_ART_UNIFIE.md) §13.
 
 ## Projet

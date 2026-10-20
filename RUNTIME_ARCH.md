@@ -1728,6 +1728,10 @@ la part « arbre » à chaque étape.
 
 ## 18. Effets des écritures (2026-10-19)
 
+> **Remplacé le 2026-10-20 par DURABILITY_DESIGN.md** : on journalise les commandes reçues
+> (déterministes à `now` égal), pas un collecteur d'effets passé à chaque commande. Le seul
+> point d'appel est la boucle d'exécution du cœur (`exec/journal.rs`, `plan` / `finish`).
+
 Plusieurs mécanismes ont besoin de savoir ce qu'une commande a modifié : AOF, réplication,
 WATCH, notifications de keyspace, verrous de lecture des jobs (§8.1), barrière de save.
 L'exécuteur du lot est l'endroit naturel pour le savoir.
