@@ -189,8 +189,9 @@ tour 1 : la 2e frame des connexions qui en ont encore
   AUTH, HELLO, SUBSCRIBE, UNSUBSCRIBE, QUIT, toute commande qui parque, plus tard MULTI)
   est la **dernière** exécutée pour sa connexion dans ce tour de boucle. Sinon
   `[GET a, KEYS *, GET b]` exécuterait `GET b` avant la réponse de KEYS.
-- **Budget en temps** (2026-10-19) : ~200 µs d'exécution par tour, mesurés au TSC, avec
-  1024 commandes et un plafond d'octets de sortie comme garde-fous. Un budget en nombre
+- **Budget en temps** (2026-10-19, pas encore fait : le tour est borné en commandes,
+  `RADIXOX_BATCH_CMDS`) : ~200 µs d'exécution par tour, mesurés au TSC (`radixox::tsc`),
+  avec 1024 commandes et un plafond d'octets de sortie comme garde-fous. Un budget en nombre
   de commandes ne borne rien sans pipeline : là, le coût d'un tour, ce sont les sends
   payés dans notre `enter` (~3 µs chacun en loopback), pas les commandes. Les commandes
   lourdes ne coûtent presque rien au lot : elles deviennent des jobs (§8.1), qui ont leur
@@ -872,6 +873,51 @@ aucune ne bloque les autres.** Le chemin rapide des petites commandes ne change 
 
 ---
 
+### 8.2 Travail de fond au repos (2026-10-20)
+
+Le travail de fond (jobs de connexion parquée, libérations, tranches de BGSAVE) avance de
+deux façons :
+
+1. **Pendant le tour** (`run_jobs`, inchangé) : une étape de chaque job, et les tranches de
+   BGSAVE sous le plafond de CPU (`RADIXOX_SAVE_CPU_SHARE`). C'est le **plancher** quand la
+   boucle est saturée.
+2. **Au repos** (`idle_work`, binaire) : quand le cœur n'a plus rien pour les clients
+   (`quiet` : ni op à soumettre, ni connexion prête, ni réponse à envoyer) et qu'il reste du
+   travail de fond (`has_background`), la boucle soumet les réponses du tour puis enchaîne
+   des `idle_step()` **sans plafond** tant que :
+   - `IORING_SQ_TASKRUN` est à 0 : avec `DEFER_TASKRUN` + `TASKRUN_FLAG`, le noyau le lève
+     (`atomic_or` dans `io_req_local_work_add`, `io_uring/tw.c`, vérifié dans le source)
+     dès qu'un recv, un send délégué ou une écriture de fichier a du travail pour nous ; le
+     travail lui-même ne s'exécute que dans notre `enter(GETEVENTS)`, rien ne nous
+     interrompt ;
+   - le cœur reste `quiet` (un job fini a une réponse : elle part d'abord) ;
+   - ni la prochaine échéance de timer ni `IDLE_WORK_MAX` (1 ms) ne sont passées, lues au
+     TSC (`radixox::tsc`, ~7 ns la lecture).
+
+   Ordre d'une étape : un client parqué, puis une libération, puis une tranche de save. Une
+   requête qui arrive pendant une étape attend au plus la fin de l'étape (≤ tranche max).
+
+- Le plafond de la save ne compte plus que le temps pris **pendant que des clients
+  étaient actifs** (`BgSave::contended`) : le temps de repos n'est pris à personne.
+- Corrigé au passage : `idle()` voyait « la save veut une tranche » sans voir le plafond,
+  la boucle tournait sans dormir ni avancer (`submit` non bloquants) quand la save avait
+  atteint sa part ; et `wants_slice` restait vrai quand le DFS attendait le disque.
+- Faux noyau : `Fake::idle_work` (moitié des graines de l'oracle aléatoire, test
+  `idle_work_runs_jobs_until_someone_waits`).
+
+**Mesure** (p1, 78 conns, 1:4, 1 M clés de 100 o, BGSAVE à t = 3 s, boucle sur CPU 0,
+2 workers sur 1-2 ; un run par point, deux ordres) :
+
+| | save | CPU save | tranche max | débit | p99 / p99.9 / p99.99 |
+|---|---|---|---|---|---|
+| avant | 877–896 ms | 88–90 ms | 326–328 µs | 565–572 K | 0,207–0,231 / 0,239–0,271 / 0,68–0,76 ms |
+| **après** | **158–159 ms** | 64–65 ms | 311–417 µs | 517–568 K | 0,207 / 0,247–0,263 / 0,64–0,73 ms |
+
+Save ÷5,6, latence inchangée. Mono-cœur sans délégation (boucle saturée) : 683 → 712 ms,
+attendu (pas de temps libre). Débit : l'écart de ±10 % suit la position du run, pas le
+binaire (runs sans save alternés : 570 / 569 / 516 / 513 K). Le dump fait 0,1 Mo (valeurs
+memtier constantes, compressées par zstd) : pas d'attente disque dans cette mesure.
+
 ## 8bis. Préchargement par lots et chantiers de l'arbre
 
 Constat (§12) : en accès aléatoire, RadixOx passe 84–88 % de ses cycles user à attendre la
@@ -942,7 +988,10 @@ parse par fenêtres de K commandes, précharge `Cmd::main_key`, exécute dans l'
     d'horloge en arrière prolonge des TTL, sans casser quoi que ce soit ;
   - **monotone** pour les timers internes.
   Plus de tâche ticker.
-- **Budgets de tranche** mesurés au TSC (`rdtsc`, quelques ns), pas aux horloges système.
+- **Budgets de tranche** mesurés au TSC (`radixox::tsc` : `rdtsc` étalonné au démarrage,
+  ~7 ns la lecture ; repli sur `Instant` sans TSC invariant). Fait pour les tranches de
+  BGSAVE et le travail de fond au repos (§8.2). `*_COARSE` (3 ns) n'a qu'un tick de
+  résolution (1–4 ms) : bon pour le TTL et l'inactivité, pas pour un budget.
 - **Timers** : petit tas binaire (deadlines BLPOP, autosave, fsync AOF chaque seconde,
   balayage), suppression paresseuse par `(slot, epoch)`. Le timeout de l'`enter` bloquant =
   la prochaine échéance, sinon l'horloge gèlerait au repos.

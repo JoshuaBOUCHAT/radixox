@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use io_uring::types::{BufRingEntry, Fd, Fixed, IOU_PBUF_RING_INC, SubmitArgs, Timespec};
 use io_uring::{EnterFlags, IoUring, cqueue, opcode, squeue};
 use oxidart::OxidArt;
+use radixox::tsc;
 use radixox::uring::{Bid, Completion, Config, Core, Op, Slot};
 
 /// Groupe de tampons du recv multishot.
@@ -357,6 +358,14 @@ impl Server {
             }
             self.core.flush();
             self.submit_ops()?;
+            if self.core.quiet() && self.core.has_background() {
+                // Les réponses du tour partent avant : le travail de fond peut
+                // durer jusqu'à IDLE_WORK_MAX.
+                if !self.ring.submission().is_empty() {
+                    self.ring.submit()?;
+                }
+                self.idle_work();
+            }
             let res = if self.core.idle() {
                 self.wait()
             } else {
@@ -370,6 +379,21 @@ impl Server {
                 return Err(e);
             }
         }
+    }
+
+    /// Travail de fond tant que personne n'attend : ni client côté cœur, ni
+    /// complétion côté noyau. Avec `DEFER_TASKRUN`, le noyau lève
+    /// `IORING_SQ_TASKRUN` dès qu'un recv ou un send a du travail pour nous
+    /// (RUNTIME_ARCH.md §8.2) : une requête qui arrive attend au plus la fin
+    /// de l'étape en cours. Borné par la prochaine échéance de timer et
+    /// `IDLE_WORK_MAX`, pour que l'horloge et les timers avancent.
+    fn idle_work(&mut self) {
+        let budget = self
+            .core
+            .next_deadline()
+            .map_or(IDLE_WORK_MAX, |t| t.saturating_duration_since(Instant::now()).min(IDLE_WORK_MAX));
+        let end = tsc::Deadline::after(budget);
+        while !self.ring.submission().taskrun() && self.core.quiet() && self.core.idle_step() && !end.passed() {}
     }
 
     /// Soumet et attend au moins une complétion, au plus jusqu'à la prochaine
@@ -391,6 +415,10 @@ impl Server {
         unsafe { self.ring.submitter().enter(to_submit, want, flags.bits(), Some(&args)) }
     }
 }
+
+/// Durée maximale d'une passe de travail de fond sans repasser par le tour
+/// (horloges, timers).
+const IDLE_WORK_MAX: Duration = Duration::from_millis(1);
 
 fn close(fd: RawFd) {
     // SAFETY: fd possédé, fermé une fois.
@@ -532,6 +560,7 @@ fn build_ring() -> io::Result<IoUring> {
 }
 
 fn main() -> io::Result<()> {
+    tsc::init();
     pin_cpu();
     let port: u16 = std::env::var("RADIXOX_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(6379);
     // 127.0.0.1 par défaut : sans `RADIXOX_BIND`, pas joignable depuis le réseau.

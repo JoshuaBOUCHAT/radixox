@@ -55,6 +55,9 @@ struct Fake {
     completions: Vec<Completion>,
     /// Horloge du faux noyau : avance de 50 µs par tour, déplaçable par le test.
     clock: Instant,
+    /// Comme la boucle : travail de fond à la fin du tour tant que rien
+    /// n'arrive (ici : ni complétion, ni donnée en attente chez un client).
+    idle_work: bool,
 }
 
 impl Fake {
@@ -74,6 +77,7 @@ impl Fake {
             ops: Vec::new(),
             completions: Vec::new(),
             clock: Instant::now(),
+            idle_work: false,
         }
     }
 
@@ -200,6 +204,15 @@ impl Fake {
         self.core.run_jobs();
         self.core.flush();
         self.core.take_ops(&mut self.ops);
+        if self.idle_work && self.core.quiet() && self.core.has_background() {
+            while self.completions.is_empty()
+                && self.peers.values().all(|p| p.inbound.is_empty())
+                && self.core.quiet()
+                && self.core.idle_step()
+            {}
+            self.core.flush();
+            self.core.take_ops(&mut self.ops);
+        }
         if std::env::var("FAKE_TRACE").is_ok() {
             eprintln!("  ops={:?}", self.ops);
         }
@@ -464,6 +477,36 @@ fn long_keys_parks_without_blocking_others() {
     assert!(got.ends_with("$5\r\nk2999\r\n$5\r\nafter\r\n"));
 }
 
+/// Au repos, le travail de fond avance sans attendre les tours : le KEYS
+/// répond au tour suivant. La passe s'arrête dès qu'un client a quelque chose
+/// à recevoir : la réponse part avant que le second KEYS ne reprenne.
+#[test]
+fn idle_work_runs_jobs_until_someone_waits() {
+    let mut f = Fake::new(Config { max_conn: 8, ..Config::default() });
+    f.idle_work = true;
+    let a = f.connect();
+    let b = f.connect();
+    let sets: String = (0..3000).map(|i| format!("SET k{i:04} v\r\n")).collect();
+    f.send(a, sets.as_bytes());
+    f.settle();
+    f.take(a);
+    f.send(a, b"KEYS k*\r\n");
+    f.step();
+    f.apply_ops();
+    assert!(f.take(a).starts_with("*3000\r\n"), "KEYS fini pendant le repos");
+
+    f.send(a, b"KEYS k*\r\n");
+    f.send(b, b"KEYS k*\r\n");
+    f.step();
+    f.apply_ops();
+    let (ra, rb) = (f.take(a), f.take(b));
+    assert!(ra.is_empty() != rb.is_empty(), "une seule réponse avant la fin de la passe");
+    assert!(f.core.has_background());
+    f.settle();
+    let rest = f.take(a) + &f.take(b);
+    assert!(rest.starts_with("*3000\r\n"));
+}
+
 /// UNLINK préfixe* : parqué, compte exact, clés invisibles ; une commande
 /// reçue pendant le parquage attend la réponse.
 #[test]
@@ -693,6 +736,7 @@ fn random_streams_match_oracle() {
         });
         f.max_chunk = 1 + rng.below(40) as usize;
         f.sends = if rng.below(2) == 0 { Sends::Full } else { Sends::Half };
+        f.idle_work = seed % 2 == 0;
         let conns: Vec<Slot> = (0..1 + rng.below(5)).map(|_| f.connect()).collect();
         let mut streams = vec![Vec::new(); conns.len()];
         // Envois en plusieurs vagues, entrecoupées de tours de boucle.

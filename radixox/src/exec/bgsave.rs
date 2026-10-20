@@ -126,8 +126,12 @@ pub struct BgSave {
     footer: bool,
     phase: Phase,
     err: Option<io::Error>,
-    /// Temps passé dans les tranches (plafond de CPU).
+    /// Temps passé dans les tranches.
     work: Duration,
+    /// Part de `work` prise pendant que des clients attendaient : c'est elle que
+    /// le plafond de CPU borne (les tranches faites au repos ne sont prises à
+    /// personne, RUNTIME_ARCH.md §8.2).
+    contended: Duration,
     start: Instant,
     walk: Duration,
     writes: u64,
@@ -175,6 +179,7 @@ impl BgSave {
             phase: Phase::Walk,
             err: None,
             work: Duration::ZERO,
+            contended: Duration::ZERO,
             start: Instant::now(),
             walk: Duration::ZERO,
             writes: 0,
@@ -184,26 +189,34 @@ impl BgSave {
         })
     }
 
-    /// Temps de CPU pris par les tranches depuis le début.
-    pub fn work(&self) -> Duration {
-        self.work
+    /// Temps de CPU pris aux clients par les tranches depuis le début.
+    pub fn contended(&self) -> Duration {
+        self.contended
     }
 
     pub fn started(&self) -> Instant {
         self.start
     }
 
-    /// Il reste du calcul à faire (sinon on attend seulement le disque).
+    /// Une tranche ferait avancer la save (sinon on attend seulement le disque).
     pub fn wants_slice(&self) -> bool {
         match self.phase {
+            // Morceau plein en attente du disque : le DFS ne produit plus, seule
+            // la compression peut avancer.
+            Phase::Walk if self.blocked() => self.comp.as_ref().is_some_and(|c| c.pending() > 0),
             Phase::Walk | Phase::Drain => true,
             Phase::Flush => self.comp.as_ref().is_some_and(|c| c.pending() > 0 || !c.finished),
             Phase::Sync | Phase::Done => false,
         }
     }
 
-    /// Une tranche de calcul : DFS, vidage ou compression.
-    pub fn slice(&mut self, art: &mut OxidArt) {
+    fn blocked(&self) -> bool {
+        !self.writing.is_empty() && self.fill.len() >= CHUNK
+    }
+
+    /// Une tranche de calcul : DFS, vidage ou compression. `contended` : des
+    /// clients attendaient (compte dans le plafond de CPU).
+    pub fn slice(&mut self, art: &mut OxidArt, contended: bool) {
         if self.err.is_some() {
             return;
         }
@@ -211,9 +224,8 @@ impl BgSave {
         match self.phase {
             Phase::Walk => {
                 // Disque en retard (morceau plein en attente) : on ne produit plus.
-                let blocked = !self.writing.is_empty() && self.fill.len() >= CHUNK;
                 let room = self.comp.as_ref().is_none_or(|c| c.pending() < c.backlog);
-                if !blocked && room {
+                if !self.blocked() && room {
                     let cur = self.cur.as_mut().expect("curseur pendant le DFS");
                     let done = match &mut self.comp {
                         Some(c) => {
@@ -250,6 +262,9 @@ impl BgSave {
         }
         let el = t.elapsed();
         self.work += el;
+        if contended {
+            self.contended += el;
+        }
         self.max_slice = self.max_slice.max(el);
     }
 

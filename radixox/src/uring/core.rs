@@ -27,6 +27,7 @@ use crate::exec::jobs::{FREE_BUDGET, FlushJob, KEYS_BUDGET, KeysJob, Step, Unlin
 use crate::exec::bgsave::{BgSave, FileOp, cpu_share, zstd_conf};
 use crate::exec::persist::{save_sync, sync_level};
 use crate::exec::{Executed, execute_into, resp_ok};
+use crate::tsc;
 
 use super::bufs::{Bid, BufPool};
 use super::conn::{ConnIn, ConnOut, Mode, Span};
@@ -352,14 +353,25 @@ impl Core {
 
     /// Plus rien à faire sans nouvel événement : la boucle peut attendre.
     pub fn idle(&self) -> bool {
+        self.quiet() && !self.has_background()
+    }
+
+    /// Rien à exécuter, à envoyer ni à soumettre pour les clients ; il peut
+    /// rester du travail de fond.
+    pub fn quiet(&self) -> bool {
         // Une connexion sale qui attend la fin de son send n'est pas du travail :
         // le CQE réveillera la boucle.
         self.ops.is_empty()
             && self.ready.is_empty()
-            && self.jobs.is_empty()
-            && self.conn_jobs.is_empty()
-            && self.bgsave.as_ref().is_none_or(|b| !b.wants_slice())
             && self.dirty.iter().all(|&s| self.outs[s as usize].send_in_flight())
+    }
+
+    /// Du travail de fond peut avancer : job de connexion parquée, libération,
+    /// tranche de BGSAVE (hors attente du disque), plafond de CPU ou non.
+    pub fn has_background(&self) -> bool {
+        !self.conn_jobs.is_empty()
+            || !self.jobs.is_empty()
+            || self.bgsave.as_ref().is_some_and(|b| b.wants_slice())
     }
 
     pub fn mode(&self, slot: Slot) -> Mode {
@@ -463,9 +475,10 @@ impl Core {
         // Plusieurs tranches par tour jusqu'à sa part de CPU (une seule par tour
         // ne lui en donnait que ~6 % avec des tours longs : save deux fois plus
         // longue, plus de copies T0 à libérer à la fin), 250 µs au plus.
-        let t = Instant::now();
-        while self.bgsave_slice_due() && t.elapsed() < Duration::from_micros(250) {
-            self.bgsave.as_mut().unwrap().slice(&mut self.art);
+        let end = tsc::Deadline::after(Duration::from_micros(250));
+        while self.bgsave_slice_due() && !end.passed() {
+            let contended = self.clients_active();
+            self.bgsave.as_mut().unwrap().slice(&mut self.art, contended);
             let bg = self.bgsave.as_ref().unwrap();
             if bg.in_flight() || !bg.wants_slice() {
                 break;
@@ -1103,9 +1116,16 @@ impl Core {
         if !bg.wants_slice() {
             return false;
         }
-        let active = self.now.saturating_duration_since(self.last_rx) < Duration::from_millis(1);
         let elapsed = self.now.saturating_duration_since(bg.started()).as_secs_f64();
-        !(self.save_share < 1.0 && active && bg.work().as_secs_f64() > self.save_share * elapsed)
+        !(self.save_share < 1.0
+            && self.clients_active()
+            && bg.contended().as_secs_f64() > self.save_share * elapsed)
+    }
+
+    /// Une lecture réseau dans la dernière milliseconde (SAVE_DESIGN.md,
+    /// « Plafond de CPU du BGSAVE »).
+    fn clients_active(&self) -> bool {
+        self.now.saturating_duration_since(self.last_rx) < Duration::from_millis(1)
     }
 
     /// Parque la connexion : son job répondra. Ses morceaux en attente sont
@@ -1129,19 +1149,44 @@ impl Core {
     /// Une tranche de travail de fond : un job de connexion parquée (tour à
     /// tour), puis la libération de FLUSHDB.
     pub fn run_jobs(&mut self) {
-        if let Some((slot, epoch, mut job)) = self.conn_jobs.pop_front() {
-            if job.step(&mut self.art, self.cfg.job_budget) == Step::More {
-                self.conn_jobs.push_back((slot, epoch, job));
-            } else {
-                self.unpark(slot, epoch, job);
-            }
+        self.conn_job_step();
+        self.free_step();
+        self.bgsave_slice();
+    }
+
+    /// Une étape de travail de fond quand personne n'attend : ni client ici,
+    /// ni complétion côté noyau (la boucle a lu `IORING_SQ_TASKRUN` à 0). Sans
+    /// plafond de CPU : ce temps n'est pris à personne (RUNTIME_ARCH.md §8.2).
+    /// Un client parqué d'abord, puis la libération, puis la save. Rend `true`
+    /// s'il reste du travail de fond.
+    pub fn idle_step(&mut self) -> bool {
+        let _ = self.conn_job_step() || self.free_step() || self.bgsave_idle_slice();
+        self.has_background()
+    }
+
+    fn conn_job_step(&mut self) -> bool {
+        let Some((slot, epoch, mut job)) = self.conn_jobs.pop_front() else { return false };
+        if job.step(&mut self.art, self.cfg.job_budget) == Step::More {
+            self.conn_jobs.push_back((slot, epoch, job));
+        } else {
+            self.unpark(slot, epoch, job);
         }
-        if let Some(mut job) = self.jobs.pop_front()
-            && job.step(&mut self.art, FREE_BUDGET) == Step::More
-        {
+        true
+    }
+
+    fn free_step(&mut self) -> bool {
+        let Some(mut job) = self.jobs.pop_front() else { return false };
+        if job.step(&mut self.art, FREE_BUDGET) == Step::More {
             self.jobs.push_back(job);
         }
-        self.bgsave_slice();
+        true
+    }
+
+    fn bgsave_idle_slice(&mut self) -> bool {
+        let Some(bg) = self.bgsave.as_mut().filter(|b| b.wants_slice()) else { return false };
+        bg.slice(&mut self.art, false);
+        self.bgsave_next();
+        true
     }
 
     /// Le job a fini : sa réponse part, la connexion reprend (ce qu'elle a reçu

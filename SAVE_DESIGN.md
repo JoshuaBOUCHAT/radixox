@@ -449,3 +449,12 @@ compteur par lecture) → pas de plafond (~50 ms sur serveur inactif). Écarté 
 noyau attendent que la boucle les relève ; la save comblait ces trous et le
 p99.9 remontait à 0,87 ms.
 
+**Depuis le 2026-10-20 : le plafond n'est qu'un plancher.** Le défaut de la
+version monoio (ne pas voir les requêtes déjà arrivées dans le noyau) est
+corrigé par `IORING_SQ_TASKRUN` : quand la boucle n'a plus rien pour les
+clients et que le noyau n'a rien pour nous, la save avance sans plafond
+(RUNTIME_ARCH.md §8.2). Le plafond ne compte que le temps pris pendant que des
+clients étaient actifs (`BgSave::contended`). Sous charge p1 avec 2 workers
+io-wq (la boucle a ~20 % de temps libre) : 877–896 ms → 158–159 ms, latence
+inchangée.
+

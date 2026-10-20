@@ -463,7 +463,7 @@ Environment variables:
 | `RADIXOX_SAVE_SYNC_ZSTD` | raw | zstd level of `SAVE` and of the exit save |
 | `RADIXOX_SAVE_BACKLOG_MB` | `64` | compression backlog of `BGSAVE` |
 | `RADIXOX_SAVE_ON_EXIT` | off | save on SIGINT / SIGTERM |
-| `RADIXOX_SAVE_CPU_SHARE` | `0.1` | share of the server thread a `BGSAVE` may use while clients are active (no cap after 1 ms without network reads) |
+| `RADIXOX_SAVE_CPU_SHARE` | `0.1` | share of the server thread a `BGSAVE` is guaranteed while clients are active; whenever no client and no kernel completion is waiting, background work (save, `FLUSHDB` freeing, long `KEYS`) runs uncapped |
 | `RADIXOX_SCAN_IDLE_SECS` | `60` | idle time after which a `SCAN` cursor can be reclaimed |
 | `RADIXOX_SCAN_MAX_CURSORS` | `65536` | active `SCAN` cursors at most; beyond, a new `SCAN` gets an error |
 | `RADIXOX_SCAN_MAX_CURSORS_PER_CLIENT` | `128` | active `SCAN` cursors at most per connection (its own idle cursors are reclaimed first) |
