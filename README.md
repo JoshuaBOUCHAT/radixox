@@ -70,6 +70,7 @@ SET:GET, 78 connections, saves on a SATA SSD with fsync; two runs per point; see
 | Same traffic, 60–80 % of Valkey's capacity, 1 core: p99 | **0.41–0.44 ms** | 0.73–0.77 ms | ÷1.8 |
 | same, p99.9 | **0.47–0.52 ms** | 0.84–0.94 ms | ÷1.8 |
 | same, p99.99 during a `BGSAVE` | 0.88–1.31 ms | 1.00–1.16 ms | tie |
+| same, dump writes on a second core (`RADIXOX_FILE_CPUS`, like Valkey's child) | **0.82–1.02 ms** | 1.00–1.41 ms | ahead |
 | `BGSAVE` of 105–113 MB under that load (Valkey's child on a **second, free core**) | **0.35–0.43 s**, same core | 2.1–2.2 s + ~2 core-seconds | **÷5–6** |
 | Extra memory during the save | **~0** | +160–170 MB (copy-on-write) | |
 | Server RSS | **141 MB** | 190 MB | −26 % |
@@ -167,6 +168,10 @@ Valkey's per-value LZF cannot (113 MB). Raw, both write about the same volume.
   capacity, RadixOx still has a lower p99 than Valkey at 60 % of its own.
 - **The p99.99 during a save is a tie**, the only figure where Valkey's extra core pays off:
   RadixOx's save adds 0.3–0.6 ms to its p99.99, as the dump's writes share its only core.
+  With `RADIXOX_FILE_CPUS=1`, the writes (copy into the page cache, fsync) run on an io_uring
+  worker pinned to CPU 1, the same resources as Valkey's child: the longest save slice drops
+  from 0.5–0.8 ms to 0.1 ms and the p99.99 to **0.82–1.02 ms** against Valkey's 1.35–1.41 ms
+  in that session (two runs each), for ~0.3 core-second of CPU 1 per save against ~2.5.
 - Valkey's child keeps CPU 1 busy for the whole save (~2 core-seconds per save, on top of
   the server's CPU); RadixOx's slices take ~60 ms of CPU on its own core, plus the kernel's
   writes. Valkey also needs 160–170 MB of copy-on-write memory during the save (20 % of
@@ -551,6 +556,7 @@ Environment variables:
 | `RADIXOX_RING_BUFS` / `RADIXOX_RING_BUF_KB` | `64` / `32` | receive buffer ring shared by all connections |
 | `RADIXOX_SEND_ASYNC` | off | run sends on kernel io-wq workers (`IOSQE_ASYNC`): helps clients without pipelining when a second core is available |
 | `RADIXOX_IOWQ_WORKERS` / `RADIXOX_IOWQ_CPUS` | `1` / unset | io-wq network workers at most, and the CPUs they may run on (e.g. `1,7`) |
+| `RADIXOX_FILE_CPUS` | unset | run the dump's writes and fsync on an io-wq worker pinned to these CPUs (e.g. `1`), off the server's core; io-wq has one CPU mask, the union of this and `RADIXOX_IOWQ_CPUS` |
 | `RADIXOX_MIN_WAIT_US` / `RADIXOX_WAIT_NR` | off / `32` | experimental: when idle, let the kernel wait up to this many µs for `WAIT_NR` completions before waking the loop for one (lower CPU per command, same throughput unless the loop is the bottleneck) |
 
 ### Security

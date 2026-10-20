@@ -909,6 +909,12 @@ deux façons :
   la boucle le temps de copier 2 Mo dans le cache de pages ; le fsync aussi. Pistes :
   morceaux plus petits, `O_DIRECT` (DMA depuis nos tampons, plus de copie CPU), ou workers
   de fichiers épinglés ailleurs quand un cœur est libre.
+- **Fait : `RADIXOX_FILE_CPUS`** (optionnel) : écritures du dump en `IOSQE_ASYNC`, un worker
+  « bounded » épinglé (`register_iowq_aff`, masque unique du ring = union avec
+  `RADIXOX_IOWQ_CPUS`). Vérifié : `iou-wrk` sur le CPU 1 même sous `taskset -c 0`. 1 cœur,
+  165 K ops/s, deux runs : tranche max 484–844 → 102–104 µs, p99.99 1,17–1,31 → 0,82–1,02 ms
+  (Valkey, fils sur le CPU 1, même session : 1,35–1,41), ~0,3 cœur·s de CPU 1 par save
+  (Valkey ~2,5). Reste ~0,3 ms au-dessus du p99.99 sans save.
 - Corrigé au passage : `idle()` voyait « la save veut une tranche » sans voir le plafond,
   la boucle tournait sans dormir ni avancer (`submit` non bloquants) quand la save avait
   atteint sa part ; et `wants_slice` restait vrai quand le DFS attendait le disque.
