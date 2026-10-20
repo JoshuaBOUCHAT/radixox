@@ -19,6 +19,23 @@ pub fn save_dir() -> PathBuf {
     PathBuf::from(std::env::var("RADIXOX_DIR").unwrap_or_else(|_| ".".into()))
 }
 
+/// Où écrire un dump : `dir/tmp`, renommé en `dir/name` une fois complet ;
+/// `pos` : position du flux de commandes qu'il contient (en-tête v2).
+#[derive(Debug, Clone)]
+pub struct Target {
+    pub dir: PathBuf,
+    pub tmp: String,
+    pub name: String,
+    pub pos: oxidart::JournalPos,
+}
+
+impl Target {
+    /// `RADIXOX_DIR/dump.rxd`, sans flux.
+    pub fn dump() -> Self {
+        Self { dir: save_dir(), tmp: TMP_NAME.into(), name: FILE_NAME.into(), pos: Default::default() }
+    }
+}
+
 /// Recharge `RADIXOX_DIR/dump.rxd` dans l'arbre (vide) avant d'accepter des
 /// connexions (SAVE_DESIGN.md §5bis). Fichier absent : démarrage à vide.
 /// Fichier illisible, tronqué ou corrompu : erreur, le serveur ne démarre
@@ -74,13 +91,18 @@ pub struct SyncStats {
 /// `level` : niveau zstd (`None` : brut, le plus rapide en CPU). Erreur si un
 /// BGSAVE est en cours.
 pub fn save_sync(art: &mut OxidArt, level: Option<i32>) -> io::Result<SyncStats> {
+    save_sync_to(art, level, &Target::dump())
+}
+
+/// [`save_sync`] vers `to`.
+pub fn save_sync_to(art: &mut OxidArt, level: Option<i32>, to: &Target) -> io::Result<SyncStats> {
     use std::io::Write;
     if art.is_saving() {
         return Err(io::Error::other("Background save already in progress"));
     }
     let start = Instant::now();
-    let dir = save_dir();
-    let tmp = dir.join(TMP_NAME);
+    let dir = &to.dir;
+    let tmp = dir.join(&to.tmp);
     let res = (|| {
         let mut file = std::fs::File::create(&tmp)?;
         let mut z = level.map(ZstdStream::new);
@@ -116,7 +138,7 @@ pub fn save_sync(art: &mut OxidArt, level: Option<i32>) -> io::Result<SyncStats>
             buf.clear();
             Ok(())
         };
-        let mut cur = art.save_start(&mut buf);
+        let mut cur = art.save_start_at(&mut buf, &to.pos);
         let walk_start = Instant::now();
         let mut walk = Duration::ZERO;
         loop {
@@ -137,8 +159,8 @@ pub fn save_sync(art: &mut OxidArt, level: Option<i32>) -> io::Result<SyncStats>
         drop(flush);
         file.sync_data()?;
         drop(file);
-        std::fs::rename(&tmp, dir.join(FILE_NAME))?;
-        std::fs::File::open(&dir)?.sync_all()?;
+        std::fs::rename(&tmp, dir.join(&to.name))?;
+        std::fs::File::open(dir)?.sync_all()?;
         Ok(SyncStats { raw, written, walk, total: start.elapsed() })
     })();
     if res.is_err() {

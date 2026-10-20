@@ -3,6 +3,7 @@
 //! connexion cliente (AUTH, CLIENT, HELLO), curseurs SCAN, jobs, persistance.
 //! Utilisé par le cœur de la boucle io_uring (`radixox::uring`).
 
+pub mod aof;
 pub mod auth;
 pub mod autosave;
 pub mod bgsave;

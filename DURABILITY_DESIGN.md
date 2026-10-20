@@ -1,10 +1,11 @@
 # Durabilité — AOF et réplication par un seul flux de commandes
 
-> **État : étapes 1–2 faites (2026-10-20)** : `exec/journal.rs` (plan / finish, format de
+> **État : étapes 1–3 faites (2026-10-20)** : `exec/journal.rs` (plan / finish, format de
 > bloc, `Stream` en mémoire, rejeu `apply`), plomberie dans `Core::exec_window`, tests 1 et 2 ;
-> dump v2 (position du journal, condensé `oxidart/src/digest.rs` vérifié au reload), test 3.
-> Le flux n'est pas encore écrit sur disque (`Config::journal`, désactivé dans le binaire).
-> Suite : étape 3 (§13). Ce document doit suffire à
+> dump v2 (position du journal, condensé `oxidart/src/digest.rs` vérifié au reload), test 3 ;
+> `exec/aof.rs` (manifeste, segments préalloués, reprise `recover`, création `create`,
+> nettoyage), test 4. Le flux n'est pas encore écrit sur disque pendant le service
+> (`Config::journal`, désactivé dans le binaire, pas de `RADIXOX_APPENDONLY`). Suite : étape 4. Ce document doit suffire à
 > un agent qui ne connaît pas le projet : §1 donne le contexte du code, §2–§11 la conception,
 > §12 les tests, §13 l'ordre de travail avec ses critères d'acceptation. Il remplace le
 > « collecteur d'effets » de RUNTIME_ARCH.md §18 et complète ARCHITECTURE.md §3.
@@ -291,9 +292,14 @@ off  taille  champ
   `query_limit`, 1 Gio) fait un bloc à elle seule : le pool devra servir ce cas hors tampons
   de 1 MiB (étape 8).
 - Un bloc vide n'est pas écrit (tour sans écriture), sauf s'il porte `CUT`.
-- Validité d'un bloc lu : magic, `version` acceptée, flags connus, `len ≤ 1 Gio`, CRC exact,
-  `seq = seq précédent + 1`, `offset = offset précédent + 40 + len précédent`,
-  `now ≥ now précédent`.
+- Validité d'un bloc lu : magic, `len ≤ 1 Gio`, CRC exact, **puis** `version` acceptée, flags
+  connus, `seq = seq précédent + 1`, `offset = offset précédent + 40 + len précédent`,
+  `now ≥ now précédent`. Le CRC passe avant la version : un en-tête coupé suivi des zéros de la
+  préallocation se lit « version 0 » et n'est pas une autre version (trouvé par le test 4).
+- **Coupure ou incohérence** (`BadBlock::is_torn`) : seuls un bloc incomplet, un CRC faux ou des
+  octets quelconques peuvent venir d'une écriture coupée. Un bloc **intact** dont la séquence,
+  la version ou les drapeaux ne vont pas (segment manquant, autre histoire) n'est jamais
+  tronqué, même avec `RADIXOX_AOF_LOAD_TRUNCATED=yes` : refus de démarrer.
 
 ### 6.2 Segments
 
@@ -532,9 +538,11 @@ réécriture quand la taille des segments depuis la dernière base dépasse `min
    - `art.set_now(bloc.now)`, puis chaque commande de la charge par l'exécuteur normal, avec un
      client interne authentifié, sans réponse, sans journalisation (on ne réécrit pas ce qu'on
      relit) ;
-5. Bloc invalide **à la fin du dernier segment** (écriture coupée par le crash) : tronquer le
-   segment à la fin du dernier bloc valide, continuer, journaliser un avertissement
-   (`RADIXOX_AOF_LOAD_TRUNCATED=yes`, défaut). Bloc invalide **ailleurs** : refus de démarrer.
+5. Bloc invalide **à la fin du dernier segment** (écriture coupée par le crash, `is_torn`) :
+   tronquer le segment à la fin du dernier bloc valide, continuer, journaliser un avertissement
+   (`RADIXOX_AOF_LOAD_TRUNCATED=yes`, défaut). Bloc invalide **ailleurs**, ou bloc intact
+   incohérent : refus de démarrer. Fait : le dernier segment est toujours ramené à sa fin
+   logique (`set_len`) ; le prochain palier est préalloué à l'écriture.
 6. Reprendre `replid`, `seq`, `offset`, `last_now` ; l'horloge réelle reprend avec
    `max(last_now, horloge)`.
 7. Supprimer les fichiers non cités.
@@ -704,9 +712,9 @@ Commandes : `BGREWRITEAOF`, `WAIT`, `REPLICATE`, `REPLICAOF NO ONE`, et les comm
 |---|---|---|
 | 1 ✅ | `exec/journal.rs` (`plan`, `finish`, `Stream` en mémoire), plomberie `raw` + réponse | test 1 (oracle depuis vide) et test 2 verts — `uring/tests.rs` : `journal_replay_matches_state`, `expired_keys_are_absent_for_writes` (1000 graines vertes) |
 | 2 ✅ | Dump v2 : `base_seq`, `replid`, `base_offset`, condensé ; vérification au rechargement | test 3 ; tous les tests de save existants verts ; v1 toujours lisible — `oxidart/src/test_save.rs` : `save_digest_is_the_t0_state_under_mutations`, `reload_checks_digest_even_with_expired_keys`, `reload_refuses_altered_content_with_valid_crc`, `reload_reads_version_1`, `journal_position_roundtrip` |
-| 3 | Format de bloc, segments préalloués, manifeste, rejeu au démarrage, troncature | tests 4 et 6 |
+| 3 ✅ | Format de bloc, segments préalloués, manifeste, rejeu au démarrage, troncature | test 4 — `uring/tests.rs` : `aof_recovery_matches_state_across_segments`, `aof_truncated_tail_is_cut_only_at_the_end`, `aof_unlisted_files_are_removed` ; le test 6 (coupure) passe à l'étape 5, qui introduit `CUT` |
 | 4 | `appendfsync no` / `everysec`, deux canaux de fichiers, plafond §7.6, erreurs §7.7, `INFO aof_*` | test 5 en `everysec` et `no` |
-| 5 | Réécriture : coupure `CUT`, rotation, ordre §8.2–8.3, automatique, `BGREWRITEAOF` | test 5 avec rotations ; test 1 depuis un dump |
+| 5 | Réécriture : coupure `CUT`, rotation, ordre §8.2–8.3, automatique, `BGREWRITEAOF` | tests 5 (avec rotations) et 6 ; test 1 depuis un dump |
 | 6 | `always` : marquage §7.5, un fsync en vol | tests 5 (`always`) et 8 ; bench `always` contre Valkey `appendfsync always` (même disque, pas tmpfs) |
 | 7 | Réplication : mode suivi, `RXHELLO`/`RXLOAD`/`RXBLOCK`, `REPLICATE`, backlog, `REPLICAOF NO ONE` | test 7 |
 | 8 | Pool de tampons enregistrés, `SEND(MSG)_ZC`, `splice`, `WAIT`, `min-replicas-to-write` | test 7 + mesure deux machines |

@@ -989,3 +989,151 @@ fn expired_keys_are_absent_for_writes() {
         assert_eq!(state(&mut a), state(&mut b), "graine {seed}");
     }
 }
+
+// ── Reprise depuis les fichiers de l'AOF (DURABILITY_DESIGN.md §9, test 4) ──
+
+/// Dossier de test neuf (supprimé s'il existe).
+fn test_dir(name: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("radixox-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// Un flux aléatoire sur le faux noyau ; rend les blocs fermés, un par
+/// élément, et l'arbre du serveur.
+fn journaled_run(seed: u64) -> (Vec<Vec<u8>>, Fake) {
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let mut f = Fake::new(Config { max_conn: 8, reserved: 0, journal: true, ..Config::default() });
+    let mut wall = 1_000u64;
+    f.wall = Some(wall);
+    let conns: Vec<Slot> = (0..1 + rng.below(3)).map(|_| f.connect()).collect();
+    for _ in 0..20 {
+        for &c in &conns {
+            for _ in 0..rng.below(10) {
+                f.send(c, &resp(&random_write(&mut rng, true)));
+            }
+        }
+        f.step();
+        wall += rng.below(3);
+        f.wall = Some(wall);
+    }
+    f.settle();
+    let blocks = f.core.journal_mut().unwrap().closed.drain(..).collect();
+    (blocks, f)
+}
+
+/// Base vide + segments contenant `parts` (des listes de blocs), manifeste.
+fn write_aof(dir: &std::path::Path, parts: &[&[Vec<u8>]]) {
+    use crate::exec::aof::{self, Manifest};
+    use std::os::unix::fs::FileExt;
+    let mut empty = OxidArt::new();
+    let res = aof::create(&mut empty, dir).unwrap();
+    let mut m: Manifest = res.manifest;
+    m.incrs.clear();
+    for (i, blocks) in parts.iter().enumerate() {
+        let name = aof::segment_name(i as u64 + 1);
+        let _ = std::fs::remove_file(dir.join(&name));
+        let file = aof::create_segment(dir, &name).unwrap();
+        let bytes: Vec<u8> = blocks.iter().flatten().copied().collect();
+        file.write_all_at(&bytes, 0).unwrap();
+        m.incrs.push(name);
+    }
+    m.write(dir).unwrap();
+}
+
+fn recover_state(dir: &std::path::Path, now: u64, truncated: bool) -> std::io::Result<(Vec<String>, crate::exec::aof::Resume)> {
+    let mut art = OxidArt::new();
+    let res = crate::exec::aof::recover(&mut art, dir, truncated)?.expect("manifeste");
+    art.set_now(now);
+    Ok((state(&mut art), res))
+}
+
+#[test]
+fn aof_recovery_matches_state_across_segments() {
+    let dir = test_dir("aof-recover");
+    for seed in 1..=15 {
+        let (blocks, mut f) = journaled_run(seed);
+        let cut = blocks.len() / 2;
+        write_aof(&dir, &[&blocks[..cut], &blocks[cut..]]);
+        let now = f.core.art.now;
+        let (got, res) = recover_state(&dir, now, false).unwrap();
+        assert_eq!(got, state(&mut f.core.art), "graine {seed}");
+        let total: usize = blocks.iter().map(Vec::len).sum();
+        assert_eq!(res.cursor.offset as usize, total);
+        assert_eq!(res.cursor.seq as usize, blocks.len());
+        // Le segment courant est ramené à sa fin logique (plus de préallocation).
+        let tail: usize = blocks[cut..].iter().map(Vec::len).sum();
+        assert_eq!(res.tail_end as usize, tail);
+        assert_eq!(std::fs::metadata(dir.join("journal.2.rxj")).unwrap().len() as usize, tail);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn aof_truncated_tail_is_cut_only_at_the_end() {
+    let dir = test_dir("aof-trunc");
+    let (blocks, _) = journaled_run(7);
+    assert!(blocks.len() >= 3);
+    let n = blocks.len();
+    // État de référence de chaque préfixe de blocs.
+    let prefix_state = |k: usize| {
+        let bytes: Vec<u8> = blocks[..k].iter().flatten().copied().collect();
+        let mut art = replay(&bytes);
+        art.set_now(10_000);
+        state(&mut art)
+    };
+    let full: Vec<u8> = blocks.iter().flatten().copied().collect();
+    let last_start = full.len() - blocks[n - 1].len();
+    let want_prefix = prefix_state(n - 1);
+    // Coupé à chaque octet du dernier bloc : préfixe exact, accepté seulement
+    // avec RADIXOX_AOF_LOAD_TRUNCATED.
+    // Chaque octet de l'en-tête, puis un octet sur 13 de la charge.
+    let cuts = (last_start..last_start + 41).chain((last_start + 41..full.len()).step_by(13));
+    for cut in cuts {
+        write_aof(&dir, &[&[full[..cut].to_vec()]]);
+        assert!(recover_state(&dir, 10_000, false).is_err() || cut == last_start, "coupé à {cut}");
+        write_aof(&dir, &[&[full[..cut].to_vec()]]);
+        let (got, res) = recover_state(&dir, 10_000, true).unwrap();
+        assert_eq!(got, want_prefix, "coupé à {cut}");
+        assert_eq!(res.tail_end as usize, last_start);
+    }
+    // Octet altéré dans le dernier bloc : même chose.
+    let mut bad = full.clone();
+    bad[last_start + 20] ^= 1;
+    write_aof(&dir, &[&[bad.clone()]]);
+    assert!(recover_state(&dir, 10_000, false).is_err());
+    write_aof(&dir, &[&[bad]]);
+    assert_eq!(recover_state(&dir, 10_000, true).unwrap().0, want_prefix);
+    // Bloc altéré au milieu d'un segment qui n'est pas le dernier : refus.
+    let mut first = blocks[..n - 1].iter().flatten().copied().collect::<Vec<u8>>();
+    first[50] ^= 1;
+    write_aof(&dir, &[&[first], &blocks[n - 1..]]);
+    assert!(recover_state(&dir, 10_000, true).is_err());
+    // Un bloc sauté entre deux segments, ou dans le dernier : refus, même
+    // avec la troncature permise (ce n'est pas une écriture coupée).
+    write_aof(&dir, &[&blocks[..1], &blocks[2..]]);
+    assert!(recover_state(&dir, 10_000, true).is_err());
+    let skipped = [blocks[..1].concat(), blocks[2..].concat()].concat();
+    write_aof(&dir, &[&[skipped]]);
+    assert!(recover_state(&dir, 10_000, true).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn aof_unlisted_files_are_removed() {
+    use crate::exec::aof;
+    let dir = test_dir("aof-unlisted");
+    write_aof(&dir, &[&[]]);
+    std::fs::write(dir.join("journal.9.rxj"), b"reste").unwrap();
+    std::fs::write(dir.join("base.9.rxdb.tmp"), b"reste").unwrap();
+    std::fs::write(dir.join("notes.txt"), b"pas a nous").unwrap();
+    let mut art = OxidArt::new();
+    let res = aof::recover(&mut art, &dir, true).unwrap().unwrap();
+    aof::remove_unlisted(&dir, &res.manifest).unwrap();
+    let mut names: Vec<String> =
+        std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    names.sort();
+    assert_eq!(names, ["base.1.rxdb", "journal.1.rxj", "manifest", "notes.txt"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

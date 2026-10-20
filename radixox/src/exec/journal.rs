@@ -204,6 +204,16 @@ pub enum BadBlock {
     Sequence,
 }
 
+impl BadBlock {
+    /// Ce qu'une écriture coupée par un crash peut laisser : bloc incomplet,
+    /// CRC faux, octets quelconques. Un bloc intact (CRC exact) dont la
+    /// version, les drapeaux ou la séquence ne vont pas n'est pas une
+    /// coupure : c'est une incohérence, jamais tronquée en silence.
+    pub fn is_torn(self) -> bool {
+        matches!(self, BadBlock::Truncated | BadBlock::Magic | BadBlock::TooBig | BadBlock::Crc)
+    }
+}
+
 /// Position attendue du prochain bloc : continuité vérifiée par [`read_block`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Cursor {
@@ -227,21 +237,22 @@ pub fn read_block<'d>(d: &'d [u8], cur: &mut Cursor) -> Result<(Block, &'d [u8])
     let u16_at = |i: usize| u16::from_le_bytes([head[i], head[i + 1]]);
     let u32_at = |i: usize| u32::from_le_bytes(head[i..i + 4].try_into().unwrap());
     let u64_at = |i: usize| u64::from_le_bytes(head[i..i + 8].try_into().unwrap());
-    let version = u16_at(4);
-    if version != VERSION {
-        return Err(BadBlock::Version(version));
-    }
-    let flags = u16_at(6);
-    if flags & !F_KNOWN != 0 {
-        return Err(BadBlock::Flags(flags));
-    }
-    let b = Block { flags, len: u32_at(8), seq: u64_at(16), offset: u64_at(24), now: u64_at(32) };
+    let b = Block { flags: u16_at(6), len: u32_at(8), seq: u64_at(16), offset: u64_at(24), now: u64_at(32) };
     if b.len as usize > MAX_PAYLOAD {
         return Err(BadBlock::TooBig);
     }
     let payload = d.get(HEADER..HEADER + b.len as usize).ok_or(BadBlock::Truncated)?;
+    // Le CRC d'abord : un en-tête coupé (suivi des zéros de la préallocation)
+    // n'est pas « une autre version » ; seul un bloc intact l'est.
     if crc(head, payload) != u32_at(12) {
         return Err(BadBlock::Crc);
+    }
+    let version = u16_at(4);
+    if version != VERSION {
+        return Err(BadBlock::Version(version));
+    }
+    if b.flags & !F_KNOWN != 0 {
+        return Err(BadBlock::Flags(b.flags));
     }
     if b.seq != cur.seq + 1 || b.offset != cur.offset || b.now < cur.now {
         return Err(BadBlock::Sequence);
