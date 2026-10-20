@@ -1338,6 +1338,33 @@ Le copy-on-write de Valkey est le cas défavorable de `fork` (20 % de SET sur de
 uniformes touchent presque toutes les pages). Le chiffre 3 cœurs + BGSAVE de RadixOx est
 antérieur à la correction du plancher (§8.2).
 
+**Charge partielle 60–80 %, fils de Valkey sur un cœur libre** (avantage donné à Valkey :
+son fils de BGSAVE sur le CPU 1, RadixOx seul sur le CPU 0). Débits visés = 60/70/80 % de la
+capacité de Valkey (207 K), soit 47–62 % de celle de RadixOx ; le limiteur de memtier livre
+±10 % autour (mêmes valeurs pour les deux à chaque paire). BGSAVE dans chaque run, deux
+répétitions, ordre alterné ; plages = les deux runs.
+
+| débit | | p50 | p99 | p99.9 | p99.99 | save | CPU |
+|---|---|---|---|---|---|---|---|
+| ~124 K | RadixOx | 0,29 | **0,42** | **0,50–0,51** | 1,03–1,31 | **348–360 ms** | 0,4 cœur |
+| | Valkey | 0,37 | 0,76–0,77 | 0,93–0,94 | 1,10–1,16 | 2 061–2 153 ms | 0,6 + ~2 cœur·s de fils |
+| ~145 K | RadixOx | 0,29 | **0,42** | **0,50** | 1,08–1,21 | **376–383 ms** | 0,5 |
+| | Valkey | 0,37 | 0,75 | 0,89–0,90 | 1,04–1,16 | 2 150–2 245 ms | 0,6–0,7 + ~2 |
+| ~165 K | RadixOx | 0,29 | **0,41–0,44** | **0,48–0,54** | 0,88–1,27 | **408–427 ms** | 0,5–0,6 |
+| | Valkey | 0,36–0,38 | 0,73–0,77 | 0,84–0,91 | 1,00–1,07 | 2 149–2 163 ms | 0,7–0,8 + ~2 |
+| 213 K (80 % de RadixOx) | RadixOx | 0,29 | 0,38–0,42 | 0,47–0,50 | 1,04–1,26 | 613–671 ms | 0,7 |
+| 165 K sans save | RadixOx | 0,29 | 0,42–0,45 | 0,47–0,52 | **0,57–0,73** | — | 0,6 |
+| | Valkey | 0,37 | 0,74–0,75 | 0,86 | 0,96–1,02 | — | 0,7–0,8 |
+
+- p50 −20 %, p99 et p99.9 ÷1,8 à toutes les charges, save ÷5–6 ; RadixOx à 80 % de **sa**
+  capacité garde un p99 meilleur que Valkey à 60 % de la sienne.
+- **p99.99 sous save : à égalité** (0,88–1,31 contre 1,00–1,16 ms) : c'est le seul
+  percentile où le cœur supplémentaire de Valkey compense. Coût de RadixOx : +0,3 à +0,6 ms
+  sur le p99.99 pendant la save, l'écriture du dump partageant son unique cœur (§8.2).
+- Fils de Valkey : ~2 cœur·s par save (CPU 1 à ~100 % pendant les ~2,1 s), contre ~60 ms de
+  CPU de tranches pour RadixOx (plus le noyau pour l'écriture). Mémoire : RSS 141–145 contre
+  190 Mo ; copy-on-write de Valkey +160–170 Mo pendant la save.
+
 ---
 
 ## 13. Migration
