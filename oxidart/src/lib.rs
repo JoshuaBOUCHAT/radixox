@@ -117,6 +117,10 @@ pub enum TtlResult {
     KeyWithoutTtl,
 }
 
+/// `parent_idx` d'une racine de sous-arbre détaché, pas encore libéré (la
+/// racine de l'arbre a `u32::MAX`).
+const DETACHED: u32 = u32::MAX - 1;
+
 /// A compressed Adaptive Radix Tree for fast key-value storage.
 ///
 /// Nœuds de 128 o à feuilles inline (voir `node.rs`). Une clé a un seul
@@ -1125,6 +1129,9 @@ impl OxidArt {
                 }
                 self.key_count -= removed;
                 self.map.untag(root);
+                for &c in &kids {
+                    self.mark_detached(c);
+                }
                 (kids, freed)
             }
             PrefixHit::Node(idx) => {
@@ -1134,6 +1141,7 @@ impl OxidArt {
                 self.node_mut(p).remove(r);
                 self.retag(p, before);
                 self.normalize(p);
+                self.mark_detached(idx);
                 (vec![idx], 0)
             }
         }
@@ -1153,6 +1161,7 @@ impl OxidArt {
             let node = self.node(idx);
             count += (node.has_val() && !expired(node.exp_and_radix.exp(), now)) as usize;
             let mut removed = node.has_val() as usize;
+            let first = stack.len();
             for (_, e) in node.iter() {
                 match e {
                     EntryRef::Child(c) => stack.push(c),
@@ -1164,6 +1173,10 @@ impl OxidArt {
             }
             if counted {
                 self.key_count -= removed;
+            }
+            // Leur parent disparaît : ils deviennent des racines détachées.
+            for i in first..stack.len() {
+                self.mark_detached(stack[i]);
             }
             // le Drop du nœud libère ses feuilles, sa page et sa self-val
             drop(self.remove_node(idx));
@@ -1214,8 +1227,30 @@ impl OxidArt {
         (evicted, hit_nodes, sampled)
     }
 
+    /// Racine d'un sous-arbre détaché (FLUSHDB, `UNLINK prefix*`) en attente
+    /// de libération : il garde ses tags TTL, l'évicteur ne doit pas y
+    /// toucher (ses clés sont déjà retirées, ou comptées par le job).
+    fn mark_detached(&mut self, idx: u32) {
+        // SAFETY: `idx` désigne un nœud vivant (sous-arbre pas encore libéré).
+        unsafe { self.map.get_unchecked_mut(idx) }.parent_idx = DETACHED;
+    }
+
+    /// Le nœud est dans l'arbre (pas dans un sous-arbre détaché).
+    fn attached(&self, mut idx: u32) -> bool {
+        while idx != self.root_idx {
+            match self.node(idx).parent_idx {
+                DETACHED => return false,
+                p => idx = p,
+            }
+        }
+        true
+    }
+
     /// Retire les valeurs expirées du nœud `idx` ; renvoie leur nombre.
     fn evict_node(&mut self, idx: u32) -> usize {
+        if !self.attached(idx) {
+            return 0;
+        }
         let now = self.now;
         let node = self.node(idx);
         let self_exp = node.has_val() && expired(node.exp_and_radix.exp(), now);

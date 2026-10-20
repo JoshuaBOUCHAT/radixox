@@ -106,3 +106,36 @@ fn free_waits_for_save() {
     assert!(a.node_count() < nodes);
 }
 
+
+/// L'évicteur ne touche pas aux sous-arbres détachés pas encore libérés :
+/// leurs clés sont déjà hors du compte (FLUSHDB) ou comptées par le job
+/// (UNLINK), une éviction les retirait une seconde fois (compteur négatif).
+#[test]
+fn evictor_skips_detached_subtrees() {
+    for flush in [true, false] {
+        let mut a = OxidArt::new();
+        a.set_now(1_000);
+        for i in 0..2_000 {
+            let key = SharedByte::from_str(&format!("t:{i:04}"));
+            a.set_ttl(key, std::time::Duration::from_secs(1), Value::from_str("v"));
+        }
+        a.set(SharedByte::from_str("keep"), Value::from_str("v"));
+        let mut d = Detached::default();
+        if flush {
+            a.detach_all(&mut d);
+        } else {
+            a.detach_prefix(b"t:", &mut d);
+        }
+        a.set_now(2_000);
+        // Libération par petites tranches, l'évicteur passe entre elles.
+        loop {
+            a.evict_expired();
+            if a.free_detached(&mut d, 3) {
+                break;
+            }
+        }
+        a.evict_expired();
+        a.check();
+        assert_eq!(a.len(), usize::from(!flush), "flush {flush}");
+    }
+}
