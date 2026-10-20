@@ -453,8 +453,8 @@ p99.9 remontait à 0,87 ms.
 version monoio (ne pas voir les requêtes déjà arrivées dans le noyau) est
 corrigé par `IORING_SQ_TASKRUN` : quand la boucle n'a plus rien pour les
 clients et que le noyau n'a rien pour nous, la save avance sans plafond
-(RUNTIME_ARCH.md §8.2). Le plafond ne compte que le temps pris pendant que des
-clients étaient actifs (`BgSave::contended`). Sous charge p1 avec 2 workers
+(RUNTIME_ARCH.md §8.2). Le tour ne prend sur les clients que ce qui manque à la
+save pour atteindre sa part, repos compris. Sous charge p1 avec 2 workers
 io-wq (la boucle a ~20 % de temps libre) : 877–896 ms → 158–159 ms, latence
 inchangée.
 

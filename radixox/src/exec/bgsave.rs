@@ -126,12 +126,8 @@ pub struct BgSave {
     footer: bool,
     phase: Phase,
     err: Option<io::Error>,
-    /// Temps passé dans les tranches.
+    /// Temps passé dans les tranches, au repos compris (plancher de CPU).
     work: Duration,
-    /// Part de `work` prise pendant que des clients attendaient : c'est elle que
-    /// le plafond de CPU borne (les tranches faites au repos ne sont prises à
-    /// personne, RUNTIME_ARCH.md §8.2).
-    contended: Duration,
     start: Instant,
     walk: Duration,
     writes: u64,
@@ -179,7 +175,6 @@ impl BgSave {
             phase: Phase::Walk,
             err: None,
             work: Duration::ZERO,
-            contended: Duration::ZERO,
             start: Instant::now(),
             walk: Duration::ZERO,
             writes: 0,
@@ -189,9 +184,9 @@ impl BgSave {
         })
     }
 
-    /// Temps de CPU pris aux clients par les tranches depuis le début.
-    pub fn contended(&self) -> Duration {
-        self.contended
+    /// Temps de CPU pris par les tranches depuis le début.
+    pub fn work(&self) -> Duration {
+        self.work
     }
 
     pub fn started(&self) -> Instant {
@@ -214,9 +209,8 @@ impl BgSave {
         !self.writing.is_empty() && self.fill.len() >= CHUNK
     }
 
-    /// Une tranche de calcul : DFS, vidage ou compression. `contended` : des
-    /// clients attendaient (compte dans le plafond de CPU).
-    pub fn slice(&mut self, art: &mut OxidArt, contended: bool) {
+    /// Une tranche de calcul : DFS, vidage ou compression.
+    pub fn slice(&mut self, art: &mut OxidArt) {
         if self.err.is_some() {
             return;
         }
@@ -262,9 +256,6 @@ impl BgSave {
         }
         let el = t.elapsed();
         self.work += el;
-        if contended {
-            self.contended += el;
-        }
         self.max_slice = self.max_slice.max(el);
     }
 

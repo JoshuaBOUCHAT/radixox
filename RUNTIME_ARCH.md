@@ -897,8 +897,18 @@ deux façons :
    Ordre d'une étape : un client parqué, puis une libération, puis une tranche de save. Une
    requête qui arrive pendant une étape attend au plus la fin de l'étape (≤ tranche max).
 
-- Le plafond de la save ne compte plus que le temps pris **pendant que des clients
-  étaient actifs** (`BgSave::contended`) : le temps de repos n'est pris à personne.
+- **Le tour n'est qu'un plancher.** Le travail fait au repos compte dans la part : le tour
+  ne fait de tranches de save que si la save a eu moins de `RADIXOX_SAVE_CPU_SHARE` du temps
+  écoulé, repos compris. Erreur corrigée le jour même : ne compter que le temps « disputé »
+  laissait le tour se croire toujours sous sa part et refaire 250 µs de save à chaque
+  rafale de requêtes (1 cœur, 165 K ops/s, save de 105 Mo : p99.9 0,80–0,96 → 0,49–0,51 ms,
+  p99.99 1,7–2,4 → 0,87–1,29 ms, durée inchangée).
+- Reste sur 1 cœur : quelques tranches de 300–550 µs, toutes avec une écriture de 2 Mo en
+  vol. Probable : l'écriture bufferisée ext4 qui doit allouer des blocs part sur un worker
+  io-wq qui hérite de notre affinité (`iou-wrk` vu sur le CPU 0 pendant la save) et préempte
+  la boucle le temps de copier 2 Mo dans le cache de pages ; le fsync aussi. Pistes :
+  morceaux plus petits, `O_DIRECT` (DMA depuis nos tampons, plus de copie CPU), ou workers
+  de fichiers épinglés ailleurs quand un cœur est libre.
 - Corrigé au passage : `idle()` voyait « la save veut une tranche » sans voir le plafond,
   la boucle tournait sans dormir ni avancer (`submit` non bloquants) quand la save avait
   atteint sa part ; et `wants_slice` restait vrai quand le DFS attendait le disque.
@@ -1300,6 +1310,33 @@ pendant au plus ce délai avant de nous rendre la main pour une seule.
 - Plafond de la boucle, en cycles : ~7 600/cmd classique → **~680 K** ; ~6 400 avec
   `min_wait` → **~810 K** (l'occupation `/proc/stat` en mode `min_wait` est incohérente
   avec les cycles : ~6,5 GHz implicites ; se fier aux cycles). À mesurer sur deux machines.
+
+### 12.6 Contre Valkey 9.1.2, saves sur SSD (2026-10-20, loopback, p1)
+
+1 000 001 clés de 100 o (`--random-data`), 1:4, 78 conns, 12 s, BGSAVE à t = 3 s ; mêmes
+CPU pour les deux (1 cœur : CPU 0 ; 3 cœurs : 0-2, RadixOx boucle + 2 workers, Valkey
+`--io-threads 3`), fils du BGSAVE de Valkey sur les mêmes CPU (`--bgsave-cpulist`) sauf
+mention. Dumps sur le SSD SATA (PNY CS900), fsync compris. RadixOx en dump brut
+(`RADIXOX_SAVE_ZSTD=0`) : les valeurs « aléatoires » de memtier se répètent d'une clé à
+l'autre, zstd en flux les écrase (11–24 Mo) quand le LZF de Valkey, valeur par valeur, n'y
+peut rien (113 Mo) ; brut = même volume à écrire. Un run par point. ⚠ Premiers runs écrits
+sur `/tmp` (tmpfs) : fsync gratuit des deux côtés, saves irréalistes (111 ms).
+
+| | RadixOx | Valkey |
+|---|---|---|
+| capacité 1 cœur | **266 K** | 207 K |
+| 1 cœur, 165 K ops/s : CPU | **0,5 cœur** | 0,7 cœur |
+| 1 cœur, 165 K : p99 / p99.9 / p99.99 | **0,38 / 0,44 / 0,58 ms** | 0,73 / 0,82 / 0,98 ms |
+| + BGSAVE : durée | **0,43 s** | 5,4 s (fils sur un cœur libre : 1,96 s) |
+| + BGSAVE : p99 / p99.9 / p99.99 | **0,42–0,44 / 0,49–0,51 / 0,87–1,29** | 2,45 / 2,83 / 3,41 (cœur libre : 0,74 / 0,85 / 1,02) |
+| 3 cœurs à fond | **622 K** | 404 K |
+| 3 cœurs + BGSAVE : débit, durée | **536 K, 0,36 s** | 379 K, 3,0 s |
+| 3 cœurs + BGSAVE : p99 / p99.9 / p99.99 | **0,27 / 0,39** / 2,08 | 0,49 / 2,27 / 3,01 |
+| RSS ; copy-on-write pendant la save | **135–142 Mo ; 0** | 190 Mo ; +170–180 Mo |
+
+Le copy-on-write de Valkey est le cas défavorable de `fork` (20 % de SET sur des clés
+uniformes touchent presque toutes les pages). Le chiffre 3 cœurs + BGSAVE de RadixOx est
+antérieur à la correction du plancher (§8.2).
 
 ---
 

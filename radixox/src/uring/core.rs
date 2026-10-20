@@ -477,8 +477,7 @@ impl Core {
         // longue, plus de copies T0 à libérer à la fin), 250 µs au plus.
         let end = tsc::Deadline::after(Duration::from_micros(250));
         while self.bgsave_slice_due() && !end.passed() {
-            let contended = self.clients_active();
-            self.bgsave.as_mut().unwrap().slice(&mut self.art, contended);
+            self.bgsave.as_mut().unwrap().slice(&mut self.art);
             let bg = self.bgsave.as_ref().unwrap();
             if bg.in_flight() || !bg.wants_slice() {
                 break;
@@ -1117,9 +1116,9 @@ impl Core {
             return false;
         }
         let elapsed = self.now.saturating_duration_since(bg.started()).as_secs_f64();
-        !(self.save_share < 1.0
-            && self.clients_active()
-            && bg.contended().as_secs_f64() > self.save_share * elapsed)
+        // Plancher : le travail fait au repos compte, le tour ne prend sur les
+        // clients que ce qui manque pour atteindre la part (RUNTIME_ARCH.md §8.2).
+        !(self.save_share < 1.0 && self.clients_active() && bg.work().as_secs_f64() > self.save_share * elapsed)
     }
 
     /// Une lecture réseau dans la dernière milliseconde (SAVE_DESIGN.md,
@@ -1184,7 +1183,7 @@ impl Core {
 
     fn bgsave_idle_slice(&mut self) -> bool {
         let Some(bg) = self.bgsave.as_mut().filter(|b| b.wants_slice()) else { return false };
-        bg.slice(&mut self.art, false);
+        bg.slice(&mut self.art);
         self.bgsave_next();
         true
     }
