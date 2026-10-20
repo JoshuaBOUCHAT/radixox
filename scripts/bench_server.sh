@@ -1,7 +1,11 @@
 #!/bin/bash
-# Côté serveur d'un bench réseau (à lancer sur la machine serveur, dans le dépôt).
+# Côté serveur d'un bench réseau. Piloté par ssh depuis le client par bench_2pc.sh : rien
+# à lancer à la main sur le serveur.
 #
-#   scripts/bench_server.sh setup <ip_client>         # prep + libère le port + pare-feu (sudo)
+#   scripts/bench_server.sh check                     # prérequis (lecture seule, sans sudo)
+#   scripts/bench_server.sh setup <ip_client>         # installe ce qui manque, prep, libère le
+#                                                     # port, ouvre le pare-feu, build (sudo)
+#   scripts/bench_server.sh firewall open|close <ip>  # pare-feu seul (ufw, firewalld ou iptables)
 #   scripts/bench_server.sh prep                      # réglages système (sudo), une fois par démarrage
 #   scripts/bench_server.sh start radixox [K]         # RadixOx sur K cœurs physiques (défaut 1)
 #   scripts/bench_server.sh start valkey  [K]         # la référence sur les mêmes K cœurs :
@@ -28,6 +32,26 @@ PIDFILE="$STATE/server.pid"
 mkdir -p "$STATE"
 
 die() { echo "bench_server: $*" >&2; exit 1; }
+
+# Root (conteneur, VM jetable) : pas besoin de sudo, qui peut d'ailleurs manquer.
+if [ "$(id -u)" = 0 ]; then SUDO=(); else SUDO=(sudo); fi
+
+version_ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$2" ]; }
+
+# PONG sur 127.0.0.1:$PORT ? En bash pur (/dev/tcp) : redis-cli n'est pas requis ici.
+ping_local() {
+  (
+    exec 3<>"/dev/tcp/127.0.0.1/$PORT" || exit 1
+    printf 'PING\r\n' >&3
+    read -r -t 1 reply <&3 || exit 1
+    [ "${reply%$'\r'}" = "+PONG" ]
+  ) 2>/dev/null
+}
+
+# Commit des sources : celui écrit par bench_2pc.sh à l'envoi, sinon git.
+source_rev() {
+  cat "$ROOT/.bench-rev" 2>/dev/null || git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo '?'
+}
 
 # Serveur de référence : Valkey s'il est installé, sinon Redis (mêmes options).
 ref_bin() {
@@ -74,7 +98,7 @@ wait_ready() {
   local pid; pid=$(cat "$PIDFILE")
   for _ in $(seq 1 100); do
     running_pid >/dev/null || { tail -20 "$STATE/server.log" >&2; die "le serveur s'est arrêté au démarrage"; }
-    if [ "$(port_owner)" = "$pid" ] && redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG; then
+    if [ "$(port_owner)" = "$pid" ] && ping_local; then
       return 0
     fi
     sleep 0.1
@@ -111,8 +135,9 @@ cmd_start() {
     radixox)
       local bin="$ROOT/target/release/radixox"
       # Toujours à jour avec le dépôt (rapide si rien n'a changé).
-      (cd "$ROOT" && RUSTFLAGS="-C target-cpu=native" cargo build --release --bin radixox -q) \
-        || die "build de radixox impossible"
+      # Sortie dans build.log : cargo rejouerait ses warnings à chaque démarrage.
+      (cd "$ROOT" && RUSTFLAGS="-C target-cpu=native" cargo build --release --bin radixox) >"$STATE/build.log" 2>&1 \
+        || { tail -30 "$STATE/build.log" >&2; die "build de radixox impossible (log : $STATE/build.log)"; }
       local env=(RADIXOX_BIND=0.0.0.0 RADIXOX_PORT="$PORT" RADIXOX_CPU_PIN="$main" RADIXOX_DIR="$STATE")
       if [ -n "$iowq" ]; then
         env+=(RADIXOX_SEND_ASYNC=1 RADIXOX_IOWQ_WORKERS=$((k - 1)) RADIXOX_IOWQ_CPUS="$iowq")
@@ -145,7 +170,7 @@ cmd_status() {
   local pid
   if pid=$(running_pid); then
     ps -o pid,psr,pcpu,rss,args -p "$pid"
-    redis-cli -p "$PORT" PING
+    ping_local && echo PONG || echo "pas de réponse sur :$PORT"
   else
     echo "aucun serveur lancé par ce script"
   fi
@@ -157,12 +182,109 @@ cmd_rss() {
   awk '/VmHWM/ {printf "%.0f\n", $2 / 1024}' "/proc/$pid/status"
 }
 
+# Lecture seule, sans sudo. Ce qui manque et que `setup` installe est seulement
+# annoncé ; code 2 pour ce qu'aucun script ne peut corriger (noyau, pas de sudo).
+cmd_check() {
+  local fatal=() todo=() c
+  version_ge "$(uname -r | cut -d. -f1-2)" 6.12 \
+    || fatal+=("noyau >= 6.12 pour io_uring (actuel : $(uname -r) ; Ubuntu 24.04 : sudo apt install linux-generic-hwe-24.04 puis redémarrer)")
+  [ ${#SUDO[@]} -eq 0 ] || command -v sudo >/dev/null || fatal+=("sudo absent : se connecter en root")
+  [ "$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0)" = 0 ] || todo+=("io_uring à réactiver")
+  rust_ok || todo+=("Rust >= $RUST_MIN (rustup)")
+  for c in cc curl tar lscpu taskset setsid ss; do
+    command -v "$c" >/dev/null || todo+=("$c")
+  done
+  command -v valkey-server >/dev/null || todo+=("valkey (à défaut : redis)")
+  if [ ${#todo[@]} -gt 0 ] && ! pkg_manager >/dev/null; then
+    fatal+=("ni apt, ni pacman, ni dnf : installer à la main : ${todo[*]}")
+  fi
+  [ ${#fatal[@]} -eq 0 ] || { printf '  ✗ %s\n' "${fatal[@]}" >&2; return 2; }
+  [ ${#todo[@]} -eq 0 ] || printf '  • à installer/régler par la préparation : %s\n' "${todo[*]}"
+  echo "  ✓ $(uname -r), $(lscpu -p=CORE 2>/dev/null | grep -v '^#' | sort -u | wc -l) cœurs physiques"
+}
+
+RUST_MIN=1.88
+rust_ok() {
+  command -v cargo >/dev/null && version_ge "$(cargo --version | awk '{print $2}')" "$RUST_MIN"
+}
+
+pkg_manager() {
+  local m
+  for m in apt-get pacman dnf; do command -v "$m" >/dev/null && { echo "$m"; return 0; }; done
+  return 1
+}
+
+# pkg_install <nom apt> <nom pacman> <nom dnf>
+pkg_install() {
+  case "$(pkg_manager)" in
+    apt-get)
+      if [ -z "${APT_UPDATED:-}" ]; then "${SUDO[@]}" apt-get update -qq || true; APT_UPDATED=1; fi
+      "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$1" >/dev/null ;;
+    pacman) "${SUDO[@]}" pacman -S --needed --noconfirm "$2" >/dev/null ;;
+    dnf) "${SUDO[@]}" dnf install -y -q "$3" >/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+# Tout ce qui manque : paquets, Rust, Valkey (Redis à défaut).
+install_deps() {
+  command -v cc >/dev/null || { echo "installation : compilateur C"; pkg_install build-essential base-devel gcc; }
+  command -v curl >/dev/null || { echo "installation : curl"; pkg_install curl curl curl; }
+  command -v tar >/dev/null || pkg_install tar tar tar
+  local c
+  for c in lscpu taskset setsid; do
+    command -v "$c" >/dev/null || { echo "installation : util-linux"; pkg_install util-linux util-linux util-linux; break; }
+  done
+  command -v ss >/dev/null || { echo "installation : iproute2"; pkg_install iproute2 iproute2 iproute; }
+  if ! command -v valkey-server >/dev/null; then
+    echo "installation : valkey"
+    pkg_install valkey-server valkey valkey 2>/dev/null \
+      || { command -v redis-server >/dev/null || { echo "valkey indisponible, installation : redis"; pkg_install redis-server redis redis; }; }
+  fi
+  if ! rust_ok; then
+    if command -v rustup >/dev/null; then
+      echo "mise à jour de Rust (rustup)"
+      rustup update stable --no-self-update >/dev/null
+    else
+      echo "installation de Rust (rustup, dans ~/.cargo)"
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null
+    fi
+    . "$HOME/.cargo/env"
+  fi
+  if [ "$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0)" != 0 ]; then
+    "${SUDO[@]}" sysctl -q kernel.io_uring_disabled=0 && echo "io_uring réactivé"
+  fi
+}
+
+# Pare-feu : open|close <ip_client>. ufw, sinon firewalld, sinon iptables s'il filtre.
+cmd_firewall() {
+  local op=${1:?firewall open|close <ip_client>} client=${2:?ip_client}
+  # LC_ALL=C : sinon « État : actif » sur un système en français.
+  if command -v ufw >/dev/null && "${SUDO[@]}" env LC_ALL=C ufw status | grep -q '^Status: active'; then
+    if [ "$op" = open ]; then
+      "${SUDO[@]}" ufw allow from "$client" to any port "$PORT" proto tcp >/dev/null
+    else
+      "${SUDO[@]}" ufw delete allow from "$client" to any port "$PORT" proto tcp >/dev/null
+    fi
+    echo "pare-feu (ufw) : port $PORT $([ "$op" = open ] && echo ouvert || echo refermé) pour $client"
+  elif systemctl is-active --quiet firewalld 2>/dev/null; then
+    # Règle runtime seulement : disparaît aussi au prochain reload/redémarrage.
+    "${SUDO[@]}" firewall-cmd -q "--$([ "$op" = open ] && echo add || echo remove)-rich-rule=rule family=ipv4 source address=$client port port=$PORT protocol=tcp accept" || true
+    echo "pare-feu (firewalld) : port $PORT $([ "$op" = open ] && echo ouvert || echo refermé) pour $client"
+  elif command -v iptables >/dev/null \
+       && "${SUDO[@]}" iptables -S INPUT 2>/dev/null | grep -qE '^-P INPUT DROP|-j (DROP|REJECT)'; then
+    local rule=(INPUT -p tcp -s "$client" --dport "$PORT" -j ACCEPT)
+    if [ "$op" = open ]; then
+      "${SUDO[@]}" iptables -C "${rule[@]}" 2>/dev/null || "${SUDO[@]}" iptables -I "${rule[@]}"
+    else
+      "${SUDO[@]}" iptables -D "${rule[@]}" 2>/dev/null || true
+    fi
+    echo "pare-feu (iptables) : port $PORT $([ "$op" = open ] && echo ouvert || echo refermé) pour $client"
+  fi
+}
+
 cmd_prep() {
   echo "noyau : $(uname -r)"
-  local v; v=$(uname -r | cut -d. -f1-2)
-  if [ "$(printf '%s\n6.12\n' "$v" | sort -V | head -1)" != "6.12" ]; then
-    echo "  ⚠ RadixOx demande un noyau >= 6.12 (Ubuntu 24.04 : linux-generic-hwe-24.04)"
-  fi
   echo "io_uring_disabled : $(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo '?') (doit valoir 0)"
   echo "cœurs physiques : $(lscpu -p=CORE | grep -v '^#' | sort -u | wc -l), CPU : $(nproc)"
   # Fréquence : gouverneur performance sur tous les CPU.
@@ -170,13 +292,13 @@ cmd_prep() {
     powerprofilesctl set performance && echo "profil d'énergie : performance"
   fi
   for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-    [ -f "$g" ] && echo performance | sudo tee "$g" >/dev/null
+    [ -f "$g" ] && echo performance | "${SUDO[@]}" tee "$g" >/dev/null
   done
   echo "gouverneur : $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo '?')"
   # THP en madvise : RadixOx le demande pour son arbre, Valkey ne le prend pas (sa recommandation).
-  echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null
+  echo madvise | "${SUDO[@]}" tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null
   echo "THP : $(cat /sys/kernel/mm/transparent_hugepage/enabled)"
-  sudo sysctl -q vm.overcommit_memory=1 && echo "vm.overcommit_memory = 1 (recommandé par Valkey)"
+  "${SUDO[@]}" sysctl -q vm.overcommit_memory=1 && echo "vm.overcommit_memory = 1 (recommandé par Valkey)"
   local iface
   iface=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
   if [ -n "$iface" ]; then
@@ -184,34 +306,37 @@ cmd_prep() {
   fi
 }
 
-# Tout ce qui demande sudo, en une fois : réglages, port libéré, pare-feu ouvert au client.
+# Tout ce qui demande sudo, en une fois : installations, réglages, port libéré,
+# pare-feu ouvert au client, build.
 cmd_setup() {
   local client=${1:?setup <ip_client>}
+  cmd_check >/dev/null || die "prérequis impossibles à corriger automatiquement (voir ci-dessus)"
+  install_deps
   cmd_prep
-  # Services redis / valkey du système qui prendraient le port.
+  # Services redis / valkey du système (dont ceux qu'on vient d'installer) qui prendraient le port.
   local svc
   for svc in $(systemctl list-units --type=service --state=active --no-legend 2>/dev/null \
                  | awk '{print $1}' | grep -Ei '^(redis|valkey)' || true); do
     echo "service système $svc arrêté et désactivé (il occupe le port des benchs)"
-    sudo systemctl disable --now "$svc"
+    "${SUDO[@]}" systemctl disable --now "$svc" 2>/dev/null
   done
   cmd_stop >/dev/null
   if [ -n "$(ss -ltnH "sport = :$PORT" 2>/dev/null)" ]; then
-    die "port $PORT toujours pris : $(ss -ltnH "sport = :$PORT" | awk '{print $4}' | paste -sd' ')"
+    die "port $PORT toujours pris : $(ss -ltnH "sport = :$PORT" | awk '{print $4}' | paste -sd' ') (PORT=autre_port)"
   fi
-  if command -v ufw >/dev/null && sudo ufw status | grep -q '^Status: active'; then
-    sudo ufw allow from "$client" to any port "$PORT" proto tcp >/dev/null
-    echo "pare-feu : port $PORT ouvert pour $client"
-  fi
-  ref_bin >/dev/null || die "ni valkey-server ni redis-server (sudo apt install valkey-server ou redis-server)"
-  command -v cargo >/dev/null || die "cargo absent (https://rustup.rs)"
+  cmd_firewall open "$client"
   echo "référence : $(cmd_refname)"
-  echo "build de radixox…"
-  (cd "$ROOT" && RUSTFLAGS="-C target-cpu=native" cargo build --release --bin radixox -q) || die "build impossible"
-  echo "serveur prêt (commit $(cd "$ROOT" && git rev-parse --short HEAD))"
+  echo "build de radixox (plusieurs minutes la première fois : LTO)…"
+  # Progression visible (une ligne par crate), sortie complète dans build.log.
+  (cd "$ROOT" && RUSTFLAGS="-C target-cpu=native" cargo build --release --bin radixox 2>&1 \
+     | tee "$STATE/build.log" | grep --line-buffered -E '^\s*(Compiling|Finished)'; exit "${PIPESTATUS[0]}") \
+    || { tail -30 "$STATE/build.log" >&2; die "build impossible (log : $STATE/build.log)"; }
+  echo "serveur prêt (commit $(source_rev))"
 }
 
 case "${1:-}" in
+  check) cmd_check ;;
+  firewall) shift; cmd_firewall "$@" ;;
   setup) shift; cmd_setup "$@" ;;
   prep) cmd_prep ;;
   start) shift; cmd_start "$@" ;;
@@ -219,5 +344,5 @@ case "${1:-}" in
   status) cmd_status ;;
   rss) cmd_rss ;;
   refname) cmd_refname ;;
-  *) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
