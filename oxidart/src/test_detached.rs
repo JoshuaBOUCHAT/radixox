@@ -139,3 +139,22 @@ fn evictor_skips_detached_subtrees() {
         assert_eq!(a.len(), usize::from(!flush), "flush {flush}");
     }
 }
+
+/// FLUSHDB pendant la libération d'un `UNLINK prefix*` : le compte remis à 0
+/// par FLUSHDB couvre aussi les clés pas encore libérées de l'UNLINK, qui ne
+/// sont plus décomptées une seconde fois à leur libération.
+#[test]
+fn flush_while_unlink_is_pending() {
+    let mut a = make_art();
+    let mut u = Detached::default();
+    a.detach_prefix(b"user:", &mut u);
+    let mut f = Detached::default();
+    a.detach_all(&mut f);
+    assert_eq!(a.len(), 0);
+    a.set(SharedByte::from_str("after"), Value::from_str("v"));
+    while !a.free_detached(&mut u, 1) {}
+    while !a.free_detached(&mut f, 1) {}
+    assert_eq!(u.freed, 5);
+    a.check();
+    assert_eq!(a.len(), 1);
+}

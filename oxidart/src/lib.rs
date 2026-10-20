@@ -157,6 +157,8 @@ pub struct OxidArt {
     /// Valeurs stockées, expirées pas encore nettoyées comprises (comme le
     /// `DBSIZE` de Redis).
     pub(crate) key_count: usize,
+    /// FLUSHDB faits ([`detach_all`](Self::detach_all)) : voir `Detached::flushes`.
+    flushes: u64,
 }
 
 impl Default for OxidArt {
@@ -297,6 +299,7 @@ impl OxidArt {
             now: 0,
             save: OxidSave::default(),
             key_count: 0,
+            flushes: 0,
         }
     }
 
@@ -1064,6 +1067,9 @@ impl OxidArt {
     /// disparaissent tout de suite, la mémoire est rendue ensuite par
     /// [`free_detached`](Self::free_detached), par tranches.
     pub fn detach_prefix(&mut self, prefix: &[u8], into: &mut Detached) {
+        if into.stack.is_empty() {
+            into.flushes = self.flushes;
+        }
         let (stack, count) = self.cut_prefix(prefix);
         into.stack.extend(stack);
         into.freed += count;
@@ -1076,7 +1082,10 @@ impl OxidArt {
         into.stack.extend(stack);
         into.freed += count;
         into.uncounted = true;
+        // Les sous-arbres détachés avant, pas encore libérés, sont comptés
+        // dans `key_count` : remis à 0 avec le reste.
         self.key_count = 0;
+        self.flushes += 1;
     }
 
     /// Libère au plus `budget` nœuds détachés. `true` quand tout est libéré.
@@ -1089,7 +1098,8 @@ impl OxidArt {
         if self.is_saving() {
             return false;
         }
-        d.freed += self.free_subtrees(&mut d.stack, budget, !d.uncounted);
+        let counted = !d.uncounted && d.flushes == self.flushes;
+        d.freed += self.free_subtrees(&mut d.stack, budget, counted);
         d.stack.is_empty()
     }
 
@@ -1372,6 +1382,9 @@ pub struct Detached {
     pub freed: usize,
     /// Clés déjà retirées de `key_count` (FLUSHDB).
     uncounted: bool,
+    /// Nombre de FLUSHDB de l'arbre au détachement : un FLUSHDB plus récent a
+    /// remis `key_count` à 0, ces clés n'y sont plus.
+    flushes: u64,
 }
 
 impl Detached {
