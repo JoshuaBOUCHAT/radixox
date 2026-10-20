@@ -343,7 +343,7 @@ impl Server {
         }
         loop {
             // Deux horloges par tour : murale pour le TTL, monotone pour les timers.
-            self.core.art.tick();
+            self.core.tick();
             self.core.set_now(Instant::now());
             self.harvest();
             self.core.fire_timers();
@@ -374,6 +374,8 @@ impl Server {
                 }
                 self.idle_work();
             }
+            // Le bloc du tour se ferme ici, travail au repos compris.
+            self.core.end_turn();
             let res = if self.core.idle() {
                 self.wait()
             } else {

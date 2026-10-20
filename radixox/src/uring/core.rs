@@ -25,6 +25,7 @@ use radixox_lib::shared_frame::{SharedFrame as Frame, extend_encode};
 use crate::exec::client::Client;
 use crate::exec::jobs::{FREE_BUDGET, FlushJob, KEYS_BUDGET, KeysJob, Step, UnlinkJob};
 use crate::exec::autosave::{Persistence, Rule};
+use crate::exec::journal::{self, Stream};
 use crate::exec::bgsave::{BgSave, FileOp, cpu_share, zstd_conf};
 use crate::exec::persist::{save_sync, sync_level};
 use crate::exec::{Executed, execute_into, resp_ok};
@@ -69,6 +70,8 @@ pub struct Config {
     pub save_rules: Vec<Rule>,
     /// Écritures refusées après un BGSAVE en échec (`stop-writes-on-bgsave-error`).
     pub stop_writes_on_bgsave_error: bool,
+    /// Flux de commandes (AOF, réplication ; DURABILITY_DESIGN.md) tenu à jour.
+    pub journal: bool,
 }
 
 impl Default for Config {
@@ -92,6 +95,7 @@ impl Default for Config {
             job_budget: KEYS_BUDGET.min(FREE_BUDGET),
             save_rules: Vec::new(),
             stop_writes_on_bgsave_error: true,
+            journal: false,
         }
     }
 }
@@ -260,6 +264,8 @@ pub struct Core {
     last_rx: Instant,
     /// Saves automatiques, dernière save, écritures depuis.
     persist: Persistence,
+    /// Flux de commandes, si `cfg.journal`.
+    journal: Option<Stream>,
 }
 
 impl Core {
@@ -297,6 +303,7 @@ impl Core {
             save_share: cpu_share(),
             last_rx: now,
             persist: Persistence::new(cfg.save_rules.clone(), cfg.stop_writes_on_bgsave_error, now),
+            journal: cfg.journal.then(Stream::default),
             cfg,
         }
     }
@@ -306,6 +313,32 @@ impl Core {
     /// Horloge monotone du tour.
     pub fn set_now(&mut self, now: Instant) {
         self.now = now;
+    }
+
+    /// Horloge murale du TTL, une fois par tour ; avec le flux, jamais en
+    /// arrière du dernier `now` écrit (DURABILITY_DESIGN.md §4).
+    pub fn tick(&mut self) {
+        self.art.tick();
+        self.set_wall(self.art.now);
+    }
+
+    /// Pose l'horloge murale du TTL (secondes), rendue monotone avec le flux.
+    pub fn set_wall(&mut self, secs: u64) {
+        let secs = self.journal.as_mut().map_or(secs, |j| j.observe_now(secs));
+        self.art.set_now(secs);
+    }
+
+    /// Fin de tour : le bloc en cours du flux est fermé (après le travail au
+    /// repos, avant le `tick` suivant, §4).
+    pub fn end_turn(&mut self) {
+        if let Some(j) = &mut self.journal {
+            j.end_turn();
+        }
+    }
+
+    /// Flux de commandes (blocs fermés), si `cfg.journal`.
+    pub fn journal_mut(&mut self) -> Option<&mut Stream> {
+        self.journal.as_mut()
     }
 
     /// Prochaine échéance : borne l'attente dans `enter` (sinon l'horloge et
@@ -882,9 +915,10 @@ impl Core {
         let mut afters: Window<(Slot, After)> = SmallVec::new();
         {
             let job_budget = self.cfg.job_budget;
-            let Core { art, ins, outs, bufs, persist, .. } = self;
+            let Core { art, ins, outs, bufs, persist, journal, .. } = self;
             let refuse_writes = persist.refuse_writes();
-            let mut frames: Window<(Slot, Cmd<'_>)> = SmallVec::new();
+            // (connexion, commande, octets de sa frame)
+            let mut frames: Window<(Slot, Cmd<'_>, &[u8])> = SmallVec::new();
             for (rank, &slot) in picked.iter().enumerate() {
                 if frames.len() >= width {
                     break;
@@ -897,11 +931,12 @@ impl Core {
                 let mut plan = Plan { slot, from_rx: false, consumed: 0, tail: false, err: None, first: frames.len() };
                 let mut barrier = false;
                 if i.rx_ready > 0 {
-                    let Parse::Done(cmd, _) = Cmd::parse(&i.rx[..i.rx_ready]) else {
+                    let raw = &i.rx[..i.rx_ready];
+                    let Parse::Done(cmd, _) = Cmd::parse(raw) else {
                         unreachable!("rx_ready : frame complète");
                     };
                     barrier = stops_window(&cmd);
-                    frames.push((slot, cmd));
+                    frames.push((slot, cmd, raw));
                     plan.from_rx = true;
                 }
                 // Des octets attendent encore dans `rx` après cette frame : les
@@ -916,9 +951,10 @@ impl Core {
                     while frames.len() < stop_at && pos < data.len() {
                         match Cmd::parse(&data[pos..]) {
                             Parse::Done(cmd, n) => {
+                                let raw = &data[pos..pos + n];
                                 pos += n;
                                 let b = stops_window(&cmd);
-                                frames.push((slot, cmd));
+                                frames.push((slot, cmd, raw));
                                 if b {
                                     break;
                                 }
@@ -940,12 +976,12 @@ impl Core {
                 }
             }
             if frames.len() > 1 {
-                let keys: Window<&[u8]> = frames.iter().filter_map(|(_, c)| c.main_key()).collect();
+                let keys: Window<&[u8]> = frames.iter().filter_map(|(_, c, _)| c.main_key()).collect();
                 if keys.len() > 1 {
                     art.prefetch_keys(&keys);
                 }
             }
-            for (slot, cmd) in frames {
+            for (slot, cmd, raw) in frames {
                 let o = &mut outs[slot as usize];
                 let weight = cmd.write_weight();
                 if weight > 0 && o.client.authed {
@@ -957,7 +993,16 @@ impl Core {
                     // FLUSHDB : toutes les clés changent (le `dirty` de Redis).
                     persist.note_writes(if matches!(cmd, Cmd::FlushDb) { art.len() as u64 } else { weight });
                 }
+                let Some(stream) = journal.as_mut() else {
+                    afters.push((slot, run_cmd(cmd, art, o, job_budget)));
+                    continue;
+                };
+                // Le flux : la frame reçue, décidée avant (la commande est
+                // consommée), confirmée par la réponse (DURABILITY_DESIGN.md §3).
+                let plan = journal::plan(&cmd);
+                let start = o.out.len();
                 afters.push((slot, run_cmd(cmd, art, o, job_budget)));
+                journal::finish(plan, &o.out[start..], raw, art.now, stream);
             }
         }
         let done = afters.len();

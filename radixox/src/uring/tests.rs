@@ -58,6 +58,8 @@ struct Fake {
     /// Comme la boucle : travail de fond à la fin du tour tant que rien
     /// n'arrive (ici : ni complétion, ni donnée en attente chez un client).
     idle_work: bool,
+    /// Horloge murale du TTL (secondes), posée à chaque tour si définie.
+    wall: Option<u64>,
 }
 
 impl Fake {
@@ -78,6 +80,7 @@ impl Fake {
             completions: Vec::new(),
             clock: Instant::now(),
             idle_work: false,
+            wall: None,
         }
     }
 
@@ -190,6 +193,9 @@ impl Fake {
     fn step(&mut self) -> bool {
         self.clock += Duration::from_micros(50);
         self.core.set_now(self.clock);
+        if let Some(w) = self.wall {
+            self.core.set_wall(w);
+        }
         self.apply_ops();
         self.deliver();
         let busy = !self.completions.is_empty() || !self.core.idle();
@@ -213,6 +219,7 @@ impl Fake {
             self.core.flush();
             self.core.take_ops(&mut self.ops);
         }
+        self.core.end_turn();
         if std::env::var("FAKE_TRACE").is_ok() {
             eprintln!("  ops={:?}", self.ops);
         }
@@ -761,5 +768,224 @@ fn random_streams_match_oracle() {
                 "graine {seed}, connexion {n}"
             );
         }
+    }
+}
+
+// ── Flux de commandes (DURABILITY_DESIGN.md §12, tests 1 et 2) ──────────────
+
+/// Une écriture ou une lecture aléatoire, tous types, TTL courts, sur un petit
+/// jeu de clés partagé entre types (WRONGTYPE compris). `spop` : avec SPOP
+/// (non déterministe, réécrit par le flux).
+fn random_write(rng: &mut Rng, spop: bool) -> Vec<String> {
+    let k = |rng: &mut Rng| format!("k{}", rng.below(8));
+    let v = |rng: &mut Rng| format!("v{}", rng.below(20));
+    let m = |rng: &mut Rng| format!("m{}", rng.below(12));
+    let ttl = |rng: &mut Rng| (1 + rng.below(3)).to_string();
+    let s = |x: &str| x.to_string();
+    // `s0..s2` : sets seulement, pour que SPOP tire souvent dans un set plein.
+    let sk = |rng: &mut Rng| format!("s{}", rng.below(3));
+    match rng.below(if spop { 37 } else { 35 }) {
+        0 => vec![s("SET"), k(rng), v(rng)],
+        1 => vec![s("SET"), k(rng), v(rng), s("EX"), ttl(rng)],
+        2 => vec![s("SET"), k(rng), v(rng), s("NX")],
+        3 => vec![s("SET"), k(rng), v(rng), s("XX"), s("EX"), ttl(rng)],
+        4 => vec![s("SETNX"), k(rng), v(rng)],
+        5 => vec![s("MSET"), k(rng), v(rng), k(rng), v(rng)],
+        6 => vec![s("DEL"), k(rng), k(rng)],
+        7 => vec![s("UNLINK"), k(rng)],
+        8 => vec![s("EXPIRE"), k(rng), ttl(rng)],
+        9 => vec![s("PERSIST"), k(rng)],
+        10 => vec![s("INCR"), k(rng)],
+        11 => vec![s("DECRBY"), k(rng), rng.below(5).to_string()],
+        12 => vec![s("HSET"), k(rng), m(rng), v(rng)],
+        13 => vec![s("HMSET"), k(rng), m(rng), v(rng), m(rng), v(rng)],
+        14 => vec![s("HDEL"), k(rng), m(rng)],
+        15 => vec![s("HINCRBY"), k(rng), m(rng), rng.below(5).to_string()],
+        16 => vec![s("SADD"), k(rng), m(rng), m(rng)],
+        17 => vec![s("SREM"), k(rng), m(rng)],
+        18 => vec![s("ZADD"), k(rng), rng.below(9).to_string(), m(rng)],
+        19 => vec![s("ZREM"), k(rng), m(rng)],
+        20 => vec![s("ZINCRBY"), k(rng), s("1.5"), m(rng)],
+        21 => vec![s("GET"), k(rng)],
+        22 => vec![s("TTL"), k(rng)],
+        23 => vec![s("EXISTS"), k(rng), k(rng)],
+        24 => vec![s("HGET"), k(rng), m(rng)],
+        25 => vec![s("SISMEMBER"), k(rng), m(rng)],
+        26 => vec![s("ZSCORE"), k(rng), m(rng)],
+        27 => vec![s("TYPE"), k(rng)],
+        28 => vec![s("INCRBY"), k(rng), rng.below(5).to_string()],
+        29 => vec![s("SETEX"), k(rng), ttl(rng), v(rng)],
+        30 => vec![s("UNLINK"), format!("k{}*", rng.below(3))],
+        31 if rng.below(8) == 0 => vec![s("FLUSHDB")],
+        31 | 32 => vec![s("SCARD"), k(rng)],
+        33 => vec![s("SADD"), sk(rng), m(rng), m(rng), m(rng)],
+        34 => vec![s("SREM"), sk(rng), m(rng)],
+        35 => vec![s("SPOP"), sk(rng)],
+        _ => vec![s("SPOP"), k(rng), (1 + rng.below(2)).to_string()],
+    }
+}
+
+fn resp(args: &[String]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", args.len());
+    for a in args {
+        out += &format!("${}\r\n{a}\r\n", a.len());
+    }
+    out.into_bytes()
+}
+
+/// État métier, indépendant de l'encodage : clés vivantes à `art.now`, type,
+/// valeur canonique (contenu trié), TTL restant.
+fn state(art: &mut OxidArt) -> Vec<String> {
+    use oxidart::value::Value;
+    use radixox_lib::shared_byte::SharedByte;
+    let mut out = Vec::new();
+    let mut entries = art.getn(SharedByte::from_slice(b""));
+    entries.sort_by(|a, b| a.0.as_slice().cmp(b.0.as_slice()));
+    for (key, val) in entries {
+        let ttl = art.get_ttl(key.clone());
+        let show = |b: &SharedByte| String::from_utf8_lossy(b).into_owned();
+        let v = match val {
+            Value::String(b) => format!("str {}", show(&b)),
+            Value::Int(n) => format!("int {n}"),
+            Value::Hash(mut f) => {
+                f.sort_by(|a, b| a.0.as_slice().cmp(b.0.as_slice()));
+                format!("hash {:?}", f.iter().map(|(a, b)| (show(a), show(b))).collect::<Vec<_>>())
+            }
+            Value::Set(mut m) => {
+                m.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+                format!("set {:?}", m.iter().map(show).collect::<Vec<_>>())
+            }
+            Value::ZSet(_) => {
+                let r = art.cmd_zrange(&key, 0, -1, true).unwrap();
+                format!("zset {:?}", r.iter().map(show).collect::<Vec<_>>())
+            }
+            Value::List(_) => "list".into(),
+        };
+        out.push(format!("{} {v} {ttl:?}", show(&key)));
+    }
+    out
+}
+
+/// Rejoue les blocs fermés sur un arbre neuf.
+fn replay(blocks: &[u8]) -> OxidArt {
+    use crate::exec::journal::{Cursor, apply, read_block};
+    let mut art = OxidArt::new();
+    let mut cur = Cursor::default();
+    let mut pos = 0;
+    while pos < blocks.len() {
+        let (b, payload) = read_block(&blocks[pos..], &mut cur).expect("bloc valide");
+        pos += b.size() as usize;
+        art.set_now(b.now);
+        apply(&mut art, payload).expect("charge valide");
+    }
+    art
+}
+
+#[test]
+fn journal_replay_matches_state() {
+    // `URING_SEEDS=3000` pour une passe longue.
+    let seeds: u64 = std::env::var("URING_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+    for seed in 1..=seeds {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut f = Fake::new(Config {
+            max_conn: 8,
+            reserved: 0,
+            bufs: 1 + rng.below(4) as Bid,
+            buf_size: 64 + rng.below(400) as u32,
+            batch_cmds: 1 + rng.below(20) as usize,
+            prefetch: 1 + rng.below(10) as usize,
+            job_budget: 1 + rng.below(3) as usize,
+            journal: true,
+            ..Config::default()
+        });
+        f.max_chunk = 1 + rng.below(60) as usize;
+        f.idle_work = seed % 2 == 0;
+        let mut wall = 1_000u64;
+        f.wall = Some(wall);
+        let conns: Vec<Slot> = (0..1 + rng.below(4)).map(|_| f.connect()).collect();
+        for _ in 0..30 {
+            for &c in &conns {
+                for _ in 0..rng.below(12) {
+                    let cmd = resp(&random_write(&mut rng, true));
+                    f.send(c, &cmd);
+                }
+            }
+            for _ in 0..1 + rng.below(4) {
+                f.step();
+            }
+            // L'horloge avance, parfois recule (ramenée au dernier `now` écrit).
+            wall = match rng.below(6) {
+                0 => wall.saturating_sub(2),
+                1 | 2 => wall,
+                _ => wall + rng.below(3),
+            };
+            f.wall = Some(wall);
+            // L'évicteur passe quand il veut : ses suppressions ne sont pas journalisées.
+            if rng.below(3) == 0 {
+                f.core.art.evict_expired();
+            }
+        }
+        f.settle();
+        let blocks: Vec<u8> = f.core.journal_mut().unwrap().closed.iter().flatten().copied().collect();
+        let mut replayed = replay(&blocks);
+        replayed.set_now(f.core.art.now);
+        let (got, want) = (state(&mut replayed), state(&mut f.core.art));
+        assert_eq!(got, want, "graine {seed}");
+    }
+}
+
+/// DET2 : une écriture ne voit pas une clé expirée, qu'elle soit encore dans
+/// l'arbre ou déjà supprimée : avec ou sans passage de l'évicteur juste avant,
+/// même réponse et même état.
+#[test]
+fn expired_keys_are_absent_for_writes() {
+    use crate::exec::jobs::{FlushJob, Step, UnlinkJob};
+    use radixox_lib::cmd::{Cmd, Parse};
+    fn run(art: &mut OxidArt, raw: &[u8]) -> Vec<u8> {
+        let mut client = Client::new();
+        client.authed = true;
+        let mut out = Vec::new();
+        let Parse::Done(cmd, _) = Cmd::parse(raw) else { panic!("commande de test") };
+        match execute_into(cmd, art, &mut client, &mut out) {
+            Executed::Done => {}
+            Executed::Runtime(Cmd::Unlink(keys)) => {
+                let mut job = UnlinkJob::start(art, &keys);
+                while job.step(art, usize::MAX) == Step::More {}
+                out = format!(":{}\r\n", job.count()).into_bytes();
+            }
+            Executed::Runtime(Cmd::FlushDb) => {
+                let mut job = FlushJob::start(art);
+                while job.step(art, usize::MAX) == Step::More {}
+                out = b"+OK\r\n".to_vec();
+            }
+            Executed::Runtime(_) => panic!("commande inattendue"),
+        }
+        out
+    }
+    let seeds: u64 = std::env::var("URING_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+    for seed in 1..=seeds {
+        let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
+        let (mut a, mut b) = (OxidArt::new(), OxidArt::new());
+        let mut now = 1_000;
+        for i in 0..400 {
+            if rng.below(4) == 0 {
+                now += rng.below(3);
+            }
+            a.set_now(now);
+            b.set_now(now);
+            // `a` purge tout ce qui est expiré (l'évicteur échantillonne).
+            for _ in 0..4 {
+                a.evict_expired();
+            }
+            let cmd = resp(&random_write(&mut rng, false));
+            let (ra, rb) = (run(&mut a, &cmd), run(&mut b, &cmd));
+            assert_eq!(
+                String::from_utf8_lossy(&ra),
+                String::from_utf8_lossy(&rb),
+                "graine {seed}, commande {i} : {}",
+                String::from_utf8_lossy(&cmd).escape_debug()
+            );
+        }
+        assert_eq!(state(&mut a), state(&mut b), "graine {seed}");
     }
 }

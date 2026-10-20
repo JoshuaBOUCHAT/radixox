@@ -8,6 +8,7 @@ pub mod autosave;
 pub mod bgsave;
 pub mod client;
 pub mod jobs;
+pub mod journal;
 pub mod persist;
 mod hash;
 pub mod scan;

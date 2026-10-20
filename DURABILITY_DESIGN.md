@@ -1,6 +1,9 @@
 # Durabilité — AOF et réplication par un seul flux de commandes
 
-> **État : conception complète (2026-10-20), rien d'implémenté.** Ce document doit suffire à
+> **État : étape 1 faite (2026-10-20)** : `exec/journal.rs` (plan / finish, format de bloc,
+> `Stream` en mémoire, rejeu `apply`), plomberie dans `Core::exec_window`, tests 1 et 2 ; le
+> flux n'est pas encore écrit sur disque (`Config::journal`, désactivé dans le binaire).
+> Suite : étape 2 (§13). Ce document doit suffire à
 > un agent qui ne connaît pas le projet : §1 donne le contexte du code, §2–§11 la conception,
 > §12 les tests, §13 l'ordre de travail avec ses critères d'acceptation. Il remplace le
 > « collecteur d'effets » de RUNTIME_ARCH.md §18 et complète ARCHITECTURE.md §3.
@@ -141,7 +144,7 @@ démarrer (§9).
 | Commande | Dans le flux |
 |---|---|
 | écritures déterministes : `SET` (toutes options), `SETNX`, `MSET`, `DEL`, `UNLINK`, `EXPIRE`, `PERSIST`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `HSET`, `HMSET`, `HDEL`, `HINCRBY`, `SADD`, `SREM`, `ZADD`, `ZREM`, `ZINCRBY`, `FLUSHDB` | **la frame reçue, octet pour octet** |
-| écriture sans effet, vue dans sa réponse : `SETNX` → `:0`, `SET NX/XX` → nul, `DEL`/`UNLINK`/`SREM`/`HDEL`/`ZREM` → `:0` ; toute réponse d'erreur (`WRONGTYPE`, `MISCONF`, `NOAUTH`, `READONLY`…) | **rien** (optimisation : la rejouer resterait correct, sauf l'erreur qui n'a rien changé non plus) |
+| écriture sans effet, vue dans sa réponse : `SETNX` → `:0`, `SET NX/XX` → nul, `DEL`/`UNLINK`/`EXPIRE`/`PERSIST`/`HDEL`/`SADD`/`SREM`/`ZREM` → `:0` ; toute réponse d'erreur (`WRONGTYPE`, `MISCONF`, `NOAUTH`, `READONLY`…) | **rien** (optimisation : la rejouer resterait correct, sauf l'erreur qui n'a rien changé non plus) |
 | `SPOP` | `SREM <clé> <membres tirés>` (lus dans la réponse) ; réponse vide → rien |
 | lectures, `PING`, `AUTH`, `HELLO`, `CLIENT`, `COMMAND`, `SELECT`, `INFO`, `LASTSAVE`, `DBSIZE`, `KEYS`, `SCAN`, `KRANGE`, Pub/Sub, `SAVE`, `BGSAVE` | rien |
 | expirations (évicteur, expiration paresseuse) | **rien** (§4) |
@@ -191,15 +194,17 @@ pub enum Journal<'a> {
 pub fn plan<'a>(cmd: &Cmd<'a>) -> Journal<'a>;
 
 /// Après exécution : la réponse dit si l'écriture a changé quelque chose.
-pub fn finish(j: Journal<'_>, cmd_kind: Kind, reply: &Frame, raw: &[u8], out: &mut Stream);
+pub fn finish(j: Journal<'_>, reply: &[u8], raw: &[u8], now: u64, out: &mut Stream);
 ```
 
-Plomberie nécessaire : faire suivre `raw` (les `n` octets de la frame, `Parse::Done(cmd, n)`)
-avec chaque `(slot, cmd)` de la fenêtre ; récupérer la `Frame` des écritures avant
-l'encodage (dans `execute_into`, la branche `cmd => execute_sync(cmd, art)`). Les commandes
-`Runtime` qui écrivent (`UNLINK`, `FLUSHDB`) journalisent leur frame dans `runtime()` /
-`finish_frame`, au moment où leur effet est décidé (§5). Les fonctions `cmd_*` ne changent
-pas.
+Fait ainsi (étape 1) : `raw` (les `n` octets de la frame, `Parse::Done(cmd, n)`) suit chaque
+`(slot, cmd, raw)` de la fenêtre ; `reply` = **les octets que la commande a ajoutés à `out`**
+(`out[start..]` autour de `run_cmd`), pas la `Frame` : `execute_into` ne change pas, et SPOP
+relit ses membres dans ces octets (que nous avons encodés nous-mêmes). `UNLINK` et `FLUSHDB`
+font leur effet dans `runtime()`, à l'intérieur de `run_cmd` : même point d'accroche ; un
+`UNLINK` parqué n'a pas encore de réponse (`reply` vide) et est journalisé (effet décidé au
+départ, §5). Les fonctions `cmd_*` ne changent pas. Une commande inline est journalisée telle
+quelle (le parseur du rejeu l'accepte).
 
 ---
 
@@ -227,9 +232,12 @@ mais un bloc ne serait plus autonome (un réplica qui reprend au milieu, un reje
 
 - `now` du bloc = **la valeur exacte utilisée par l'arbre** (`art.now`, secondes). Passer à la
   milliseconde = nouvelle `version` du flux.
-- **Monotone** : le primaire tient `last_now` et écrit `max(last_now, art.now)` ; si l'horloge
-  murale recule, `art.now` est lui aussi ramené à `last_now` pour le tour (sinon une clé
-  expirée, déjà supprimée au rejeu ou sur un réplica, « revivrait » sur le primaire).
+- **Monotone** : le primaire tient `last_now` = **le plus grand `now` posé sur l'arbre**, écrit
+  dans un bloc ou non (`Stream::observe_now`, appelé par `Core::tick` / `set_wall`) ; si
+  l'horloge murale recule, `art.now` est ramené à `last_now` pour le tour. Pas seulement le
+  dernier `now` écrit : une lecture à `t`, dans un tour sans écriture, peut avoir supprimé
+  paresseusement une clé expirée à `t` ; si l'horloge revenait à `t-1`, cette clé serait
+  vivante au rejeu et absente ici (divergence trouvée par le test 1, graine 412).
 - Un bloc se ferme **à la fin du tour**, après `idle_work` et avant le `tick` suivant : une étape
   de job faite au repos (un futur `STEP`, §5) tombe dans le bloc de son tour.
 - Le rejeu (§9) et un réplica (§10) font `art.set_now(bloc.now)` avant d'appliquer un bloc, et
@@ -276,10 +284,13 @@ off  taille  champ
 40   len     charge     commandes RESP (tableaux de bulk strings), à la suite
 ```
 
-- Taille d'en-tête : 40 octets. **Plafond de charge : 1 MiB** (taille d'un tampon du pool,
-  §7.2) ; un tour plus gros produit plusieurs blocs, les suivants avec `CONT`, même `now`.
+- Taille d'en-tête : 40 octets. **Remplissage : 1 MiB** (taille d'un tampon du pool, §7.2) :
+  le bloc est fermé dès qu'il l'atteint ; un tour plus gros produit plusieurs blocs, les
+  suivants avec `CONT`, même `now`. Une commande seule plus grosse (une frame va jusqu'à
+  `query_limit`, 1 Gio) fait un bloc à elle seule : le pool devra servir ce cas hors tampons
+  de 1 MiB (étape 8).
 - Un bloc vide n'est pas écrit (tour sans écriture), sauf s'il porte `CUT`.
-- Validité d'un bloc lu : magic, `version` acceptée, flags connus, `len ≤ 1 MiB`, CRC exact,
+- Validité d'un bloc lu : magic, `version` acceptée, flags connus, `len ≤ 1 Gio`, CRC exact,
   `seq = seq précédent + 1`, `offset = offset précédent + 40 + len précédent`,
   `now ≥ now précédent`.
 
@@ -667,7 +678,7 @@ Commandes : `BGREWRITEAOF`, `WAIT`, `REPLICATE`, `REPLICAOF NO ONE`, et les comm
 
 | # | Étape | Fini quand |
 |---|---|---|
-| 1 | `exec/journal.rs` (`plan`, `finish`, `Stream` en mémoire), plomberie `raw` + `Frame` | test 1 (oracle depuis vide) et test 2 verts |
+| 1 ✅ | `exec/journal.rs` (`plan`, `finish`, `Stream` en mémoire), plomberie `raw` + réponse | test 1 (oracle depuis vide) et test 2 verts — `uring/tests.rs` : `journal_replay_matches_state`, `expired_keys_are_absent_for_writes` (1000 graines vertes) |
 | 2 | Dump v2 : `base_seq`, `replid`, `base_offset`, condensé ; vérification au rechargement | test 3 ; tous les tests de save existants verts ; v1 toujours lisible |
 | 3 | Format de bloc, segments préalloués, manifeste, rejeu au démarrage, troncature | tests 4 et 6 |
 | 4 | `appendfsync no` / `everysec`, deux canaux de fichiers, plafond §7.6, erreurs §7.7, `INFO aof_*` | test 5 en `everysec` et `no` |

@@ -20,7 +20,7 @@
 | [`RUNTIME_ARCH.md`](RUNTIME_ARCH.md) | boucle io_uring maison : connexions, réception, émission, lot, équité, jobs, jamais bloquant, déploiement, migration, mesures | **implémentée** (étapes 0–6, 2026-10-19) ; reste l'étape 7+ (optimisations) |
 | [`SAVE_DESIGN.md`](SAVE_DESIGN.md) | save progressive : COW applicatif par nœud, format du dump, BGSAVE / SAVE / reload | **implémenté** (étapes 1–8) et saves automatiques ; AOF : DURABILITY_DESIGN.md |
 | [`SCAN_DESIGN.md`](SCAN_DESIGN.md) | SCAN à curseur côté serveur (table de curseurs, LRU, COUNT exact) | **implémenté** |
-| [`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md) | AOF et réplication par un seul flux : commandes journalisées par blocs de tour (avec `now`), exceptions non déterministes, point de linéarisation des commandes longues, snapshot exact, commit groupé `always` | conception, rien d'implémenté |
+| [`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md) | AOF et réplication par un seul flux : commandes journalisées par blocs de tour (avec `now`), exceptions non déterministes, point de linéarisation des commandes longues, snapshot exact, commit groupé `always` | étape 1 faite (flux en mémoire, rejeu, tests oracle) ; disque et réplication à venir |
 | [`TX_DESIGN.md`](TX_DESIGN.md) | transactions atomiques à conditions (`MULTI ATOMIC`, `DELPREFIX`, `EXEC DURABLE`) | conception, rien d'implémenté ; dépend de la boucle maison |
 | [`ANALYSE_ART_UNIFIE.md`](ANALYSE_ART_UNIFIE.md) | journal de décisions « tout dans l'ART » : TTL par champ (abandonné), valart (§11–12), design ZSet retenu (§13) | journal ; §13 = référence du futur ZSet |
 | [`protocol-spec.md`](protocol-spec.md) | spécification RESP de Redis (copie de référence) | référence externe |
