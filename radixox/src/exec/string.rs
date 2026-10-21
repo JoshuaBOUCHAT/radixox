@@ -30,7 +30,7 @@ pub fn cmd_set(art: &mut OxidArt, key: &[u8], val: SharedByte, opts: SetOpts) ->
         return Frame::Null;
     }
 
-    Frame::SimpleString(SharedByte::from_slice(b"OK"))
+    Frame::SimpleString("OK")
 }
 
 pub fn cmd_setnx(art: &mut OxidArt, key: &[u8], val: SharedByte) -> Frame {
@@ -132,15 +132,15 @@ pub fn cmd_mset(art: &mut OxidArt, pairs: &[(&[u8], SharedByte)]) -> Frame {
             art.set(SharedByte::from_slice(k), Value::String(v.clone()));
         }
     }
-    Frame::SimpleString(SharedByte::from_slice(b"OK"))
+    Frame::SimpleString("OK")
 }
 
 pub fn cmd_type(art: &mut OxidArt, key: &[u8]) -> Frame {
     match art.get(key) {
         Some(val) => {
-            Frame::SimpleString(SharedByte::from_slice(val.redis_type().as_str().as_bytes()))
+            Frame::SimpleString(val.redis_type().as_str())
         }
-        None => Frame::SimpleString(SharedByte::from_slice(b"none")),
+        None => Frame::SimpleString("none"),
     }
 }
 

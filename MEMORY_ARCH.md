@@ -387,8 +387,9 @@ relevée par signal autour d'un nombre fixe de requêtes (1 M, 200 k pour GET pi
 
 Le GET n'alloue presque rien. Le SET alloue sa valeur, qui vit, et **un temporaire de 8 o :
 la réponse `+OK`**, construite par `Frame::SimpleString(SharedByte::from_slice(b"OK"))`
-(`exec/string.rs`, 9 endroits de ce genre dans `exec/`). Il se supprime sans allocateur
-maison (réponse constante, sans allocation). En dehors de lui, les temporaires du chemin
+(`exec/string.rs`, 9 endroits de ce genre dans `exec/`). **Corrigé le 2026-10-21** :
+`SharedFrame::SimpleString` porte un `&'static str` ; recompté sur le SET par écrasement,
+2,01 → 1,006 allocation par commande (ne reste que la valeur). En dehors de lui, les temporaires du chemin
 chaud sont négligeables : **le pool court n'est pas prioritaire**.
 
 **Part de l'allocateur dans le CPU** (`perf record -F 1999` sur le processus, 4 s, build
@@ -418,7 +419,7 @@ plein, soit 10 fois la mémoire vivante. Le rechargement réutilise les trous, m
 proche de 100 k × 135 o + la réserve.
 
 **Conséquence sur l'ordre** : on garde §14. Pool `SharedByte` d'abord (la mémoire), puis
-le GC ; le pool court plus tard. La réponse `+OK` se corrige à part, tout de suite.
+le GC ; le pool court plus tard. La réponse `+OK` est corrigée à part (ci-dessus).
 
 **Critères à chaque étape** : octets par clé à nombre de clés fixe ; RSS après
 suppressions aléatoires puis une passe de GC ; débit et p99.9 identiques à mimalloc sur

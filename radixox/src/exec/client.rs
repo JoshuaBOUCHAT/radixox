@@ -29,7 +29,7 @@ impl Client {
 }
 
 fn ok() -> Frame {
-    Frame::SimpleString(SharedByte::from_slice(b"OK"))
+    Frame::SimpleString("OK")
 }
 
 fn bulk(s: &[u8]) -> Frame {

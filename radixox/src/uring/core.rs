@@ -1526,9 +1526,9 @@ impl Core {
                 } else {
                     match self.start_bgsave() {
                         Ok(()) if rewrite => {
-                            Frame::SimpleString(SharedByte::from_slice(b"Background append only file rewriting started"))
+                            Frame::SimpleString("Background append only file rewriting started")
                         }
-                        Ok(()) => Frame::SimpleString(SharedByte::from_slice(b"Background saving started")),
+                        Ok(()) => Frame::SimpleString("Background saving started"),
                         Err(e) => Frame::Error(format!("ERR {e}")),
                     }
                 };

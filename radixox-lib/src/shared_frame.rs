@@ -4,7 +4,8 @@ use crate::shared_byte::SharedByte;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SharedFrame {
-    SimpleString(SharedByte),
+    /// Réponses d'état constantes (`OK`, `PONG`…) : pas d'allocation.
+    SimpleString(&'static str),
     Error(String),
     Integer(i64),
     BulkString(SharedByte),
@@ -25,7 +26,8 @@ impl Hash for SharedFrame {
         };
         prefix.hash(state);
         match self {
-            SharedFrame::SimpleString(b) | SharedFrame::BulkString(b) => b.hash(state),
+            SharedFrame::BulkString(b) => b.hash(state),
+            SharedFrame::SimpleString(s) => s.hash(state),
             SharedFrame::Error(s) => s.hash(state),
             SharedFrame::Integer(i) => i.hash(state),
             SharedFrame::Array(f) => f.iter().for_each(|f| f.hash(state)),
@@ -100,7 +102,7 @@ fn encode_frame(dst: &mut Vec<u8>, frame: &SharedFrame) {
     match frame {
         SharedFrame::SimpleString(s) => {
             dst.push(b'+');
-            dst.extend_from_slice(s.as_slice());
+            dst.extend_from_slice(s.as_bytes());
             dst.extend_from_slice(b"\r\n");
         }
         SharedFrame::Error(s) => {

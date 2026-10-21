@@ -36,7 +36,7 @@ pub fn cmd_auth(user: Option<&[u8]>, pass: &[u8], authed: &mut bool) -> Frame {
     // `&` et non `&&` : la comparaison du mot de passe a lieu quel que soit l'utilisateur.
     if user_ok & ct_eq(pass, expected) {
         *authed = true;
-        Frame::SimpleString(radixox_lib::shared_byte::SharedByte::from_slice(b"OK"))
+        Frame::SimpleString("OK")
     } else {
         Frame::Error("WRONGPASS invalid username-password pair or user is disabled.".into())
     }

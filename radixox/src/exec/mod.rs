@@ -299,10 +299,10 @@ pub fn encode_int_bulk(buf: &mut Vec<u8>, n: i64) {
 pub fn resp_pong(msg: Option<&[u8]>) -> Frame {
     match msg {
         Some(m) => Frame::BulkString(SharedByte::from_slice(m)),
-        None => Frame::SimpleString(SharedByte::from_slice(b"PONG")),
+        None => Frame::SimpleString("PONG"),
     }
 }
 
 pub fn resp_ok() -> Frame {
-    Frame::SimpleString(SharedByte::from_slice(b"OK"))
+    Frame::SimpleString("OK")
 }
