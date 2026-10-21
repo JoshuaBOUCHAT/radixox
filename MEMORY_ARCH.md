@@ -1,6 +1,6 @@
 # Mémoire v2 — allocateur maison, GC par évacuation, compactage, maxmemory
 
-> **État : conception (2026-10-21), rien d'implémenté.** Ce document rassemble les décisions
+> **État : conception (2026-10-21), rien d'implémenté ; mesures de départ faites (§13.1).** Ce document rassemble les décisions
 > prises en discussion le 2026-10-07 (allocation des `SharedByte`, GC) et le 2026-10-21
 > (allocateur global d'abord, puis `maxmemory`). §15 liste ce qui reste ouvert, §14 l'ordre
 > de travail. Il complète ARCHITECTURE.md §5 (anti-pic de latence) et remplace, pour la
@@ -365,6 +365,60 @@ mutation (SAVE_DESIGN.md).
 
 Le résultat fixe l'ordre : si les temporaires pèsent, le pool court passe avant ; sinon le
 pool `SharedByte` d'abord (le gros de la RAM).
+
+### 13.1 Mesures de départ (2026-10-21)
+
+Machine au repos, profil `performance`, build `profiling`, serveur sous `systemd-run`
+(`MemoryMax=6G`), `RADIXOX_SAVE=""`, AOF coupé. memtier : `-t 2 -c 25 -d 100`,
+`--distinct-client-seed --randomize`, 1 M clés.
+
+**Allocations par commande.** Build `--cfg radixox_sysalloc` (toutes les allocations, y
+compris celles de `raw_alloc`, passent par la libc) et une bibliothèque `LD_PRELOAD` qui
+compte `malloc` / `calloc` / `realloc` / `free` par classe de taille, remise à zéro et
+relevée par signal autour d'un nombre fixe de requêtes (1 M, 200 k pour GET pipeline 1).
+
+| charge | allocations / commande | dont | `realloc` / commande |
+|---|---|---|---|
+| SET, clés neuves, pipeline 16 | 2,31 | 1 × ≤ 128 o (la valeur), **1 × ≤ 8 o** (la réponse), 0,3 × ≤ 32 o (structure) | 0,007 |
+| SET, écrasement, pipeline 16 | 2,01 | 1 × ≤ 128 o, 1 × ≤ 8 o | 0,007 |
+| GET, pipeline 16 | 0,006 | buffers | 0,007 |
+| GET, pipeline 1 | 0,11 | buffers (16 o – 2 Kio) | 0,10 |
+| 1 SET : 10 GET, pipeline 16 | 0,19 | ≈ les SET | 0,007 |
+
+Le GET n'alloue presque rien. Le SET alloue sa valeur, qui vit, et **un temporaire de 8 o :
+la réponse `+OK`**, construite par `Frame::SimpleString(SharedByte::from_slice(b"OK"))`
+(`exec/string.rs`, 9 endroits de ce genre dans `exec/`). Il se supprime sans allocateur
+maison (réponse constante, sans allocation). En dehors de lui, les temporaires du chemin
+chaud sont négligeables : **le pool court n'est pas prioritaire**.
+
+**Part de l'allocateur dans le CPU** (`perf record -F 1999` sur le processus, 4 s, build
+normal donc mimalloc) : fonctions `mi_*`, `malloc`, `free`, `realloc`, noyau compris dans le
+total.
+
+| charge | débit | allocateur | noyau |
+|---|---|---|---|
+| SET, écrasement, pipeline 16 | 1,42 M ops/s | **8,3 %** | 35,9 % |
+| 1 SET : 10 GET, pipeline 16 | 1,70 M ops/s | 1,4 % | 41,9 % |
+
+Sur les écritures, un bump (avancer un pointeur, décrémenter un compteur) peut reprendre
+l'essentiel de ces 8 % ; sur un mélange courant, le gain CPU est faible.
+
+**Octets par clé et RSS après suppressions** (clés `key:0000000` à `key:0999999` chargées
+par `redis-cli --pipe`, puis `DEL` d'une moitié tirée au hasard, puis de 80 % du reste,
+puis rechargement complet ; RSS lu dans `/proc/<pid>/status`) :
+
+| valeur | RSS à vide | 1 M clés | o / clé | 500 k clés | 100 k clés | o / clé vivante à 100 k | rechargé à 1 M |
+|---|---|---|---|---|---|---|---|
+| 100 o | 8,4 Mo | 141,1 Mo | 135 | 141,1 Mo | 141,1 Mo | **1 358** | 155,4 Mo |
+| 16 o | 8,3 Mo | 63,2 Mo | 56 | 63,3 Mo | 63,3 Mo | **562** | 63,3 Mo |
+
+**Aucun octet n'est rendu** : après la suppression de 90 % des clés, le RSS est celui du
+plein, soit 10 fois la mémoire vivante. Le rechargement réutilise les trous, mais pas tous
+(+10 % à 100 o). C'est le chiffre que ce chantier doit faire tomber : RSS à 100 k clés
+proche de 100 k × 135 o + la réserve.
+
+**Conséquence sur l'ordre** : on garde §14. Pool `SharedByte` d'abord (la mémoire), puis
+le GC ; le pool court plus tard. La réponse `+OK` se corrige à part, tout de suite.
 
 **Critères à chaque étape** : octets par clé à nombre de clés fixe ; RSS après
 suppressions aléatoires puis une passe de GC ; débit et p99.9 identiques à mimalloc sur
