@@ -20,6 +20,7 @@ const PORT_NO: u16 = 6431;
 const PORT_CLEAN: u16 = 6432;
 const PORT_REWRITE: u16 = 6433;
 const PORT_ALWAYS: u16 = 6434;
+const PORT_CONTINUOUS: u16 = 6435;
 const CLIENTS: usize = 3;
 /// Commandes par pipeline : `INCR c{t}` puis `SET c{t}:{n} n`, par paires.
 const PAIRS: usize = 20;
@@ -215,6 +216,12 @@ fn kill9_always_loses_nothing_acknowledged() {
 #[test]
 fn kill9_during_rewrites_keeps_an_exact_prefix() {
     crash_loop_with(PORT_REWRITE, "everysec", true);
+}
+
+/// `continuous` avec réécritures : cycles écriture + fsync liés, rotations.
+#[test]
+fn kill9_continuous_keeps_an_exact_prefix() {
+    crash_loop_with(PORT_CONTINUOUS, "continuous", true);
 }
 
 #[test]

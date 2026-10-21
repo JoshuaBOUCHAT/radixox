@@ -12,7 +12,8 @@
 > cœur (`Op::Connect`), `REPLICATE`, `RXHELLO` / `RXLOAD` / `RXBLOCK` / `RXTICK`, backlog,
 > synchronisation complète par un BGSAVE coupé, mode suivi, `REPLICAOF NO ONE`, `INFO
 > # Replication`, test 7 (§10.9, avec les écarts) ; `WAIT`, réplica avec AOF et chaînage
-> (§10.9). Pas fait : zéro copie (la mesure ne le justifie pas, §12bis) et
+> (§10.9) ; **`appendfsync continuous`** (cycles écriture + fsync liés, §7.4,
+> 2026-10-21). Pas fait : zéro copie (la mesure ne le justifie pas, §12bis) et
 > `min-replicas-to-write` (sémantique à trancher, §16). Ce document doit suffire à
 > un agent qui ne connaît pas le projet : §1 donne le contexte du code, §2–§11 la conception,
 > §12 les tests, §13 l'ordre de travail avec ses critères d'acceptation. Il remplace le
@@ -455,6 +456,16 @@ incr journal.19.rxj
   bornée (≈ 1 s, ou `RADIXOX_AOF_SYNC_MB` d'écritures), rien de plus ; qui veut « rien
   d'acquitté perdu » prend `always`. Le fsync part chaque seconde **ou dès que l'écrit non
   fsyncé atteint `RADIXOX_AOF_SYNC_MB`** (§7.4).
+- **Essayé et abandonné (2026-10-21) : retenir les réponses d'`everysec` / `no` jusqu'au
+  `write`** (la garantie de Valkey contre un crash du processus). Mesuré : en pipeline 16 avec
+  les réécritures automatiques, −25 % et p99.9 2 ms → 28 ms. Cause, vue par le `wchan` des
+  workers io-wq : un `write` bufferisé attend le journal ext4 (`do_get_write_access`,
+  `wait_transaction_locked` : commit en cours, déclenché par un fsync), la page en cours
+  d'écriture (`folio_wait_bit`) ou la file du disque (`blk_mq_get_tag`) ; 10–130 ms
+  couramment, jusqu'à 1,6 s quand une réécriture supprime ses anciens fichiers. Valkey a le
+  même problème : pendant un fsync en cours, il reporte son `write` jusqu'à 2 s et répond
+  quand même. Écrire dans le segment suivant sans attendre le fsync de l'ancien (rotation) n'y
+  changeait rien. Le travail est dans un `git stash` (« option 1 … abandonnées »).
 
 ### 7.4 Modes de fsync (`RADIXOX_APPENDFSYNC`)
 
@@ -463,6 +474,18 @@ incr journal.19.rxj
 | `no` | dès qu'un bloc est fermé | jamais (le noyau) | immédiates |
 | `everysec` (défaut) | idem | `fdatasync` toutes les secondes (timer) ou dès que l'écrit non fsyncé atteint `RADIXOX_AOF_SYNC_MB` (32 Mio par défaut), sur io-wq ; jamais deux en vol | immédiates, avant même l'écriture (§7.3) |
 | `always` | idem, **write + fsync liés** (`IOSQE_IO_LINK`) | un seul en vol ; les blocs fermés pendant ce temps partent dans le suivant | retenues jusqu'au fsync qui les couvre (§7.5) |
+| `continuous` | par cycles : tout ce qui attend, puis le fsync lié à la dernière écriture (`IOSQE_IO_LINK`) ; **rien pendant un fsync** | un cycle en vol ; le suivant part dès `RADIXOX_AOF_CYCLE_MIN_KB` en attente (4 Kio), ou après `RADIXOX_AOF_CYCLE_MS` (10 ms) pour un reste plus petit | immédiates |
+
+`continuous` (2026-10-21) : perte bornée comme `everysec`, mais la borne est d'environ deux
+cycles au lieu d'une seconde ; les cycles se calibrent sur le disque (disque rapide : petits
+lots, fsync rapprochés ; disque lent : gros lots). Aucun `write` ne chevauche un fsync du
+fichier : un `write` pendant un fsync attend le commit du journal ext4 et le rallonge (§7.3,
+mesuré). Prix : un `kill -9` perd ce qui s'est accumulé pendant le fsync en cours (en
+mémoire, pas encore dans le cache de pages). Le seuil de 4 Kio évite de réécrire la même page
+partielle à chaque fsync sous faible trafic (usure). Un cycle enchaîne plusieurs écritures
+(`WRITE_MAX` = 4 Mio chacune) et ne lie le fsync qu'à la dernière, au plus 64 Mio par cycle :
+sinon le journal plafonnerait à 4 Mio par fsync. Écriture partielle : le fsync lié revient
+`-ECANCELED`, le cycle reprend le reste. `INFO aof_fsyncs` compte les fsync réussis.
 
 `everysec` : si le fsync précédent dure plus de 2 s, Valkey retarde les écritures ; ici le
 plafond du §7.6 joue ce rôle sans bloquer la boucle.
@@ -843,6 +866,7 @@ réplica décalée de ±1 h, coupures du réseau, BGSAVE des clients ; 3000 grai
 | `RADIXOX_AOF_LOAD_TRUNCATED` | `yes` | `aof-load-truncated` |
 | `RADIXOX_AOF_MAX_PENDING_MB` | `64` | (pas d'équivalent ; retard d'`everysec`) |
 | `RADIXOX_AOF_SYNC_MB` | `32` | (pas d'équivalent ; fsync anticipé d'`everysec`) |
+| `RADIXOX_AOF_CYCLE_MS` / `RADIXOX_AOF_CYCLE_MIN_KB` | `10` / `4` | (pas d'équivalent ; `continuous`) |
 | `RADIXOX_REPLICATE` | vide | (`replicaof`, mais en poussée) |
 | `RADIXOX_REPLICATE_AUTH` | vide | (`masterauth`, côté source : mot de passe des cibles) |
 | `RADIXOX_REPL_BACKLOG_MB` | `64` | `repl-backlog-size` |
@@ -856,7 +880,7 @@ commandes internes `RXHELLO`, `RXLOAD`, `RXBLOCK`, `RXTICK` (§10.2, §10.9).
 
 - `# Persistence` : `aof_enabled`, `aof_rewrite_in_progress`, `aof_last_write_status`,
   `aof_last_fsync_status`, `aof_current_size`, `aof_base_size`, `aof_pending_bytes`,
-  `aof_delayed_fsync` ;
+  `aof_delayed_fsync`, `aof_fsyncs` ;
 - `# Replication` : `role:master|replica`, `replid`, `master_repl_offset` (`offset` courant),
   `repl_seq`, `connected_replicas`, puis par réplica
   `replicaN:ip=…,port=…,state=down|connecting|handshake|sync|online,seq=…,lag_bytes=…`, puis
@@ -919,6 +943,13 @@ Valkey sur le CPU 1, memtier SET seul 100 o, 4 × 10 clients, 8 s, profil `perfo
   coût : pas fait (§16).
 - `always` : à égalité avec Valkey, plafonné par le fsync de ce disque (~2 ms) ; le commit
   groupé ne peut pas faire mieux que « un fsync en vol ». Sur NVMe à PLP, à refaire.
+- `continuous` (2026-10-21, machine chargée par un jeu qui écrit sur le même disque) : sur
+  disque calme, au niveau d'`everysec` (p16 0,6–0,9 M ops/s, p99.9 3,9–5,8 ms ; p1 sans écart
+  net), **170–540 fsync/s**, retard du journal ≤ 5 Mio. Deux passes sur six à 2 fsync/s
+  pendant que le jeu écrivait : p16 −10 à −30 %, p99.9 87–411 ms ; hypothèse non vérifiée :
+  un fsync de ~500 ms laisse les blocs s'accumuler en mémoire jusqu'au plafond du §7.6, qui
+  parque les écrivains (en `everysec`, le cache de pages les absorbe). À refaire machine au
+  repos.
 - `always` à 200 / 500 / 1000 connexions sans pipeline (2026-10-21, machine chargée par un
   autre programme : écarts de ×2 entre deux passes, à refaire) : ~43–82 k ops/s pour RadixOx,
   ~60–71 k pour Valkey, CPU serveur 20–50 % ; le débit suit le nombre d'écritures en attente
@@ -977,6 +1008,7 @@ Configuration, commandes supportées).
 | Répliquer la configuration | propre à chaque nœud, comme Redis |
 | `now` seulement quand il change (`TICK`) | blocs non autonomes pour la reprise ; 8 octets par tour ne valent pas la complication |
 | Un second algorithme de somme de contrôle (CRC32C, xxh3) | un seul CRC partout (D10) |
+| Réponses d'`everysec` / `no` retenues jusqu'au `write` | un `write` bufferisé peut attendre le journal ext4 10–130 ms (jusqu'à 1,6 s) : p99.9 ×14 mesuré (§7.3) ; `continuous` réduit la perte sans faire attendre les réponses |
 
 ---
 

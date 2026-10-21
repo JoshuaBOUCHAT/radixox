@@ -78,6 +78,11 @@ pub struct Config {
     /// Retard du flux sur le disque au-delà duquel les écrivains sont parqués
     /// (`RADIXOX_AOF_MAX_PENDING_MB`, DURABILITY_DESIGN.md §7.6).
     pub aof_max_pending: u64,
+    /// `continuous` : délai maximal avant le cycle d'un reste plus petit que
+    /// `aof_cycle_min` (`RADIXOX_AOF_CYCLE_MS`), et ce volume
+    /// (`RADIXOX_AOF_CYCLE_MIN_KB`).
+    pub aof_cycle: Duration,
+    pub aof_cycle_min: u64,
     /// `everysec` : fsync anticipé au-delà de ce non-fsyncé (`RADIXOX_AOF_SYNC_MB`).
     pub aof_sync_bytes: u64,
     /// Réécriture automatique (`auto-aof-rewrite-percentage`, `-min-size`, §8.4).
@@ -117,6 +122,8 @@ impl Default for Config {
             stop_writes_on_bgsave_error: true,
             journal: false,
             aof_max_pending: 64 << 20,
+            aof_cycle: Duration::from_millis(10),
+            aof_cycle_min: crate::exec::aof::CYCLE_MIN,
             aof_sync_bytes: crate::exec::aof::SYNC_BYTES,
             aof_rewrite_percentage: 100,
             aof_rewrite_min_size: 64 << 20,
@@ -170,7 +177,9 @@ pub enum Op {
     /// fsync (données) du fichier de BGSAVE.
     FileSync { fd: i32, save: u32 },
     /// Écrire [`Core::pending_journal_write`]`(writer)` dans le segment de l'AOF à `off`.
-    JournalWrite { fd: i32, off: u64, writer: u32 },
+    /// `link` : l'op suivante (le `JournalSync` du cycle) lui est liée
+    /// (`IOSQE_IO_LINK`), soumise dans la même tournée.
+    JournalWrite { fd: i32, off: u64, writer: u32, link: bool },
     /// fsync (données) du segment de l'AOF.
     JournalSync { fd: i32, writer: u32 },
     /// Connexion sortante vers un réplica : socket installé dans `slot`
@@ -486,7 +495,7 @@ impl Core {
         let follow = w.manifest.follow;
         self.replace_aof(w);
         if first {
-            self.timers.push(Reverse((self.now + AOF_EVERY, Timer::Aof)));
+            self.timers.push(Reverse((self.now + self.aof_every(), Timer::Aof)));
         }
         if let Some(replid) = follow {
             self.resume_follow(replid);
@@ -498,11 +507,22 @@ impl Core {
     fn replace_aof(&mut self, mut w: AofWriter) {
         self.aof_gen += 1;
         w.generation = self.aof_gen;
+        w.cycle_min = self.cfg.aof_cycle_min;
         w.sync_bytes = self.cfg.aof_sync_bytes;
         if let Some(old) = self.aof.replace(w)
             && old.busy()
         {
             self.aof_old.push(old);
+        }
+    }
+
+    /// Période du timer de l'AOF : la seconde d'`everysec` (et des essais
+    /// après erreur, de la réécriture automatique), ou le délai maximal d'un
+    /// cycle `continuous`.
+    fn aof_every(&self) -> Duration {
+        match self.aof.as_ref().map(|w| w.fsync) {
+            Some(crate::exec::aof::Fsync::Continuous) => self.cfg.aof_cycle,
+            _ => AOF_EVERY,
         }
     }
 
@@ -538,7 +558,7 @@ impl Core {
         let writer = w.generation;
         while let Some(op) = w.next_op(j, self.now) {
             self.ops.push(match op {
-                AofOp::Write { fd, off } => Op::JournalWrite { fd, off, writer },
+                AofOp::Write { fd, off, link } => Op::JournalWrite { fd, off, writer, link },
                 AofOp::Sync { fd } => Op::JournalSync { fd, writer },
             });
         }
@@ -626,7 +646,7 @@ impl Core {
                             eprintln!("[aof] échec du démarrage de la réécriture : {e}");
                         }
                     }
-                    self.timers.push(Reverse((self.now + AOF_EVERY, Timer::Aof)));
+                    self.timers.push(Reverse((self.now + self.aof_every(), Timer::Aof)));
                 }
                 Timer::AutoSave => {
                     if self.bgsave.is_none()

@@ -295,14 +295,22 @@ impl Server {
                     .user_data(ud(K_FILE, save)),
                 // Second canal de fichiers : le segment de l'AOF (DURABILITY_DESIGN.md §7.3).
                 // Génération de l'écrivain dans le champ slot du user_data.
-                Op::JournalWrite { fd, off, writer } => {
+                Op::JournalWrite { fd, off, writer, link } => {
                     // Le tampon reste intact jusqu'au CQE (invariant de l'écrivain).
                     let buf = self.core.pending_journal_write(writer);
                     let sqe = opcode::Write::new(Fd(fd), buf.as_ptr(), buf.len() as u32)
                         .offset(off)
                         .build()
                         .user_data(ud(K_JWRITE, writer));
-                    if self.file_async { sqe.flags(squeue::Flags::ASYNC) } else { sqe }
+                    let sqe = if self.file_async { sqe.flags(squeue::Flags::ASYNC) } else { sqe };
+                    if link {
+                        // Le fsync lié suit dans la même soumission : une chaîne
+                        // coupée par une SQ pleine laisserait le fsync partir seul.
+                        self.reserve_sqes(2)?;
+                        sqe.flags(squeue::Flags::IO_LINK)
+                    } else {
+                        sqe
+                    }
                 }
                 Op::JournalSync { fd, writer } => {
                     let sqe = opcode::Fsync::new(Fd(fd))
@@ -347,6 +355,20 @@ impl Server {
             self.bufring.publish();
         }
         Ok(())
+    }
+
+    /// Place pour `n` SQE consécutives (une chaîne liée) sans soumission entre.
+    fn reserve_sqes(&mut self, n: usize) -> io::Result<()> {
+        loop {
+            let free = {
+                let sq = self.ring.submission();
+                sq.capacity() - sq.len()
+            };
+            if free >= n {
+                return Ok(());
+            }
+            self.ring.submit()?;
+        }
     }
 
     fn push_sqe(&mut self, sqe: &squeue::Entry) -> io::Result<()> {
@@ -803,6 +825,12 @@ fn main() -> io::Result<()> {
     let min_wait = min_wait(&ring);
     if let Some(mb) = std::env::var("RADIXOX_AOF_MAX_PENDING_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
         cfg.aof_max_pending = mb.max(1) << 20;
+    }
+    if let Some(ms) = std::env::var("RADIXOX_AOF_CYCLE_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        cfg.aof_cycle = Duration::from_millis(ms.max(1));
+    }
+    if let Some(kb) = std::env::var("RADIXOX_AOF_CYCLE_MIN_KB").ok().and_then(|v| v.parse::<u64>().ok()) {
+        cfg.aof_cycle_min = kb.max(1) << 10;
     }
     if let Some(mb) = std::env::var("RADIXOX_AOF_SYNC_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
         cfg.aof_sync_bytes = mb.max(1) << 20;

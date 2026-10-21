@@ -68,6 +68,12 @@ struct Fake {
     /// fsync de l'AOF retenus (disque lent à commiter).
     sync_stalled: bool,
     sync_held: Vec<Op>,
+    /// Une écriture liée vient d'être retenue : son fsync la suit.
+    link_held: bool,
+    /// L'écriture liée précédente est restée partielle : son fsync est annulé.
+    cancel_sync: bool,
+    /// Écritures du segment exécutées alors qu'un fsync était en vol.
+    writes_during_sync: u64,
     /// `connect` sortants pas encore aboutis (le test les accepte ou refuse).
     connecting: Vec<(Slot, std::net::SocketAddr)>,
 }
@@ -96,6 +102,9 @@ impl Fake {
             journal_held: Vec::new(),
             sync_stalled: false,
             sync_held: Vec::new(),
+            link_held: false,
+            cancel_sync: false,
+            writes_during_sync: 0,
             connecting: Vec::new(),
         }
     }
@@ -177,9 +186,18 @@ impl Fake {
                     self.completions.push(Completion::File { res, save });
                 }
                 // Segment de l'AOF : écritures réelles (relues par le test).
-                Op::JournalWrite { .. } if self.journal_stalled => self.journal_held.push(op),
+                Op::JournalWrite { link, .. } if self.journal_stalled => {
+                    self.link_held = link;
+                    self.journal_held.push(op);
+                }
+                // Chaîne liée (IOSQE_IO_LINK) : le fsync suit son écriture.
+                Op::JournalSync { .. } if std::mem::take(&mut self.link_held) => self.journal_held.push(op),
+                Op::JournalSync { writer, .. } if std::mem::take(&mut self.cancel_sync) => {
+                    self.completions.push(Completion::JournalSync { res: -libc::ECANCELED, writer });
+                }
                 Op::JournalSync { .. } if self.sync_stalled => self.sync_held.push(op),
-                Op::JournalWrite { fd, off, writer } => {
+                Op::JournalWrite { fd, off, writer, link } => {
+                    self.writes_during_sync += u64::from(!self.sync_held.is_empty());
                     let buf = self.core.pending_journal_write(writer);
                     let n = match self.journal_write_max {
                         Some(max) => buf.len().min(max),
@@ -187,6 +205,7 @@ impl Fake {
                     };
                     // SAFETY: fd ouvert par l'écrivain, tampon valide.
                     let res = unsafe { libc::pwrite(fd, buf.as_ptr().cast(), n, off as i64) };
+                    self.cancel_sync = link && (res as usize) < buf.len();
                     self.completions.push(Completion::JournalWrite { res: res as i32, writer });
                 }
                 Op::JournalSync { fd, writer } => {
@@ -1305,6 +1324,134 @@ fn everysec_syncs_early_past_the_threshold() {
             assert_eq!(w.durable, start);
         }
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `continuous` : cycles « écriture + fsync liés », un seul en vol, aucune
+/// écriture pendant un fsync ; écritures partielles (fsync lié annulé) et
+/// fsync lents au hasard ; à la fin tout est fsyncé et se rejoue.
+#[test]
+fn continuous_cycles_never_overlap_and_replay() {
+    use crate::exec::aof::Fsync;
+    let dir = test_dir("aof-continuous");
+    let mut rewritten = 0;
+    for seed in 1..=20u64 {
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let cfg = Config { max_conn: 8, reserved: 0, aof_cycle_min: 1 + rng.below(4096), ..Config::default() };
+        let mut f = fake_with_aof_fsync(&dir, cfg, Fsync::Continuous);
+        f.journal_write_max = (seed % 2 == 0).then(|| 1 + rng.below(100) as usize);
+        // Réécritures (rotations de segment) au fil du trafic.
+        f.idle_work = true;
+        let mut wall = 1_000u64;
+        f.wall = Some(wall);
+        let conns: Vec<Slot> = (0..1 + rng.below(3)).map(|_| f.connect()).collect();
+        for _ in 0..30 {
+            f.sync_stalled = rng.below(3) == 0;
+            for &c in &conns {
+                for _ in 0..rng.below(10) {
+                    f.send(c, &resp(&random_write(&mut rng, true)));
+                }
+                if rng.below(8) == 0 {
+                    f.send(c, b"BGREWRITEAOF\r\n");
+                }
+            }
+            f.step();
+            if rng.below(4) == 0 {
+                f.clock += cfg_cycle();
+                f.core.set_now(f.clock);
+                f.core.fire_timers();
+            }
+            wall += rng.below(2);
+            f.wall = Some(wall);
+        }
+        f.sync_stalled = false;
+        for _ in 0..3 {
+            f.settle();
+            f.clock += cfg_cycle();
+            f.core.set_now(f.clock);
+            f.core.fire_timers();
+        }
+        f.settle();
+        assert_eq!(f.writes_during_sync, 0, "graine {seed} : écriture pendant un fsync");
+        let w = f.core.aof().unwrap();
+        assert_eq!((f.core.aof_pending(), w.durable), (0, w.written), "graine {seed}");
+        let mut back = OxidArt::new();
+        crate::exec::aof::recover(&mut back, &dir, false).unwrap().unwrap();
+        back.set_now(f.core.art.now);
+        assert_eq!(state(&mut back), state(&mut f.core.art), "graine {seed}");
+        rewritten += u32::from(manifest_of(&dir).base != "base.1.rxdb");
+    }
+    assert!(rewritten > 5, "réécritures : {rewritten} graines sur 20");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn cfg_cycle() -> Duration {
+    Config::default().aof_cycle
+}
+
+/// `continuous` : les réponses n'attendent ni l'écriture ni le fsync ; un
+/// reste sous `aof_cycle_min` attend le timer, au-delà le cycle part tout de
+/// suite.
+#[test]
+fn continuous_replies_never_wait_and_small_rests_wait_the_timer() {
+    use crate::exec::aof::Fsync;
+    let dir = test_dir("aof-continuous-min");
+    let mut f = fake_with_aof_fsync(&dir, Config { max_conn: 8, reserved: 0, ..Config::default() }, Fsync::Continuous);
+    let c = f.connect();
+    let start = f.core.aof().unwrap().durable;
+    // Petit : rien n'est écrit avant le timer.
+    f.send(c, b"SET a 1\r\n");
+    f.settle();
+    assert_eq!(f.take(c), "+OK\r\n");
+    assert_eq!(f.core.aof().unwrap().written, start);
+    f.clock += cfg_cycle();
+    f.core.set_now(f.clock);
+    f.core.fire_timers();
+    f.settle();
+    let w = f.core.aof().unwrap();
+    assert!(w.durable > start && w.durable == w.written);
+    // fsync bloqué : les réponses partent quand même, les blocs s'accumulent.
+    f.sync_stalled = true;
+    let big = "x".repeat(5000);
+    for i in 0..10 {
+        f.send(c, format!("SET k{i} {big}\r\n").as_bytes());
+        f.settle();
+        assert_eq!(f.take(c), "+OK\r\n");
+    }
+    let w = f.core.aof().unwrap();
+    assert!(f.core.aof_pending() > 0 && w.durable < w.written);
+    f.sync_stalled = false;
+    f.settle();
+    let w = f.core.aof().unwrap();
+    assert_eq!((f.core.aof_pending(), w.durable), (0, w.written));
+    assert_eq!(f.writes_during_sync, 0);
+    // Disque bloqué pendant que 6 Mio s'accumulent : un seul cycle de
+    // plusieurs écritures (au-delà de WRITE_MAX), un seul fsync, pas un
+    // fsync par écriture.
+    let fsyncs = |f: &mut Fake| {
+        f.send(c, b"INFO persistence\r\n");
+        f.settle();
+        let info = f.take(c);
+        info.split("aof_fsyncs:").nth(1).unwrap().split('\r').next().unwrap().parse::<u64>().unwrap()
+    };
+    let before = fsyncs(&mut f);
+    f.journal_stalled = true;
+    let big = "y".repeat(60_000);
+    f.send(c, format!("SET first {big}\r\n").as_bytes());
+    f.settle();
+    for i in 0..100 {
+        f.send(c, format!("SET b{i} {big}\r\n").as_bytes());
+    }
+    f.settle();
+    assert_eq!(f.take(c).matches("+OK").count(), 101);
+    assert!(f.core.aof_pending() > 5 << 20);
+    f.journal_stalled = false;
+    f.settle();
+    let w = f.core.aof().unwrap();
+    assert_eq!((f.core.aof_pending(), w.durable), (0, w.written));
+    // Le cycle bloqué (SET first), puis le cycle des 6 Mio.
+    assert_eq!(fsyncs(&mut f) - before, 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

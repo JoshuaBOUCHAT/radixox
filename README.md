@@ -548,7 +548,11 @@ Not yet: list commands, `MULTI`/`EXEC`, `CONFIG`, RESP3, Lua, cluster.
   segment is truncated (`RADIXOX_AOF_LOAD_TRUNCATED`), anything else inconsistent prevents
   startup. `appendfsync everysec` (default): replies go out at once, even before the log
   write, and an `fdatasync` runs every second or as soon as `RADIXOX_AOF_SYNC_MB` of written
-  data is not yet synced, so a crash loses at most about that much. `no`: the kernel decides.
+  data is not yet synced, so a crash loses at most about that much. `continuous`: replies go
+  out at once too, and the log is written in back-to-back cycles of "write everything pending,
+  then a linked `fdatasync`" (`IOSQE_IO_LINK`), one cycle in flight and nothing written during
+  an `fdatasync`; a power loss loses about two cycles (a few ms on an idle SSD) instead of a
+  second, at about `everysec`'s throughput. `no`: the kernel decides.
   `always`: replies — to writes, and to reads that may have seen a write not yet on disk —
   are held until the `fdatasync` that covers them, one `fdatasync` in flight at a time, everything that arrives meanwhile goes into
   the next one (group commit; the loop never blocks). Writes are refused with `-MISCONF` while
@@ -630,10 +634,11 @@ Environment variables:
 | `RADIXOX_STOP_WRITES_ON_BGSAVE_ERROR` | on | refuse writes (`-MISCONF`) after a failed `BGSAVE` while automatic saves are on |
 | `RADIXOX_SAVE_ON_EXIT` | on with automatic saves | save on SIGINT / SIGTERM |
 | `RADIXOX_APPENDONLY` | `no` | append-only file in `RADIXOX_DIR/appendonlydir/` (created from `dump.rxd` the first time) |
-| `RADIXOX_APPENDFSYNC` | `everysec` | `everysec` (one `fdatasync` per second, off the loop), `no` (left to the kernel), or `always` (replies wait for the `fdatasync` covering them, group commit) |
+| `RADIXOX_APPENDFSYNC` | `everysec` | `everysec` (one `fdatasync` per second, off the loop), `no` (left to the kernel), `always` (replies wait for the `fdatasync` covering them, group commit), or `continuous` (back-to-back write + `fdatasync` cycles, replies do not wait) |
 | `RADIXOX_AOF_LOAD_TRUNCATED` | `yes` | at startup, cut a block left incomplete by a crash at the end of the log instead of refusing to start |
 | `RADIXOX_AOF_MAX_PENDING_MB` | `64` | log bytes not yet written beyond which writers wait (reads go on) |
 | `RADIXOX_AOF_SYNC_MB` | `32` | `everysec`: written but unsynced log bytes that trigger an `fdatasync` before the one-second timer |
+| `RADIXOX_AOF_CYCLE_MIN_KB` / `RADIXOX_AOF_CYCLE_MS` | `4` / `10` | `continuous`: a cycle starts as soon as this much is pending, or after this delay for less (limits SSD wear under light traffic) |
 | `RADIXOX_AUTO_AOF_REWRITE_PERCENTAGE` / `_MIN_SIZE` | `100` / `64mb` | rewrite the log when it has grown by this percentage of the base and at least this size (`0` = never) |
 | `RADIXOX_REPLICATE` | unset | replicas to push to, `host:port,host:port` (IPv6 in brackets) |
 | `RADIXOX_REPLICATE_AUTH` | unset | password sent with `AUTH` to the replicas of `RADIXOX_REPLICATE` |

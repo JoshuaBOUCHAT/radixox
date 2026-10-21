@@ -408,6 +408,10 @@ pub enum Fsync {
     /// Commit groupé : fsync dès qu'il y a du non-durable, un seul en vol ;
     /// les réponses attendent le fsync qui les couvre (§7.5).
     Always,
+    /// Cycles « écriture + fsync liés » enchaînés, un seul en vol ; pendant
+    /// un cycle, rien ne touche le fichier et les blocs s'accumulent ; les
+    /// réponses n'attendent jamais (§7.4). Perte sur coupure ≈ deux cycles.
+    Continuous,
 }
 
 impl Fsync {
@@ -416,7 +420,8 @@ impl Fsync {
             "no" => Ok(Fsync::No),
             "everysec" => Ok(Fsync::EverySec),
             "always" => Ok(Fsync::Always),
-            _ => Err(format!("appendfsync inconnu : {v:?} (no, everysec, always)")),
+            "continuous" => Ok(Fsync::Continuous),
+            _ => Err(format!("appendfsync inconnu : {v:?} (no, everysec, always, continuous)")),
         }
     }
 
@@ -425,6 +430,7 @@ impl Fsync {
             Fsync::No => "no",
             Fsync::EverySec => "everysec",
             Fsync::Always => "always",
+            Fsync::Continuous => "continuous",
         }
     }
 }
@@ -433,12 +439,19 @@ impl Fsync {
 const WRITE_MAX: usize = 4 << 20;
 /// Seuil par défaut du fsync anticipé d'`everysec` (`AofWriter::sync_bytes`).
 pub const SYNC_BYTES: u64 = 32 << 20;
+/// Volume minimal d'un cycle `continuous` hors timer : une page.
+pub const CYCLE_MIN: u64 = 4 << 10;
+/// Volume au-delà duquel un cycle `continuous` se clôt par son fsync même si
+/// des blocs attendent encore (un débit soutenu ne repousse pas le fsync).
+const CYCLE_MAX: u64 = 64 << 20;
 
 /// Opération de fichier demandée par l'écrivain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AofOp {
-    /// Écrire [`AofWriter::writing`] à `off` dans le fichier `fd`.
-    Write { fd: i32, off: u64 },
+    /// Écrire [`AofWriter::writing`] à `off` dans le fichier `fd`. `link` :
+    /// le `Sync` rendu juste après lui est lié (`IOSQE_IO_LINK`), annulé
+    /// (`-ECANCELED`) si l'écriture échoue ou reste partielle.
+    Write { fd: i32, off: u64, link: bool },
     Sync { fd: i32 },
 }
 
@@ -494,6 +507,17 @@ pub struct AofWriter {
     /// `everysec` : écrit et pas encore fsyncé au-delà duquel un fsync part
     /// sans attendre le timer (`RADIXOX_AOF_SYNC_MB`, §7.4).
     pub sync_bytes: u64,
+    /// `continuous` : un cycle part dès que ce volume attend ; en dessous,
+    /// au timer (`RADIXOX_AOF_CYCLE_MIN_KB`, garde-fou d'usure).
+    pub cycle_min: u64,
+    /// Le `Sync` lié à l'écriture qui vient d'être rendue est à rendre.
+    link_next: bool,
+    /// Le fsync en vol est lié à une écriture : `-ECANCELED` = pas fait.
+    linked_sync: bool,
+    /// fsync réussis (`INFO aof_fsyncs`).
+    fsyncs: u64,
+    /// Octets écrits par le cycle `continuous` en cours (avant son fsync).
+    cycle_bytes: u64,
 }
 
 impl AofWriter {
@@ -523,6 +547,11 @@ impl AofWriter {
             base_size,
             delayed_fsync: 0,
             sync_bytes: SYNC_BYTES,
+            cycle_min: CYCLE_MIN,
+            link_next: false,
+            linked_sync: false,
+            fsyncs: 0,
+            cycle_bytes: 0,
             rotation: None,
             pending_base: None,
             generation: 0,
@@ -552,6 +581,12 @@ impl AofWriter {
     /// fermés du flux, jamais au-delà d'une frontière de rotation), fsync
     /// `everysec`. À rappeler tant qu'elle rend quelque chose.
     pub fn next_op(&mut self, stream: &mut super::journal::Stream, now: std::time::Instant) -> Option<AofOp> {
+        if std::mem::take(&mut self.link_next) {
+            // Couvre l'écriture liée, rendue juste avant.
+            self.syncing = Some(self.written + (self.writing.len() - self.done) as u64);
+            self.linked_sync = true;
+            return Some(AofOp::Sync { fd: self.fd() });
+        }
         if let Some(rot) = &mut self.rotation
             && !rot.sync_sent
             && self.written == rot.boundary
@@ -565,9 +600,12 @@ impl AofWriter {
         if self.rotation.as_ref().is_some_and(|r| r.synced) && self.retry_due(now) {
             self.finish_rotation(now);
         }
+        if self.fsync == Fsync::Continuous {
+            return self.next_cycle(stream, now);
+        }
         if !self.in_flight && !self.retry_at.is_some_and(|t| now < t) && self.prepare_write(stream, now) {
             self.in_flight = true;
-            return Some(AofOp::Write { fd: self.fd(), off: self.file_end });
+            return Some(AofOp::Write { fd: self.fd(), off: self.file_end, link: false });
         }
         // `everysec` : chaque seconde, ou plus tôt si le non-fsyncé dépasse le
         // seuil (perte bornée en temps et en volume, fsync de taille bornée).
@@ -575,6 +613,46 @@ impl AofWriter {
         let due = self.sync_due || full || self.fsync == Fsync::Always;
         if due && self.syncing.is_none() && self.fsync_err.is_none() && self.durable < self.written {
             self.sync_due = false;
+            self.syncing = Some(self.written);
+            return Some(AofOp::Sync { fd: self.fd() });
+        }
+        None
+    }
+
+    /// `continuous` : un cycle à la fois, rien d'autre ne touche le fichier
+    /// pendant qu'il tourne (un `write` pendant un fsync attend le commit du
+    /// journal ext4 et le rallonge, mesuré). Part dès `cycle_min` en attente,
+    /// ou au timer pour un reste plus petit. Un cycle écrit tout ce qui
+    /// attend (plusieurs écritures si besoin) ; seule la dernière porte le
+    /// fsync lié : sinon le journal plafonnerait à `WRITE_MAX` par fsync.
+    fn next_cycle(&mut self, stream: &mut super::journal::Stream, now: std::time::Instant) -> Option<AofOp> {
+        if self.in_flight || self.syncing.is_some() || self.retry_at.is_some_and(|t| now < t) {
+            return None;
+        }
+        let pending = self.pending(stream);
+        // Reste d'une écriture partielle : le cycle en cours continue.
+        let resume = self.done < self.writing.len();
+        let started = self.cycle_bytes > 0;
+        if pending > 0
+            && (resume || started || pending >= self.cycle_min || self.sync_due)
+            && self.prepare_write(stream, now)
+        {
+            self.sync_due = false;
+            self.in_flight = true;
+            let len = (self.writing.len() - self.done) as u64;
+            self.cycle_bytes += len;
+            // Dernière écriture du cycle : plus rien d'autre n'attend, ou assez écrit.
+            let last = stream.closed_bytes() == 0 || self.cycle_bytes >= CYCLE_MAX;
+            self.link_next = last && self.fsync_err.is_none();
+            if last {
+                self.cycle_bytes = 0;
+            }
+            return Some(AofOp::Write { fd: self.fd(), off: self.file_end, link: self.link_next });
+        }
+        // Écrit mais pas fsyncé (fsync lié annulé par une écriture partielle).
+        if self.durable < self.written && self.fsync_err.is_none() {
+            self.sync_due = false;
+            self.cycle_bytes = 0;
             self.syncing = Some(self.written);
             return Some(AofOp::Sync { fd: self.fd() });
         }
@@ -657,6 +735,10 @@ impl AofWriter {
 
     /// Timer d'une seconde : un fsync `everysec` est dû.
     pub fn tick(&mut self) {
+        if self.fsync == Fsync::Continuous {
+            self.sync_due = true;
+            return;
+        }
         if self.fsync != Fsync::EverySec {
             return;
         }
@@ -671,6 +753,10 @@ impl AofWriter {
     /// base réussie.
     pub fn sync_done(&mut self, res: i32, now: std::time::Instant) {
         let Some(upto) = self.syncing.take() else { return };
+        if std::mem::take(&mut self.linked_sync) && res == -libc::ECANCELED {
+            // Écriture liée partielle ou en échec : le cycle suivant reprend.
+            return;
+        }
         if res < 0 {
             let e = io::Error::from_raw_os_error(-res);
             if self.fsync == Fsync::Always {
@@ -686,6 +772,7 @@ impl AofWriter {
             return;
         }
         self.durable = self.durable.max(upto);
+        self.fsyncs += 1;
         if let Some(rot) = &mut self.rotation
             && rot.sync_sent
             && upto >= rot.boundary
@@ -830,7 +917,7 @@ impl AofWriter {
         let _ = write!(
             out,
             "aof_enabled:1\r\naof_rewrite_in_progress:{}\r\naof_last_write_status:{}\r\naof_last_fsync_status:{}\r\n\
-             aof_fsync:{}\r\naof_current_size:{}\r\naof_base_size:{}\r\naof_pending_bytes:{}\r\naof_delayed_fsync:{}\r\n",
+             aof_fsync:{}\r\naof_current_size:{}\r\naof_base_size:{}\r\naof_pending_bytes:{}\r\naof_delayed_fsync:{}\r\naof_fsyncs:{}\r\n",
             u8::from(self.rewriting()),
             if self.write_err.is_some() { "err" } else { "ok" },
             if self.fsync_err.is_some() { "err" } else { "ok" },
@@ -839,6 +926,7 @@ impl AofWriter {
             self.base_size,
             self.pending(stream),
             self.delayed_fsync,
+            self.fsyncs,
         );
     }
 
