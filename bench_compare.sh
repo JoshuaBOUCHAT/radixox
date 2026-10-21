@@ -169,7 +169,7 @@ persist_report() {
     redis-cli -p "$PORT" INFO persistence
     redis-cli -p "$PORT" INFO stats
   } 2>/dev/null | tr -d '\r' |
-    grep -E '^(rdb_saves|rdb_last_bgsave_status|rdb_last_cow_size|aof_rewrites|aof_last_bgrewrite_status|aof_last_write_status|aof_last_cow_size|aof_current_size|aof_base_size|aof_delayed_fsync|aof_fsyncs|current_cow_peak|total_forks|latest_fork_usec):' \
+    grep -E '^(rdb_saves|rdb_last_bgsave_status|rdb_last_cow_size|aof_rewrites|aof_last_bgrewrite_status|aof_last_write_status|aof_last_cow_size|aof_current_size|aof_base_size|aof_delayed_fsync|aof_fsyncs|current_cow_peak|total_forks|latest_fork_usec):' |
     awk '!seen[$0]++' >"$out" || true
 }
 
