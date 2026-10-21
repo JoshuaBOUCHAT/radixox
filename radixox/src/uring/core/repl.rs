@@ -1024,11 +1024,12 @@ impl Core {
             j.follow = false;
             j.observe_now(self.art.now);
         }
-        if let Some(w) = &mut self.aof
-            && let Err(e) = w.set_follow(None)
-        {
-            eprintln!("[repl] manifeste de l'AOF après la promotion : {e} ; un redémarrage reviendrait en réplica");
+        // Manifeste démarqué hors de la boucle (en cas d'échec, l'écrivain le
+        // dit : un redémarrage reviendrait en réplica).
+        if let Some(w) = &mut self.aof {
+            w.set_follow(None);
         }
+        self.aof_pump();
         if let Some(l) = self.loading.take() {
             let _ = std::fs::remove_file(&l.path);
         }
@@ -1061,10 +1062,11 @@ impl Core {
             follow: Some(follow),
         };
         manifest.write(&dir)?;
-        aof::remove_unlisted(&dir, &manifest)?;
+        let trash = aof::unlisted(&dir, &manifest)?;
         let res = Resume { manifest, cursor: cur, tail_end: 0, tail_start_offset: pos.offset };
         let w = AofWriter::open(&dir, &res, fsync)?;
         self.replace_aof(w);
+        self.fs_trash(trash);
         // Les marques des réponses retenues sont celles de l'ancienne histoire.
         for slot in std::mem::take(&mut self.held) {
             let o = &mut self.outs[slot as usize];

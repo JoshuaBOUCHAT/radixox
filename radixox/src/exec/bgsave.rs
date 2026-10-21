@@ -5,7 +5,9 @@
 //! Déroulé : DFS par tranches (barrière COW ouverte) → fermeture de la barrière
 //! et vidage par tranches de la liste différée valart → fin de la compression
 //! zstd → dernières écritures → fsync → `rename` sur `dump.rxd` → fsync du
-//! dossier. Le DFS remplit `fill` (ou le flux brut à compresser) ; quand `fill`
+//! dossier. La création du fichier et le renommage final sont des suites
+//! [`FsTask`] exécutées hors de la boucle (DURABILITY_DESIGN.md §8.6) : le DFS
+//! commence sans attendre le fichier. Le DFS remplit `fill` (ou le flux brut à compresser) ; quand `fill`
 //! dépasse `CHUNK` et qu'aucune écriture n'est en vol, il devient l'écriture
 //! en vol (double tampon : `fill` / `spare` / `writing`).
 
@@ -17,6 +19,7 @@ use oxidart::compress::ZstdStream;
 use oxidart::save::format;
 use oxidart::{OxidArt, SaveCursor};
 
+use super::fs_task::FsTask;
 use super::persist::Target;
 
 /// Budget d'une tranche de DFS ou de vidage (nœuds).
@@ -105,6 +108,8 @@ enum Phase {
     Flush,
     /// fsync en vol.
     Sync,
+    /// `rename` et fsync du dossier en vol.
+    Finalize,
     Done,
 }
 
@@ -113,7 +118,12 @@ pub struct BgSave {
     pub id: u32,
     /// Fichier visé (`dump.rxd`, ou une base de l'AOF) et position du flux.
     target: Target,
-    file: std::fs::File,
+    /// Fichier temporaire, une fois créé (suite demandée au démarrage).
+    file: Option<std::fs::File>,
+    /// Suite de fichiers à lancer (création, puis renommage final).
+    fs_req: Option<FsTask>,
+    /// Une suite de fichiers est en vol.
+    fs_in_flight: bool,
     pos: u64,
     cur: Option<SaveCursor>,
     comp: Option<Compress>,
@@ -142,10 +152,12 @@ pub struct BgSave {
 }
 
 impl BgSave {
-    /// Ouvre le fichier temporaire de `target` et la barrière de save.
+    /// Ouvre la barrière de save ; le fichier temporaire de `target` est créé
+    /// hors de la boucle ([`take_fs`](Self::take_fs)).
     pub fn start(art: &mut OxidArt, zstd: Option<ZstdConf>, target: Target) -> io::Result<Self> {
         let t0 = Instant::now();
-        let file = std::fs::File::create(target.dir.join(&target.tmp))?;
+        let mut create = FsTask::new();
+        create.open(&target.dir.join(&target.tmp), libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644);
         let mut comp = zstd.map(|c| Compress {
             z: ZstdStream::new(c.level),
             raw: Vec::with_capacity(CHUNK + CHUNK / 4),
@@ -167,7 +179,9 @@ impl BgSave {
         Ok(Self {
             id: 0,
             target,
-            file,
+            file: None,
+            fs_req: Some(create),
+            fs_in_flight: false,
             pos: 0,
             cur: Some(cur),
             comp,
@@ -206,12 +220,14 @@ impl BgSave {
             Phase::Walk if self.blocked() => self.comp.as_ref().is_some_and(|c| c.pending() > 0),
             Phase::Walk | Phase::Drain => true,
             Phase::Flush => self.comp.as_ref().is_some_and(|c| c.pending() > 0 || !c.finished),
-            Phase::Sync | Phase::Done => false,
+            Phase::Sync | Phase::Finalize | Phase::Done => false,
         }
     }
 
+    /// Morceau plein qui attend le disque (écriture en vol, ou fichier pas
+    /// encore créé).
     fn blocked(&self) -> bool {
-        !self.writing.is_empty() && self.fill.len() >= CHUNK
+        (!self.writing.is_empty() || self.file.is_none()) && self.fill.len() >= CHUNK
     }
 
     /// Une tranche de calcul : DFS, vidage ou compression.
@@ -258,7 +274,7 @@ impl BgSave {
                 self.compress_slice();
             }
             Phase::Flush => self.compress_slice(),
-            Phase::Sync | Phase::Done => {}
+            Phase::Sync | Phase::Finalize | Phase::Done => {}
         }
         let el = t.elapsed();
         self.work += el;
@@ -290,10 +306,10 @@ impl BgSave {
     /// Prochaine opération de fichier à soumettre, s'il y en a une (au plus une
     /// en vol). `None` aussi quand le BGSAVE est fini ou en erreur.
     pub fn next_file_op(&mut self) -> Option<FileOp> {
-        if !self.writing.is_empty() || self.phase == Phase::Sync || self.phase == Phase::Done {
+        if !self.writing.is_empty() || matches!(self.phase, Phase::Sync | Phase::Finalize | Phase::Done) {
             return None;
         }
-        let fd = self.file.as_raw_fd();
+        let fd = self.file.as_ref()?.as_raw_fd();
         if self.err.is_some() {
             return None;
         }
@@ -346,23 +362,47 @@ impl BgSave {
 
     /// Écriture partielle à reprendre : même tampon, offset avancé.
     pub fn resume_write(&self) -> Option<FileOp> {
-        (!self.writing.is_empty()).then(|| FileOp::Write { fd: self.file.as_raw_fd(), off: self.pos })
+        let fd = self.file.as_ref()?.as_raw_fd();
+        (!self.writing.is_empty()).then_some(FileOp::Write { fd, off: self.pos })
     }
 
-    /// Fin du fsync : `rename` et fsync du dossier ; le BGSAVE est fini.
+    /// Fin du fsync : reste le `rename` et le fsync du dossier, hors de la
+    /// boucle ([`take_fs`](Self::take_fs)).
     pub fn sync_done(&mut self, res: i32) {
-        self.phase = Phase::Done;
         if res < 0 {
+            self.phase = Phase::Done;
             self.err = Some(io::Error::from_raw_os_error(-res));
             return;
         }
-        let t = Instant::now();
-        let t_ = &self.target;
-        let r = std::fs::rename(t_.dir.join(&t_.tmp), t_.dir.join(&t_.name))
-            .and_then(|_| std::fs::File::open(&t_.dir)?.sync_all());
-        self.finalize_took = t.elapsed();
-        if let Err(e) = r {
-            self.err = Some(e);
+        self.phase = Phase::Finalize;
+        let t = &self.target;
+        let mut fin = FsTask::new();
+        fin.rename(&t.dir.join(&t.tmp), &t.dir.join(&t.name));
+        fin.sync_dir(&t.dir);
+        self.fs_req = Some(fin);
+        self.finalize_took = self.start.elapsed();
+    }
+
+    /// Suite de fichiers à lancer : création du fichier, puis renommage final.
+    pub fn take_fs(&mut self) -> Option<FsTask> {
+        let t = self.fs_req.take()?;
+        self.fs_in_flight = true;
+        Some(t)
+    }
+
+    /// Retour de la suite lancée par [`take_fs`](Self::take_fs).
+    pub fn fs_done(&mut self, mut t: FsTask) {
+        self.fs_in_flight = false;
+        let err = t.error();
+        if self.phase == Phase::Finalize {
+            self.finalize_took = self.start.elapsed() - self.finalize_took;
+            self.phase = Phase::Done;
+            self.err = err;
+            return;
+        }
+        match err {
+            Some(e) => self.err = Some(e),
+            None => self.file = t.take_file(0),
         }
     }
 
@@ -373,14 +413,14 @@ impl BgSave {
 
     /// Fini (ou en erreur et plus rien en vol) : rend le résultat.
     pub fn finished(&mut self, art: &mut OxidArt) -> Option<io::Result<()>> {
-        if self.err.is_some() && self.writing.is_empty() && self.phase != Phase::Sync {
+        if self.err.is_some() && !self.in_flight() {
             self.abort(art);
             return Some(Err(self.err.take().unwrap()));
         }
         (self.phase == Phase::Done).then(|| {
             eprintln!(
                 "[bgsave] {:.1} MB écrits en {:.2?} (DFS {:.2?}) ; {} écritures, CPU {:.2?} ; \
-                 démarrage {:.2?}, tranche max {:.2?}, rename+fsync dossier {:.2?}",
+                 démarrage {:.2?}, tranche max {:.2?}, rename+fsync dossier (hors boucle) {:.2?}",
                 self.pos as f64 / 1e6,
                 self.start.elapsed(),
                 self.walk,
@@ -409,8 +449,8 @@ impl BgSave {
         self.phase == Phase::Sync
     }
 
-    /// Une écriture ou un fsync est en vol.
+    /// Une écriture, un fsync ou une suite de fichiers est en vol.
     pub fn in_flight(&self) -> bool {
-        !self.writing.is_empty() || self.phase == Phase::Sync
+        !self.writing.is_empty() || self.phase == Phase::Sync || self.fs_in_flight
     }
 }

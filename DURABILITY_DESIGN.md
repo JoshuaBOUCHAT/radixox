@@ -13,7 +13,8 @@
 > synchronisation complète par un BGSAVE coupé, mode suivi, `REPLICAOF NO ONE`, `INFO
 > # Replication`, test 7 (§10.9, avec les écarts) ; `WAIT`, réplica avec AOF et chaînage
 > (§10.9) ; **`appendfsync continuous`** (cycles écriture + fsync liés, §7.4,
-> 2026-10-21). Pas fait : zéro copie (la mesure ne le justifie pas, §12bis) et
+> 2026-10-21) ; **opérations de fichier hors de la boucle** (rotation, manifeste,
+> suppressions, création et renommage du dump, §8.6, 2026-10-21). Pas fait : zéro copie (la mesure ne le justifie pas, §12bis) et
 > `min-replicas-to-write` (sémantique à trancher, §16). Ce document doit suffire à
 > un agent qui ne connaît pas le projet : §1 donne le contexte du code, §2–§11 la conception,
 > §12 les tests, §13 l'ordre de travail avec ses critères d'acceptation. Il remplace le
@@ -593,11 +594,13 @@ réécriture quand la taille des segments depuis la dernière base dépasse `min
   une fois le segment écrit jusqu'à elle, **fsync dans tous les modes**, `no` compris (sinon une
   coupure de courant pourrait laisser N déchiré et N+1 valide : refus de démarrer) ; puis
   `set_len` à la fin logique, création et préallocation de `journal.<N+1>.rxj`, manifeste qui
-  le cite, et l'écriture reprend. Ces appels système sont **synchrones**, une fois par
-  réécriture (à passer en io_uring si une mesure le demande).
+  le cite, et l'écriture reprend. Ces appels système étaient synchrones, « une fois par
+  réécriture » : la mesure a montré qu'ils faisaient exploser le p99.99. Ils passent
+  désormais hors de la boucle (§8.6).
 - Fin du BGSAVE réussie : la base est publiée (manifeste `base.<N+1>` + segments ≥ N+1, puis
-  `remove_unlisted`) dès que la rotation est finie ; en échec, rien (l'ancien manifeste cite
-  déjà le nouveau segment). Une base publiée lève une erreur de fsync antérieure.
+  suppression des fichiers non cités) dès que la rotation est finie ; en échec, rien (l'ancien
+  manifeste cite déjà le nouveau segment). Une base publiée lève une erreur de fsync
+  antérieure.
 - Écarts assumés : `SAVE` (bloquante) écrit toujours `dump.rxd`, ce n'est pas une réécriture
   (snapshot autonome, comme le `SAVE` de Valkey avec l'AOF actif) ; à l'arrêt avec l'AOF, pas de
   save par défaut (le flux est complet ; `RADIXOX_SAVE_ON_EXIT=1` la force) ; les blocs qui
@@ -611,6 +614,67 @@ réécriture quand la taille des segments depuis la dernière base dépasse `min
   précède la coupure).
 - Écrivains parqués (plafond §7.6, futurs verrous) : journalisés quand ils **s'exécutent**.
   L'ordre du flux est l'ordre d'exécution.
+
+### 8.6 Opérations de fichier hors de la boucle (2026-10-21)
+
+**Constat.** `bench_compare.sh` avec `AOF=everysec SAVE="3600 1 300 100 60 10000"` (YCSB,
+5 M clés) : p99.99 de lecture 3,7 ms contre 1,4 ms chez Valkey, et dans les logs, un
+BGSAVE dont le démarrage a pris 457 ms (la création synchrone du fichier temporaire pendant
+que le disque écrivait un journal de 1,6 Go). Mesure ciblée (RadixOx seul, 1 M clés de
+100 o, memtier 1:1, 100 clients, 25 s, `strace --seccomp-bpf` sur les appels fichier) :
+
+| | débit | p99 | p99.9 | p99.99 | max |
+|---|---|---|---|---|---|
+| sans persistance | 260 k ops/s | 0,51 ms | 0,62 ms | 0,79 ms | 2,6 ms |
+| AOF `everysec` + règles de save, avant | 227 k ops/s | 0,77 ms | 1,14 ms | 5,44 ms | 20,1 ms |
+
+Tous les appels lents venaient du thread de la boucle (le binaire n'en a pas d'autre) :
+`unlink` de l'ancien journal à chaque réécriture (9 à 14 ms), `fdatasync` du manifeste et
+`fsync` du nouveau segment et du dossier (2 à 23 ms). Chacun gèle tous les clients.
+`open` avec création, `fsync`, `fallocate`, `rename`, `unlink` n'ont pas de forme non
+bloquante : on ne peut pas les rendre rapides sur la boucle, seulement les faire ailleurs.
+Valkey fait de même avec ses threads bio (fsync, fermeture et suppression des anciens
+fichiers) et ses enfants forkés.
+
+**Mécanisme** (`exec/fs_task.rs`). Un `FsTask` est une suite d'étapes (`open`, `fallocate`,
+`fsync`/`fdatasync`, `pwrite`, `ftruncate`, `rename`, `unlink`, `close`), arrêtée à la
+première erreur. Le cœur en soumet une étape à la fois (`Op::Fs { id }`, l'étape se lit
+par `Core::fs_step`) ; la couche io_uring la traduit en SQE avec `IOSQE_ASYNC` (worker
+io-wq, sur `RADIXOX_FILE_CPUS` s'il est réglé) ; le CQE (`Completion::Fs`) fait passer à la
+suivante. Le faux noyau des tests et l'arrêt du serveur exécutent les mêmes étapes par
+appels bloquants (`FsTask::run_blocking`). Trois files, une étape en vol par file, les
+suites d'une file dans l'ordre de leur demande :
+
+- `Aof` : création du segment suivant d'une rotation (`ftruncate` de l'ancien à sa fin
+  logique, `unlink` d'un reste, `open(O_EXCL)`, `fallocate`, `fsync`), puis manifeste
+  (temporaire au nom unique `manifest.<génération>.<n>.tmp`, `fdatasync`, `rename`, fsync du
+  dossier) ; publication d'une base ; marque `follow`. L'écrivain (`AofWriter::next_fs`)
+  construit chaque suite au moment de partir, depuis son manifeste courant, une à la fois ;
+- `Save` : création du fichier temporaire d'un BGSAVE, puis `rename` et fsync du dossier ;
+- `Trash` : suppression des fichiers que le manifeste ne cite plus (la liste est faite par
+  `aof::unlisted` au retour de la publication).
+
+**Conséquences.**
+- Pendant la création du segment suivant, la suite du flux attend en mémoire (bornée par
+  `RADIXOX_AOF_MAX_PENDING_MB`, §7.6) ; les réponses ne l'attendent pas (sauf `always`).
+- Le DFS d'un BGSAVE commence sans attendre son fichier ; un morceau plein attend la
+  création. Une erreur de création (dossier en lecture seule…) arrive **après** la réponse
+  « Background saving started », comme chez Valkey (l'enfant forké échoue après) : le
+  statut passe à `err`, `MISCONF` ensuite.
+- Réplica avec AOF : la fin d'un `RXLOAD` (qui refait les fichiers par `rebase_aof`)
+  attend qu'aucune suite de la file `Aof` ne soit en cours ; la connexion de la source est
+  parquée comme un écrivain au plafond (§7.6).
+- Arrêt : la boucle attend la fin des suites en cours (`finish_fs`), puis `flush_sync` mène
+  une rotation restante et la publication d'une base déjà écrite à leur terme, d'une traite.
+
+**Reste synchrone sur la boucle**, mesuré négligeable ou assumé : `fallocate` d'un palier de
+64 Mio (< 1 ms mesuré), lecture du dossier et `stat` de la base à la publication, démarrage
+et arrêt, `rebase_aof` et l'écriture des données d'un `RXLOAD` sur un réplica
+(synchronisation complète, déjà bloquante par conception, §10), suppression du
+temporaire d'un BGSAVE abandonné.
+
+**Après** : à mesurer machine au repos (le run de vérification a tourné avec un jeu actif,
+débit faussé) ; sous `strace`, plus aucun appel fichier lent sur la boucle pendant le service.
 
 ---
 

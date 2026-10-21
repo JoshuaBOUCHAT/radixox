@@ -28,6 +28,7 @@ use crate::exec::autosave::{Persistence, Rule};
 use crate::exec::aof::{AofOp, AofWriter, ReplId, new_replid};
 use crate::exec::journal::{self, Cursor, Stream};
 use crate::exec::bgsave::{BgSave, FileOp, cpu_share, zstd_conf};
+use crate::exec::fs_task::{FsTask, StepRef};
 use crate::exec::persist::{Target, save_dir, save_sync_to, sync_level};
 use crate::exec::{Executed, execute_into, resp_ok};
 use crate::tsc;
@@ -153,6 +154,8 @@ pub enum Completion {
     JournalSync { res: i32, writer: u32 },
     /// Connexion sortante (réplication) : 0 ou `-errno`.
     Connect { slot: Slot, res: i32 },
+    /// Étape d'une suite de fichiers (`Op::Fs`) : valeur du CQE.
+    Fs { id: u32, res: i32 },
 }
 
 /// Opération à soumettre au noyau.
@@ -185,6 +188,39 @@ pub enum Op {
     /// Connexion sortante vers un réplica : socket installé dans `slot`
     /// (réglages comme `Install`), puis `connect`.
     Connect { slot: Slot, addr: std::net::SocketAddr },
+    /// Étape courante ([`Core::fs_step`]) de la suite de fichiers `id`, à
+    /// exécuter hors de la boucle (worker io-wq).
+    Fs { id: u32 },
+}
+
+/// Files de suites de fichiers : dans une file, une seule étape en vol et les
+/// suites dans l'ordre de leur demande ; les files avancent indépendamment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    /// Segments et manifeste de l'AOF (l'ordre compte).
+    Aof,
+    /// Fichier d'un BGSAVE (création, renommage final).
+    Save,
+    /// Suppressions de fichiers que plus rien ne cite.
+    Trash,
+}
+
+/// À qui rendre une suite finie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FsOwner {
+    /// Écrivain de l'AOF, par génération.
+    Aof(u32),
+    /// BGSAVE, par numéro.
+    Save(u32),
+    Trash,
+}
+
+struct FsJob {
+    id: u32,
+    lane: Lane,
+    owner: FsOwner,
+    task: FsTask,
+    in_flight: bool,
 }
 
 /// Une fenêtre de préchargement, sur la pile (pas d'allocation par fenêtre).
@@ -387,6 +423,9 @@ pub struct Core {
     promoted: bool,
     /// Connexions en `WAIT`.
     waiters: Vec<repl::Waiter>,
+    /// Suites de fichiers en cours, dans l'ordre de leur demande (§8.6).
+    fs_jobs: Vec<FsJob>,
+    fs_seq: u32,
 }
 
 impl Core {
@@ -440,6 +479,8 @@ impl Core {
             loading: None,
             promoted: false,
             waiters: Vec::new(),
+            fs_jobs: Vec::new(),
+            fs_seq: 0,
             cfg,
         }
     }
@@ -562,6 +603,96 @@ impl Core {
                 AofOp::Sync { fd } => Op::JournalSync { fd, writer },
             });
         }
+        let task = w.next_fs(self.now);
+        let trash = w.take_trash();
+        if let Some(task) = task {
+            self.fs_push(Lane::Aof, FsOwner::Aof(writer), task);
+        }
+        self.fs_trash(trash);
+    }
+
+    // ── Suites de fichiers hors de la boucle (DURABILITY_DESIGN.md §8.6) ─
+
+    fn fs_push(&mut self, lane: Lane, owner: FsOwner, task: FsTask) {
+        self.fs_seq = self.fs_seq.wrapping_add(1);
+        self.fs_jobs.push(FsJob { id: self.fs_seq, lane, owner, task, in_flight: false });
+        self.fs_kick();
+    }
+
+    /// Suppressions (une suite, file `Trash`).
+    fn fs_trash(&mut self, paths: Vec<std::path::PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        let mut t = FsTask::new();
+        for p in &paths {
+            t.unlink(p, true);
+        }
+        self.fs_push(Lane::Trash, FsOwner::Trash, t);
+    }
+
+    /// Soumet l'étape courante de la première suite de chaque file qui n'a
+    /// rien en vol.
+    fn fs_kick(&mut self) {
+        for lane in [Lane::Aof, Lane::Save, Lane::Trash] {
+            let Some(job) = self.fs_jobs.iter_mut().find(|j| j.lane == lane) else { continue };
+            if !job.in_flight && job.task.step().is_some() {
+                job.in_flight = true;
+                self.ops.push(Op::Fs { id: job.id });
+            }
+        }
+    }
+
+    /// Étape à exécuter pour `Op::Fs { id }` (pointeurs valides jusqu'au CQE).
+    pub fn fs_step(&self, id: u32) -> Option<StepRef<'_>> {
+        self.fs_jobs.iter().find(|j| j.id == id).and_then(|j| j.task.step())
+    }
+
+    /// Des suites de fichiers sont en cours : l'arrêt les attend.
+    pub fn fs_pending(&self) -> bool {
+        !self.fs_jobs.is_empty()
+    }
+
+    /// Des suites de la file `Aof` sont en cours (segments, manifeste).
+    fn aof_files_busy(&self) -> bool {
+        self.fs_jobs.iter().any(|j| j.lane == Lane::Aof)
+    }
+
+    fn on_fs(&mut self, id: u32, res: i32) {
+        let Some(i) = self.fs_jobs.iter().position(|j| j.id == id) else {
+            debug_assert!(false, "CQE d'une suite de fichiers inconnue");
+            return;
+        };
+        let job = &mut self.fs_jobs[i];
+        job.in_flight = false;
+        job.task.done(res);
+        if !job.task.finished() {
+            self.fs_kick();
+            return;
+        }
+        let job = self.fs_jobs.remove(i);
+        match job.owner {
+            FsOwner::Aof(writer) => {
+                if let Some(w) = self.aof.as_mut().filter(|w| w.generation == writer) {
+                    w.fs_done(job.task, self.now);
+                } else if let Some(k) = self.aof_old.iter().position(|w| w.generation == writer) {
+                    // Écrivain remplacé : sa suite est finie, il peut partir.
+                    self.aof_old[k].fs_done(job.task, self.now);
+                    if !self.aof_old[k].busy() {
+                        self.aof_old.swap_remove(k);
+                    }
+                }
+                self.aof_pump();
+                self.aof_unpark();
+            }
+            FsOwner::Save(save) => self.on_save_fs(save, job.task),
+            FsOwner::Trash => {
+                if let Some(e) = job.task.error() {
+                    eprintln!("[aof] suppression d'un ancien fichier : {e}");
+                }
+            }
+        }
+        self.fs_kick();
     }
 
     /// Le durable a avancé : les connexions dont une réponse retenue est
@@ -765,7 +896,7 @@ impl Core {
                     let w = &mut self.aof_old[i];
                     match c {
                         Completion::JournalWrite { .. } => w.write_done(res, self.now),
-                        _ => w.sync_done(res, self.now),
+                        _ => w.sync_done(res),
                     }
                     if !w.busy() {
                         self.aof_old.swap_remove(i);
@@ -781,12 +912,13 @@ impl Core {
             }
             Completion::JournalSync { res, .. } => {
                 if let Some(w) = &mut self.aof {
-                    w.sync_done(res, self.now);
+                    w.sync_done(res);
                 }
                 self.release_held();
                 self.aof_pump();
             }
             Completion::Connect { slot, res } => self.on_connect(slot, res),
+            Completion::Fs { id, res } => self.on_fs(id, res),
         }
     }
 
@@ -845,9 +977,28 @@ impl Core {
         });
     }
 
+    /// Retour d'une suite de fichiers d'un BGSAVE (création, renommage final).
+    fn on_save_fs(&mut self, save: u32, task: FsTask) {
+        if let Some(bg) = self.bgsave.as_mut().filter(|b| b.id == save) {
+            bg.fs_done(task);
+            self.bgsave_next();
+        } else if let Some(i) = self.bgsave_dead.iter().position(|b| b.id == save) {
+            // BGSAVE abandonné : sa suite est finie, il peut partir.
+            self.bgsave_dead[i].fs_done(task);
+            if !self.bgsave_dead[i].in_flight() {
+                self.bgsave_dead.swap_remove(i);
+            }
+        }
+    }
+
     /// Soumet l'écriture suivante du BGSAVE s'il y en a une ; termine-le.
     fn bgsave_next(&mut self) {
         let Some(bg) = self.bgsave.as_mut() else { return };
+        if let Some(task) = bg.take_fs() {
+            let save = bg.id;
+            self.fs_push(Lane::Save, FsOwner::Save(save), task);
+        }
+        let bg = self.bgsave.as_mut().unwrap();
         if !bg.in_flight()
             && let Some(op) = bg.next_file_op()
         {
@@ -895,6 +1046,8 @@ impl Core {
                 self.bgsave_seq += 1;
                 bg.id = self.bgsave_seq;
                 self.bgsave = Some(bg);
+                // Création du fichier temporaire, hors de la boucle.
+                self.bgsave_next();
                 Ok(())
             }
             Err(e) => {
@@ -1300,6 +1453,10 @@ impl Core {
         // Écrivains arrêtés par le plafond du flux : (connexion, début dans le
         // morceau de tête de la frame arrêtée ; `None` : la frame de `rx`).
         let mut aof_stops: Window<(Slot, Option<u32>)> = SmallVec::new();
+        // Réplica avec AOF : la fin d'un `RXLOAD` refait les fichiers de l'AOF
+        // (`rebase_aof`) ; elle attend qu'aucune suite de la file `Aof` ne soit
+        // en cours (une rotation de l'ancien écrivain écrirait par-dessus).
+        let aof_files_busy = self.aof_files_busy();
         {
             let job_budget = self.cfg.job_budget;
             let Core { art, ins, outs, bufs, persist, journal, aof, cfg, held, follow, .. } = self;
@@ -1389,7 +1546,9 @@ impl Core {
                 }
                 let o = &mut outs[slot as usize];
                 // Réplica avec AOF : les blocs reçus attendent aussi le disque.
-                if over_cap && matches!(cmd, Cmd::RxBlock(_)) {
+                if (over_cap && matches!(cmd, Cmd::RxBlock(_)))
+                    || (aof_files_busy && matches!(cmd, Cmd::RxLoad(radixox_lib::cmd::RxLoad::End)))
+                {
                     aof_stops.push((slot, end.map(|e| e - raw.len() as u32)));
                     continue;
                 }

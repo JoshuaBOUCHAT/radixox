@@ -1,7 +1,8 @@
 //! Fichiers de l'AOF (DURABILITY_DESIGN.md §6.2–§6.5, §9) : manifeste,
 //! segments de blocs, base, reprise au démarrage. Sans io_uring : la reprise
-//! et la création tournent avant la boucle ; l'écriture des blocs pendant le
-//! service passe par le cœur (`Op::FileWrite`).
+//! et la création tournent avant la boucle ; pendant le service, l'écriture
+//! des blocs passe par le cœur (`Op::JournalWrite`), et la rotation, le
+//! manifeste et les suppressions par des suites [`FsTask`] (§8.6).
 //!
 //! ```text
 //! RADIXOX_DIR/appendonlydir/
@@ -16,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use oxidart::{JournalPos, OxidArt};
 
+use super::fs_task::{FdRef, FsTask};
 use super::journal::{BadBlock, Cursor, HEADER, MAX_PAYLOAD, apply, read_block};
 use super::persist::{Target, save_dir, save_sync_to};
 
@@ -380,9 +382,10 @@ pub fn create(art: &mut OxidArt, dir: &Path) -> io::Result<Resume> {
     })
 }
 
-/// Supprime les fichiers de l'AOF que le manifeste ne cite pas (restes d'une
-/// rotation interrompue), après un chargement réussi (§9.7).
-pub fn remove_unlisted(dir: &Path, m: &Manifest) -> io::Result<()> {
+/// Fichiers de l'AOF que le manifeste ne cite pas (anciennes bases et
+/// segments, restes d'une rotation interrompue, temporaires).
+pub fn unlisted(dir: &Path, m: &Manifest) -> io::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let name = entry?.file_name();
         let Some(name) = name.to_str() else { continue };
@@ -390,8 +393,18 @@ pub fn remove_unlisted(dir: &Path, m: &Manifest) -> io::Result<()> {
         let ours = file_index(name).is_some() || name.ends_with(".tmp");
         if ours && !listed {
             eprintln!("[aof] {name} : non cité par le manifeste, supprimé");
-            std::fs::remove_file(dir.join(name))?;
+            out.push(dir.join(name));
         }
+    }
+    Ok(out)
+}
+
+/// Supprime, d'une traite, les fichiers que le manifeste ne cite pas, après
+/// un chargement réussi (§9.7). Pendant le service : [`unlisted`] et une
+/// suite de suppressions hors de la boucle.
+pub fn remove_unlisted(dir: &Path, m: &Manifest) -> io::Result<()> {
+    for path in unlisted(dir, m)? {
+        std::fs::remove_file(path)?;
     }
     Ok(())
 }
@@ -468,6 +481,18 @@ struct Rotation {
     synced: bool,
 }
 
+/// Suite de fichiers en vol de l'écrivain (une à la fois, file `Aof` du
+/// cœur), avec ce qu'il faut pour l'appliquer à son retour.
+#[derive(Debug)]
+enum FsWork {
+    /// Segment suivant créé, manifeste qui le cite ; `seg` : son fichier.
+    Rotate { manifest: Manifest, seg: usize },
+    /// Manifeste qui cite la nouvelle base.
+    Publish { manifest: Manifest, pos: JournalPos },
+    /// Manifeste marqué (ou démarqué) `follow`.
+    Follow { manifest: Manifest },
+}
+
 /// Écrivain du segment courant : machine à états sans I/O, comme le BGSAVE.
 /// Le cœur demande les opérations ([`next_op`](Self::next_op)), les soumet
 /// et rend leurs résultats ; une seule écriture et un seul fsync en vol.
@@ -499,8 +524,17 @@ pub struct AofWriter {
     /// fsync dus alors que le précédent était encore en vol.
     delayed_fsync: u64,
     rotation: Option<Rotation>,
-    /// Base écrite par une réécriture finie avant la rotation : publiée après.
+    /// Base écrite par une réécriture finie : publiée dès la rotation finie.
     pending_base: Option<(String, JournalPos)>,
+    /// Suite de fichiers en vol (§8.6).
+    in_fs: Option<FsWork>,
+    /// Marque `follow` du manifeste à écrire.
+    follow_pending: Option<Option<ReplId>>,
+    /// Fichiers que le manifeste ne cite plus : à supprimer hors de la boucle.
+    trash: Vec<PathBuf>,
+    /// Numéro du prochain manifeste temporaire (noms uniques : une suite d'un
+    /// écrivain remplacé ne peut pas écrire dans le temporaire d'une autre).
+    tmp_seq: u64,
     /// Génération : un réplica qui recharge un dump remplace son écrivain ;
     /// les opérations de l'ancien encore en vol sont reconnues par ce numéro.
     pub generation: u32,
@@ -554,21 +588,131 @@ impl AofWriter {
             cycle_bytes: 0,
             rotation: None,
             pending_base: None,
+            in_fs: None,
+            follow_pending: None,
+            trash: Vec::new(),
+            tmp_seq: 0,
             generation: 0,
         })
     }
 
-    /// Réplica / promotion : marque (ou démarque) le manifeste `follow`.
-    pub fn set_follow(&mut self, follow: Option<ReplId>) -> io::Result<()> {
-        let m = Manifest { follow, ..self.manifest.clone() };
-        m.write(&self.dir)?;
-        self.manifest = m;
-        Ok(())
+    /// Réplica / promotion : marque (ou démarque) le manifeste `follow`. Écrit
+    /// hors de la boucle, après les suites déjà demandées.
+    pub fn set_follow(&mut self, follow: Option<ReplId>) {
+        self.follow_pending = Some(follow);
     }
 
     /// Une opération est en vol (le noyau lit `writing` ou le fichier).
     pub fn busy(&self) -> bool {
-        self.in_flight || self.syncing.is_some()
+        self.in_flight || self.syncing.is_some() || self.in_fs.is_some()
+    }
+
+    /// Prochaine suite de fichiers à lancer (file `Aof` : une à la fois, dans
+    /// l'ordre des demandes) : création du segment suivant d'une rotation,
+    /// publication d'une base, marque `follow`. Construite au moment de partir,
+    /// depuis le manifeste courant.
+    pub fn next_fs(&mut self, now: std::time::Instant) -> Option<FsTask> {
+        if self.in_fs.is_some() {
+            return None;
+        }
+        let mut t = FsTask::new();
+        let work = if let Some(rot) = &self.rotation {
+            if !rot.synced || !self.retry_due(now) {
+                return None;
+            }
+            // Segment courant ramené à sa fin logique, segment suivant créé et
+            // cité par le manifeste **avant** d'y écrire (§8.3). Un seul fsync
+            // du dossier à la fin : il rend durables la création et le renommage.
+            let name = segment_name(rot.index);
+            use std::os::fd::AsRawFd;
+            t.ftruncate(FdRef::Raw(self.file.as_raw_fd()), self.file_end);
+            t.unlink(&self.dir.join(&name), true);
+            let seg = t.open(&self.dir.join(&name), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o644);
+            t.fallocate(seg, 0, PREALLOC);
+            t.fsync(seg, false);
+            let mut manifest = self.manifest.clone();
+            manifest.incrs.push(name);
+            let FdRef::Opened(seg) = seg else { unreachable!() };
+            FsWork::Rotate { manifest, seg }
+        } else if let Some((base, pos)) = self.pending_base.take() {
+            let Some(from) = file_index(&base) else { return None };
+            let manifest = Manifest {
+                replid: self.manifest.replid,
+                base,
+                base_seq: pos.seq,
+                base_offset: pos.offset,
+                incrs: self.manifest.incrs.iter().filter(|n| file_index(n).is_some_and(|i| i >= from)).cloned().collect(),
+                follow: self.manifest.follow,
+            };
+            FsWork::Publish { manifest, pos }
+        } else if let Some(follow) = self.follow_pending.take() {
+            FsWork::Follow { manifest: Manifest { follow, ..self.manifest.clone() } }
+        } else {
+            return None;
+        };
+        let manifest = match &work {
+            FsWork::Rotate { manifest, .. } | FsWork::Publish { manifest, .. } | FsWork::Follow { manifest } => manifest,
+        };
+        self.tmp_seq += 1;
+        let tmp = format!("{MANIFEST}.{}.{}.tmp", self.generation, self.tmp_seq);
+        t.replace_file(&self.dir, &tmp, MANIFEST, manifest.render().into_bytes());
+        self.in_fs = Some(work);
+        Some(t)
+    }
+
+    /// Retour de la suite lancée par [`next_fs`](Self::next_fs).
+    pub fn fs_done(&mut self, mut t: FsTask, now: std::time::Instant) {
+        let Some(work) = self.in_fs.take() else { return };
+        let err = t.error();
+        match work {
+            FsWork::Rotate { manifest, seg } => {
+                let Some(file) = err.is_none().then(|| t.take_file(seg)).flatten() else {
+                    let name = manifest.incrs.last().cloned().unwrap_or_default();
+                    let e = err.map_or_else(|| "segment non ouvert".into(), |e| e.to_string());
+                    // Nouvel essai après le délai d'erreur (la suite recommence
+                    // par supprimer un segment à moitié créé).
+                    self.fail_write(format!("rotation vers {name} : {e}"), now);
+                    return;
+                };
+                self.file = file;
+                self.file_end = 0;
+                self.reserved = PREALLOC;
+                self.manifest = manifest;
+                let rot = self.rotation.take().expect("rotation en cours");
+                debug_assert_eq!(self.written, rot.boundary);
+            }
+            FsWork::Publish { manifest, pos } => {
+                if let Some(e) = err {
+                    // L'ancien manifeste reste valide ; la prochaine réécriture réessaiera.
+                    eprintln!("[aof] manifeste de la base {} : {e} ; ancienne base gardée", manifest.base);
+                    return;
+                }
+                self.manifest = manifest;
+                let base = &self.manifest.base;
+                self.base_size = std::fs::metadata(self.dir.join(base)).map(|m| m.len()).unwrap_or(0);
+                match unlisted(&self.dir, &self.manifest) {
+                    Ok(paths) => self.trash.extend(paths),
+                    Err(e) => eprintln!("[aof] liste des anciens fichiers : {e}"),
+                }
+                // Tout ce qui précède la base est dans un fichier neuf, fsyncé : un
+                // fsync raté plus tôt ne compte plus que pour les blocs d'après.
+                if self.fsync_err.take().is_some() {
+                    eprintln!("[aof] nouvelle base publiée : écritures de nouveau acceptées");
+                }
+                eprintln!("[aof] réécriture publiée : {base} (seq {}), {} segment(s)", pos.seq, self.manifest.incrs.len());
+            }
+            FsWork::Follow { manifest } => match err {
+                None => self.manifest = manifest,
+                Some(e) => eprintln!(
+                    "[aof] manifeste (follow) : {e} ; au redémarrage, le serveur reprendrait son ancien rôle"
+                ),
+            },
+        }
+    }
+
+    /// Fichiers à supprimer hors de la boucle (file `Trash` du cœur).
+    pub fn take_trash(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.trash)
     }
 
     fn fd(&self) -> i32 {
@@ -596,9 +740,6 @@ impl AofWriter {
             rot.sync_sent = true;
             self.syncing = Some(self.written);
             return Some(AofOp::Sync { fd: self.fd() });
-        }
-        if self.rotation.as_ref().is_some_and(|r| r.synced) && self.retry_due(now) {
-            self.finish_rotation(now);
         }
         if self.fsync == Fsync::Continuous {
             return self.next_cycle(stream, now);
@@ -751,7 +892,7 @@ impl AofWriter {
     /// CQE d'un fsync. Un fsync en échec n'est jamais réessayé (l'état du
     /// cache de pages est inconnu) : écritures refusées jusqu'à la prochaine
     /// base réussie.
-    pub fn sync_done(&mut self, res: i32, now: std::time::Instant) {
+    pub fn sync_done(&mut self, res: i32) {
         let Some(upto) = self.syncing.take() else { return };
         if std::mem::take(&mut self.linked_sync) && res == -libc::ECANCELED {
             // Écriture liée partielle ou en échec : le cycle suivant reprend.
@@ -777,48 +918,17 @@ impl AofWriter {
             && rot.sync_sent
             && upto >= rot.boundary
         {
+            // Le segment suivant est créé par `next_fs`, hors de la boucle.
             rot.synced = true;
-            self.finish_rotation(now);
-        }
-    }
-
-    /// Segment courant écrit et fsyncé jusqu'à la frontière : ramené à sa fin
-    /// logique, segment suivant créé et cité par le manifeste **avant** d'y
-    /// écrire (§8.3). Appels système synchrones : une fois par réécriture.
-    fn finish_rotation(&mut self, now: std::time::Instant) {
-        let Some(rot) = &self.rotation else { return };
-        let (boundary, index) = (rot.boundary, rot.index);
-        let name = segment_name(index);
-        let r = (|| -> io::Result<File> {
-            self.file.set_len(self.file_end)?;
-            let _ = std::fs::remove_file(self.dir.join(&name));
-            let f = create_segment(&self.dir, &name)?;
-            let mut m = self.manifest.clone();
-            m.incrs.push(name.clone());
-            m.write(&self.dir)?;
-            self.manifest = m;
-            Ok(f)
-        })();
-        match r {
-            Ok(f) => {
-                self.file = f;
-                self.file_end = 0;
-                self.reserved = PREALLOC;
-                debug_assert_eq!(self.written, boundary);
-                self.rotation = None;
-                if let Some((base, pos)) = self.pending_base.take() {
-                    self.publish_base(base, pos);
-                }
-            }
-            Err(e) => self.fail_write(format!("rotation vers {name} : {e}"), now),
         }
     }
 
     // ── Réécriture (§8) ──────────────────────────────────────────────────
 
-    /// Une réécriture ou une rotation est en cours.
+    /// Une réécriture ou une rotation est en cours (jusqu'à la publication de
+    /// la nouvelle base comprise).
     pub fn rewriting(&self) -> bool {
-        self.rotation.is_some() || self.pending_base.is_some()
+        self.rotation.is_some() || self.pending_base.is_some() || matches!(self.in_fs, Some(FsWork::Publish { .. }))
     }
 
     /// Point de coupure d'une réécriture (§8.1) : le bloc en cours est fermé
@@ -844,42 +954,10 @@ impl AofWriter {
     /// fichiers, §8.2). En échec : l'ancien manifeste reste valide (il cite
     /// le nouveau segment).
     pub fn rewrite_done(&mut self, target: &Target, ok: bool) {
-        if !ok {
-            return;
-        }
-        if self.rotation.is_some() {
+        if ok {
+            // Publiée par `next_fs` dès la rotation finie.
             self.pending_base = Some((target.name.clone(), target.pos));
-        } else {
-            self.publish_base(target.name.clone(), target.pos);
         }
-    }
-
-    fn publish_base(&mut self, base: String, pos: JournalPos) {
-        let Some(from) = file_index(&base) else { return };
-        let m = Manifest {
-            replid: self.manifest.replid,
-            base: base.clone(),
-            base_seq: pos.seq,
-            base_offset: pos.offset,
-            incrs: self.manifest.incrs.iter().filter(|n| file_index(n).is_some_and(|i| i >= from)).cloned().collect(),
-            follow: self.manifest.follow,
-        };
-        if let Err(e) = m.write(&self.dir) {
-            // L'ancien manifeste reste valide ; la prochaine réécriture réessaiera.
-            eprintln!("[aof] manifeste de la base {base} : {e} ; ancienne base gardée");
-            return;
-        }
-        self.manifest = m;
-        self.base_size = std::fs::metadata(self.dir.join(&base)).map(|m| m.len()).unwrap_or(0);
-        if let Err(e) = remove_unlisted(&self.dir, &self.manifest) {
-            eprintln!("[aof] suppression des anciens fichiers : {e}");
-        }
-        // Tout ce qui précède la base est dans un fichier neuf, fsyncé : un
-        // fsync raté plus tôt ne compte plus que pour les blocs d'après.
-        if self.fsync_err.take().is_some() {
-            eprintln!("[aof] nouvelle base publiée : écritures de nouveau acceptées");
-        }
-        eprintln!("[aof] réécriture publiée : {base} (seq {}), {} segment(s)", pos.seq, self.manifest.incrs.len());
     }
 
     /// Réécriture automatique due (§8.4) : le journal depuis la base dépasse
@@ -932,9 +1010,11 @@ impl AofWriter {
 
     /// Arrêt : ferme le bloc en cours, écrit tout ce qui reste (l'écriture en
     /// vol comprise : mêmes octets au même endroit) et fsync, d'une traite.
-    /// Une rotation en cours est menée à son terme d'abord.
+    /// Une rotation en cours est menée à son terme d'abord. Aucune suite de
+    /// fichiers ne doit être en vol (la boucle les attend avant l'arrêt).
     pub fn flush_sync(&mut self, stream: &mut super::journal::Stream) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
+        debug_assert!(self.in_fs.is_none(), "suite de fichiers en vol à l'arrêt");
         stream.end_turn();
         let rest = self.writing[self.done..].to_vec();
         self.writing.clear();
@@ -950,7 +1030,14 @@ impl AofWriter {
             self.written += before.len() as u64;
             self.file.sync_data()?;
             self.rotation.as_mut().unwrap().synced = true;
-            self.finish_rotation(std::time::Instant::now());
+            // Pas de délai d'erreur à l'arrêt : la rotation part tout de suite,
+            // puis la publication d'une base déjà écrite, s'il y en a une.
+            self.retry_at = None;
+            let now = std::time::Instant::now();
+            while let Some(mut t) = self.next_fs(now) {
+                t.run_blocking();
+                self.fs_done(t, now);
+            }
             if self.rotation.is_some() {
                 return Err(io::Error::other(self.write_err.clone().unwrap_or_default()));
             }

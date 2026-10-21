@@ -393,9 +393,15 @@ fn failed_bgsave_refuses_writes() {
     let mut c = redis::Client::open(format!("redis://127.0.0.1:{PORT_MISCONF}")).unwrap().get_connection().unwrap();
     redis::cmd("SET").arg("a").arg("1").query::<()>(&mut c).unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let r: redis::RedisResult<String> = redis::cmd("BGSAVE").query(&mut c);
-    assert!(r.is_err(), "BGSAVE dans un dossier en lecture seule");
-    assert_eq!(info_field(&mut c, "rdb_last_bgsave_status"), "err");
+    // Le fichier est créé hors de la boucle : comme chez Valkey (enfant
+    // forké), BGSAVE répond qu'elle démarre, puis échoue.
+    let r: String = redis::cmd("BGSAVE").query(&mut c).unwrap();
+    assert_eq!(r, "Background saving started");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while info_field(&mut c, "rdb_last_bgsave_status") != "err" {
+        assert!(Instant::now() < deadline, "BGSAVE dans un dossier en lecture seule");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let w: redis::RedisResult<()> = redis::cmd("SET").arg("b").arg("2").query(&mut c);
     assert!(w.unwrap_err().to_string().contains("MISCONF"));
     let v: String = redis::cmd("GET").arg("a").query(&mut c).unwrap();

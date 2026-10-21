@@ -76,6 +76,9 @@ struct Fake {
     writes_during_sync: u64,
     /// `connect` sortants pas encore aboutis (le test les accepte ou refuse).
     connecting: Vec<(Slot, std::net::SocketAddr)>,
+    /// Étapes des suites de fichiers retenues (disque lent à créer, renommer).
+    fs_stalled: bool,
+    fs_held: Vec<Op>,
 }
 
 impl Fake {
@@ -106,6 +109,8 @@ impl Fake {
             cancel_sync: false,
             writes_during_sync: 0,
             connecting: Vec::new(),
+            fs_stalled: false,
+            fs_held: Vec::new(),
         }
     }
 
@@ -121,6 +126,10 @@ impl Fake {
         }
         if !self.sync_stalled {
             let held = std::mem::take(&mut self.sync_held);
+            self.ops.splice(0..0, held);
+        }
+        if !self.fs_stalled {
+            let held = std::mem::take(&mut self.fs_held);
             self.ops.splice(0..0, held);
         }
         for op in std::mem::take(&mut self.ops) {
@@ -214,6 +223,13 @@ impl Fake {
                     self.completions.push(Completion::JournalSync { res, writer });
                 }
                 Op::Connect { slot, addr } => self.connecting.push((slot, addr)),
+                Op::Fs { .. } if self.fs_stalled => self.fs_held.push(op),
+                // Suites de fichiers : appels réels, comme le ferait un worker io-wq.
+                Op::Fs { id } => {
+                    let step = self.core.fs_step(id).expect("étape d'une suite en cours");
+                    let res = crate::exec::fs_task::FsTask::exec_blocking(step);
+                    self.completions.push(Completion::Fs { id, res });
+                }
             }
         }
     }
@@ -1528,8 +1544,8 @@ fn rewrites_under_random_traffic_replay_to_the_served_state() {
             }
         }
         f.settle();
-        // Une dernière réécriture menée à son terme.
-        while f.core.bgsave_running() || f.core.aof().unwrap().rewriting() {
+        // Une dernière réécriture menée à son terme, anciens fichiers supprimés.
+        while f.core.bgsave_running() || f.core.aof().unwrap().rewriting() || f.core.fs_pending() {
             f.step();
         }
         let m = manifest_of(&dir);
@@ -1538,6 +1554,51 @@ fn rewrites_under_random_traffic_replay_to_the_served_state() {
         let (got, _) = recover_state(&dir, f.core.art.now, false).unwrap();
         assert_eq!(got, state(&mut f.core.art), "graine {seed}");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Disque lent à créer, renommer, supprimer (§8.6) : pendant une réécriture
+/// dont les suites de fichiers sont retenues, les clients restent servis ; la
+/// suite du flux attend le segment suivant ; au déblocage, la base est publiée,
+/// les anciens fichiers supprimés, et la reprise redonne l'état servi.
+#[test]
+fn rewrite_with_slow_file_operations_keeps_serving() {
+    let dir = test_dir("aof-slow-files");
+    let mut f = fake_with_aof(&dir, Config { max_conn: 8, reserved: 0, ..Config::default() });
+    f.idle_work = true;
+    f.wall = Some(1_000);
+    let c = f.connect();
+    f.send(c, b"SET a 1\r\n");
+    f.settle();
+    assert_eq!(f.take(c), "+OK\r\n");
+    f.fs_stalled = true;
+    f.send(c, b"BGSAVE\r\n");
+    f.settle();
+    assert_eq!(f.take(c), "+Background saving started\r\n");
+    for i in 0..50 {
+        f.send(c, format!("SET k{i} {i}\r\n").as_bytes());
+        f.step();
+    }
+    f.settle();
+    assert_eq!(f.take(c).matches("+OK").count(), 50, "les écritures sont servies pendant que le disque traîne");
+    f.send(c, b"GET k49\r\n");
+    f.settle();
+    assert_eq!(f.take(c), "$2\r\n49\r\n");
+    assert!(f.core.bgsave_running(), "fichier du dump pas encore créé");
+    assert!(f.core.aof().unwrap().rewriting() && f.core.fs_pending());
+    assert!(f.core.aof_pending() > 0, "la suite du flux attend le segment suivant");
+    f.fs_stalled = false;
+    while f.core.bgsave_running() || f.core.aof().unwrap().rewriting() || f.core.fs_pending() {
+        f.step();
+    }
+    f.settle();
+    assert_eq!(f.core.aof_pending(), 0);
+    let m = manifest_of(&dir);
+    assert_eq!((m.base.as_str(), m.incrs.as_slice()), ("base.2.rxdb", &["journal.2.rxj".to_string()][..]));
+    assert!(!dir.join("base.1.rxdb").exists() && !dir.join("journal.1.rxj").exists());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3, "manifeste, base, segment");
+    let (got, _) = recover_state(&dir, f.core.art.now, false).unwrap();
+    assert_eq!(got, state(&mut f.core.art));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -7,6 +7,7 @@ pub mod aof;
 pub mod auth;
 pub mod autosave;
 pub mod bgsave;
+pub mod fs_task;
 pub mod client;
 pub mod jobs;
 pub mod journal;

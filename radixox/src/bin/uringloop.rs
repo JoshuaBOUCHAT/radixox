@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use io_uring::types::{BufRingEntry, Fd, Fixed, IOU_PBUF_RING_INC, SubmitArgs, Timespec};
 use io_uring::{EnterFlags, IoUring, cqueue, opcode, squeue};
 use oxidart::OxidArt;
+use radixox::exec::fs_task::StepRef;
 use radixox::exec::{aof, autosave};
 use radixox::tsc;
 use radixox::uring::{Bid, Completion, Config, Core, Op, Slot};
@@ -42,6 +43,7 @@ const K_FILE: u64 = 7;
 const K_JWRITE: u64 = 8;
 const K_JSYNC: u64 = 9;
 const K_CONNECT: u64 = 10;
+const K_FS: u64 = 11;
 
 fn ud(kind: u64, slot: Slot) -> u64 {
     kind << 32 | slot as u64
@@ -130,6 +132,8 @@ struct Server {
     /// Adresses des `connect` en vol (liens de réplication) : lues par le
     /// noyau jusqu'au CQE.
     connects: std::collections::HashMap<Slot, Box<(libc::sockaddr_storage, libc::socklen_t)>>,
+    /// Signal d'arrêt reçu (`true` : save à l'arrêt) : traité en fin de récolte.
+    stop: Option<bool>,
 }
 
 /// Arrêt propre sur signal : la `signalfd` est lue par io_uring ; à réception,
@@ -183,9 +187,9 @@ extern "C" fn exit_now(_sig: i32) {
 
 /// Signal reçu : flux de l'AOF sur disque, save si demandée, puis sortie
 /// (second signal : sortie immédiate).
-fn shutdown(core: &mut Core, save: bool) -> ! {
-    eprintln!("[shutdown] signal reçu : arrêt (second signal : sortie immédiate)");
-    // La boucle ne lira plus la signalfd pendant la save : gestionnaire classique.
+/// La boucle ne lira plus la signalfd : un second signal sort tout de suite
+/// (gestionnaire classique).
+fn exit_on_second_signal() {
     // SAFETY: gestionnaire réduit à `_exit` ; masque initialisé.
     unsafe {
         libc::signal(libc::SIGINT, exit_now as *const () as libc::sighandler_t);
@@ -196,6 +200,10 @@ fn shutdown(core: &mut Core, save: bool) -> ! {
         libc::sigaddset(&mut mask, libc::SIGTERM);
         libc::pthread_sigmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut());
     }
+}
+
+fn shutdown(core: &mut Core, save: bool) -> ! {
+    exit_on_second_signal();
     if let Err(e) = core.flush_journal_sync() {
         eprintln!("[shutdown] échec de l'écriture de l'AOF : {e}");
         std::process::exit(1)
@@ -348,6 +356,31 @@ impl Server {
                     self.connects.insert(slot, sa);
                     sqe
                 }
+                // Suites de fichiers (DURABILITY_DESIGN.md §8.6) : toujours sur un
+                // worker io-wq (`IOSQE_ASYNC`), jamais dans notre `enter`.
+                Op::Fs { id } => {
+                    let Some(step) = self.core.fs_step(id) else { continue };
+                    let cwd = Fd(libc::AT_FDCWD);
+                    let sqe = match step {
+                        StepRef::Open { path, flags, mode } => {
+                            opcode::OpenAt::new(cwd, path.as_ptr()).flags(flags).mode(mode).build()
+                        }
+                        StepRef::Fallocate { fd, off, len } => opcode::Fallocate::new(Fd(fd), len).offset(off).build(),
+                        StepRef::Fsync { fd, data } => {
+                            let f = if data { io_uring::types::FsyncFlags::DATASYNC } else { io_uring::types::FsyncFlags::empty() };
+                            opcode::Fsync::new(Fd(fd)).flags(f).build()
+                        }
+                        StepRef::Write { fd, buf, off } => {
+                            let len = buf.len().min(u32::MAX as usize) as u32;
+                            opcode::Write::new(Fd(fd), buf.as_ptr(), len).offset(off).build()
+                        }
+                        StepRef::Ftruncate { fd, len } => opcode::Ftruncate::new(Fd(fd), len).build(),
+                        StepRef::Rename { from, to } => opcode::RenameAt::new(cwd, from.as_ptr(), cwd, to.as_ptr()).build(),
+                        StepRef::Unlink { path } => opcode::UnlinkAt::new(cwd, path.as_ptr()).build(),
+                        StepRef::Close { fd } => opcode::Close::new(Fd(fd)).build(),
+                    };
+                    sqe.flags(squeue::Flags::ASYNC).user_data(ud(K_FS, id))
+                }
             };
             self.push_sqe(&sqe)?;
         }
@@ -403,12 +436,13 @@ impl Server {
                 },
                 K_SEND => Completion::Send { slot, res },
                 K_SIGNAL => {
-                    let save = self.signals.as_ref().is_some_and(|s| s.save);
-                    shutdown(&mut self.core, save)
+                    self.stop = Some(self.signals.as_ref().is_some_and(|s| s.save));
+                    continue;
                 }
                 K_FILE => Completion::File { res, save: slot },
                 K_JWRITE => Completion::JournalWrite { res, writer: slot },
                 K_JSYNC => Completion::JournalSync { res, writer: slot },
+                K_FS => Completion::Fs { id: slot, res },
                 K_CONNECT => {
                     self.connects.remove(&slot);
                     Completion::Connect { slot, res }
@@ -427,6 +461,21 @@ impl Server {
         any
     }
 
+    /// Arrêt : les suites de fichiers en cours (rotation de l'AOF, renommage
+    /// d'un dump) vont à leur terme avant l'écriture finale du journal.
+    fn finish_fs(&mut self) -> io::Result<()> {
+        eprintln!("[shutdown] signal reçu : arrêt (second signal : sortie immédiate)");
+        exit_on_second_signal();
+        loop {
+            self.submit_ops()?;
+            if !self.core.fs_pending() {
+                return Ok(());
+            }
+            self.ring.submit_and_wait(1)?;
+            self.harvest();
+        }
+    }
+
     fn run(&mut self) -> io::Result<()> {
         if let Some(sig) = self.signals.as_mut() {
             let sqe = sig.read_sqe();
@@ -437,6 +486,10 @@ impl Server {
             self.core.tick();
             self.core.set_now(Instant::now());
             self.harvest();
+            if let Some(save) = self.stop.take() {
+                self.finish_fs()?;
+                shutdown(&mut self.core, save);
+            }
             self.core.fire_timers();
             // Par tranches : les réponses des connexions qui ont fini partent
             // entre deux tranches au lieu d'attendre la fin du tour.
@@ -864,6 +917,7 @@ fn main() -> io::Result<()> {
     let mut server = Server { ring, bufring, core, listener, ops: Vec::new(), no_iowait, send_async, file_async, min_wait,
         signals,
         connects: Default::default(),
+        stop: None,
     };
     server.run()
 }

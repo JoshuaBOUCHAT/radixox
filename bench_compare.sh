@@ -249,6 +249,8 @@ if [ "$MODE" = "running" ]; then
   SVC_READ_P999=$(parse_inline_pct /tmp/service_run.txt READ 99.9)
   SVC_READ_P9999=$(parse_inline_pct /tmp/service_run.txt READ 99.99)
   SVC_UPDATE_P99=$(parse_stat /tmp/service_run.txt "[UPDATE], 99thPercentileLatency")
+  SVC_READ_MAX=$(parse_stat /tmp/service_run.txt "[READ], MaxLatency(us)")
+  SVC_UPDATE_MAX=$(parse_stat /tmp/service_run.txt "[UPDATE], MaxLatency(us)")
   echo "  Run: $SVC_RUN_OPS ops/sec"
 
   if [ -n "$SVC_PID" ]; then
@@ -272,6 +274,8 @@ if [ "$MODE" = "running" ]; then
   printf "%-28s %12s\n" "READ P99.9 (µs)" "$SVC_READ_P999"
   printf "%-28s %12s\n" "READ P99.99 (µs)" "$SVC_READ_P9999"
   printf "%-28s %12s\n" "UPDATE P99 (µs)" "$SVC_UPDATE_P99"
+  printf "%-28s %12s\n" "READ max (µs)" "$SVC_READ_MAX"
+  printf "%-28s %12s\n" "UPDATE max (µs)" "$SVC_UPDATE_MAX"
   echo ""
   printf "%-28s %12s\n" "Peak RSS (MB)" "$SVC_PEAK_MB"
   echo ""
@@ -354,6 +358,8 @@ RADIXOX_READ_P99=$(parse_stat /tmp/radixox_run.txt "[READ], 99thPercentileLatenc
 RADIXOX_READ_P999=$(parse_inline_pct /tmp/radixox_run.txt READ 99.9)
 RADIXOX_READ_P9999=$(parse_inline_pct /tmp/radixox_run.txt READ 99.99)
 RADIXOX_UPDATE_P99=$(parse_stat /tmp/radixox_run.txt "[UPDATE], 99thPercentileLatency")
+RADIXOX_READ_MAX=$(parse_stat /tmp/radixox_run.txt "[READ], MaxLatency(us)")
+RADIXOX_UPDATE_MAX=$(parse_stat /tmp/radixox_run.txt "[UPDATE], MaxLatency(us)")
 echo "  Run: $RADIXOX_RUN_OPS ops/sec"
 
 # Read peak RSS before killing
@@ -405,6 +411,8 @@ VALKEY_READ_P99=$(parse_stat /tmp/valkey_run.txt "[READ], 99thPercentileLatency"
 VALKEY_READ_P999=$(parse_inline_pct /tmp/valkey_run.txt READ 99.9)
 VALKEY_READ_P9999=$(parse_inline_pct /tmp/valkey_run.txt READ 99.99)
 VALKEY_UPDATE_P99=$(parse_stat /tmp/valkey_run.txt "[UPDATE], 99thPercentileLatency")
+VALKEY_READ_MAX=$(parse_stat /tmp/valkey_run.txt "[READ], MaxLatency(us)")
+VALKEY_UPDATE_MAX=$(parse_stat /tmp/valkey_run.txt "[UPDATE], MaxLatency(us)")
 echo "  Run: $VALKEY_RUN_OPS ops/sec"
 
 # Read peak RSS before killing
@@ -468,6 +476,13 @@ printf "%-28s %12s %12s %10s\n" "READ P99.99 (µs)" \
 printf "%-28s %12s %12s %10s\n" "UPDATE P99 (µs)" \
   "$RADIXOX_UPDATE_P99" "$VALKEY_UPDATE_P99" \
   "$(winner "$RADIXOX_UPDATE_P99" "$VALKEY_UPDATE_P99" 0)"
+# Le p99.99 ne voit pas quelques gros gels rares (fork de Valkey, appel disque) : le max, si.
+printf "%-28s %12s %12s %10s\n" "READ max (µs)" \
+  "$RADIXOX_READ_MAX" "$VALKEY_READ_MAX" \
+  "$(winner "$RADIXOX_READ_MAX" "$VALKEY_READ_MAX" 0)"
+printf "%-28s %12s %12s %10s\n" "UPDATE max (µs)" \
+  "$RADIXOX_UPDATE_MAX" "$VALKEY_UPDATE_MAX" \
+  "$(winner "$RADIXOX_UPDATE_MAX" "$VALKEY_UPDATE_MAX" 0)"
 echo ""
 printf "%-28s %12s %12s %10s\n" "Peak RSS (MB)" \
   "${RADIXOX_PEAK_MB}" "${VALKEY_PEAK_MB}" \
