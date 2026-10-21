@@ -10,7 +10,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 >   `radixox-lib/src/save_barrier.rs` → [`SAVE_DESIGN.md`](SAVE_DESIGN.md) ;
 > - SCAN → [`SCAN_DESIGN.md`](SCAN_DESIGN.md) ; transactions → [`TX_DESIGN.md`](TX_DESIGN.md) ;
 >   ZSet → [`ANALYSE_ART_UNIFIE.md`](ANALYSE_ART_UNIFIE.md) §13 ;
-> - AOF, réplication, journal des commandes → [`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md).
+> - AOF, réplication, journal des commandes → [`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md) ;
+> - allocation, GC, compactage des slabs, `maxmemory` → [`MEMORY_ARCH.md`](MEMORY_ARCH.md).
 
 ## Projet
 

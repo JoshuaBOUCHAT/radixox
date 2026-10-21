@@ -21,6 +21,7 @@
 | [`SAVE_DESIGN.md`](SAVE_DESIGN.md) | save progressive : COW applicatif par nœud, format du dump, BGSAVE / SAVE / reload | **implémenté** (étapes 1–8) et saves automatiques ; AOF : DURABILITY_DESIGN.md |
 | [`SCAN_DESIGN.md`](SCAN_DESIGN.md) | SCAN à curseur côté serveur (table de curseurs, LRU, COUNT exact) | **implémenté** |
 | [`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md) | AOF et réplication par un seul flux : commandes journalisées par blocs de tour (avec `now`), exceptions non déterministes, point de linéarisation des commandes longues, snapshot exact, commit groupé `always` | AOF fait (étapes 1–6 : `everysec` / `no` / `always`, réécriture) ; réplication de base faite (étape 7 : poussée, backlog, synchronisation complète, promotion) ; reste l'étape 8 (zéro copie, `WAIT`) |
+| [`MEMORY_ARCH.md`](MEMORY_ARCH.md) | mémoire v2 : allocateur maison par pools (bump + compteur par page, chunks de 2 Mio), GC par évacuation, compactage HiSlab, `maxmemory` (CLOCK) | conception, rien d'implémenté |
 | [`TX_DESIGN.md`](TX_DESIGN.md) | transactions atomiques à conditions (`MULTI ATOMIC`, `DELPREFIX`, `EXEC DURABLE`) | conception, rien d'implémenté ; dépend de la boucle maison |
 | [`ANALYSE_ART_UNIFIE.md`](ANALYSE_ART_UNIFIE.md) | journal de décisions « tout dans l'ART » : TTL par champ (abandonné), valart (§11–12), design ZSet retenu (§13) | journal ; §13 = référence du futur ZSet |
 | [`protocol-spec.md`](protocol-spec.md) | spécification RESP de Redis (copie de référence) | référence externe |
@@ -179,7 +180,7 @@ complet.
 - Slabs : réservation virtuelle d'un coup (`mmap`), pas de realloc qui copie ; THP pour le
   TLB, pre-fault minimal.
 - Travaux longs : par tranches (§1.2), avec une part de CPU plafonnée sous charge.
-- Compaction des slabs et GC (prévus) : gelés pendant une save (ils déplacent des idx).
+- Compaction des slabs et GC (prévus, MEMORY_ARCH.md) : gelés pendant une save (ils déplacent des idx).
 
 ---
 
