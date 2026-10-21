@@ -1281,6 +1281,33 @@ fn aof_backlog_parks_writers_not_readers() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `everysec` : sans timer, un fsync part dès que l'écrit non fsyncé atteint
+/// le seuil ; sous le seuil, rien avant la seconde.
+#[test]
+fn everysec_syncs_early_past_the_threshold() {
+    let dir = test_dir("aof-sync-bytes");
+    for (sync_bytes, early) in [(100, true), (1 << 20, false)] {
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut f = fake_with_aof(&dir, Config { max_conn: 8, reserved: 0, aof_sync_bytes: sync_bytes, ..Config::default() });
+        let c = f.connect();
+        let start = f.core.aof().unwrap().durable;
+        for i in 0..20 {
+            f.send(c, format!("SET k{i} {i}\r\n").as_bytes());
+            f.step();
+        }
+        f.settle();
+        assert_eq!(f.take(c).matches("+OK").count(), 20);
+        let w = f.core.aof().unwrap();
+        assert!(w.written - start > 100);
+        if early {
+            assert!(w.durable > start && w.written - w.durable < 100, "{} / {}", w.durable, w.written);
+        } else {
+            assert_eq!(w.durable, start);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── Réécriture (DURABILITY_DESIGN.md §8, tests 6 et 1 depuis une base) ──────
 
 fn manifest_of(dir: &std::path::Path) -> crate::exec::aof::Manifest {

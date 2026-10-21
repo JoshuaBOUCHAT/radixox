@@ -447,20 +447,21 @@ incr journal.19.rxj
 - Arrêt (SIGINT / SIGTERM) : la `signalfd` est installée dès que l'AOF est actif ; le bloc en
   cours est fermé, tout ce qui reste est écrit et fsyncé d'une traite (`flush_sync`), puis la
   save d'arrêt si elle est demandée.
-- **Écart avec Valkey, à trancher** : ici une réponse peut partir avant que son bloc soit écrit
-  dans le cache de pages (bloc fermé en fin de tour, écriture asynchrone). Valkey écrit son AOF
-  (`write`) avant d'envoyer les réponses : un crash **du processus** (`kill -9`, panic) n'y perd
-  rien d'acquitté, seule une coupure de courant perd ≤ 1 s. Ici, un crash du processus peut perdre
-  les écritures acquittées du dernier tour (millisecondes). Le marquage du §7.5 le corrigerait
-  au prix d'une écriture par tour avant les réponses (condition `marque ≤ written` au lieu de
-  `durable`) : naturel à ajouter avec l'étape 6.
+- **Écart avec Valkey, tranché (2026-10-21) : on le garde.** Ici une réponse peut partir
+  avant que son bloc soit écrit dans le cache de pages (bloc fermé en fin de tour, écriture
+  asynchrone) ; Valkey fait son `write` avant d'envoyer les réponses, si bien qu'un crash du
+  processus n'y perd rien d'acquitté. Ici, un crash du processus peut perdre les écritures
+  acquittées du dernier tour (millisecondes). Décision : `everysec` ne promet qu'une perte
+  bornée (≈ 1 s, ou `RADIXOX_AOF_SYNC_MB` d'écritures), rien de plus ; qui veut « rien
+  d'acquitté perdu » prend `always`. Le fsync part chaque seconde **ou dès que l'écrit non
+  fsyncé atteint `RADIXOX_AOF_SYNC_MB`** (§7.4).
 
 ### 7.4 Modes de fsync (`RADIXOX_APPENDFSYNC`)
 
 | Mode | Écriture | fsync | Réponses |
 |---|---|---|---|
 | `no` | dès qu'un bloc est fermé | jamais (le noyau) | immédiates |
-| `everysec` (défaut) | idem | `fdatasync` toutes les secondes (timer), sur io-wq ; jamais deux en vol | immédiates |
+| `everysec` (défaut) | idem | `fdatasync` toutes les secondes (timer) ou dès que l'écrit non fsyncé atteint `RADIXOX_AOF_SYNC_MB` (32 Mio par défaut), sur io-wq ; jamais deux en vol | immédiates, avant même l'écriture (§7.3) |
 | `always` | idem, **write + fsync liés** (`IOSQE_IO_LINK`) | un seul en vol ; les blocs fermés pendant ce temps partent dans le suivant | retenues jusqu'au fsync qui les couvre (§7.5) |
 
 `everysec` : si le fsync précédent dure plus de 2 s, Valkey retarde les écritures ; ici le
@@ -841,6 +842,7 @@ réplica décalée de ±1 h, coupures du réseau, BGSAVE des clients ; 3000 grai
 | `RADIXOX_AUTO_AOF_REWRITE_MIN_SIZE` | `64mb` | `auto-aof-rewrite-min-size` |
 | `RADIXOX_AOF_LOAD_TRUNCATED` | `yes` | `aof-load-truncated` |
 | `RADIXOX_AOF_MAX_PENDING_MB` | `64` | (pas d'équivalent ; retard d'`everysec`) |
+| `RADIXOX_AOF_SYNC_MB` | `32` | (pas d'équivalent ; fsync anticipé d'`everysec`) |
 | `RADIXOX_REPLICATE` | vide | (`replicaof`, mais en poussée) |
 | `RADIXOX_REPLICATE_AUTH` | vide | (`masterauth`, côté source : mot de passe des cibles) |
 | `RADIXOX_REPL_BACKLOG_MB` | `64` | `repl-backlog-size` |

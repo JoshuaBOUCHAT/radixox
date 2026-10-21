@@ -546,9 +546,11 @@ Not yet: list commands, `MULTI`/`EXEC`, `CONFIG`, RESP3, Lua, cluster.
   segments preallocated by 64 MiB, a manifest); at startup the base is loaded, its content
   digest checked, and the segments replayed; a block cut by a crash at the end of the last
   segment is truncated (`RADIXOX_AOF_LOAD_TRUNCATED`), anything else inconsistent prevents
-  startup. `appendfsync everysec` (default), `no`, or `always`: replies — to writes, and to
-  reads that may have seen a write not yet on disk — are held until the `fdatasync` that
-  covers them, one `fdatasync` in flight at a time, everything that arrives meanwhile goes into
+  startup. `appendfsync everysec` (default): replies go out at once, even before the log
+  write, and an `fdatasync` runs every second or as soon as `RADIXOX_AOF_SYNC_MB` of written
+  data is not yet synced, so a crash loses at most about that much. `no`: the kernel decides.
+  `always`: replies — to writes, and to reads that may have seen a write not yet on disk —
+  are held until the `fdatasync` that covers them, one `fdatasync` in flight at a time, everything that arrives meanwhile goes into
   the next one (group commit; the loop never blocks). Writes are refused with `-MISCONF` while
   the log cannot be written, and writers wait when the disk falls behind by more than
   `RADIXOX_AOF_MAX_PENDING_MB`. `INFO` reports `aof_*` fields.
@@ -631,6 +633,7 @@ Environment variables:
 | `RADIXOX_APPENDFSYNC` | `everysec` | `everysec` (one `fdatasync` per second, off the loop), `no` (left to the kernel), or `always` (replies wait for the `fdatasync` covering them, group commit) |
 | `RADIXOX_AOF_LOAD_TRUNCATED` | `yes` | at startup, cut a block left incomplete by a crash at the end of the log instead of refusing to start |
 | `RADIXOX_AOF_MAX_PENDING_MB` | `64` | log bytes not yet written beyond which writers wait (reads go on) |
+| `RADIXOX_AOF_SYNC_MB` | `32` | `everysec`: written but unsynced log bytes that trigger an `fdatasync` before the one-second timer |
 | `RADIXOX_AUTO_AOF_REWRITE_PERCENTAGE` / `_MIN_SIZE` | `100` / `64mb` | rewrite the log when it has grown by this percentage of the base and at least this size (`0` = never) |
 | `RADIXOX_REPLICATE` | unset | replicas to push to, `host:port,host:port` (IPv6 in brackets) |
 | `RADIXOX_REPLICATE_AUTH` | unset | password sent with `AUTH` to the replicas of `RADIXOX_REPLICATE` |

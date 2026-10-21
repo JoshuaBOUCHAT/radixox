@@ -431,6 +431,8 @@ impl Fsync {
 
 /// Octets écrits par opération au plus (plusieurs blocs fermés à la suite).
 const WRITE_MAX: usize = 4 << 20;
+/// Seuil par défaut du fsync anticipé d'`everysec` (`AofWriter::sync_bytes`).
+pub const SYNC_BYTES: u64 = 32 << 20;
 
 /// Opération de fichier demandée par l'écrivain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -489,6 +491,9 @@ pub struct AofWriter {
     /// Génération : un réplica qui recharge un dump remplace son écrivain ;
     /// les opérations de l'ancien encore en vol sont reconnues par ce numéro.
     pub generation: u32,
+    /// `everysec` : écrit et pas encore fsyncé au-delà duquel un fsync part
+    /// sans attendre le timer (`RADIXOX_AOF_SYNC_MB`, §7.4).
+    pub sync_bytes: u64,
 }
 
 impl AofWriter {
@@ -517,6 +522,7 @@ impl AofWriter {
             retry_at: None,
             base_size,
             delayed_fsync: 0,
+            sync_bytes: SYNC_BYTES,
             rotation: None,
             pending_base: None,
             generation: 0,
@@ -563,7 +569,10 @@ impl AofWriter {
             self.in_flight = true;
             return Some(AofOp::Write { fd: self.fd(), off: self.file_end });
         }
-        let due = self.sync_due || self.fsync == Fsync::Always;
+        // `everysec` : chaque seconde, ou plus tôt si le non-fsyncé dépasse le
+        // seuil (perte bornée en temps et en volume, fsync de taille bornée).
+        let full = self.fsync == Fsync::EverySec && self.written.saturating_sub(self.durable) >= self.sync_bytes;
+        let due = self.sync_due || full || self.fsync == Fsync::Always;
         if due && self.syncing.is_none() && self.fsync_err.is_none() && self.durable < self.written {
             self.sync_due = false;
             self.syncing = Some(self.written);

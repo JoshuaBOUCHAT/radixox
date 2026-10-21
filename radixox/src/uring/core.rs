@@ -78,6 +78,8 @@ pub struct Config {
     /// Retard du flux sur le disque au-delà duquel les écrivains sont parqués
     /// (`RADIXOX_AOF_MAX_PENDING_MB`, DURABILITY_DESIGN.md §7.6).
     pub aof_max_pending: u64,
+    /// `everysec` : fsync anticipé au-delà de ce non-fsyncé (`RADIXOX_AOF_SYNC_MB`).
+    pub aof_sync_bytes: u64,
     /// Réécriture automatique (`auto-aof-rewrite-percentage`, `-min-size`, §8.4).
     pub aof_rewrite_percentage: u64,
     pub aof_rewrite_min_size: u64,
@@ -115,6 +117,7 @@ impl Default for Config {
             stop_writes_on_bgsave_error: true,
             journal: false,
             aof_max_pending: 64 << 20,
+            aof_sync_bytes: crate::exec::aof::SYNC_BYTES,
             aof_rewrite_percentage: 100,
             aof_rewrite_min_size: 64 << 20,
             repl_backlog: 64 << 20,
@@ -495,6 +498,7 @@ impl Core {
     fn replace_aof(&mut self, mut w: AofWriter) {
         self.aof_gen += 1;
         w.generation = self.aof_gen;
+        w.sync_bytes = self.cfg.aof_sync_bytes;
         if let Some(old) = self.aof.replace(w)
             && old.busy()
         {

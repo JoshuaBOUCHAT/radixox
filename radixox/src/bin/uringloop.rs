@@ -804,6 +804,9 @@ fn main() -> io::Result<()> {
     if let Some(mb) = std::env::var("RADIXOX_AOF_MAX_PENDING_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
         cfg.aof_max_pending = mb.max(1) << 20;
     }
+    if let Some(mb) = std::env::var("RADIXOX_AOF_SYNC_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
+        cfg.aof_sync_bytes = mb.max(1) << 20;
+    }
     // `auto-aof-rewrite-percentage` (0 = jamais) et `auto-aof-rewrite-min-size`.
     if let Some(p) = std::env::var("RADIXOX_AUTO_AOF_REWRITE_PERCENTAGE").ok().and_then(|v| v.parse::<u64>().ok()) {
         cfg.aof_rewrite_percentage = p;
