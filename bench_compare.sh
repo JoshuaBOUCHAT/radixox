@@ -1,7 +1,5 @@
 #!/bin/bash
 set -euo pipefail
-# Pas de save automatique pendant un bench (Valkey y tourne avec --save "").
-export RADIXOX_SAVE="${RADIXOX_SAVE-}"
 
 # Usage:
 #   ./bench_compare.sh                    # RadixOx vs Valkey (starts/stops both, as before)
@@ -14,6 +12,28 @@ export RADIXOX_SAVE="${RADIXOX_SAVE-}"
 #   ./bench_compare.sh --running [label]  # bench whatever server is ALREADY running on $PORT
 #                                          # (any Redis-compatible service). Does not start or
 #                                          # kill anything. label defaults to "Service".
+#   RECORDS=1000000 OPS=2000000 ./bench_compare.sh   # smaller run (defaults 5M / 10M)
+#
+# Durability (same settings for both servers; default: none, as before):
+#   AOF=everysec ./bench_compare.sh       # AOF: off | no | everysec | always | continuous
+#                                         # (continuous is RadixOx only: Valkey gets everysec)
+#   SAVE="60 10000" ./bench_compare.sh    # snapshot rules, Valkey's `save` syntax
+#                                         # (RADIXOX_SAVE / --save); "" = none
+#   AOF=everysec SAVE="3600 1 300 100 60 10000" ./bench_compare.sh   # Valkey's defaults
+#   DIR=~/aofbench/compare                # where the files go: a real disk, never tmpfs
+#   With AOF or SAVE on, one more physical core is taken from YCSB for background work,
+#   given to both: Valkey's fork children and bio threads (bgsave/aof-rewrite/bio
+#   cpulists), RadixOx's file writes and fsyncs (RADIXOX_FILE_CPUS). Auto-rewrite of the
+#   log: 100 % / 64mb on both. No save at shutdown on either (outside the measurement).
+AOF="${AOF:-off}"
+SAVE="${SAVE-}"
+case "$AOF" in
+  off | no | everysec | always | continuous) ;;
+  *) echo "AOF=$AOF : off | no | everysec | always | continuous" >&2; exit 1 ;;
+esac
+PERSIST=0
+{ [ "$AOF" != off ] || [ -n "$SAVE" ]; } && PERSIST=1
+DIR="${DIR:-$HOME/aofbench/compare}"
 MODE="compare"
 RUNNING_LABEL="Service"
 if [ "${1:-}" = "--running" ]; then
@@ -25,8 +45,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 YCSB_DIR="$(cd "$SCRIPT_DIR/../ycsb-redis-binding-0.18.0-SNAPSHOT" && pwd)"
 WORKLOAD="workloads/workloada"
 PORT=6379
-RECORDS=5000000
-OPS=10000000
+RECORDS="${RECORDS:-5000000}"
+OPS="${OPS:-10000000}"
 THREADS=100
 FIELDLENGTH=100
 
@@ -44,14 +64,15 @@ while IFS=, read -r cpu core; do
   CORE_CPUS[$core]="${CORE_CPUS[$core]:+${CORE_CPUS[$core]},}$cpu"
 done < <(lscpu -p=CPU,CORE)
 NCORES=${#CORE_IDS[@]}
-if [ "$SERVER_CORES" -lt 1 ] || [ "$SERVER_CORES" -ge "$NCORES" ]; then
-  echo "SERVER_CORES=$SERVER_CORES : entre 1 et $((NCORES - 1)) ($NCORES cœurs physiques)" >&2
+if [ "$SERVER_CORES" -lt 1 ] || [ "$((SERVER_CORES + PERSIST))" -ge "$NCORES" ]; then
+  echo "SERVER_CORES=$SERVER_CORES : entre 1 et $((NCORES - 1 - PERSIST)) ($NCORES cœurs physiques$([ $PERSIST = 1 ] && echo ", dont un pour la persistance"))" >&2
   exit 1
 fi
 join() { local IFS=,; echo "$*"; }
 # Un thread par cœur physique : le premier CPU de chaque cœur serveur ; ses frères SMT
 # ne sont donnés à personne (ni serveur, ni client).
-SERVER_SET=(); IOWQ_SET=(); CLIENT_SET=(); IDLE_SET=()
+# Avec persistance, le cœur suivant (tous ses CPU logiques) va aux tâches de fond.
+SERVER_SET=(); IOWQ_SET=(); CLIENT_SET=(); IDLE_SET=(); BG_CPUS=""
 for i in "${!CORE_IDS[@]}"; do
   cpus="${CORE_CPUS[${CORE_IDS[$i]}]}"
   first="${cpus%%,*}"
@@ -59,6 +80,8 @@ for i in "${!CORE_IDS[@]}"; do
     SERVER_SET+=("$first")
     [ "$i" -gt 0 ] && IOWQ_SET+=("$first")
     [ "$cpus" != "$first" ] && IDLE_SET+=("${cpus#*,}")
+  elif [ "$i" -eq "$SERVER_CORES" ] && [ "$PERSIST" = 1 ]; then
+    BG_CPUS="$cpus"
   else
     CLIENT_SET+=("$cpus")
   fi
@@ -124,6 +147,30 @@ kill_port() {
 peak_rss_mb() {
   local pid=$1
   awk '/VmHWM/ {printf "%.0f", $2/1024}' "/proc/$pid/status" 2>/dev/null || echo "N/A"
+}
+
+# Dossier propre pour un serveur (sous-dossier de $DIR, refusé en tmpfs avec persistance)
+fresh_dir() {
+  local d="$DIR/$1"
+  mkdir -p "$DIR"
+  if [ "$PERSIST" = 1 ] && [ "$(findmnt -n -o FSTYPE -T "$DIR" 2>/dev/null || true)" = tmpfs ]; then
+    echo "DIR=$DIR est en tmpfs (fsync gratuit, mesures fausses) : refusé" >&2
+    exit 1
+  fi
+  rm -rf "$d"
+  mkdir -p "$d"
+  echo "$d"
+}
+
+# Ce que la persistance a fait pendant le bench (champs INFO présents sur le serveur)
+persist_report() {
+  local out=$1
+  {
+    redis-cli -p "$PORT" INFO persistence
+    redis-cli -p "$PORT" INFO stats
+  } 2>/dev/null | tr -d '\r' |
+    grep -E '^(rdb_saves|rdb_last_bgsave_status|rdb_last_cow_size|aof_rewrites|aof_last_bgrewrite_status|aof_last_write_status|aof_last_cow_size|aof_current_size|aof_base_size|aof_delayed_fsync|aof_fsyncs|current_cow_peak|total_forks|latest_fork_usec):' \
+    awk '!seen[$0]++' >"$out" || true
 }
 
 run_ycsb() {
@@ -249,6 +296,14 @@ echo "  Server: $SERVER_CORES physical core(s), one thread each: CPUs $SERVER_CP
 echo "    RadixOx: event loop on $MAIN_CPU${IOWQ_CPUS:+, io-wq send workers on $IOWQ_CPUS}"
 echo "    Valkey:  io-threads=$VALKEY_IO_THREADS on $VALKEY_CPUS"
 echo "  Idle (SMT siblings of server cores): ${IDLE_CPUS:-none} | YCSB: CPUs $CLIENT_CPUS"
+VALKEY_AOF="$AOF"
+[ "$AOF" = continuous ] && VALKEY_AOF=everysec
+if [ "$PERSIST" = 1 ]; then
+  echo "  Durability: AOF=$AOF$([ "$AOF" = continuous ] && echo " (Valkey: everysec)") | SAVE=\"$SAVE\""
+  echo "    background CPUs (both): $BG_CPUS | files: $DIR ($(findmnt -n -o SOURCE,FSTYPE -T "$(dirname "$DIR")" 2>/dev/null || true))"
+else
+  echo "  Durability: none (no AOF, no snapshot)"
+fi
 echo "═══════════════════════════════════════════════════"
 echo ""
 echo "[0/4] Building RadixOx (release)..."
@@ -262,11 +317,22 @@ echo ""
 # ============================================
 echo "[1/4] Starting RadixOx on :$PORT..."
 kill_port || true
-RADIXOX_ENV=(RADIXOX_CPU_PIN="$MAIN_CPU")
+RADIXOX_DIR=$(fresh_dir radixox)
+RADIXOX_ENV=(RADIXOX_CPU_PIN="$MAIN_CPU" RADIXOX_PORT="$PORT" RADIXOX_DIR="$RADIXOX_DIR"
+  RADIXOX_SAVE="$SAVE" RADIXOX_SAVE_ON_EXIT=no)
 if [ "$IOWQ_WORKERS" -gt 0 ]; then
   RADIXOX_ENV+=(RADIXOX_SEND_ASYNC=1 RADIXOX_IOWQ_WORKERS="$IOWQ_WORKERS" RADIXOX_IOWQ_CPUS="$IOWQ_CPUS")
 fi
-taskset -c "$SERVER_CPUS" env "${RADIXOX_ENV[@]}" "$RADIXOX_BIN" &
+RADIXOX_CPUS="$SERVER_CPUS"
+if [ "$PERSIST" = 1 ]; then
+  RADIXOX_ENV+=(RADIXOX_FILE_CPUS="$BG_CPUS" RADIXOX_AUTO_AOF_REWRITE_PERCENTAGE=100
+    RADIXOX_AUTO_AOF_REWRITE_MIN_SIZE=64mb)
+  RADIXOX_CPUS="$SERVER_CPUS,$BG_CPUS"
+fi
+if [ "$AOF" != off ]; then
+  RADIXOX_ENV+=(RADIXOX_APPENDONLY=yes RADIXOX_APPENDFSYNC="$AOF")
+fi
+taskset -c "$RADIXOX_CPUS" env "${RADIXOX_ENV[@]}" "$RADIXOX_BIN" &
 RADIXOX_PID=$!
 wait_for_server
 
@@ -293,6 +359,7 @@ echo "  Run: $RADIXOX_RUN_OPS ops/sec"
 # Read peak RSS before killing
 RADIXOX_PEAK_MB=$(peak_rss_mb "$RADIXOX_PID")
 echo "  Peak RSS: ${RADIXOX_PEAK_MB} MB"
+persist_report /tmp/radixox_persist.txt
 echo ""
 
 kill_port
@@ -301,9 +368,22 @@ kill_port
 # Valkey Benchmark
 # ============================================
 echo "[3/4] Starting Valkey (io-threads=$VALKEY_IO_THREADS, CPUs $VALKEY_CPUS) on :$PORT..."
-taskset -c "$SERVER_CPUS" valkey-server \
-  --port "$PORT" --daemonize no --save "" --appendonly no --dir /tmp \
-  --io-threads "$VALKEY_IO_THREADS" --server-cpulist "$VALKEY_CPUS" &
+VALKEY_DIR=$(fresh_dir valkey)
+VALKEY_ARGS=(--port "$PORT" --daemonize no --dir "$VALKEY_DIR" --save "$SAVE"
+  --io-threads "$VALKEY_IO_THREADS" --server-cpulist "$VALKEY_CPUS"
+  --shutdown-on-sigterm nosave --shutdown-on-sigint nosave)
+VALKEY_TASKSET="$SERVER_CPUS"
+if [ "$PERSIST" = 1 ]; then
+  VALKEY_ARGS+=(--bio-cpulist "$BG_CPUS" --bgsave-cpulist "$BG_CPUS" --aof-rewrite-cpulist "$BG_CPUS"
+    --auto-aof-rewrite-percentage 100 --auto-aof-rewrite-min-size 64mb)
+  VALKEY_TASKSET="$SERVER_CPUS,$BG_CPUS"
+fi
+if [ "$AOF" = off ]; then
+  VALKEY_ARGS+=(--appendonly no)
+else
+  VALKEY_ARGS+=(--appendonly yes --appendfsync "$VALKEY_AOF")
+fi
+taskset -c "$VALKEY_TASKSET" valkey-server "${VALKEY_ARGS[@]}" &
 VALKEY_PID=$!
 wait_for_server
 
@@ -330,6 +410,7 @@ echo "  Run: $VALKEY_RUN_OPS ops/sec"
 # Read peak RSS before killing
 VALKEY_PEAK_MB=$(peak_rss_mb "$VALKEY_PID")
 echo "  Peak RSS: ${VALKEY_PEAK_MB} MB"
+persist_report /tmp/valkey_persist.txt
 echo ""
 
 kill_port
@@ -392,4 +473,14 @@ printf "%-28s %12s %12s %10s\n" "Peak RSS (MB)" \
   "${RADIXOX_PEAK_MB}" "${VALKEY_PEAK_MB}" \
   "$(winner "$RADIXOX_PEAK_MB" "$VALKEY_PEAK_MB" 0)"
 echo ""
+if [ "$PERSIST" = 1 ]; then
+  echo "Persistence during the bench (INFO):"
+  echo "  RadixOx: $(tr '\n' ' ' </tmp/radixox_persist.txt)"
+  echo "           files: $(du -sh "$DIR/radixox" 2>/dev/null | cut -f1) (log segments are preallocated)"
+  echo "  Valkey:  $(tr '\n' ' ' </tmp/valkey_persist.txt)"
+  echo "           files: $(du -sh "$DIR/valkey" 2>/dev/null | cut -f1)"
+  echo "  Peak RSS is the server process only: Valkey's fork children (BGSAVE, rewrite) are"
+  echo "  extra processes, their copy-on-write is current_cow_peak / *_last_cow_size."
+  echo ""
+fi
 echo "Full logs: /tmp/radixox_{load,run}.txt  /tmp/valkey_{load,run}.txt"
