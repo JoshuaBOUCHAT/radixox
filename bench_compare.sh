@@ -14,6 +14,7 @@ set -euo pipefail
 #                                          # kill anything. label defaults to "Service".
 #   RECORDS=1000000 OPS=2000000 ./bench_compare.sh   # smaller run (defaults 5M / 10M)
 #   RADIXOX_* variables of the calling shell reach RadixOx (e.g. RADIXOX_MIN_WAIT_US=10).
+#   WARMUP=2: run latencies leave out the first WARMUP seconds (JVM warm-up of YCSB).
 #   CPU rows: /proc/stat on each server's own CPUs during each phase (softirq included):
 #   ops/s per 100% CPU (= ops / busy CPU-seconds), CPUs busy, user/kernel/idle %.
 #
@@ -188,10 +189,12 @@ run_ycsb() {
       -p fieldlength="$FIELDLENGTH" \
       -p recordcount="$RECORDS" \
       -threads "$THREADS" \
-      -p percentiles=95,99,99.9,99.99 \
+      -p hdrhistogram.percentiles=95,99,99.9,99.99 \
       $extra_args \
       >"$outfile" 2>&1
   else
+    # Histogrammes par seconde (HDR_DIR) : les centiles se recalculent sans la chauffe.
+    rm -rf "$HDR_DIR"; mkdir -p "$HDR_DIR"
     taskset -c "$CLIENT_CPUS" "$YCSB_DIR/bin/ycsb.sh" run redis -s -P "$YCSB_DIR/$WORKLOAD" \
       -p redis.host=127.0.0.1 -p redis.port="$PORT" \
       -p fieldcount=1 -p fieldnamekey=false \
@@ -199,7 +202,8 @@ run_ycsb() {
       -p operationcount="$OPS" \
       -p recordcount="$RECORDS" \
       -threads "$THREADS" \
-      -p percentiles=95,99,99.9,99.99 \
+      -p hdrhistogram.percentiles=95,99,99.9,99.99 \
+      -p status.interval=1 -p hdrhistogram.fileoutput=true -p hdrhistogram.output.path="$HDR_DIR/" \
       $extra_args \
       >"$outfile" 2>&1
   fi
@@ -211,12 +215,19 @@ parse_stat() {
   grep -F "$metric" "$file" 2>/dev/null | awk '{print $3}' | head -1 || true
 }
 
-parse_inline_pct() {
-  local file=$1
-  local op=$2  # READ, UPDATE, INSERT
-  local pct=$3 # 99.9 or 99.99
-  grep -oP "\[$op:[^\]]*\]" "$file" 2>/dev/null | tail -1 |
-    grep -oP "${pct}=\K[0-9]+" || true
+# Centiles d'une opération sur la phase run, sans ses WARMUP premières secondes (chauffe de
+# la JVM de YCSB : JIT et connexions font ~1 000 requêtes lentes et le max de la première
+# seconde, assez pour décider du p99.99). Rend « p95 p99 p99.9 p99.99 max » en µs.
+WARMUP="${WARMUP:-2}"
+HDR_JAR=$(ls "$YCSB_DIR"/lib/HdrHistogram-*.jar 2>/dev/null | head -1)
+hdr_tail() {
+  local op=$1 # READ, UPDATE
+  java -cp "$HDR_JAR" org.HdrHistogram.HistogramLogProcessor -i "$HDR_DIR/$op.hdr" \
+    -start "$WARMUP" -outputValueUnitRatio 1 -percentilesOutputTicksPerHalf 200 2>/dev/null |
+    awk 'BEGIN { n = split("0.95 0.99 0.999 0.9999", t, " ") }
+      $2 ~ /^[01]\.[0-9]+$/ { for (j = 1; j <= n; j++) if (v[j] == "" && $2 + 0 >= t[j] - 1e-12) v[j] = $1 }
+      /#\[Max/ { gsub(/[=,]/, " "); m = $2 }
+      END { printf "%.0f %.0f %.0f %.0f %.0f\n", v[1], v[2], v[3], v[4], m }'
 }
 
 # Client considéré saturé au-delà de ce % de ses CPU logiques : les frères SMT ne
@@ -285,16 +296,13 @@ if [ "$MODE" = "running" ]; then
 
   echo "[2/2] Running $OPS operations..."
   CURRENT_LOG=/tmp/service_run.txt
+  HDR_DIR=/tmp/service_hdr
   run_ycsb run /tmp/service_run.txt
+  read -r SVC_READ_P95 SVC_READ_P99 SVC_READ_P999 SVC_READ_P9999 SVC_READ_MAX <<<"$(hdr_tail READ)"
+  read -r _ SVC_UPDATE_P99 _ _ SVC_UPDATE_MAX <<<"$(hdr_tail UPDATE)"
   SVC_RUN_OPS=$(parse_stat /tmp/service_run.txt "Throughput(ops/sec)")
   SVC_READ_AVG=$(parse_stat /tmp/service_run.txt "[READ], AverageLatency")
-  SVC_READ_P95=$(parse_stat /tmp/service_run.txt "[READ], 95thPercentileLatency")
-  SVC_READ_P99=$(parse_stat /tmp/service_run.txt "[READ], 99thPercentileLatency")
-  SVC_READ_P999=$(parse_inline_pct /tmp/service_run.txt READ 99.9)
-  SVC_READ_P9999=$(parse_inline_pct /tmp/service_run.txt READ 99.99)
-  SVC_UPDATE_P99=$(parse_stat /tmp/service_run.txt "[UPDATE], 99thPercentileLatency")
-  SVC_READ_MAX=$(parse_stat /tmp/service_run.txt "[READ], MaxLatency(us)")
-  SVC_UPDATE_MAX=$(parse_stat /tmp/service_run.txt "[UPDATE], MaxLatency(us)")
+  SVC_READ_MAX_ALL=$(parse_stat /tmp/service_run.txt "[READ], MaxLatency(us)")
   echo "  Run: $SVC_RUN_OPS ops/sec"
 
   if [ -n "$SVC_PID" ]; then
@@ -320,6 +328,7 @@ if [ "$MODE" = "running" ]; then
   printf "%-28s %12s\n" "UPDATE P99 (µs)" "$SVC_UPDATE_P99"
   printf "%-28s %12s\n" "READ max (µs)" "$SVC_READ_MAX"
   printf "%-28s %12s\n" "UPDATE max (µs)" "$SVC_UPDATE_MAX"
+  printf "%-28s %12s\n" "READ max incl. warm-up (µs)" "$SVC_READ_MAX_ALL"
   echo ""
   printf "%-28s %12s\n" "Peak RSS (MB)" "$SVC_PEAK_MB"
   echo ""
@@ -396,18 +405,15 @@ echo "  Load: $RADIXOX_LOAD_OPS ops/sec | P99: $RADIXOX_LOAD_P99 µs"
 
 echo "  Running $OPS operations..."
 CURRENT_LOG=/tmp/radixox_run.txt
+HDR_DIR=/tmp/radixox_hdr
 run_ycsb_cpu run /tmp/radixox_run.txt "$RADIXOX_CPUS" "$OPS"
 RADIXOX_CPU_RUN=$CPU_run
 RADIXOX_CLIENT_RUN=$CLIENT_run
 RADIXOX_RUN_OPS=$(parse_stat /tmp/radixox_run.txt "Throughput(ops/sec)")
 RADIXOX_READ_AVG=$(parse_stat /tmp/radixox_run.txt "[READ], AverageLatency")
-RADIXOX_READ_P95=$(parse_stat /tmp/radixox_run.txt "[READ], 95thPercentileLatency")
-RADIXOX_READ_P99=$(parse_stat /tmp/radixox_run.txt "[READ], 99thPercentileLatency")
-RADIXOX_READ_P999=$(parse_inline_pct /tmp/radixox_run.txt READ 99.9)
-RADIXOX_READ_P9999=$(parse_inline_pct /tmp/radixox_run.txt READ 99.99)
-RADIXOX_UPDATE_P99=$(parse_stat /tmp/radixox_run.txt "[UPDATE], 99thPercentileLatency")
-RADIXOX_READ_MAX=$(parse_stat /tmp/radixox_run.txt "[READ], MaxLatency(us)")
-RADIXOX_UPDATE_MAX=$(parse_stat /tmp/radixox_run.txt "[UPDATE], MaxLatency(us)")
+read -r RADIXOX_READ_P95 RADIXOX_READ_P99 RADIXOX_READ_P999 RADIXOX_READ_P9999 RADIXOX_READ_MAX <<<"$(hdr_tail READ)"
+read -r _ RADIXOX_UPDATE_P99 _ _ RADIXOX_UPDATE_MAX <<<"$(hdr_tail UPDATE)"
+RADIXOX_READ_MAX_ALL=$(parse_stat /tmp/radixox_run.txt "[READ], MaxLatency(us)")
 echo "  Run: $RADIXOX_RUN_OPS ops/sec"
 
 # Read peak RSS before killing
@@ -453,18 +459,15 @@ echo "  Load: $VALKEY_LOAD_OPS ops/sec | P99: $VALKEY_LOAD_P99 µs"
 
 echo "  Running $OPS operations..."
 CURRENT_LOG=/tmp/valkey_run.txt
+HDR_DIR=/tmp/valkey_hdr
 run_ycsb_cpu run /tmp/valkey_run.txt "$VALKEY_TASKSET" "$OPS"
 VALKEY_CPU_RUN=$CPU_run
 VALKEY_CLIENT_RUN=$CLIENT_run
 VALKEY_RUN_OPS=$(parse_stat /tmp/valkey_run.txt "Throughput(ops/sec)")
 VALKEY_READ_AVG=$(parse_stat /tmp/valkey_run.txt "[READ], AverageLatency")
-VALKEY_READ_P95=$(parse_stat /tmp/valkey_run.txt "[READ], 95thPercentileLatency")
-VALKEY_READ_P99=$(parse_stat /tmp/valkey_run.txt "[READ], 99thPercentileLatency")
-VALKEY_READ_P999=$(parse_inline_pct /tmp/valkey_run.txt READ 99.9)
-VALKEY_READ_P9999=$(parse_inline_pct /tmp/valkey_run.txt READ 99.99)
-VALKEY_UPDATE_P99=$(parse_stat /tmp/valkey_run.txt "[UPDATE], 99thPercentileLatency")
-VALKEY_READ_MAX=$(parse_stat /tmp/valkey_run.txt "[READ], MaxLatency(us)")
-VALKEY_UPDATE_MAX=$(parse_stat /tmp/valkey_run.txt "[UPDATE], MaxLatency(us)")
+read -r VALKEY_READ_P95 VALKEY_READ_P99 VALKEY_READ_P999 VALKEY_READ_P9999 VALKEY_READ_MAX <<<"$(hdr_tail READ)"
+read -r _ VALKEY_UPDATE_P99 _ _ VALKEY_UPDATE_MAX <<<"$(hdr_tail UPDATE)"
+VALKEY_READ_MAX_ALL=$(parse_stat /tmp/valkey_run.txt "[READ], MaxLatency(us)")
 echo "  Run: $VALKEY_RUN_OPS ops/sec"
 
 # Read peak RSS before killing
@@ -550,6 +553,7 @@ printf "%-28s %12s %12s %10s\n" "READ max (µs)" \
 printf "%-28s %12s %12s %10s\n" "UPDATE max (µs)" \
   "$RADIXOX_UPDATE_MAX" "$VALKEY_UPDATE_MAX" \
   "$(winner "$RADIXOX_UPDATE_MAX" "$VALKEY_UPDATE_MAX" 0)"
+printf "%-28s %12s %12s\n" "READ max incl. warm-up (µs)" "$RADIXOX_READ_MAX_ALL" "$VALKEY_READ_MAX_ALL"
 cpu_rows Run "$RADIXOX_CPU_RUN" "$VALKEY_CPU_RUN" "$RADIXOX_CLIENT_RUN" "$VALKEY_CLIENT_RUN"
 echo ""
 printf "%-28s %12s %12s %10s\n" "Peak RSS (MB)" \
@@ -566,6 +570,8 @@ if [ "$PERSIST" = 1 ]; then
   echo "  extra processes, their copy-on-write is current_cow_peak / *_last_cow_size."
   echo ""
 fi
+echo "Run latencies (p95 → max): whole run minus its first ${WARMUP} s (YCSB's JVM warm-up), from"
+echo "  per-second histograms (/tmp/{radixox,valkey}_hdr). READ avg and load P99: whole phase."
 echo "CPU: /proc/stat on each server's own CPUs (RadixOx $RADIXOX_CPUS, Valkey $VALKEY_TASKSET),"
 echo "  softirq included (kernel), YCSB start-up included (idle). Busy per CPU:"
 for x in "RadixOx load:$RADIXOX_CPU_LOAD" "RadixOx run:$RADIXOX_CPU_RUN" "Valkey load:$VALKEY_CPU_LOAD" "Valkey run:$VALKEY_CPU_RUN" \
