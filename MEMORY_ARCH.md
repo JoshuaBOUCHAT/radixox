@@ -1,6 +1,6 @@
 # Mémoire v2 — allocateur maison, GC par évacuation, compactage, maxmemory
 
-> **État : conception (2026-10-21), rien d'implémenté ; mesures de départ faites (§13.1).** Ce document rassemble les décisions
+> **État : conception terminée (2026-10-22), rien d'implémenté. La spécification de la v1, à suivre telle quelle, est en §16.** Mesures de départ : §13.1, §13.2. Ce document rassemble les décisions
 > prises en discussion le 2026-10-07 (allocation des `SharedByte`, GC) et le 2026-10-21
 > (allocateur global d'abord, puis `maxmemory`), complétées le 2026-10-22 (objets moyens §6,
 > sélection et réserve du GC §8.2–8.3, noyau §11). §15 liste ce qui reste ouvert, §14 l'ordre
@@ -192,8 +192,9 @@ pointeur hors de nos plages part chez mimalloc. On peut donc migrer un type à l
   (commande refusée, `UNLINK` d'arguments) laisse un trou dans un bloc jeune : c'est le
   cas normal du générationnel, le GC voit ces blocs se vider seuls.
 - **Objets moyens** : avec des blocs de 64 Kio et pas d'objet à cheval, un objet de 40 Kio
-  peut gaspiller jusqu'à 40 Kio en fin de bloc. Les objets au-delà d'un seuil S (quelques
-  Kio, à mesurer) ont leur propre curseur, qui garde une **fenêtre de 8 blocs ouverts**
+  peut gaspiller jusqu'à 40 Kio en fin de bloc. Avec G = 16 Kio (grands objets ci-dessous),
+  la perte est au plus de 16 Kio par bloc. Les objets dont l'emplacement (en-tête compris)
+  dépasse **M = 2 Kio** ont leur propre curseur, qui garde une **fenêtre de 8 blocs ouverts**
   (décision du 2026-10-22) :
   - le reste de chaque bloc est compté en granules de 2 o, dans un `u16` (bloc vide =
     32 768, ça tient) ;
@@ -202,7 +203,7 @@ pointeur hors de nos plages part chez mimalloc. On peut donc migrer un type à l
     (SSE4.1) donne le minimum et son index en une instruction. La recherche reste
     négligeable devant la copie de plusieurs Kio ;
   - aucun bloc ne tient → bloc neuf ; fenêtre pleine → on ferme le **plus plein**, pas le
-    plus vieux ; un bloc dont le reste tombe sous S est fermé tout de suite ;
+    plus vieux ; un bloc dont le reste tombe sous M est fermé tout de suite ;
   - exemple : deux objets de 33 Kio ne tiennent jamais ensemble ; chacun laisse ~31 Kio que
     la fenêtre offre aux objets suivants au lieu de les jeter.
 
@@ -212,9 +213,10 @@ pointeur hors de nos plages part chez mimalloc. On peut donc migrer un type à l
   perte est de quelques pourcents. Les petits objets ne passent jamais par la fenêtre :
   leur chemin reste un bump. **Aucun objet ne chevauche deux blocs, objets moyens
   compris** (décision ferme du 2026-10-22) : un bloc = un compteur, sans exception.
-- **Grands objets (> 64 Kio)** : jamais un `mmap` par objet (syscall sur le chemin chaud).
-  N blocs contigus d'une page jusqu'à 2 Mio, N pages contiguës de la plage au-delà. Jamais
-  évacués : copier 1 Mio pour compacter ne rapporte rien.
+- **Grands objets (> G = 16 Kio de données)** : **jemalloc** avec son thread de fond
+  (décision du 2026-10-22, mesures §13.2), en-tête long (§16.2). Jamais évacués par le GC :
+  jemalloc rend leur mémoire seul. Écarté pour la v1 : un pool à nous (N blocs contigus
+  d'une page jusqu'à 2 Mio, N pages au-delà), à ne reprendre que si jemalloc déçoit.
 - **Reload** : le dump est rechargé en masse ; ses valeurs vont directement dans les pages
   « survivantes » et sortent parfaitement denses. Un redémarrage défragmente.
 
@@ -430,7 +432,8 @@ Valeurs de départ, réglables, à confirmer sur mesures.
 | quoi | valeur |
 |---|---|
 | bloc / page / granule | 64 Kio / 2 Mio / 2 o |
-| fenêtre des objets moyens (§6) | 8 blocs, Best-Fit ; seuil S de départ 4 Kio (au-delà : mimalloc en v1) |
+| objets moyens (§6) | emplacement > M = 2 Kio : fenêtre de 8 blocs, Best-Fit |
+| grands objets (§6) | données > G = 16 Kio : jemalloc + `background_thread` |
 | réserve (§8.3) | `max(2 pages, vivants / 16)` |
 | A sous charge | blocs < 75 %, si f > 15 % et ≥ 8 Mio récupérables |
 | A au repos | blocs < 90 %, si f > 5 % |
@@ -712,6 +715,33 @@ suppressions aléatoires puis une passe de GC ; débit et p99.9 identiques à mi
 `scripts/bench_vs_valkey.sh` ; latence de la première requête après un creux (borne =
 une tranche).
 
+### 13.2 Grosses valeurs : mimalloc ou jemalloc (2026-10-22)
+
+Programme C (dans le scratchpad de la session, à refaire au besoin) : 512 Mo de valeurs,
+fixes de 100 Kio ou log-uniformes de 4 Kio à 2 Mio, écrites ; `free` de 50 % au hasard ;
+RSS à t+0, t+1 s, t+12 s ; `free` de 90 % du reste ; mêmes relevés ; réallocation de tout.
+Chaque cas sous `systemd-run --scope -p MemoryMax=1G`. mimalloc compilé depuis les sources
+de `libmimalloc-sys` 0.1.47 (v2 = celle du dépôt, et v3), jemalloc 5.3 du système.
+
+RSS en Mo (100 Kio fixes / 4 Kio–2 Mio) :
+
+| allocateur | plein | −50 %, t+12 s (vivants 256) | −90 % du reste, t+12 s (vivants ~25) | rechargé |
+|---|---|---|---|---|
+| mimalloc v2 (dépôt) | 559 / 561 | 559 / 561 | 280 / 290 | 539 / 549 |
+| mimalloc v3 | 581 / 553 | 582 / 553 | 582 / 373 | 584 / 589 |
+| jemalloc, réglages par défaut | 555 / 535 | 555 / 535 | 524 / 530 | 607 / 537 |
+| **jemalloc, `background_thread:true`** | 585 / 544 | **288 / 276** | **44 / 47** | 549 / 537 |
+| glibc | 516 / 516 | 516 / 285 | 516 / 88 | 516 / 514 |
+
+- mimalloc ne rend rien après −50 % et garde 11 × les vivants après −90 %.
+- jemalloc sans thread de fond ne rend rien non plus : son *decay* n'avance que sur des
+  appels d'allocation. Avec `background_thread`, il revient à vivants + ~20 Mo en ~10 s
+  (`dirty_decay_ms` par défaut 10 000). C'est le réglage de Redis (`jemalloc-bg-thread yes`).
+- glibc rend bien les objets servis par `mmap` (au-delà de son seuil dynamique) et rien
+  des autres : écarté.
+
+**Décision** : objets de plus de G = 16 Kio de données → jemalloc avec `background_thread`.
+
 ---
 
 ## 14. Ordre de travail
@@ -742,7 +772,7 @@ Dans la v1 :
   bien prédite et une lecture de `u16` alignée. Granule et alignement de 2 o ; plus aucune
   écriture de `u32` aligné (le code actuel en fait une) ;
 - **écrasement sur place** (§6) et **un seul compteur** en granules (§4) ;
-- **objets > S** : mimalloc, compté ; `free` aiguille par plage d'adresse ;
+- **objets > G = 16 Kio** : jemalloc, compté ; `free` aiguille par le bit « externe » de l'en-tête (§16.2) ;
 - **GC niveau A** sur le parcours linéaire des slots occupés de la HiSlab (§8.1), puis la
   slab valart. Le parcours ignore la logique métier mais connaît le **layout** : par slot,
   le tag dit quels mots sont des `SharedByte` (valeur du nœud, feuilles inline, champs et
@@ -760,10 +790,8 @@ Dans la v1 :
 - **simple** : faute de page synchrone dans la boucle acceptée mais comptée dans `INFO`,
   liste des blocs libres LIFO, pas de niveau B, pas de `maxmemory`.
 
-Ouvert : pour les grosses valeurs avec RSS dynamique, rester sur mimalloc ou passer à
-jemalloc (*decay* réglable, extents au plus bas d'adresse, ce que Redis utilise) ? À
-trancher par une mesure : 10 k valeurs de 100 Kio, `DEL` de 50 % au hasard, RSS après
-quelques secondes, puis rechargement.
+Grosses valeurs : **jemalloc + `background_thread`**, tranché par la mesure de §13.2.
+**La spécification complète de la v1, sans décision restante, est en §16.**
 
 ---
 
@@ -779,9 +807,9 @@ quelques secondes, puis rechargement.
   parcours du GC sur les tests différentiels le détecte.
 - Allocation dans la page la plus occupée (aide le niveau B, §8.2) contre la plus récente
   (lignes chaudes, M5) : à mesurer.
-- Grosses valeurs (> S) : mimalloc ou jemalloc (§14.1) : à mesurer.
-- Seuil S des objets moyens (§6 ; la fenêtre de 8 blocs est décidée) et taille de bloc du
-  pool court (§5).
+- ~~Grosses valeurs : mimalloc ou jemalloc~~ : jemalloc, mesuré (§13.2).
+- Seuils M = 2 Kio et G = 16 Kio (§6) : décidés, à recaler si la répartition des tailles
+  mesurée le demande. Taille de bloc du pool court (§5) : ouvert (hors v1).
 - `IORING_OP_MADVISE` avec `MADV_POPULATE_WRITE` (§3).
 - Coût du bit CLOCK sur un bench de GET (§10.2), avec et sans préchargement.
 - Taille des tranches ; valeurs de départ du déclenchement et des seuils de densité (§8.2)
@@ -822,3 +850,286 @@ Ajouts du 2026-10-22 (pas encore tranchés) :
 - **Le GC a besoin de repos sur la boucle** : il tourne par le même chemin que la save
   (tranches au repos + plancher). Les gains de RUNTIME_ARCH.md §17.6 (envois et recv
   délégués, attente groupée) sont ce qui lui donne ce repos sous charge.
+
+---
+
+## 16. Spécification d'implémentation de la v1 (2026-10-22)
+
+Cette section suffit pour implémenter la v1 sans décision restante. Elle reprend les choix
+des sections précédentes et fixe chaque valeur, nom et emplacement. En cas de conflit avec
+une section plus haute, **§16 fait foi pour la v1**. Vocabulaire : en tête du document.
+
+### 16.1 Périmètre
+
+Dans la v1 : en-tête compact, pool `SharedByte` (bump, compteurs, pages, rendu au système),
+grands objets dans jemalloc, écrasement sur place, GC niveau A (y compris pendant les
+saves), énumérateurs oxidart / valart / List, mode débogage, `INFO`, réglages.
+
+Hors v1 : GC niveau B (on rend seulement les pages devenues vides d'elles-mêmes), objets
+de structure (`CompactPath`, pages des nœuds, blocs `HashSmall` / `SetSmall`, débordements
+valart : ils restent dans mimalloc), pool court, buffers de connexion, compactage HiSlab,
+`maxmemory`, générations (M5 : la v1 prend les blocs libres en LIFO), thread auxiliaire
+de préparation des pages, hugetlbfs.
+
+### 16.2 En-tête de `SharedByte`
+
+`SharedByte` garde un seul champ `ptr: NonNull<u8>`, qui pointe désormais **sur les
+données**. L'en-tête est lu à reculons, en `u16` alignés (l'adresse des données est
+toujours paire) :
+
+```text
+forme courte (pool)        : [len_lo u16][rc u16][données…]          en-tête 4 o
+forme longue (externe)     : [len_hi u16][len_lo u16][rc u16][données…]   en-tête 6 o
+rc     = *(ptr − 2)
+len_lo = *(ptr − 4) ; bit 15 = EXTERNE
+len    = EXTERNE ? (len_hi << 15) | (len_lo & 0x7FFF) : len_lo     (len_hi = *(ptr − 6))
+```
+
+- **EXTERNE = 0** : objet du pool, `len ≤ G = 16 384`. Emplacement = 4 + len arrondi au
+  granule supérieur (2 o) ; ses granules = `(4 + len + 1) / 2`.
+- **EXTERNE = 1** : objet alloué par jemalloc, base = `ptr − 6`. Longueur max
+  2³¹ − 1 (`assert!`). Toute valeur de plus de G octets est externe.
+- **Externe forcé** : `SharedByte::from_slice_external(data)` donne toujours la forme
+  longue, quelle que soit la taille. Sert aux `SharedByte` qui vivent longtemps hors de
+  l'arbre (§16.9).
+- `rc` : `u16` saturant, inchangé (à `u16::MAX`, immortel).
+- `free` (dernier `drop`) lit EXTERNE : 1 → `jemalloc::free(ptr − 6)` ; 0 → pool (§16.4).
+  Pas de test de plage d'adresse sur ce chemin.
+- `to_uppercase` (seul autre constructeur interne) passe par les mêmes fonctions.
+- Repli de la plage épuisée (§16.3) : l'objet est alloué externe, même s'il est petit.
+
+Tests unitaires (`radixox-lib`) : longueurs 0, 1, 2, 16 383, 16 384, 16 385, 1 Mio ;
+forme forcée externe ; `rc` saturé ; `to_uppercase` partagé et non partagé.
+
+### 16.3 Plage, blocs, pages
+
+Nouveau module `radixox-lib/src/pool.rs`, état dans un `static mut` (le serveur est
+mono-thread ; les tests le sont déjà, `RUST_TEST_THREADS=1`), initialisé à la première
+allocation.
+
+- **Plage** : `mmap(PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE)` de
+  `RADIXOX_POOL_VIRT_GB` Gio (défaut **256**) + 2 Mio, base alignée sur 2 Mio,
+  `madvise(MADV_HUGEPAGE)` sur toute la plage. Si `mmap` échoue : pool désactivé, tout
+  externe, message au démarrage.
+- **Compteurs** : `live: *mut u16`, un par bloc (granules vivants), dans un second `mmap`
+  `MAP_NORESERVE` de `nb_blocs × 2` o (8 Mio de virtuel pour 256 Gio).
+- **Bitmaps** (1 bit par bloc, même technique) : `marked` (GC), `open` (bloc courant d'un
+  curseur : le compteur à 0 ne le libère pas).
+- **Page** (2 Mio, 32 blocs) : `struct PageState { free_mask: u32, state: u8 }`,
+  `state ∈ {Unused, Active, Empty, Released}`, dans un `Vec` indexé par numéro de page,
+  agrandi au fil des pages mises en service.
+  - `Unused` : jamais touchée (au-delà de `next_page`).
+  - `Active` : au moins un bloc occupé ou ouvert.
+  - `Empty` : 32 blocs libres, mémoire encore tenue ; entrée dans `empty_pages`.
+  - `Released` : rendue par `MADV_DONTNEED` ; réutilisable comme une page neuve.
+- **Listes** :
+  - `pages_with_free: Vec<u32>` (pile LIFO) : pages `Active` dont `free_mask != 0`.
+    Suppression paresseuse : au dépilement, ignorer une page dont le masque est vide ou
+    l'état n'est plus `Active`.
+  - `empty_pages: VecDeque<(u32, Instant)>` : pages `Empty` et l'instant où elles le sont
+    devenues (les plus anciennes devant).
+  - `released_pages: Vec<u32>` : pages `Released`.
+- **Prendre un bloc** (`take_block`) : dans l'ordre, (1) dépiler `pages_with_free`, bit le
+  plus bas du masque ; (2) une page de `empty_pages` (la plus récente, en queue) ; (3) une
+  page de `released_pages` ; (4) `next_page += 1` (si la plage est pleine : repli externe,
+  compteur `mem_pool_range_full`). Les cas 3 et 4 font une faute de page synchrone dans
+  la boucle (v1), comptée dans `mem_pool_sync_faults`. Le bloc pris est marqué `open`.
+- **Libérer un bloc** (compteur tombé à 0 et bloc non `open`, ou bloc fermé avec un
+  compteur à 0) : bit mis dans `free_mask` ; si le masque était vide, la page est empilée
+  dans `pages_with_free` ; si le masque devient plein (`u32::MAX`), la page passe `Empty`
+  et entre dans `empty_pages`. Démarquer le bloc s'il était marqué.
+- **Rendre des pages** (`release_step`, appelé seulement depuis `idle_step`, jamais sous
+  charge) : tant que `empty_pages.len() × 2 Mio > réserve` (§16.6) et que la plus ancienne
+  est vide depuis plus de `RADIXOX_MEMORY_DECAY` secondes (défaut **10**) :
+  `madvise(base_page, 2 Mio, MADV_DONTNEED)` (appel direct en v1), état `Released`.
+
+### 16.4 Allocation et libération dans le pool
+
+Trois curseurs bump : `main` (emplacements ≤ M = 2 Kio), `medium` (fenêtre, > M), `survivor`
+(destination du GC, toutes tailles ≤ G). Un curseur = bloc courant + `top` + `end`.
+
+- **`alloc_main(size)`** : si `top + size ≤ end` : `top += size`, `live[bloc] += size / 2`.
+  Sinon fermer le bloc (bit `open` à 0 ; s'il a `live == 0`, le libérer), `take_block`,
+  recommencer. Pas d'objet à cheval sur deux blocs, jamais.
+- **`alloc_medium(size)`** : fenêtre de 8 blocs ouverts, reste de chacun en granules
+  (`[u16; 8]`, 0 = case vide). Best-Fit : parmi les cases dont le reste ≥ taille, celle
+  au plus petit reste (boucle scalaire). Aucune : prendre un bloc ; si la fenêtre est
+  pleine, fermer la case au plus petit reste. Une case dont le reste tombe sous M est
+  fermée tout de suite. Chaque case a son propre `top` (bump dans son bloc).
+- **`alloc_survivor(size)`** : comme `main`, sur son propre bloc courant (≤ M) ; au-delà de
+  M, une seconde fenêtre de 8 blocs réservée aux survivants (même code que `medium`).
+- **`free_pool(ptr)`** : `bloc = (ptr − 4 − base) >> 16`, `g = granules(len)`. Si l'objet
+  est le dernier du bloc courant de son curseur (`ptr − 4 + 2g == top`), `top -= 2g`.
+  Puis `live[bloc] -= g` ; à 0 et bloc non `open` → libérer le bloc (§16.3).
+- **Comptes globaux** : `live_bytes` (somme des emplacements vivants), `held_blocks`
+  (blocs de pages `Active` non libres). Servent au déclenchement (§16.6) et à `INFO`.
+
+### 16.5 Écrasement sur place
+
+`SharedByte::overwrite_from(&mut self, src: &[u8]) -> bool` : vrai et fait si `rc == 1`,
+EXTERNE == 0, `src.len() ≤ G` et `granules(src.len()) ≤ granules(self.len())` ; alors copie
+des données, nouveau `len_lo`, `live[bloc] -= granules(ancien) − granules(nouveau)`,
+`live_bytes` ajusté. Sinon faux et rien ne change.
+
+Branché dans `OxidArt::set_raw` (`oxidart/src/lib.rs`), aux deux endroits qui remplacent
+une valeur existante : la branche *self-val* (`take_self` + `put_self`) et la branche
+`Step::SameLeaf` (`update_leaf`). **Toujours après `node_mut(idx)`** : la barrière de save
+a alors déjà capturé le nœud s'il était intact, et sa capture tient un clone, donc
+`rc == 2` et l'écrasement est refusé tout seul. Si la nouvelle valeur est `Tag::Bytes` et
+l'ancienne aussi, tenter `overwrite_from` ; en cas de succès, mettre à jour le TTL comme
+aujourd'hui et laisser tomber la `SharedByte` de l'argument (dernier objet du bloc
+courant : `top` recule, §16.4).
+
+### 16.6 GC niveau A
+
+**Énumérateurs** (le parcours ne connaît que le layout, §8.1) :
+
+- `hislab` : ajouter `slot_span(&self) -> u32` (= `lvl1.len() << 9`) et
+  `next_occupied(&self, from: u32) -> Option<u32>` sur `HiSlab` et `TaggedHiSlab`
+  (nouvelle version du crate `hislab`, à publier avant radixox).
+- `OxidArt::gc_visit(&mut self, from: u32, budget: u32, f: &mut impl FnMut(&mut SharedByte)) -> Option<u32>`
+  : visite les slots occupés de `map` à partir de `from`, au plus `budget` slots, rend le
+  slot suivant (ou `None` à la fin). Par nœud : la valeur propre si `tag == Bytes` ; chaque
+  feuille `Bytes` (`node.iter()` puis `leaf_val_mut(radix)`) ; les entrées des blocs
+  `HashSmall` / `SetSmall` (`small.rs`, `n` entrées de `W` `SharedByte`). Accès au nœud par
+  `map.get_unchecked_mut`, **pas par `node_mut`** : réécrire un pointeur vers les mêmes
+  octets n'est pas une mutation et ne doit pas passer par la barrière (§8.5). C'est la
+  seule exception au point de passage ; un commentaire le dit à cet endroit.
+- `ValTrees::gc_visit(...)` (même signature) : slots occupés de `nodes` ; par nœud
+  (`HashNode` / `SetNode`) les clés et valeurs inline puis celles du bloc de débordement ;
+  puis, une fois les slots finis, les `CollisionBuckets` (Hash puis Set).
+- Listes : `gc_visit_lists(...)` sur `LIST_SLAB` (`VecDeque::iter_mut`).
+- ZSet : **non visité** (chaque membre est dans `sorted` et dans `scores`, `rc == 2`). Ses
+  membres sont alloués externes (§16.9) et n'épinglent donc aucun bloc.
+
+**La fonction appliquée à chaque `SharedByte`** (`pool::gc_relocate(&mut SharedByte)`) :
+
+1. EXTERNE → rien. Adresse hors plage → rien.
+2. `marked` faux pour son bloc → rien.
+3. `rc != 1` → épinglé : `gc_pinned += 1`, rien.
+4. Sinon : `new = alloc_survivor(emplacement)`, copie de l'en-tête et des données,
+   `let old = mem::replace(sb, new); drop(old);` (le `drop` fait tomber rc à 0 et libère
+   l'ancien emplacement par le chemin normal). `gc_evacuated_objects/bytes += …`.
+
+**Réserve** : `R = max(2 pages, live_bytes / RADIXOX_GC_RESERVE_DIV)`, diviseur par défaut
+**16**.
+
+**Déclenchement** (évalué au plus toutes les 100 ms, depuis `run_jobs` et `idle_step`,
+seulement s'il n'y a pas de passe en cours) :
+
+- `held = held_blocks × 64 Kio` ; `f = 1 − live_bytes / held` ; `récupérable = held − live_bytes`.
+- `au_repos` = `idle_step` a été appelé dans les 10 dernières ms.
+- **au repos** : passe si `f > 5 %` ; seuil de densité **90 %**.
+- **sous charge** : passe si `f > 15 %` **et** `récupérable ≥ 8 Mio` **et** blocs libres
+  disponibles (blocs libres des pages `Active` + pages `Empty`) < R ; seuil **75 %**.
+- Une passe qui a rendu moins de 2 Mio de blocs suspend le déclenchement pendant 10 s.
+
+**Marquage** (début de passe, figé ensuite) : blocs non `open`, `live > 0`, densité
+`live × 2 / 65 536` sous le seuil ; tri par densité croissante ; on marque tant que la
+somme de leurs octets vivants ≤ R. Liste `marked_list: Vec<(u32 /*bloc*/, u8 /*passes*/)>`.
+
+**Passe** : curseur `(phase, slot)` avec `phase ∈ {Oxidart, Valart, Lists}`. Valart est
+**sauté si une save est en cours** au moment d'y entrer (`OxidArt::is_saving()`), et la
+passe se termine alors après les listes. Fin de passe : pour chaque bloc encore marqué
+(`live > 0`), `passes += 1` ; à 2, démarqué (`gc_unmarked_blocks += 1`) ; les autres restent
+marqués pour la passe suivante, qui démarre aussitôt si le déclenchement le permet.
+
+**Cadence** :
+
+- `idle_step` : une tranche de **512 slots** par appel (la boucle `idle_work` enchaîne les
+  appels tant que personne n'attend), ordre : jobs de connexion, libérations, save, **GC**,
+  puis `release_step`.
+- `run_jobs` (sous charge, une fois par tour) : `budget = max(64, alloc_tour × N / R)`
+  slots, avec `alloc_tour` = octets alloués dans le pool depuis le tour précédent et `N` =
+  somme des `slot_span` d'oxidart, valart et des listes.
+- Une page neuve prise faute de bloc libre pendant une passe : permis, compté dans
+  `gc_fresh_pages`.
+
+**Pendant une save** (§8.5) : la passe continue sur oxidart et les listes ; aucune
+capture (accès sans barrière) ; valart sauté ; compactage HiSlab inexistant en v1.
+
+### 16.7 jemalloc
+
+- Dépendance `tikv-jemalloc-sys` dans `radixox-lib`, **sans** la fonctionnalité
+  `unprefixed_malloc_on_supported_platforms` : les symboles restent préfixés, jemalloc ne
+  remplace pas le `malloc` du processus et ne sert qu'aux objets externes.
+- Configuration par le symbole `malloc_conf` préfixé (vérifier le nom exact,
+  `_rjem_malloc_conf`, dans la documentation de la version retenue) :
+  `"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0"`. Au démarrage, relire
+  `opt.background_thread` par `mallctl` et le signaler dans `INFO` (`mem_external_bg_thread`).
+  Le thread de fond de jemalloc ne touche à aucune donnée de RadixOx.
+- Comptes tenus par RadixOx : `mem_external_bytes` (somme des `6 + len` vivants),
+  `mem_external_objects`.
+
+### 16.8 Interrupteurs, réglages, `INFO`, journal
+
+- `--cfg radixox_sysalloc` (existant, ASan) et nouveau `--cfg radixox_nopool` : pas de pool
+  ni de jemalloc, tous les `SharedByte` en forme longue alloués par `raw_alloc` (mimalloc,
+  ou malloc sous `radixox_sysalloc`). Le GC devient un no-op (aucune adresse dans la plage).
+- `--cfg radixox_gc_debug` : blocs libérés remplis de `0xDB` ; vérificateur appelable
+  (`pool::verify(&OxidArt)`) qui recompte les granules de chaque bloc à partir des
+  énumérateurs et les compare à `live` ; une passe de GC complète forcée après chaque
+  commande dans les tests différentiels.
+
+| variable | défaut | effet |
+|---|---|---|
+| `RADIXOX_GC` | `1` | `0` : pas de GC (pool et rendu des pages actifs) |
+| `RADIXOX_GC_RESERVE_DIV` | `16` | réserve = `max(2 pages, vivants / div)` |
+| `RADIXOX_MEMORY_DECAY` | `10` | secondes avant de rendre une page vide au-delà de la réserve |
+| `RADIXOX_POOL_VIRT_GB` | `256` | plage virtuelle du pool |
+| `RADIXOX_GC_LOG` | `0` | `1` : une ligne sur stderr par passe (début, blocs marqués, fin : évacués, épinglés, démarqués, durée) et par page rendue |
+
+À ajouter au tableau *Configuration* du README.
+
+`INFO`, nouvelle section `# Memory` (ou ajout à la section existante) :
+`mem_pool_live_bytes`, `mem_pool_held_bytes`, `mem_pool_fragmentation` (f, 2 décimales),
+`mem_pool_pages_active`, `mem_pool_pages_empty`, `mem_pool_pages_released`,
+`mem_pool_sync_faults`, `mem_pool_range_full`, `mem_external_bytes`,
+`mem_external_objects`, `mem_external_bg_thread`, `gc_enabled`, `gc_running`,
+`gc_passes`, `gc_evacuated_objects`, `gc_evacuated_bytes`, `gc_pinned`,
+`gc_unmarked_blocks`, `gc_fresh_pages`, `gc_last_pass_ms`, `gc_reserve_bytes`.
+
+### 16.9 `SharedByte` vivant hors de l'arbre
+
+Ils épingleraient leur bloc pour toujours (le GC ne les voit pas) : ils sont **convertis en
+externe** à l'endroit où ils sont gardés (`SharedByte::into_external(self) -> SharedByte`,
+copie si l'objet est du pool, sinon rien) :
+
+- membres de ZSet : à l'insertion dans `ZSetInner` (`oxidart/src/zset_inner.rs`, `insert`) ;
+- Pub/Sub : clés de `subs` (`radixox/src/uring/core.rs`) et `channels` des connexions
+  (`radixox/src/uring/conn.rs`) ;
+- nom de client (`radixox/src/exec/client.rs`, `name`).
+
+Les temporaires (arguments de commande, trames de réponse, journal, réplication, motif
+d'un job KEYS) restent dans le pool : ils meurent vite, leur bloc se vide seul.
+
+**Audit d'unicité (prérequis, §15)** : avant d'activer le GC par défaut, le test
+différentiel en mode `radixox_gc_debug` vérifie après chaque commande que chaque
+`SharedByte` visité par les énumérateurs a `rc == 1`. Tout cas `rc > 1` hors ZSet est un
+partage à remplacer par une copie profonde.
+
+### 16.10 Ordre d'implémentation
+
+Chaque étape : tests verts, commit, push (règle du dépôt) ; mesure courte quand indiquée.
+
+1. **En-tête** (§16.2) + jemalloc pour > G + `from_slice_external` / `into_external` et
+   leurs branchements (§16.9) ; le reste encore dans mimalloc. Mesure : débit et RSS sur
+   `scripts/bench_vs_valkey.sh` (pas de régression).
+2. **Pool** (§16.3, §16.4) sans GC, derrière `--cfg radixox_pool` (désactivé par défaut à
+   cette étape). Tests unitaires du pool : rembobinage du `top`, réutilisation d'un bloc à
+   0, page vide puis rendue, plage pleine → externe, fenêtre Best-Fit.
+3. **Écrasement sur place** (§16.5). Test : SET répétés de même taille → `live_bytes`
+   stable, aucune allocation ; SET pendant une save → valeur sauvegardée = ancienne.
+4. **`hislab`** : `slot_span`, `next_occupied` ; publication.
+5. **Énumérateurs** (§16.6) et `pool::verify` ; test différentiel en `radixox_gc_debug`
+   avec l'audit d'unicité.
+6. **GC niveau A** : marquage, passe, cadence, save, journal, `INFO`. Tests : passe forcée
+   entre chaque commande (différentiel), passe pendant une save (dump identique à celui
+   d'une save sans GC), objet épinglé tout le long d'une passe puis relâché, valeur ratée
+   (recompression derrière le curseur) rattrapée à la passe suivante.
+7. **Pool + GC activés par défaut** (`radixox_pool` retiré, `radixox_nopool` devient
+   l'interrupteur) une fois les critères de §8.7 tenus : RSS après −90 % puis GC
+   ≤ vivants × 1,15 + R ; écrasements au hasard 30 s : RSS stable à ±15 % ; débit et
+   p99.9 identiques à mimalloc ; première requête après un creux ≤ une tranche.
+8. Mettre à jour `ARCHITECTURE.md`, le README (configuration, `INFO`) et l'état en tête de
+   ce document.
