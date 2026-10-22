@@ -263,7 +263,8 @@ cpu_report() {
     NR == FNR { u[$1] = $2; k[$1] = $3; i[$1] = $4; next }
     { du = $2 - u[$1]; dk = $3 - k[$1]; di = $4 - i[$1]
       U += du; K += dk; I += di
-      per = per sprintf("%s%s:%.0f%%", (per == "" ? "" : " "), $1, (du + dk) * 100 / (du + dk + di)) }
+      t = du + dk + di
+      per = per sprintf("%s%s:%.0f%%(u%.0f/k%.0f)", (per == "" ? "" : " "), $1, (du + dk) * 100 / t, du * 100 / t, dk * 100 / t) }
     END { T = U + K + I; busy = (U + K) / hz
       printf "%.0f %.0f %.0f %.2f %.0f %s\n", U * 100 / T, K * 100 / T, I * 100 / T,
         (U + K) / T * NR / 2, (busy > 0 ? ops / busy : 0), per }' "$1" "$2"
@@ -618,7 +619,8 @@ fi
 echo "Run latencies (p95 → max): whole run minus its first ${WARMUP} s (YCSB's JVM warm-up), from"
 echo "  per-second histograms (/tmp/{radixox,valkey}_hdr). READ avg and load P99: whole phase."
 echo "CPU: /proc/stat on each server's own CPUs (RadixOx $RADIXOX_CPUS, Valkey $VALKEY_TASKSET),"
-echo "  softirq included (kernel), YCSB start-up included (idle). Busy per CPU:"
+echo "  softirq included (kernel), YCSB start-up included (idle). Busy per CPU, (u)ser/(k)ernel %;"
+echo "  RadixOx: first CPU = event loop, the others = io-wq send workers:"
 for x in "RadixOx load:$RADIXOX_CPU_LOAD" "RadixOx run:$RADIXOX_CPU_RUN" "Valkey load:$VALKEY_CPU_LOAD" "Valkey run:$VALKEY_CPU_RUN" \
   "YCSB (RadixOx) run:$RADIXOX_CLIENT_RUN" "YCSB (Valkey) run:$VALKEY_CLIENT_RUN"; do
   read -r -a f <<<"${x#*:}"
