@@ -219,6 +219,10 @@ parse_inline_pct() {
     grep -oP "${pct}=\K[0-9]+" || true
 }
 
+# Client considéré saturé au-delà de ce % de ses CPU logiques : les frères SMT ne
+# doublent pas la capacité, ~60-65 % des CPU logiques occupent déjà les cœurs physiques.
+CLIENT_SATURATED="${CLIENT_SATURATED:-60}"
+
 # ── CPU des cœurs serveur pendant une phase (/proc/stat, par CPU) ──────────
 # Par CPU et non par processus : le softirq réseau qui tourne sur un cœur serveur
 # n'est compté dans aucun processus, mais il occupe bien ce cœur.
@@ -243,15 +247,17 @@ cpu_report() {
         (U + K) / T * NR / 2, (busy > 0 ? ops / busy : 0), per }' "$1" "$2"
 }
 
-# Exécute une phase YCSB en relevant le CPU des cœurs serveur ; résultat dans CPU_<phase>.
+# Exécute une phase YCSB en relevant le CPU des cœurs serveur (CPU_<phase>) et des
+# cœurs du client (CLIENT_<phase>) : un client saturé plafonne le débit des deux serveurs.
 run_ycsb_cpu() {
-  local phase=$1 outfile=$2 cpus=$3 nops=$4 before after
-  before=$(mktemp); after=$(mktemp)
-  cpu_snap "$cpus" >"$before"
+  local phase=$1 outfile=$2 cpus=$3 nops=$4 t
+  t=$(mktemp -d)
+  cpu_snap "$cpus" >"$t/s0"; cpu_snap "$CLIENT_CPUS" >"$t/c0"
   run_ycsb "$phase" "$outfile"
-  cpu_snap "$cpus" >"$after"
-  printf -v "CPU_$phase" '%s' "$(cpu_report "$before" "$after" "$nops")"
-  rm -f "$before" "$after"
+  cpu_snap "$cpus" >"$t/s1"; cpu_snap "$CLIENT_CPUS" >"$t/c1"
+  printf -v "CPU_$phase" '%s' "$(cpu_report "$t/s0" "$t/s1" "$nops")"
+  printf -v "CLIENT_$phase" '%s' "$(cpu_report "$t/c0" "$t/c1" "$nops")"
+  rm -rf "$t"
 }
 
 # ============================================
@@ -383,6 +389,7 @@ echo "  Loading $RECORDS records..."
 CURRENT_LOG=/tmp/radixox_load.txt
 run_ycsb_cpu load /tmp/radixox_load.txt "$RADIXOX_CPUS" "$RECORDS"
 RADIXOX_CPU_LOAD=$CPU_load
+RADIXOX_CLIENT_LOAD=$CLIENT_load
 RADIXOX_LOAD_OPS=$(parse_stat /tmp/radixox_load.txt "Throughput(ops/sec)")
 RADIXOX_LOAD_P99=$(parse_stat /tmp/radixox_load.txt "[INSERT], 99thPercentileLatency")
 echo "  Load: $RADIXOX_LOAD_OPS ops/sec | P99: $RADIXOX_LOAD_P99 µs"
@@ -391,6 +398,7 @@ echo "  Running $OPS operations..."
 CURRENT_LOG=/tmp/radixox_run.txt
 run_ycsb_cpu run /tmp/radixox_run.txt "$RADIXOX_CPUS" "$OPS"
 RADIXOX_CPU_RUN=$CPU_run
+RADIXOX_CLIENT_RUN=$CLIENT_run
 RADIXOX_RUN_OPS=$(parse_stat /tmp/radixox_run.txt "Throughput(ops/sec)")
 RADIXOX_READ_AVG=$(parse_stat /tmp/radixox_run.txt "[READ], AverageLatency")
 RADIXOX_READ_P95=$(parse_stat /tmp/radixox_run.txt "[READ], 95thPercentileLatency")
@@ -438,6 +446,7 @@ echo "  Loading $RECORDS records..."
 CURRENT_LOG=/tmp/valkey_load.txt
 run_ycsb_cpu load /tmp/valkey_load.txt "$VALKEY_TASKSET" "$RECORDS"
 VALKEY_CPU_LOAD=$CPU_load
+VALKEY_CLIENT_LOAD=$CLIENT_load
 VALKEY_LOAD_OPS=$(parse_stat /tmp/valkey_load.txt "Throughput(ops/sec)")
 VALKEY_LOAD_P99=$(parse_stat /tmp/valkey_load.txt "[INSERT], 99thPercentileLatency")
 echo "  Load: $VALKEY_LOAD_OPS ops/sec | P99: $VALKEY_LOAD_P99 µs"
@@ -446,6 +455,7 @@ echo "  Running $OPS operations..."
 CURRENT_LOG=/tmp/valkey_run.txt
 run_ycsb_cpu run /tmp/valkey_run.txt "$VALKEY_TASKSET" "$OPS"
 VALKEY_CPU_RUN=$CPU_run
+VALKEY_CLIENT_RUN=$CLIENT_run
 VALKEY_RUN_OPS=$(parse_stat /tmp/valkey_run.txt "Throughput(ops/sec)")
 VALKEY_READ_AVG=$(parse_stat /tmp/valkey_run.txt "[READ], AverageLatency")
 VALKEY_READ_P95=$(parse_stat /tmp/valkey_run.txt "[READ], 95thPercentileLatency")
@@ -488,6 +498,11 @@ cpu_rows() {
   printf "%-28s %12s %12s %10s\n" "$phase ops/s per 100% CPU" "${r[4]}" "${v[4]}" "$(winner "${r[4]}" "${v[4]}" 1)"
   printf "%-28s %12s %12s\n" "$phase CPUs busy" "${r[3]}" "${v[3]}"
   printf "%-28s %12s %12s\n" "$phase user/kernel/idle %" "${r[0]}/${r[1]}/${r[2]}" "${v[0]}/${v[1]}/${v[2]}"
+  read -r -a r <<<"$4"; read -r -a v <<<"$5"
+  printf "%-28s %12s %12s\n" "$phase YCSB client busy %" "$((r[0] + r[1]))" "$((v[0] + v[1]))"
+  if [ "$((r[0] + r[1]))" -ge "$CLIENT_SATURATED" ] || [ "$((v[0] + v[1]))" -ge "$CLIENT_SATURATED" ]; then
+    printf "  ⚠ %s : YCSB uses ≥ %s %% of its CPUs, the client may be the limit\n" "$phase" "$CLIENT_SATURATED"
+  fi
 }
 
 VALKEY_LABEL="Valkey"
@@ -505,7 +520,7 @@ printf "%-28s %12s %12s %10s\n" "Load throughput (ops/sec)" \
 printf "%-28s %12s %12s %10s\n" "Load P99 (µs)" \
   "$RADIXOX_LOAD_P99" "$VALKEY_LOAD_P99" \
   "$(winner "$RADIXOX_LOAD_P99" "$VALKEY_LOAD_P99" 0)"
-cpu_rows Load "$RADIXOX_CPU_LOAD" "$VALKEY_CPU_LOAD"
+cpu_rows Load "$RADIXOX_CPU_LOAD" "$VALKEY_CPU_LOAD" "$RADIXOX_CLIENT_LOAD" "$VALKEY_CLIENT_LOAD"
 echo ""
 printf "%-28s %12s %12s %10s\n" "Run throughput (ops/sec)" \
   "$RADIXOX_RUN_OPS" "$VALKEY_RUN_OPS" \
@@ -535,7 +550,7 @@ printf "%-28s %12s %12s %10s\n" "READ max (µs)" \
 printf "%-28s %12s %12s %10s\n" "UPDATE max (µs)" \
   "$RADIXOX_UPDATE_MAX" "$VALKEY_UPDATE_MAX" \
   "$(winner "$RADIXOX_UPDATE_MAX" "$VALKEY_UPDATE_MAX" 0)"
-cpu_rows Run "$RADIXOX_CPU_RUN" "$VALKEY_CPU_RUN"
+cpu_rows Run "$RADIXOX_CPU_RUN" "$VALKEY_CPU_RUN" "$RADIXOX_CLIENT_RUN" "$VALKEY_CLIENT_RUN"
 echo ""
 printf "%-28s %12s %12s %10s\n" "Peak RSS (MB)" \
   "${RADIXOX_PEAK_MB}" "${VALKEY_PEAK_MB}" \
@@ -553,9 +568,10 @@ if [ "$PERSIST" = 1 ]; then
 fi
 echo "CPU: /proc/stat on each server's own CPUs (RadixOx $RADIXOX_CPUS, Valkey $VALKEY_TASKSET),"
 echo "  softirq included (kernel), YCSB start-up included (idle). Busy per CPU:"
-for x in "RadixOx load:$RADIXOX_CPU_LOAD" "RadixOx run:$RADIXOX_CPU_RUN" "Valkey load:$VALKEY_CPU_LOAD" "Valkey run:$VALKEY_CPU_RUN"; do
+for x in "RadixOx load:$RADIXOX_CPU_LOAD" "RadixOx run:$RADIXOX_CPU_RUN" "Valkey load:$VALKEY_CPU_LOAD" "Valkey run:$VALKEY_CPU_RUN" \
+  "YCSB (RadixOx) run:$RADIXOX_CLIENT_RUN" "YCSB (Valkey) run:$VALKEY_CLIENT_RUN"; do
   read -r -a f <<<"${x#*:}"
-  printf "  %-14s %s\n" "${x%%:*}" "${f[*]:5}"
+  printf "  %-20s %s\n" "${x%%:*}" "${f[*]:5}"
 done
 echo ""
 echo "Full logs: /tmp/radixox_{load,run}.txt  /tmp/valkey_{load,run}.txt"
