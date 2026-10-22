@@ -689,7 +689,12 @@ worker arme un poll et rend la main, chaque arrivée s'exécute ensuite dans not
 `task_work` (`io_poll_issue`). Un recv **simple** en ASYNC part bien sur io-wq (réveil du
 poll → `io_req_task_submit` → `io_queue_iowq`), mais chaque lecture repasse par nous
 (relais, mise en file, CQE) et coûte un SQE : contre ~1 500–1 700 cycles/cmd de recv
-économisés, gain net probable faible. Non retenu. Ce qui reste à notre thread dans la
+économisés, gain net probable faible. Non retenu. **À rouvrir (2026-10-22)** : avec les envois
+délégués, `io_recv` pèse 25 % du thread de la boucle (§12.7) ; le critère n'est plus le
+débit maximal mais le CPU libéré sur la boucle à débit fixé (pour le métier, la save, le
+GC). Prototype prévu : `RADIXOX_RECV_ASYNC=1`, statique comme `SEND_ASYNC`, un recv en vol
+par connexion, buffer select sur notre anneau ; c'est alors le worker qui copie dans nos
+tampons. Le type de buffer (`READ_FIXED`, enregistré) ne change pas qui copie. Ce qui reste à notre thread dans la
 réception : la copie socket → tampon de l'anneau et le CQE, au moment où **nous** entrons
 (le softirq TCP tourne ailleurs).
 
@@ -1104,6 +1109,16 @@ dans la même zone.
 - **Topologie CPU** (Ryzen 7600X : cœur physique n = CPU n et n+6) : serveur épinglé
   (`RADIXOX_CPU_PIN`), client sur d'autres cœurs physiques, jamais sur le frère SMT du
   serveur.
+- **`bench_compare.sh` (YCSB A, 2026-10-22)** : tient le profil `performance` pendant le
+  bench (`powerprofilesctl launch`, `PROFILE=keep` pour ne pas y toucher ; −15 % d'horloge et
+  −10 % de débit en `power-saver`, boost coupé) ; centiles et max du run calculés sans les
+  `WARMUP=2` premières secondes (chauffe de la JVM) à partir des histogrammes par seconde ;
+  occupation par CPU depuis `/proc/stat` (softirq compris), user/noyau par CPU, ops par
+  seconde-CPU, fréquence tenue (`cpuinfo_avg_freq`) du serveur et du client, avertissement
+  quand YCSB dépasse 60 % de ses CPU logiques (`CLIENT_SATURATED`). À 3 cœurs par serveur,
+  **YCSB est la limite** (Java, 6 CPU logiques sur 3 cœurs) : comparer alors l'efficacité par
+  CPU, pas le débit ; pour la capacité, memtier ou deux machines. Les variables `RADIXOX_*`
+  du shell passent à RadixOx. Résultats de référence : §12.7.
 - **Clients Node.js** (ioredis) : les pauses du GC de V8 (~40 ms) produisent des rafales
   et un p99.9 élevé, chez Valkey comme chez nous. Pour la latence : memtier, YCSB ou un
   client Rust.
@@ -1372,6 +1387,79 @@ répétitions, ordre alterné ; plages = les deux runs.
   190 Mo ; copy-on-write de Valkey +160–170 Mo pendant la save.
 
 ---
+
+### 12.7 Où va le CPU sous charge, `enter`, profil d'énergie (2026-10-21/22, loopback, p1)
+
+Mesures courtes (1 M clés de 100 o aléatoires, memtier 100 conns 1:1 sauf mention ; un run
+par point ; un jeu (cs2) tournait pendant les premières, ordre de grandeur seulement).
+Scripts jetables, rien dans le dépôt sauf `bench_compare.sh`.
+
+**Le temps compté au thread ment.** `utime+stime` de la boucle seule (1 cœur) : ~61 %. Le
+CPU 0 dans `/proc/stat` : user 12 %, sys 51 %, **softirq 37 %**, idle 0 %. Le noyau retire
+le softirq (TCP loopback, côté serveur et côté client) du temps du thread ; 2–9 réveils
+volontaires/s : la boucle ne dort pas. **Toujours mesurer l'occupation par CPU, softirq
+compris** (c'est ce que fait désormais `bench_compare.sh`). La note de mai « thread actif
+59 % » souffrait peut-être du même biais (autre config, pas vérifié).
+
+**Délégation des envois, même charge** (boucle CPU 0, 2 workers CPU 1+7) :
+
+| | boucle seule | envois délégués |
+|---|---|---|
+| débit | 171 K | **398 K** (199 K par cœur physique, contre 171 K) |
+| moy. / p99 | 0,58 / 1,50 ms | 0,25 / 0,63 ms |
+| CPU 0 sans save | u12 sys51 si37 **idle 0** | u44 sys38 si0 **idle 16** |
+| BGSAVE (1 M clés) | 8,5 s, 15 % du CPU | **1,5 s, 47 %** (le repos va à la save, §8.2) |
+
+**Profil de la boucle avec envois délégués** (perf, thread seul) : `io_recv` (multishot,
+dans notre `task_work`) **25 %**, dont `tcp_recvmsg` 17 % et la copie `_copy_to_iter` 6 % ;
+notre code ~18 % ; gestion io_uring ~15 % ; `Core::tick` 5,5 % → 1,4 % après bbc518c
+(`CLOCK_REALTIME_COARSE`). Attributions perf peu fiables aux bords inlinés.
+
+**Nombre d'`enter`** (compté par `LD_PRELOAD` sur `syscall()`, 5 s par point) :
+
+| config | débit | `enter`/s | commandes par `enter` |
+|---|---|---|---|
+| boucle seule, p1 | 221 K | 5,6 K | ~40 |
+| boucle seule, p16 | 1,35 M | 2,1 K | ~630 |
+| envois délégués, p1 | 419 K | **317 K** | ~1,3 |
+| envois délégués, p16 | 1,98 M | 6,2 K | ~320 |
+| délégués + `MIN_WAIT_US=10 WAIT_NR=16`, p1 | 371 K | **46 K** | ~8 |
+
+Une boucle non saturée retourne au noyau pour une ou deux commandes : les cycles qui
+devraient être du repos (GC, save) partent en syscalls (chaque entrée paie aussi la
+mitigation SRSO sur ce Zen). Sous saturation, les tours grossissent seuls. Les workers io-wq
+**ne lisent jamais la SQ** (seuls notre `enter` ou SQPOLL la vident ; un worker ne consomme
+que la file interne d'io-wq, puis `schedule_timeout`) ; avec `DEFER_TASKRUN` le CQE d'une op
+déléguée n'apparaît qu'à notre `enter` suivant : deux `enter` par op déléguée.
+
+**YCSB A à 3 cœurs, `bench_compare.sh` corrigé** (5 M clés, 10 M ops, profil performance,
+~5,2 GHz) : RadixOx 450 K / Valkey 381 K ; par CPU occupé 169 K / 127 K.
+
+| CPU | RadixOx run | Valkey run |
+|---|---|---|
+| 0 | 69 % (u29 / k40) : la boucle | 100 % (u15 / k85) |
+| 1 | 97 % (u1 / k96) : worker | 99 % (u91 / k8) : io-thread en attente active |
+| 2 | 98 % (u0 / k98) : worker | 100 % (u14 / k86) |
+| client YCSB | 70 % de ses 6 CPU (u18 / k52) | 58 % |
+
+Lecture : la boucle n'est **pas** le goulot (31 % de repos) ; les workers (TCP des envois) et
+le client le sont. Côté serveur, ~5 µs de CPU noyau par op contre ~0,64 µs de user dans la
+boucle. Plafond estimé de la boucle si on lui retire le noyau qu'on peut retirer (le recv) :
+~1–1,2 M ops/s sans pipeline (reste soumission, CQE, surcoût du recv simple) ; mais il
+faudrait 4–5 cœurs de workers et un client à part : **à vérifier sur deux machines**
+(mémoire `project_cloud_bench_plan`), le loopback mesure surtout la pile TCP.
+
+**Profil d'énergie** (même mini-bench 200 K clés, 3 cœurs) : `power-saver` coupe le boost
+(EPP `power`, ~4,5 GHz) ; `performance` ~5,2 GHz : débit +10 % (RadixOx) / +12 % (Valkey),
+client et serveur ralentis ensemble, classement inchangé. Le noyau TCP suit l'horloge ; les
+attentes mémoire de l'arbre non. `bench_compare.sh` tient désormais le profil `performance`.
+
+**Pièges de mesure trouvés dans `bench_compare.sh` (corrigés 0f6cbbe)** : P99.9/P99.99 lus
+dans la dernière ligne d'état YCSB = le dernier intervalle seulement (parfois 2 700 requêtes)
+: faux et instables. Et la chauffe de la JVM de YCSB (JIT, connexions, première seconde)
+fait ~1 000 requêtes lentes et le max (27–50 ms contre 2,4–5,6 ms ensuite), assez pour
+décider du p99.99 sur 10 M ops. Le GC de Java n'y est pour rien en mode normal (pauses ≤
+2 ms ; 13–37 ms seulement avec `measurementtype=raw`). ZGC ne change rien.
 
 ## 13. Migration
 
@@ -1723,6 +1811,37 @@ la part « arbre » à chaque étape.
    puis mode auto si les courbes se croisent (§6.4).
 5. Fusion des lectures identiques (§17.2.2), avec une charge zipfienne pour la justifier.
 6. Modes extrêmes sur VM dédiée : NAPI busy poll, `SEND_ZC`, zcrx (§17.3) ; bench cloud.
+
+### 17.6 Principe et pistes chiffrées (2026-10-22)
+
+**Principe (discuté avec l'utilisateur, à graver dans ARCHITECTURE.md s'il le confirme)** :
+le thread métier ne fait que ce qui touche l'arbre ; tout le reste se délègue (pile TCP,
+crc, zstd, fichiers). Chaque cycle retiré va à ce qui ne se parallélise pas : requêtes,
+save, GC. Mesuré : déléguer les envois n'a pas coûté d'efficacité par cœur (199 K contre
+171 K ops/s par cœur physique, loopback). Garde-fous : mode `auto` (tout en direct tant que
+la boucle a du repos, déléguer quand elle sature), drapeau mono-thread pur, et désactivation
+automatique sous 2 CPU de quota (§6.4 piège 1) ; SMT en cloud : ~+30 %, pas ×2.
+
+Pistes, par gain attendu (chacune mesurée seule, jeu fermé, `bench_compare.sh` + CPU par
+CPU) :
+1. **Attente groupée automatique** quand les envois sont délégués et que la boucle fait
+   ~1 `enter` par commande (§12.7 : `enter` ÷7). Existe déjà en option
+   (`RADIXOX_MIN_WAIT_US` / `RADIXOX_WAIT_NR`).
+2. **Recv simple en `IOSQE_ASYNC`** (§6.4, « À rouvrir ») : jusqu'à ~25 % de la boucle.
+3. **Enregistrer le fd de l'anneau** (`IORING_REGISTER_RING_FDS` +
+   `IORING_ENTER_REGISTERED_RING`) : ~1 % à 317 K `enter`/s ; vérifier le support du crate
+   `io-uring`.
+4. **Threads réseau à nous + files SPSC** (si 1–3 laissent encore >10–15 % de noyau sur la
+   boucle) : chaque thread réseau a son anneau et ses connexions ; le thread métier lit et
+   écrit des files en mémoire partagée sans aucun syscall ; « vérifier avant de dormir »
+   (attente active de quelques µs, puis futex). Contraintes : `SharedByte` non `Send` (rc
+   non atomique) → octets possédés aux frontières ; allocateur v2 mono-thread ; garder le
+   mode mono-thread pur. Proche du design « 2 threads » de mai, écarté alors : demande un
+   vrai document de conception.
+
+Écarté de nouveau : SQPOLL (§14 : incompatible avec `DEFER_TASKRUN`, mesuré sans gain de
+débit) ; « que les workers io-wq lisent la SQ » (impossible : `SINGLE_ISSUER`, tête de SQ
+avancée sans verrou par le seul consommateur).
 
 ---
 

@@ -17,18 +17,35 @@
 |---|---|---|
 | **ARCHITECTURE.md** (ici) | vue d'ensemble, invariants, checklist de revue | à jour |
 | [`README.md`](README.md) | présentation, commandes supportées, configuration (`RADIXOX_*`), benchs de référence, layout du dépôt | à jour (public, en anglais) |
-| [`RUNTIME_ARCH.md`](RUNTIME_ARCH.md) | boucle io_uring maison : connexions, réception, émission, lot, équité, jobs, jamais bloquant, déploiement, migration, mesures | **implémentée** (étapes 0–6, 2026-10-19) ; reste l'étape 7+ (optimisations) |
+| [`RUNTIME_ARCH.md`](RUNTIME_ARCH.md) | boucle io_uring maison : connexions, réception, émission, lot, équité, jobs, jamais bloquant, déploiement, migration, mesures | **implémentée** (étapes 0–6, 2026-10-19) ; reste l'étape 7+ (optimisations) ; mesures du 2026-10-22 et pistes chiffrées : §12.7, §17.6 |
 | [`SAVE_DESIGN.md`](SAVE_DESIGN.md) | save progressive : COW applicatif par nœud, format du dump, BGSAVE / SAVE / reload | **implémenté** (étapes 1–8) et saves automatiques ; AOF : DURABILITY_DESIGN.md |
 | [`SCAN_DESIGN.md`](SCAN_DESIGN.md) | SCAN à curseur côté serveur (table de curseurs, LRU, COUNT exact) | **implémenté** |
 | [`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md) | AOF et réplication par un seul flux : commandes journalisées par blocs de tour (avec `now`), exceptions non déterministes, point de linéarisation des commandes longues, snapshot exact, commit groupé `always` | AOF fait (étapes 1–6 : `everysec` / `no` / `always`, réécriture) ; réplication de base faite (étape 7 : poussée, backlog, synchronisation complète, promotion) ; reste l'étape 8 (zéro copie, `WAIT`) |
-| [`MEMORY_ARCH.md`](MEMORY_ARCH.md) | mémoire v2 : allocateur maison par pools (bump + compteur par page, chunks de 2 Mio), GC par évacuation, compactage HiSlab, `maxmemory` (CLOCK) | conception, rien d'implémenté |
+| [`MEMORY_ARCH.md`](MEMORY_ARCH.md) | mémoire v2 : allocateur maison par pools (bump + compteur par page, chunks de 2 Mio), GC par évacuation, compactage HiSlab, `maxmemory` (CLOCK) | conception, rien d'implémenté ; points ouverts du 2026-10-22 en §15 |
 | [`TX_DESIGN.md`](TX_DESIGN.md) | transactions atomiques à conditions (`MULTI ATOMIC`, `DELPREFIX`, `EXEC DURABLE`) | conception, rien d'implémenté ; dépend de la boucle maison |
-| [`ANALYSE_ART_UNIFIE.md`](ANALYSE_ART_UNIFIE.md) | journal de décisions « tout dans l'ART » : TTL par champ (abandonné), valart (§11–12), design ZSet retenu (§13) | journal ; §13 = référence du futur ZSet |
+| [`ANALYSE_ART_UNIFIE.md`](ANALYSE_ART_UNIFIE.md) | journal de décisions « tout dans l'ART » : TTL par champ (abandonné), valart (§11–12), design ZSet retenu (§13) | journal ; §13 = référence du futur ZSet, relancé en §13.8 (la save v1 bloque ~340 ms par million de membres) |
 | [`protocol-spec.md`](protocol-spec.md) | spécification RESP de Redis (copie de référence) | référence externe |
 
 Ordre de lecture conseillé : ce fichier → le document du sujet touché. Avant de toucher
 au serveur réseau : RUNTIME_ARCH.md. Avant de toucher à une mutation d'`oxidart` ou de
 `valart` : SAVE_DESIGN.md (toute mutation passe par un point de passage avec barrière).
+
+**Reprise (état au 2026-10-22).** Dernier code : opérations de fichier hors de la boucle
+(dc79ca2, DURABILITY_DESIGN.md §8.6), horloge du TTL en `CLOCK_REALTIME_COARSE` (bbc518c),
+`bench_compare.sh` corrigé et instrumenté (RUNTIME_ARCH.md §12.1). Chantiers ouverts, aucun
+commencé :
+1. **ZSet sur HiSlab** (ANALYSE_ART_UNIFIE.md §13, §13.8) : la save v1 écrit les ZSet/List
+   d'un bloc au démarrage (SAVE_DESIGN.md §D) → 1,5 s de boucle bloquée avec le ZSet
+   `_indices` de YCSB à 5 M clés. À trancher avec l'utilisateur : §13.2 ou variante à buckets.
+2. **Retirer du travail au thread métier** (RUNTIME_ARCH.md §17.6) : attente groupée auto,
+   recv en `IOSQE_ASYNC`, fd de l'anneau enregistré ; puis peut-être threads réseau + SPSC.
+3. **Allocateur v2 + GC** (MEMORY_ARCH.md, étape 1 = le socle) ; points ouverts §15.
+4. **Save sous saturation** : plancher adaptatif, coût par clé à mesurer (SAVE_DESIGN.md,
+   « Plafond de CPU du BGSAVE »).
+5. Persistance : comparaison mémoire avec Valkey (CoW de ses fils), worker de persistance,
+   AOF compressé (DURABILITY_DESIGN.md §16) ; `min-replicas-to-write`, zéro copie.
+Mesurer avec la machine au repos (pas de jeu), `bench_compare.sh` tient le profil
+`performance` ; benchs courts sous `systemd-run --scope -p MemoryMax=…` (CLAUDE.md).
 
 ---
 

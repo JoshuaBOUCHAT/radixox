@@ -467,6 +467,19 @@ save pour atteindre sa part, repos compris. Sous charge p1 avec 2 workers
 io-wq (la boucle a ~20 % de temps libre) : 877–896 ms → 158–159 ms, latence
 inchangée.
 
+
+**Plancher sous saturation (mesuré 2026-10-21/22).** Les 10 % sont un plancher : au repos la
+save prend tout (RUNTIME_ARCH.md §8.2). YCSB à 100 threads sur 1 cœur : save de 166 Mo en
+118 s pour 11,8 s de CPU (exactement 10 %) : le CPU 0 était plein (idle 0–1 %, softirq 37 %
+non compté au thread). Avec les envois délégués, le même cœur garde 16 % de repos et la
+save passe de 8,5 s à 1,5 s (47 % du CPU). Coût d'une save lente : plus de copies de la
+barrière (+535 Mo vus sous YCSB), GC et éviction bloqués plus longtemps. Piste : **plancher
+adaptatif** qui monte avec la mémoire des copies (puis avec la proximité de `maxmemory`), et
+sortir crc + zstd de la boucle (worker de persistance, DURABILITY_DESIGN.md §16). Mesure à
+faire d'abord : coût par clé d'une save sur des données YCSB (Hash 1 champ de 100 o
+aléatoires) machine au repos, réparti DFS / crc / zstd (2,4 µs/clé vus sous charge et avec
+un jeu, contre 0,28 µs/clé sur des String de memtier).
+
 ## Saves automatiques (2026-10-20)
 
 Calquées sur Valkey (`save`, `stop-writes-on-bgsave-error`, `LASTSAVE`, `INFO persistence`),

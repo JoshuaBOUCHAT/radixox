@@ -454,3 +454,36 @@ une tranche).
 - `IORING_OP_MADVISE` avec `MADV_POPULATE_WRITE` (§3).
 - Coût du bit CLOCK sur un bench de GET (§10.2), avec et sans préchargement.
 - Taille des tranches et seuil de densité des pages marquées (§8.2), à régler sur mesures.
+
+Ajouts du 2026-10-22 (pas encore tranchés) :
+
+- **La save bloque GC, compactage et éviction** (§8.5) alors que sous AOF les saves sont
+  longues (118 s vues sous YCSB à 1 cœur) et se suivent, et que c'est pendant la save que la
+  mémoire monte (copies de la barrière). Pistes : **GC derrière le curseur de la save** (un
+  nœud déjà écrit par le DFS n'est plus intact : y déplacer ses `SharedByte` ne déclenche
+  aucune capture ; seuls les nœuds intacts sont interdits) ; **maxmemory pendant une save** :
+  évincer une clé intacte déclenche une copie, donc consomme au lieu de rendre → au plafond,
+  refuser les écritures, abandonner la save, ou compter les copies dans une réserve à part
+  (Valkey ne compte pas non plus son CoW dans `maxmemory`).
+- **Pool par save pour les copies de la barrière** : elles vivent exactement une save ; toutes
+  leurs pages meurent à `end_save` → rendre des chunks entiers au lieu de `drain_leftover`
+  par tranches, et le compteur du pool donne la « mémoire des copies de save » à mettre
+  dans `INFO` (DURABILITY_DESIGN.md §16).
+- **Worker de persistance optionnel** (DURABILITY_DESIGN.md §16) : invariant à écrire —
+  l'allocateur est sans verrou ni atomique et le rc de `SharedByte` est un `u16` non
+  atomique ; un worker ne tient jamais un `SharedByte` et n'alloue jamais dans nos pools ;
+  le thread métier ne lui passe que des octets encodés (pool système).
+- **Fragmentation des grands objets** (§6, jamais évacués) : des suites de N pages libérées au
+  hasard trouent les chunks, un chunk ne se rend qu'entièrement vide → liste des suites
+  libres triée par longueur, placement qui regroupe les grands objets.
+- **Mode débogage du GC** : un pointeur périmé après évacuation est une lecture de mémoire
+  libérée silencieuse → en test, remplir les pages évacuées d'un motif ou les passer
+  `PROT_NONE` jusqu'à réutilisation ; une passe de GC entre chaque commande dans les tests
+  différentiels.
+- **Préparer les chunks hors boucle est obligatoire sous pression mémoire** (§3) : avec
+  `defrag=defer+madvise`, une faute sur une région `MADV_HUGEPAGE` peut lancer une
+  compaction directe du noyau sur le thread fautif (vu : machine à ~500 Mo libres pendant un
+  jeu).
+- **Le GC a besoin de repos sur la boucle** : il tourne par le même chemin que la save
+  (tranches au repos + plancher). Les gains de RUNTIME_ARCH.md §17.6 (envois et recv
+  délégués, attente groupée) sont ce qui lui donne ce repos sous charge.
