@@ -499,8 +499,7 @@ impl Core {
         if self.follow.is_some() {
             return;
         }
-        self.art.tick();
-        self.set_wall(self.art.now);
+        self.set_wall(crate::tsc::wall_secs());
     }
 
     /// Pose l'horloge murale du TTL (secondes), rendue monotone avec le flux.

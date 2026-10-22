@@ -101,3 +101,15 @@ mod tests {
         assert!((100_000..10_000_000_000).contains(&ticks(Duration::from_millis(1))));
     }
 }
+
+/// Horloge murale en secondes pour le TTL, lue à chaque tour :
+/// `CLOCK_REALTIME_COARSE` (~3 ns, résolution d'un tick noyau, 1–4 ms) au lieu
+/// de `SystemTime::now` (~5 % du thread de la boucle avec de petits tours).
+/// Une seconde vue jusqu'à 4 ms en retard ne change rien au TTL.
+pub fn wall_secs() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` est un timespec valide, l'horloge existe sous Linux ≥ 2.6.32.
+    let r = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut ts) };
+    debug_assert_eq!(r, 0);
+    ts.tv_sec as u64
+}
