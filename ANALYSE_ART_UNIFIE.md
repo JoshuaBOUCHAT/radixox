@@ -743,3 +743,42 @@ entrée (indice de feuille ou redescente).
 - Développement comme Set/Hash : vérificateur d'invariants (compteurs, ordre,
   remplissage, chaînage), tests contre un modèle de référence, bench 1M contre
   `BTreeSet` + `HashMap`.
+
+### 13.8 Relance (2026-10-21) : le ZSet bloque la save
+
+**Fait déclencheur.** Le ZSet actuel (`BTreeSet` + `HashMap` std) est hors slab, donc hors
+barrière : la save v1 l'écrit en entier au `begin` (SAVE_DESIGN.md §D). Mesuré : 340 ms par
+million de membres, sur la boucle ; ~1,5 s avec le ZSet `_indices` de YCSB à 5 M clés. Copier
+le ZSet à sa première écriture pendant la save ne suffit pas (YCSB fait un `ZADD _indices` par
+insertion : même arrêt). Patcher l'ancienne structure (copie à l'écriture membre par membre)
+serait du code jeté : on passe au §13.2 sur HiSlab, qui hérite de la barrière par nœud.
+
+**Variante discutée à comparer au §13.2-3.** Clé de l'arbre = **score seul** (u64 ordonné,
+unique dans l'arbre) ; les ex-aequo sortent de l'arbre :
+- valeur d'une entrée de feuille = un `SharedByte` (un seul membre à ce score), ou, bit 0 du
+  pointeur à 1 (`SharedByte` = `NonNull` aligné ≥ 8 par `mi_malloc`), un pointeur fin vers un
+  **bucket** d'ex-aequo ;
+- petit bucket : `Vec` trié de `SharedByte` avec en-tête `{len, cap}` (rang = indice par
+  dichotomie) ; gros bucket (tout à score 0, `ZRANGEBYLEX`, autocomplétion) : le **même**
+  B+tree à compteurs, générique sur la clé (`CountedTree<u64>` pour les scores,
+  `CountedTree<SharedByte>` pour les octets du membre). Une seule structure difficile à
+  écrire et à tester, utilisée deux fois ;
+- compteurs des nœuds internes = nombre de **membres** (une entrée pèse 1 ou `bucket.len`) ;
+- recherche en feuille = comparaisons de `u64` seules (SIMD), jamais de déréférencement de
+  membre hors des buckets.
+
+Cela lève les deux objections du §13.6 contre le « deux niveaux » : rang en O(log n) grâce aux
+compteurs, ordre lexicographique grâce au bucket compté (et non valart, qui trie par hash).
+Coût : un niveau d'indirection pour les ex-aequo. À trancher par un bench sur les deux profils
+(scores distincts ; tout à 0).
+
+**Points à ne pas perdre.**
+- f64 → u64 ordonné (`total_cmp`) : bijection exacte sur les bits, aucune perte ; normaliser
+  `-0.0` en `0.0` avant (vérifié sur Valkey : `ZADD z -0 a 0 b` → même score, affiché `0`,
+  départagés par le nom) ; NaN refusé avant l'arbre (`ERR value is not a valid float`).
+- Index membre → score : valart (`membre → {score}`), ZREM = score puis redescente (v1 sans
+  pointeur de retour, §13.3).
+- GC (MEMORY_ARCH.md) : les feuilles deviennent propriétaires de `SharedByte` ; le GC qui les
+  déplace doit réécrire le pointeur en gardant le bit de marquage, et le pool des
+  `SharedByte` garder un alignement ≥ 2.
+- List : même problème de save (hors barrière) ; à traiter avec le même principe.

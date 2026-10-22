@@ -1093,3 +1093,24 @@ Configuration, commandes supportées).
 - Coût des réécritures automatiques sous forte écriture (≈ 7 % en pipeline 16) : seuil par
   défaut (`64mb`, 100 %) atteint toutes les ~3 s à 880 k SET/s.
 - Comptage mémoire du pool, du backlog et des tampons d'envoi dans le futur `maxmemory`.
+- **Mémoire d'une save comparée à Valkey** (2026-10-21) : le « Peak RSS » de
+  `bench_compare.sh` (`VmHWM` du serveur seul) ne compte pas la copie à l'écriture des fils de
+  Valkey (`Fork CoW for RDB: 1021 MB` dans son log, 2057 MB affichés pour ~3,1 GB réels).
+  RadixOx n'a pas de fils : sa save se voit dans son RSS (+535 MB mesurés, run perturbé par un
+  jeu). À faire : ligne « serveur + CoW des fils » dans le script (max de `current_cow_peak`,
+  `rdb_last_cow_size`, `aof_last_cow_size`) et, côté RadixOx, octets et pic des copies de la
+  barrière dans INFO, pour séparer copies de save et section ZSet (SAVE_DESIGN.md §D).
+- **Un worker de persistance, optionnel** (idée du 2026-10-21) : un drapeau pour garder le
+  mono-thread pur ; sinon, un thread autorisé pendant les saves et pour l'AOF, qui prend la
+  sérialisation finale, la compression et l'écriture par buffers courts écrits au fil de l'eau,
+  pour que le thread métier ne fasse que des commandes. Questions : ce que le thread métier
+  lui passe (morceaux de DFS déjà encodés, pour ne pas partager l'arbre) ; la cohabitation des
+  écritures du dump et de l'AOF sur le même disque (le writeback d'un gros dump retarde les
+  fsync de l'AOF : voir `no-appendfsync-on-rewrite` et `rdb-save-incremental-fsync` chez
+  Redis ; priorité ou débit plafonné pour la file `Save`, `sync_file_range` par tranches).
+- **AOF compressé, activé par défaut avec l'AOF** (option pour le couper) : moins d'octets sur
+  le disque et vers les réplicas. Le coût CPU irait au worker ci-dessus. Contraintes : trames
+  compressées indépendantes, chacune avec son crc, pour qu'une fin déchirée ne perde que la
+  dernière trame (§9) ; offsets de réplication et `WAIT` comptés sur quoi (octets compressés
+  ou non) ; `continuous` et `always` font de petits lots, donc ratio faible sans dictionnaire
+  (dictionnaire zstd entraîné sur le flux ?).

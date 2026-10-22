@@ -112,6 +112,13 @@ deferred_drops: Vec<(NodeType, u32)>,   // hash_drop / set_drop pendant une save
 ### D. ZSet et List (v1)
 Sérialisés **intégralement au `begin`**, de façon bloquante, dans une section du fichier indexée par idx de slab. L'enregistrement d'une clé ZSet/List référence cet idx T0. Pas de barrière sur leurs slabs.
 
+**Coût mesuré (2026-10-21)** : 340 ms de boucle bloquée au `begin` pour un ZSet d'1 M membres
+(crc des petits morceaux 31 %, encodage 20 %, zstd ~22 %), linéaire. YCSB crée un ZSet
+`_indices` d'un membre par clé : à 5 M clés, une réécriture AOF bloque ~1,5 s (max mesuré
+1,566 s), et le buffer de la section reste en mémoire toute la save. Sans ZSet ni List, le
+`begin` prend 19 µs (1 M clés String). Correction prévue : ZSet sur slab derrière la barrière
+(ANALYSE_ART_UNIFIE.md §13.8), pas de rustine sur l'ancienne structure.
+
 ### E. Buckets de collision valart
 Copiés intégralement au T0 (rarissimes), **en profondeur** (clones rc+1) : ils sont modifiés et droppés sans barrière ni liste différée. Fait : `CollisionBuckets::snapshot_t0` au `begin_save`, `get_t0` dans les parcours T0, `clear_t0` à `finish_save`.
 
