@@ -15,6 +15,8 @@ set -euo pipefail
 #   RECORDS=1000000 OPS=2000000 ./bench_compare.sh   # smaller run (defaults 5M / 10M)
 #   RADIXOX_* variables of the calling shell reach RadixOx (e.g. RADIXOX_MIN_WAIT_US=10).
 #   WARMUP=2: run latencies leave out the first WARMUP seconds (JVM warm-up of YCSB).
+#   PROFILE=performance: power profile held during the bench (PROFILE=keep: leave as is).
+#   MHz rows: mean frequency of the server's and of YCSB's CPUs during each phase.
 #   CPU rows: /proc/stat on each server's own CPUs during each phase (softirq included):
 #   ops/s per 100% CPU (= ops / busy CPU-seconds), CPUs busy, user/kernel/idle %.
 #
@@ -29,6 +31,15 @@ set -euo pipefail
 #   given to both: Valkey's fork children and bio threads (bgsave/aof-rewrite/bio
 #   cpulists), RadixOx's file writes and fsyncs (RADIXOX_FILE_CPUS). Auto-rewrite of the
 #   log: 100 % / 64mb on both. No save at shutdown on either (outside the measurement).
+# Profil d'énergie tenu pendant tout le bench (powerprofilesctl launch : rendu à la fin,
+# même sur erreur) ; PROFILE=keep laisse le profil courant.
+PROFILE="${PROFILE:-performance}"
+if [ "$PROFILE" != keep ] && [ -z "${BENCH_PROFILE_HELD:-}" ] && command -v powerprofilesctl >/dev/null &&
+  [ "$(powerprofilesctl get 2>/dev/null)" != "$PROFILE" ]; then
+  export BENCH_PROFILE_HELD=1
+  exec powerprofilesctl launch -p "$PROFILE" -r bench_compare -- "$0" "$@"
+fi
+
 AOF="${AOF:-off}"
 SAVE="${SAVE-}"
 case "$AOF" in
@@ -258,16 +269,39 @@ cpu_report() {
         (U + K) / T * NR / 2, (busy > 0 ? ops / busy : 0), per }' "$1" "$2"
 }
 
+# Fréquence moyenne (MHz) d'un jeu de CPU, échantillonnée chaque 0,5 s jusqu'à ce que
+# <stop> existe. cpuinfo_avg_freq (amd-pstate, intel_pstate : APERF/MPERF, fréquence
+# réellement tenue), sinon scaling_cur_freq. Écrit la moyenne dans <out>.
+freq_sampler() {
+  local cpus=$1 out=$2 stop=$3 c f sum n=0 tot=0
+  while [ ! -e "$stop" ]; do
+    sum=0
+    for c in ${cpus//,/ }; do
+      f=/sys/devices/system/cpu/cpu$c/cpufreq/cpuinfo_avg_freq
+      [ -r "$f" ] || f=/sys/devices/system/cpu/cpu$c/cpufreq/scaling_cur_freq
+      sum=$((sum + $(cat "$f" 2>/dev/null || echo 0)))
+    done
+    tot=$((tot + sum / $(echo "${cpus//,/ }" | wc -w))); n=$((n + 1))
+    sleep 0.5
+  done
+  echo $((n > 0 ? tot / n / 1000 : 0)) >"$out"
+}
+
 # Exécute une phase YCSB en relevant le CPU des cœurs serveur (CPU_<phase>) et des
 # cœurs du client (CLIENT_<phase>) : un client saturé plafonne le débit des deux serveurs.
+# Fréquences moyennes : FREQ_<phase> = « serveur client » en MHz.
 run_ycsb_cpu() {
   local phase=$1 outfile=$2 cpus=$3 nops=$4 t
   t=$(mktemp -d)
+  freq_sampler "$cpus" "$t/fs" "$t/stop" & local p1=$!
+  freq_sampler "$CLIENT_CPUS" "$t/fc" "$t/stop" & local p2=$!
   cpu_snap "$cpus" >"$t/s0"; cpu_snap "$CLIENT_CPUS" >"$t/c0"
   run_ycsb "$phase" "$outfile"
   cpu_snap "$cpus" >"$t/s1"; cpu_snap "$CLIENT_CPUS" >"$t/c1"
+  touch "$t/stop"; wait "$p1" "$p2"
   printf -v "CPU_$phase" '%s' "$(cpu_report "$t/s0" "$t/s1" "$nops")"
   printf -v "CLIENT_$phase" '%s' "$(cpu_report "$t/c0" "$t/c1" "$nops")"
+  printf -v "FREQ_$phase" '%s %s' "$(cat "$t/fs")" "$(cat "$t/fc")"
   rm -rf "$t"
 }
 
@@ -353,6 +387,10 @@ echo "  Server: $SERVER_CORES physical core(s), one thread each: CPUs $SERVER_CP
 echo "    RadixOx: event loop on $MAIN_CPU${IOWQ_CPUS:+, io-wq send workers on $IOWQ_CPUS}"
 echo "    Valkey:  io-threads=$VALKEY_IO_THREADS on $VALKEY_CPUS"
 echo "  Idle (SMT siblings of server cores): ${IDLE_CPUS:-none} | YCSB: CPUs $CLIENT_CPUS"
+cpufreq=/sys/devices/system/cpu/cpu$MAIN_CPU/cpufreq
+echo "  Power: profile $(powerprofilesctl get 2>/dev/null || echo '?') | driver $(cat $cpufreq/scaling_driver 2>/dev/null || echo '?')," \
+  "governor $(cat $cpufreq/scaling_governor 2>/dev/null || echo '?'), EPP $(cat $cpufreq/energy_performance_preference 2>/dev/null || echo '-')," \
+  "boost $(cat $cpufreq/boost 2>/dev/null || cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null || echo '?')"
 VALKEY_AOF="$AOF"
 [ "$AOF" = continuous ] && VALKEY_AOF=everysec
 if [ "$PERSIST" = 1 ]; then
@@ -399,6 +437,7 @@ CURRENT_LOG=/tmp/radixox_load.txt
 run_ycsb_cpu load /tmp/radixox_load.txt "$RADIXOX_CPUS" "$RECORDS"
 RADIXOX_CPU_LOAD=$CPU_load
 RADIXOX_CLIENT_LOAD=$CLIENT_load
+RADIXOX_FREQ_LOAD=$FREQ_load
 RADIXOX_LOAD_OPS=$(parse_stat /tmp/radixox_load.txt "Throughput(ops/sec)")
 RADIXOX_LOAD_P99=$(parse_stat /tmp/radixox_load.txt "[INSERT], 99thPercentileLatency")
 echo "  Load: $RADIXOX_LOAD_OPS ops/sec | P99: $RADIXOX_LOAD_P99 µs"
@@ -409,6 +448,7 @@ HDR_DIR=/tmp/radixox_hdr
 run_ycsb_cpu run /tmp/radixox_run.txt "$RADIXOX_CPUS" "$OPS"
 RADIXOX_CPU_RUN=$CPU_run
 RADIXOX_CLIENT_RUN=$CLIENT_run
+RADIXOX_FREQ_RUN=$FREQ_run
 RADIXOX_RUN_OPS=$(parse_stat /tmp/radixox_run.txt "Throughput(ops/sec)")
 RADIXOX_READ_AVG=$(parse_stat /tmp/radixox_run.txt "[READ], AverageLatency")
 read -r RADIXOX_READ_P95 RADIXOX_READ_P99 RADIXOX_READ_P999 RADIXOX_READ_P9999 RADIXOX_READ_MAX <<<"$(hdr_tail READ)"
@@ -453,6 +493,7 @@ CURRENT_LOG=/tmp/valkey_load.txt
 run_ycsb_cpu load /tmp/valkey_load.txt "$VALKEY_TASKSET" "$RECORDS"
 VALKEY_CPU_LOAD=$CPU_load
 VALKEY_CLIENT_LOAD=$CLIENT_load
+VALKEY_FREQ_LOAD=$FREQ_load
 VALKEY_LOAD_OPS=$(parse_stat /tmp/valkey_load.txt "Throughput(ops/sec)")
 VALKEY_LOAD_P99=$(parse_stat /tmp/valkey_load.txt "[INSERT], 99thPercentileLatency")
 echo "  Load: $VALKEY_LOAD_OPS ops/sec | P99: $VALKEY_LOAD_P99 µs"
@@ -463,6 +504,7 @@ HDR_DIR=/tmp/valkey_hdr
 run_ycsb_cpu run /tmp/valkey_run.txt "$VALKEY_TASKSET" "$OPS"
 VALKEY_CPU_RUN=$CPU_run
 VALKEY_CLIENT_RUN=$CLIENT_run
+VALKEY_FREQ_RUN=$FREQ_run
 VALKEY_RUN_OPS=$(parse_stat /tmp/valkey_run.txt "Throughput(ops/sec)")
 VALKEY_READ_AVG=$(parse_stat /tmp/valkey_run.txt "[READ], AverageLatency")
 read -r VALKEY_READ_P95 VALKEY_READ_P99 VALKEY_READ_P999 VALKEY_READ_P9999 VALKEY_READ_MAX <<<"$(hdr_tail READ)"
@@ -503,6 +545,9 @@ cpu_rows() {
   printf "%-28s %12s %12s\n" "$phase user/kernel/idle %" "${r[0]}/${r[1]}/${r[2]}" "${v[0]}/${v[1]}/${v[2]}"
   read -r -a r <<<"$4"; read -r -a v <<<"$5"
   printf "%-28s %12s %12s\n" "$phase YCSB client busy %" "$((r[0] + r[1]))" "$((v[0] + v[1]))"
+  local rf vf
+  read -r -a rf <<<"$6"; read -r -a vf <<<"$7"
+  printf "%-28s %12s %12s\n" "$phase MHz server / YCSB" "${rf[0]}/${rf[1]}" "${vf[0]}/${vf[1]}"
   if [ "$((r[0] + r[1]))" -ge "$CLIENT_SATURATED" ] || [ "$((v[0] + v[1]))" -ge "$CLIENT_SATURATED" ]; then
     printf "  ⚠ %s : YCSB uses ≥ %s %% of its CPUs, the client may be the limit\n" "$phase" "$CLIENT_SATURATED"
   fi
@@ -523,7 +568,7 @@ printf "%-28s %12s %12s %10s\n" "Load throughput (ops/sec)" \
 printf "%-28s %12s %12s %10s\n" "Load P99 (µs)" \
   "$RADIXOX_LOAD_P99" "$VALKEY_LOAD_P99" \
   "$(winner "$RADIXOX_LOAD_P99" "$VALKEY_LOAD_P99" 0)"
-cpu_rows Load "$RADIXOX_CPU_LOAD" "$VALKEY_CPU_LOAD" "$RADIXOX_CLIENT_LOAD" "$VALKEY_CLIENT_LOAD"
+cpu_rows Load "$RADIXOX_CPU_LOAD" "$VALKEY_CPU_LOAD" "$RADIXOX_CLIENT_LOAD" "$VALKEY_CLIENT_LOAD" "$RADIXOX_FREQ_LOAD" "$VALKEY_FREQ_LOAD"
 echo ""
 printf "%-28s %12s %12s %10s\n" "Run throughput (ops/sec)" \
   "$RADIXOX_RUN_OPS" "$VALKEY_RUN_OPS" \
@@ -554,7 +599,7 @@ printf "%-28s %12s %12s %10s\n" "UPDATE max (µs)" \
   "$RADIXOX_UPDATE_MAX" "$VALKEY_UPDATE_MAX" \
   "$(winner "$RADIXOX_UPDATE_MAX" "$VALKEY_UPDATE_MAX" 0)"
 printf "%-28s %12s %12s\n" "READ max incl. warm-up (µs)" "$RADIXOX_READ_MAX_ALL" "$VALKEY_READ_MAX_ALL"
-cpu_rows Run "$RADIXOX_CPU_RUN" "$VALKEY_CPU_RUN" "$RADIXOX_CLIENT_RUN" "$VALKEY_CLIENT_RUN"
+cpu_rows Run "$RADIXOX_CPU_RUN" "$VALKEY_CPU_RUN" "$RADIXOX_CLIENT_RUN" "$VALKEY_CLIENT_RUN" "$RADIXOX_FREQ_RUN" "$VALKEY_FREQ_RUN"
 echo ""
 printf "%-28s %12s %12s %10s\n" "Peak RSS (MB)" \
   "${RADIXOX_PEAK_MB}" "${VALKEY_PEAK_MB}" \
