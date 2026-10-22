@@ -1112,5 +1112,15 @@ Configuration, commandes supportées).
   le disque et vers les réplicas. Le coût CPU irait au worker ci-dessus. Contraintes : trames
   compressées indépendantes, chacune avec son crc, pour qu'une fin déchirée ne perde que la
   dernière trame (§9) ; offsets de réplication et `WAIT` comptés sur quoi (octets compressés
-  ou non) ; `continuous` et `always` font de petits lots, donc ratio faible sans dictionnaire
-  (dictionnaire zstd entraîné sur le flux ?).
+  ou non) ; `continuous` et `always` font de petits lots, donc ratio faible sans dictionnaire.
+  **Dictionnaire (optionnel, plus tard)** : la charge est du RESP brut (`*3\r\n$3\r\nSET…`),
+  idéal pour un dictionnaire zstd. v1 : dictionnaire de base entraîné à l'avance
+  (`zstd --train`) sur des flux RESP variés, embarqué dans le binaire, préchargé en
+  `CDict`/`DDict` ; chaque bloc reste une trame indépendante (fin déchirée, réplica qui
+  reprend à n'importe quel bloc), sans checksum zstd ni taille de contenu (déjà dans notre
+  en-tête) ; `dictID` dans la trame, un dictionnaire publié ne change plus jamais (toutes les
+  versions gardées dans le binaire). v2 : dictionnaire propre à l'instance (clés, valeurs),
+  entraîné à chaque réécriture sur les derniers Mo du journal, fichier cité par le manifeste,
+  transmis aux réplicas avec la synchronisation complète. Mesure avant de trancher : un vrai
+  segment, entraîner sur une moitié, tester sur l'autre, ratios et CPU/Mo par taille de bloc
+  (bloc `continuous` typique, 4 Ko, 64 Ko) sans dictionnaire / générique / par instance.
