@@ -197,7 +197,7 @@ complet.
 - Slabs : réservation virtuelle d'un coup (`mmap`), pas de realloc qui copie ; THP pour le
   TLB, pre-fault minimal.
 - Travaux longs : par tranches (§1.2), avec une part de CPU plafonnée sous charge.
-- Compaction des slabs et GC (prévus, MEMORY_ARCH.md) : gelés pendant une save (ils déplacent des idx).
+- Compaction des slabs (prévue, MEMORY_ARCH.md) : gelée pendant une save (elle déplace des idx). Le GC des `SharedByte` continue pendant une save, sans barrière, en sautant valart (MEMORY_ARCH.md §8.5).
 
 ---
 

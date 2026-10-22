@@ -834,7 +834,7 @@ enum Job {
 - I/O fichier de la save : ops `Write` à offset sur un fd classique (kind `File`, slot =
   job), `Fsync` à la fin. Le double tampon de `bgsave.rs` (`fill` / `spare` / `in_flight`)
   se garde tel quel.
-- Une chose à la fois : pas de GC pendant une save (règle existante).
+- Une chose à la fois : pas de compactage HiSlab pendant une save ; le GC des `SharedByte` continue, en sautant valart (MEMORY_ARCH.md §8.5, 2026-10-22).
 - `save.waiters: Vec<Waker>` d'oxidart (`SaveDone`) disparaît : le job UNLINK teste
   `is_saving()` à chaque `step`. oxidart ne dépend plus des Waker.
 - Le plafond de CPU de BGSAVE (`RADIXOX_SAVE_CPU_SHARE`) garde sa règle, mais le signal

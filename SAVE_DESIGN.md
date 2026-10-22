@@ -58,7 +58,7 @@
 
 ### ZSet, List — `HiSlab` statiques, modifiés via `zset_mut` / `list_mut`.
 
-### Compaction HiSlab, GC — pas encore implémentés. Règle future : gelés pendant une save (ils déplacent des idx).
+### Compaction HiSlab, GC — pas encore implémentés. Compaction HiSlab gelée pendant une save (elle déplace des idx) ; le GC des `SharedByte` continue, sans barrière, en sautant valart (MEMORY_ARCH.md §8.5).
 
 ## 2. Protection
 

@@ -70,8 +70,9 @@ pic historique. C'est le problème que ce chantier résout.
      le tour précédent (un *pacer*). Sans lui, un serveur saturé en continu, qui n'a jamais
      de creux, dériverait jusqu'à la limite.
 - **Une tâche lourde à la fois.** Priorité : rendre les pages vides (presque gratuit) →
-  compacter → évincer (seulement si les octets vivants dépassent le budget). Rien de tout
-  ça pendant une save (elle tient des idx et des pointeurs, ARCHITECTURE §5).
+  compacter → évincer (seulement si les octets vivants dépassent le budget). Pendant une
+  save, le GC des `SharedByte` continue (§8.5) ; le compactage HiSlab et l'éviction
+  attendent (la save tient des idx, ARCHITECTURE §5).
 
 ---
 
@@ -250,6 +251,21 @@ précharger (file de nœuds façon AMAC), sans logique métier. Curseur = index 
   danger : `free_detached` (`oxidart/src/lib.rs`) relit les valeurs dans les nœuds au
   moment de libérer, il libère donc la nouvelle adresse. Au pire on a copié une valeur qui
   allait mourir.
+- **Valart, même mécanisme** (2026-10-22) : parcours linéaire des slots occupés de la slab
+  valart (128 o), curseur = index de slot, au mieux. Par nœud : les entrées inline (clé et
+  valeur `SharedByte`) puis celles de son bloc de débordement. Le parcours ignore à quel
+  Hash ou Set appartient le nœud. Une entrée qui remonte d'une feuille vers un ancêtre
+  déjà visité (HDEL, SREM) est ratée, et la passe suivante la rattrape, comme une
+  recompression côté oxidart. Pendant une save, valart est sauté (§8.5).
+- **Piste v2 : la save comme passe de GC pour oxidart.** Le DFS de la save visite déjà
+  chaque nœud et lit chaque valeur, donc nœud et octets sont en cache. Une valeur dans un
+  bloc marqué pourrait être évacuée par la save au moment où son enregistrement est écrit
+  (pas à la visite : la file tient encore une copie sans refcount, SAVE_DESIGN I3).
+  Après le `take`, le nœud n'est plus intact, donc pas de capture. On évite ainsi un
+  second parcours complet pendant la save. Prix : la save, déjà délicate (I1–I9), porte
+  du code de GC, et ses tranches s'allongent de la copie. Valart reste au GC autonome
+  après `end_save`. À ne regarder que si deux parcours simultanés (save + GC) se voient
+  dans les mesures.
 
 ### 8.2 Choisir les blocs
 
@@ -371,7 +387,28 @@ un accès au nœud par objet épinglé, sans copie de clé ni descente.
 
 ### 8.5 Interdits
 
-- Pas de GC pendant une save.
+- **GC pendant une save : permis** (décision du 2026-10-22, remplace « pas de GC pendant
+  une save »). Déplacer un `SharedByte` ne change pas la vue T0 : mêmes octets, autre
+  adresse. Les nœuds ne bougent pas, donc la pile DFS (des idx) et le bitset `intact`
+  restent valides. Conditions :
+  1. la réécriture du pointeur par le GC **ne passe pas par la barrière** (`before_write`) :
+     ce n'est pas une mutation, elle ne doit pas capturer. Un point d'écriture à part,
+     réservé au GC, documenté comme tel. Un nœud intact déplacé est lu plus tard par la
+     save à sa nouvelle adresse, avec les mêmes octets ;
+  2. entre deux tranches, la save ne tient aucun pointeur brut (SAVE_DESIGN I5 :
+     `own_pending` clone avant toute pause) et les images oxidart tiennent un clone : tout
+     ce que la save garde a rc > 1, donc est épinglé (§8.4) ;
+  3. **valart est sauté pendant une save** : ses images sont des copies bit à bit **sans
+     refcount** (SAVE_DESIGN §2.A), une valeur à rc == 1 peut donc être lue par une image ;
+     la déplacer et libérer l'ancienne adresse serait une lecture de mémoire libérée.
+     Plus tard si besoin : déplacer quand même, mais différer la libération de l'ancienne
+     copie jusqu'à `end_save` (comme `deferred_bytes`). **Écarté : un bitmap des nœuds
+     valart capturés que le GC sauterait.** Il serait faux pour la même raison que le
+     bitset `captured` écarté par SAVE_DESIGN §2.B : HDEL / SREM font remonter une entrée
+     d'une feuille capturée vers un ancêtre non capturé, et l'image de la feuille la lit
+     encore ;
+  4. le **compactage HiSlab** (§9) reste interdit pendant une save : lui déplace des nœuds,
+     donc des idx.
 - Rien de daté ne survit à une tranche (règle d'or, ARCHITECTURE §1.1) : le GC ne garde
   entre deux tranches que son curseur (index de slot, toléré parce que le parcours ne
   promet rien) et ses indices épinglés vérifiés à la relecture.
@@ -414,7 +451,7 @@ Au repos, pas de limite : on avance par tranches.
 | cas | règle |
 |---|---|
 | marquage | figé au début de la passe ; B ne marque qu'entre deux passes |
-| une save démarre en pleine passe | la passe est **abandonnée** : on démarque tout ; les copies déjà faites restent valides |
+| une save démarre en pleine passe | la passe **continue** (§8.5) ; les `SharedByte` de valart sont sautés jusqu'à `end_save` et rattrapés par la passe suivante |
 | la réserve s'épuise en pleine passe | on prend une page neuve (le RSS monte un moment), comptée dans `INFO` ; la passe ne bloque jamais |
 | bloc marqué non vide en fin de passe (objet raté ou épinglé) | reste marqué pour la passe suivante ; démarqué au bout de 2 passes |
 
@@ -433,12 +470,11 @@ blocs démarqués.
 - première requête après un creux : surcoût ≤ une tranche ;
 - débit d'évacuation au repos (Mo/s) : relevé, pas imposé.
 
-**Seul point non tranché : saves fréquentes.** Une save abandonne la passe en cours et
-interdit le GC (§8.5). Si les saves se suivent (toutes les 30 s, ou en continu sous AOF :
-118 s vues sous YCSB à 1 cœur) et qu'une passe complète demande plus que l'intervalle, le
-GC ne finit jamais et la fragmentation monte sans borne. Pistes déjà notées en §15 : GC
-derrière le curseur de la save, ou suspendre la passe au lieu de l'abandonner. À trancher
-plus tard, avec une mesure de la durée d'une passe complète.
+**Saves fréquentes : tranché le 2026-10-22.** Le GC tourne pendant les saves (§8.5) : des
+saves qui se suivent (toutes les 30 s, ou en continu sous AOF : 118 s vues sous YCSB à
+1 cœur) ne l'empêchent plus de finir. Reste : sous saves continues, les `SharedByte` de
+valart ne sont jamais évacués ; si une charge Hash/Set le montre, passer à la libération
+différée de §8.5 point 3.
 
 ---
 
@@ -733,10 +769,17 @@ quelques secondes, puis rechargement.
 
 ## 15. Questions ouvertes
 
-- Contenu des gros conteneurs valart entre deux tranches de GC (non ordonné, peut être
-  restructuré entre deux tranches) ; on accepte un peu plus de fragmentation pour eux.
-- Partage légitime d'un `SharedByte` à deux endroits : à éliminer partout (copie profonde),
-  à auditer commande par commande.
+- ~~Contenu des gros conteneurs valart entre deux tranches de GC~~ : réglé le 2026-10-22,
+  le parcours est linéaire sur la slab valart et ignore les conteneurs (§8.1).
+- **Prérequis du GC** : partage légitime d'un `SharedByte` à deux endroits de l'arbre, à
+  éliminer partout (copie profonde), à auditer commande par commande **avant** d'activer
+  le GC. Une valeur à deux emplacements aurait rc == 2 et serait épinglée pour toujours (au
+  mieux), ou déplacée par un emplacement en laissant l'autre pointer sur un bloc libéré si
+  les deux tombent à rc == 1 par un autre chemin. Un `debug_assert!(rc == 1)` dans le
+  parcours du GC sur les tests différentiels le détecte.
+- Allocation dans la page la plus occupée (aide le niveau B, §8.2) contre la plus récente
+  (lignes chaudes, M5) : à mesurer.
+- Grosses valeurs (> S) : mimalloc ou jemalloc (§14.1) : à mesurer.
 - Seuil S des objets moyens (§6 ; la fenêtre de 8 blocs est décidée) et taille de bloc du
   pool court (§5).
 - `IORING_OP_MADVISE` avec `MADV_POPULATE_WRITE` (§3).
@@ -748,7 +791,8 @@ quelques secondes, puis rechargement.
 
 Ajouts du 2026-10-22 (pas encore tranchés) :
 
-- **La save bloque GC, compactage et éviction** (§8.5) alors que sous AOF les saves sont
+- **La save bloque compactage et éviction** (le GC des `SharedByte`, lui, continue
+  depuis le 2026-10-22, §8.5) alors que sous AOF les saves sont
   longues (118 s vues sous YCSB à 1 cœur) et se suivent, et que c'est pendant la save que la
   mémoire monte (copies de la barrière). Pistes : **GC derrière le curseur de la save** (un
   nœud déjà écrit par le DFS n'est plus intact : y déplacer ses `SharedByte` ne déclenche
@@ -767,7 +811,7 @@ Ajouts du 2026-10-22 (pas encore tranchés) :
 - **Fragmentation des grands objets** (§6, jamais évacués) : des suites de N blocs libérés au
   hasard trouent les pages, une page ne se rend qu'entièrement vide → liste des suites
   libres triée par longueur, placement qui regroupe les grands objets.
-- **Mode débogage du GC** : un pointeur périmé après évacuation est une lecture de mémoire
+- **Mode débogage du GC** (repris dans le périmètre v1, §14.1) : un pointeur périmé après évacuation est une lecture de mémoire
   libérée silencieuse → en test, remplir les blocs évacués d'un motif ou les passer
   `PROT_NONE` jusqu'à réutilisation ; une passe de GC entre chaque commande dans les tests
   différentiels.
