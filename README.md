@@ -681,19 +681,21 @@ Environment variables:
 | `RADIXOX_IOWQ_WORKERS` / `RADIXOX_IOWQ_CPUS` | `1` / unset | io-wq network workers at most, and the CPUs they may run on (e.g. `1,7`) |
 | `RADIXOX_FILE_CPUS` | unset | run the dump's writes and fsync on an io-wq worker pinned to these CPUs (e.g. `1`), off the server's core; io-wq has one CPU mask, the union of this and `RADIXOX_IOWQ_CPUS` |
 | `RADIXOX_MIN_WAIT_US` / `RADIXOX_WAIT_NR` | off / `32` | experimental: when idle, let the kernel wait up to this many µs for `WAIT_NR` completions before waking the loop for one (lower CPU per command, same throughput unless the loop is the bottleneck) |
-| `RADIXOX_GC` | `1` | `0`: no compaction of the value pool (pages that empty by themselves are still returned) |
-| `RADIXOX_GC_LOG` | `0` | `1`: one stderr line per compaction pass |
+| `RADIXOX_GC` | `1` | `0`: no compaction of the pool nor of the node slab (pages that empty by themselves are still returned) |
+| `RADIXOX_GC_LOG` | `0` | `1`: one stderr line per compaction pass (pool and node slab) |
 | `RADIXOX_GC_RESERVE_DIV` | `16` | blocks kept in reserve for compaction: `max(4 MiB, live / div)` |
 | `RADIXOX_MEMORY_DECAY` | `10` | seconds an empty 2 MiB page beyond the reserve is kept before being returned to the system |
 | `RADIXOX_POOL_VIRT_GB` | `256` | virtual range reserved for the value pool (nothing is committed until used) |
 
 ### Memory
 
-Values up to 16 KiB live in RadixOx's own pool: 64 KiB bump blocks on 2 MiB huge pages, a
-live counter per block, compacted in the loop's idle moments (and in bounded slices under
-load). Memory freed by deletions goes back to the system, which mimalloc alone never did after
-scattered deletions. Larger values go to jemalloc. `INFO` shows `mem_pool_*` and `gc_*`. Build
-with `RUSTFLAGS="--cfg radixox_nopool"` to use mimalloc for everything instead.
+The whole tree lives in RadixOx's own pool: values up to 16 KiB, key suffixes, node pages,
+small hashes and sets, valart overflow blocks. 64 KiB bump blocks on 2 MiB huge pages, a live
+counter per block, compacted in the loop's idle moments (and in bounded slices under load);
+the node slab is compacted in the background too and its tail returned to the system. Memory
+freed by deletions goes back to the system, which mimalloc alone never did after scattered
+deletions. Larger values go to jemalloc. `INFO` shows `mem_pool_*`, `gc_*` and `compact_*`.
+Build with `RUSTFLAGS="--cfg radixox_nopool"` to use mimalloc instead.
 
 ### Security
 
@@ -779,7 +781,7 @@ a simulated kernel.
 - **Four shapes**: 8 entries inline (radixes searched with one 8-byte load and a bit trick,
   SWAR), 8 more in an overflow page sharing the same bitmaps, then up to 32 with the metadata
   in the node and the cells in the page, then up to 256 with a 256-bit radix bitmap. Pages
-  are sized to mimalloc's size classes and shrink with hysteresis.
+  grow by size classes, shrink with hysteresis, and live in the pool (moved by compaction).
 - **Path compression** (`CompactPath`: up to 7 bytes inline, longer segments on the heap) and
   automatic re-compression after deletions: the tree always has the same canonical shape for
   the same content.
@@ -789,8 +791,9 @@ a simulated kernel.
   evictor.
 
 **Values**
-- Strings: `SharedByte`, an 8-byte single-threaded reference-counted buffer (no atomics),
-  allocated with mimalloc. Integers are stored as `i64` and formatted on read.
+- Strings: `SharedByte`, an 8-byte single-threaded reference-counted buffer (no atomics,
+  4-byte header), allocated in the pool up to 16 KiB and in jemalloc beyond. Integers are
+  stored as `i64` and formatted on read.
 - Hash and Set: up to 8 entries, one compact block of `SharedByte` pointers; beyond that,
   **valart**, a compact radix tree per container.
 - Sorted set: `BTreeSet<(score, member)>` + hash map for O(1) `ZSCORE`.
@@ -816,6 +819,9 @@ across cores is meant to come from sharding by namespace, not from shared-state 
   partial resync after a failover.
 - Lower memory per key on random keys: long suffixes stored inline on several cells (no
   separate allocation), a smaller node class for nodes with two or three entries.
+- Memory, next steps ([`MEMORY_ARCH.md`](MEMORY_ARCH.md)): a short-lived pool for command
+  temporaries (no holes left by a bulk load, less compaction work under load), compaction of
+  valart's slab, a capped reserve.
 - Client compatibility: `CONFIG`, RESP3.
 - Sharding by namespace for multi-core throughput.
 
@@ -847,6 +853,7 @@ MIT
 
 Built with [io-uring](https://github.com/tokio-rs/io-uring),
 [mimalloc](https://github.com/microsoft/mimalloc),
+[jemalloc](https://github.com/tikv/jemallocator),
 [regex-automata](https://github.com/rust-lang/regex) and
 [hislab](https://github.com/JoshuaBOUCHAT/hislab). Benchmarked against
 [Valkey](https://github.com/valkey-io/valkey).
