@@ -1260,6 +1260,14 @@ Chaque étape : tests verts, commit, push (règle du dépôt) ; mesure courte qu
      déclenchées au repos (creux de 10 ms du client) pour reboucher les trous laissés par
      les temporaires du chargement. À remesurer avec les tranches fixes ; la vraie racine
      est le pool court des temporaires (§5).
+   - **A/B après les tranches fixes** (2026-10-23, machine au repos, `SERVER_CORES=3`,
+     500 K / 4 M, paires alternées B A B A) : RadixOx 431 732 / 429 139 / 438 452 /
+     434 169 ops/s (mimalloc / pool / mimalloc / pool), soit −0,6 % et −1 % bruts, −2 %
+     ramené au Valkey de chaque run (ratios 1,210 / 1,210 / 1,234 / 1,186) : le −8 % a
+     disparu. READ p99 +3 à 4 %, p99.9 +6 à 20 % (786→831, 617→747 µs), p99.99 égal ; RSS
+     +8 à 10 Mo (YCSB A ne supprime rien). Le critère de l'étape 7 (« p99.9 identique »)
+     n'est pas strictement tenu : à trancher (activer avec ce surcoût, ou d'abord le pool
+     court des temporaires, §5).
 7. **Pool + GC activés par défaut** (`radixox_pool` retiré, `radixox_nopool` devient
    l'interrupteur) une fois les critères de §8.7 tenus : RSS après −90 % puis GC
    ≤ vivants × 1,15 + R ; écrasements au hasard 30 s : RSS stable à ±15 % ; débit et
