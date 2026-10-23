@@ -110,17 +110,21 @@ impl HashNode {
 
     /// Tous les `SharedByte` du nœud en place, clés et valeurs, inline puis débordement
     /// (GC, MEMORY_ARCH.md §16.6). À ne réécrire que vers les mêmes octets.
-    pub(crate) fn for_each_sb_mut(&mut self, f: &mut impl FnMut(&mut SharedByte)) {
+    pub(crate) fn for_each_sb_mut(&mut self, f: &mut impl crate::ValVisitor) {
+        // le bloc de débordement d'abord : ses entrées sont lues à sa nouvelle place
+        if let Some(ov) = self.overflow.as_mut() {
+            ov.gc_block(&mut |p, size| f.block(p, size));
+        }
         for i in 0..self.count as usize {
             unsafe {
-                f(&mut *self.key_ptr_mut(i));
-                f(&mut *self.val_ptr_mut(i));
+                f.bytes(&mut *self.key_ptr_mut(i));
+                f.bytes(&mut *self.val_ptr_mut(i));
             }
         }
         if let Some(ov) = self.overflow.as_mut() {
             for i in 0..ov.len() {
-                f(ov.key_mut(i));
-                f(ov.val_mut(i));
+                f.bytes(ov.key_mut(i));
+                f.bytes(ov.val_mut(i));
             }
         }
     }

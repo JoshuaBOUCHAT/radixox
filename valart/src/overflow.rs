@@ -1,18 +1,24 @@
 use std::alloc::{Layout, handle_alloc_error};
 
-// Blocs overflow : mimalloc en direct (pools par taille, comme `SharedByte`).
-// `mi_zalloc` et pas `MiMalloc.alloc_zeroed` : ce dernier passe par
-// `mi_zalloc_aligned`, qui sur page vide sur-alloue size+align-1 et peut
-// tomber dans la classe de taille suivante. mimalloc aligne déjà sur 8, ce
-// qui suffit au tag de 3 bits.
+// Blocs overflow : pool des structures, alignés sur 8 (MEMORY_ARCH.md §17.4) ; ce qui
+// suffit au tag de 3 bits. Taille arrondie à 8 (les curseurs du pool n'allouent que des
+// multiples de 8), à l'allocation comme à la libération. Le pool ne rend pas de mémoire
+// à zéro : remise à zéro ici.
 // En test, allocateur système pour qu'AddressSanitizer voie les blocs.
 #[cfg(not(test))]
 unsafe fn block_zalloc(layout: Layout) -> *mut u8 {
-    unsafe { radixox_lib::raw_alloc::zalloc(layout.size()) }
+    let size = align_up8(layout.size());
+    unsafe {
+        let p = radixox_lib::pool::struct_alloc(size);
+        if !p.is_null() {
+            std::ptr::write_bytes(p, 0, size);
+        }
+        p
+    }
 }
 #[cfg(not(test))]
-unsafe fn block_free(ptr: *mut u8, _layout: Layout) {
-    unsafe { radixox_lib::raw_alloc::free(ptr) }
+unsafe fn block_free(ptr: *mut u8, layout: Layout) {
+    unsafe { radixox_lib::pool::struct_free(ptr, align_up8(layout.size())) }
 }
 #[cfg(test)]
 unsafe fn block_zalloc(layout: Layout) -> *mut u8 {
@@ -505,6 +511,18 @@ impl Default for SetOverflow {
     }
 }
 
+impl SetOverflow {
+    /// GC (MEMORY_ARCH.md §17.4) : donne le bloc (sans tag, taille arrondie à 8) au
+    /// visiteur, qui peut le déplacer, puis remet le tag sur la nouvelle adresse.
+    pub(crate) fn gc_block(&mut self, g: &mut impl FnMut(&mut *mut u8, usize)) {
+        let class = self.class() as usize;
+        let mut base = self.base_ptr();
+        g(&mut base, align_up8(self.block_bytes()));
+        // SAFETY: `base` est non nul (bloc vivant, éventuellement recopié).
+        self.ptr = unsafe { NonNull::new_unchecked((base as usize | class) as *mut u8) };
+    }
+}
+
 impl Drop for SetOverflow {
     fn drop(&mut self) {
         for i in 0..self.len() {
@@ -963,6 +981,18 @@ impl HashOverflow {
 impl Default for HashOverflow {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl HashOverflow {
+    /// GC (MEMORY_ARCH.md §17.4) : donne le bloc (sans tag, taille arrondie à 8) au
+    /// visiteur, qui peut le déplacer, puis remet le tag sur la nouvelle adresse.
+    pub(crate) fn gc_block(&mut self, g: &mut impl FnMut(&mut *mut u8, usize)) {
+        let class = self.class() as usize;
+        let mut base = self.base_ptr();
+        g(&mut base, align_up8(self.block_bytes()));
+        // SAFETY: `base` est non nul (bloc vivant, éventuellement recopié).
+        self.ptr = unsafe { NonNull::new_unchecked((base as usize | class) as *mut u8) };
     }
 }
 

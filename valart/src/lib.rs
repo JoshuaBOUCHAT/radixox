@@ -98,6 +98,21 @@ impl Drop for ValNodeImage {
     }
 }
 
+/// Ce que le GC voit dans valart (MEMORY_ARCH.md §16.6, §17.4) : les `SharedByte` (clés,
+/// valeurs, membres) et les blocs de débordement (objets de structure alignés sur 8). Une
+/// closure sur `&mut SharedByte` est un visiteur qui ignore les blocs.
+pub trait ValVisitor {
+    fn bytes(&mut self, sb: &mut SharedByte);
+    /// Bloc de débordement : pointeur (sans tag) en place et taille ; peut être déplacé.
+    fn block(&mut self, _ptr: &mut *mut u8, _size: usize) {}
+}
+
+impl<F: FnMut(&mut SharedByte)> ValVisitor for F {
+    fn bytes(&mut self, sb: &mut SharedByte) {
+        self(sb)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 enum NodeType {
@@ -179,7 +194,7 @@ impl ValTrees {
         });
     }
 
-    /// GC (MEMORY_ARCH.md §16.6) : visite les `SharedByte` des slots occupés à partir
+    /// GC (MEMORY_ARCH.md §16.6, §17.4) : visite les blocs de débordement et les `SharedByte` des slots occupés à partir
     /// de `from`, au plus `budget` slots ; rend le slot où reprendre, `None` à la fin.
     /// Les zones de collision (rares) sont visitées d'un coup, une fois les slots finis.
     ///
@@ -187,16 +202,16 @@ impl ValTrees {
     /// une mutation. **Jamais pendant une save** : l'image d'un nœud copie ses
     /// `SharedByte` bit à bit, déplacer l'original laisserait l'image pointer sur un
     /// emplacement libéré.
-    pub fn gc_visit(&mut self, from: u32, budget: u32, f: &mut impl FnMut(&mut SharedByte)) -> Option<u32> {
+    pub fn gc_visit(&mut self, from: u32, budget: u32, f: &mut impl ValVisitor) -> Option<u32> {
         debug_assert!(!self.save.is_active(), "GC de valart pendant une save");
         let mut at = from;
         for _ in 0..budget {
             let Some(i) = self.nodes.next_occupied(at) else {
                 self.hash_collisions.for_each_mut(|(k, v)| {
-                    f(k);
-                    f(v);
+                    f.bytes(k);
+                    f.bytes(v);
                 });
-                self.set_collisions.for_each_mut(&mut *f);
+                self.set_collisions.for_each_mut(|m| f.bytes(m));
                 return None;
             };
             let node = unsafe { self.nodes.get_unchecked_mut(i) };

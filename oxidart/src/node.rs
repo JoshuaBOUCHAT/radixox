@@ -26,7 +26,7 @@ use std::mem::ManuallyDrop;
 use std::ptr::{self, NonNull};
 
 use radixox_lib::prefetch::prefetch_l1;
-use radixox_lib::raw_alloc::{free as mi_free, malloc as mi_malloc};
+use radixox_lib::pool;
 
 use crate::ExpAndRadix;
 use crate::compact_path::CompactPath;
@@ -118,7 +118,9 @@ union Body {
     wide: WideMeta,
 }
 
-#[repr(C, align(64))]
+/// Aligné sur 128 (sa taille) : un nœud = deux lignes de cache entières, copie vectorielle
+/// alignée au compactage (MEMORY_ARCH.md §17.2 bis).
+#[repr(C, align(128))]
 pub(crate) struct Node {
     // ── ligne 1 : tout ce que lit la descente ──
     /// Page, ou `TRASH`.
@@ -143,7 +145,7 @@ pub(crate) struct Node {
     body: Body,
 }
 
-const _: () = assert!(size_of::<Node>() == 128);
+const _: () = assert!(size_of::<Node>() == 128 && align_of::<Node>() == 128);
 const _: () = assert!(std::mem::offset_of!(Node, body) == 64);
 
 // ─── Entrées ─────────────────────────────────────────────────────────────────
@@ -628,6 +630,7 @@ struct Loc {
     child_off: usize,
     child: bool,
     ttl: bool,
+    sfx: bool,
 }
 
 impl Loc {
@@ -641,6 +644,7 @@ impl Loc {
             child_off: if child { seg.child_off(i) } else { 0 },
             child,
             ttl: seg.t.bit(i),
+            sfx: seg.s.bit(i),
         }
     }
 }
@@ -1055,6 +1059,34 @@ impl Node {
         }
     }
 
+    /// Début de la page (en-tête, puis enfants), `None` sans page : préchargement.
+    #[inline]
+    pub(crate) fn page_start(&self) -> Option<*const u8> {
+        (self.pg_block8 > 0).then_some(self.ptr.as_ptr() as *const u8)
+    }
+
+    /// Page du nœud (pointeur en place, taille), `None` sans page (GC, MEMORY_ARCH.md §17).
+    /// À ne réécrire que vers une copie exacte de la page.
+    pub(crate) fn page_mut(&mut self) -> Option<(&mut *mut u8, usize)> {
+        let size = self.block();
+        // NonNull<u8> et *mut u8 ont la même représentation
+        (size > 0).then(|| (unsafe { &mut *(&mut self.ptr as *mut NonNull<u8> as *mut *mut u8) }, size))
+    }
+
+    /// Chemins du nœud en place, préfixe puis suffixes des feuilles (GC, MEMORY_ARCH.md
+    /// §17). À ne réécrire que vers les mêmes octets.
+    pub(crate) fn for_each_path_mut(&mut self, mut f: impl FnMut(&mut CompactPath)) {
+        f(&mut self.prefix);
+        for e in 0..self.len() {
+            let loc = self.loc_mut(e);
+            if !loc.child && loc.sfx {
+                // record d'une feuille : [suffixe][TTL ?][valeur], collé à `leaf_end`
+                let at = loc.leaf_end - 8 * (2 + loc.ttl as usize);
+                unsafe { f(&mut *(loc.cells.add(at) as *mut CompactPath)) };
+            }
+        }
+    }
+
     /// Valeur d'une feuille, en place. Invalide dès la prochaine mutation.
     pub(crate) fn leaf_val_mut(&mut self, radix: u8) -> Option<(&mut Tag, &mut ValUnion)> {
         let e = self.find(radix)?;
@@ -1220,7 +1252,8 @@ impl Node {
                 debug_assert!(kids + leaves == 0);
                 trash()
             } else {
-                let p = NonNull::new(mi_malloc(new_block)).expect("page alloc");
+                // Pool des structures, aligné sur 8 (MEMORY_ARCH.md §17).
+                let p = NonNull::new(pool::struct_alloc(new_block)).expect("page alloc");
                 if old_block > 0 {
                     debug_assert!(head + kids + leaves <= new_block);
                     let old = self.ptr.as_ptr();
@@ -1234,7 +1267,7 @@ impl Node {
                 p
             };
             if old_block > 0 {
-                mi_free(self.ptr.as_ptr());
+                pool::struct_free(self.ptr.as_ptr(), old_block);
             }
             self.ptr = new_ptr;
         }
@@ -1482,7 +1515,7 @@ impl Node {
             out.push(raw);
         }
         if self.pg_block8 > 0 {
-            unsafe { mi_free(self.ptr.as_ptr()) };
+            unsafe { pool::struct_free(self.ptr.as_ptr(), self.block()) };
         }
         self.ptr = trash();
         self.pg_block8 = 0;

@@ -255,9 +255,22 @@ const GC_IDLE_AFTER: Duration = Duration::from_millis(10);
 const GC_SLICE_SLOTS: u32 = 10_000;
 const GC_SLICE_BYTES: usize = 2 * radixox_lib::pool::BLOCK;
 
-/// GC niveau A du pool : passe en cours et réglages (`RADIXOX_GC`, `RADIXOX_GC_LOG`).
+/// Compactage de la slab des nœuds (MEMORY_ARCH.md §17.2) : unités par tranche (4 par
+/// copie, 2 par parent, 1 par enfant ≈ lignes de cache touchées). Pipeline de 8 sur une
+/// slab froide (5M clés) : 1 024 unités = 120–150 µs ; 512 vise ~50–70 µs sous charge.
+const COMPACT_SLICE_UNITS: u32 = 512;
+
+/// GC niveau A du pool, compactage de la slab des nœuds : passes en cours et réglages
+/// (`RADIXOX_GC`, `RADIXOX_GC_LOG`).
 struct Gc {
     pass: Option<oxidart::gc::GcPass>,
+    compact: Option<oxidart::compact::Compaction>,
+    compact_passes: u64,
+    compact_moved: u64,
+    compact_released: u64,
+    compact_max_slice_us: u64,
+    /// Temps passé dans les tranches de compactage (µs, cumul).
+    compact_total_us: u64,
     enabled: bool,
     log: bool,
     /// Plus longue tranche depuis le démarrage (µs).
@@ -269,7 +282,7 @@ struct Gc {
 impl Gc {
     fn from_env() -> Self {
         let on = |name: &str, default: bool| std::env::var(name).map_or(default, |v| v != "0");
-        Self { pass: None, enabled: on("RADIXOX_GC", true), log: on("RADIXOX_GC_LOG", false), max_slice_us: 0, started: None }
+        Self { pass: None, enabled: on("RADIXOX_GC", true), log: on("RADIXOX_GC_LOG", false), max_slice_us: 0, started: None, compact: None, compact_passes: 0, compact_moved: 0, compact_released: 0, compact_max_slice_us: 0, compact_total_us: 0 }
     }
 }
 
@@ -905,6 +918,7 @@ impl Core {
             || !self.jobs.is_empty()
             || self.bgsave.as_ref().is_some_and(|b| b.wants_slice())
             || self.gc.pass.is_some()
+            || self.gc.compact.is_some()
     }
 
     pub fn mode(&self, slot: Slot) -> Mode {
@@ -1783,6 +1797,19 @@ impl Core {
                 crate::exec::info_stats(&mut info);
                 info.push_str("\r\n");
                 crate::exec::info_memory(&mut info, self.gc.enabled, self.gc.pass.is_some(), self.gc.max_slice_us);
+                let _ = std::fmt::Write::write_fmt(
+                    &mut info,
+                    format_args!(
+                        "compact_running:{}\r\ncompact_passes:{}\r\ncompact_moved_nodes:{}\r\ncompact_released_bytes:{}\r\ncompact_max_slice_us:{}\r\ncompact_total_us:{}\r\ncompact_slab_holes_bytes:{}\r\n",
+                        self.gc.compact.is_some() as u8,
+                        self.gc.compact_passes,
+                        self.gc.compact_moved,
+                        self.gc.compact_released,
+                        self.gc.compact_max_slice_us,
+                        self.gc.compact_total_us,
+                        self.art.slab_holes_bytes(),
+                    ),
+                );
                 extend_encode(&mut self.outs[s].out, &Frame::BulkString(SharedByte::from_slice(info.as_bytes())));
             }
             After::Subscribe(channels) => self.subscribe(slot, &channels),
@@ -1920,7 +1947,7 @@ impl Core {
     /// libération, BGSAVE) : la boucle doit envoyer les réponses du tour avant
     /// de la faire (RUNTIME_ARCH.md §2).
     pub fn has_jobs(&self) -> bool {
-        !self.conn_jobs.is_empty() || !self.jobs.is_empty() || self.bgsave_slice_due() || self.gc.pass.is_some()
+        !self.conn_jobs.is_empty() || !self.jobs.is_empty() || self.bgsave_slice_due() || self.gc.pass.is_some() || self.gc.compact.is_some()
     }
 
     /// Une tranche de BGSAVE est à faire à ce tour-ci (pas de tranche à
@@ -1986,6 +2013,7 @@ impl Core {
         self.free_step();
         self.bgsave_slice();
         self.gc_slice();
+        self.compact_slice();
     }
 
     /// Une étape de travail de fond quand personne n'attend : ni client ici,
@@ -1994,16 +2022,61 @@ impl Core {
     /// Un client parqué d'abord, puis la libération, puis la save. Rend `true`
     /// s'il reste du travail de fond.
     pub fn idle_step(&mut self) -> bool {
-        let _ = self.conn_job_step() || self.free_step() || self.bgsave_idle_slice() || self.gc_slice();
+        let _ = self.conn_job_step() || self.free_step() || self.bgsave_idle_slice() || self.gc_slice() || self.compact_slice();
         self.has_background()
     }
 
     // ── GC niveau A du pool (MEMORY_ARCH.md §16.6) ───────────────────────
 
-    /// Timer : démarre une passe si le pool la demande (fragmentation, réserve).
+    /// Le compactage de la slab des nœuds peut avancer : personne ne tient d'`idx` de nœud
+    /// entre deux tranches (save, jobs de connexion, libérations).
+    fn compact_allowed(&self) -> bool {
+        !self.art.is_saving() && self.conn_jobs.is_empty() && self.jobs.is_empty()
+    }
+
+    /// Une tranche de compactage. Faux sans passe. Une save ou un job apparu entre-temps
+    /// arrête la passe (l'arbre est cohérent après chaque déplacement ; rien n'est rendu).
+    fn compact_slice(&mut self) -> bool {
+        let Some(c) = self.gc.compact.as_mut() else { return false };
+        if !(!self.art.is_saving() && self.conn_jobs.is_empty() && self.jobs.is_empty()) {
+            if self.gc.log {
+                eprintln!("[compact] arrêt : save ou job en cours ({} nœuds déplacés)", c.moved);
+            }
+            self.gc.compact_moved += c.moved;
+            self.gc.compact = None;
+            return false;
+        }
+        let t0 = Instant::now();
+        let done = self.art.compact_step(c, COMPACT_SLICE_UNITS);
+        let us = t0.elapsed().as_micros() as u64;
+        self.gc.compact_max_slice_us = self.gc.compact_max_slice_us.max(us);
+        self.gc.compact_total_us += us;
+        if let Some(r) = done {
+            self.gc.compact = None;
+            self.gc.compact_passes += 1;
+            self.gc.compact_moved += r.moved;
+            self.gc.compact_released += r.released_bytes as u64;
+            if self.gc.log {
+                eprintln!("[compact] fin : {} nœuds déplacés, {} Kio rendus", r.moved, r.released_bytes >> 10);
+            }
+        }
+        true
+    }
+
+    /// Timer : démarre une passe si le pool la demande (fragmentation, réserve), sinon un
+    /// compactage de la slab des nœuds si ses trous dépassent le seuil.
     fn gc_trigger(&mut self) {
         use radixox_lib::pool;
-        if !self.gc.enabled || self.gc.pass.is_some() {
+        if !self.gc.enabled || self.gc.pass.is_some() || self.gc.compact.is_some() {
+            return;
+        }
+        if self.compact_allowed()
+            && let Some(c) = self.art.compact_want(false)
+        {
+            if self.gc.log {
+                eprintln!("[compact] passe : {} Kio de trous dans la slab des nœuds", self.art.slab_holes_bytes() >> 10);
+            }
+            self.gc.compact = Some(c);
             return;
         }
         let idle = self.now.saturating_duration_since(self.last_rx) >= GC_IDLE_AFTER;

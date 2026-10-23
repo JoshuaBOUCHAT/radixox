@@ -811,8 +811,12 @@ fn gc_census_matches_tree_bytes() {
     let total = radixox_lib::pool::verify_census(&census).unwrap();
     assert_eq!(total, radixox_lib::pool::live_bytes() - before);
     if cfg!(not(any(radixox_nopool, radixox_sysalloc))) {
-        // 201 chaînes + 2 × (3 + 30) champs et valeurs + 33 membres + 10 éléments
-        assert_eq!(census.len(), 201 + 66 + 33 + 10);
+        // 201 chaînes + 2 × (3 + 30) champs et valeurs + 33 membres + 10 éléments, plus les
+        // pages des nœuds, les 2 petits blocs Hash / Set et les débordements valart (§17) ;
+        // l'égalité stricte porte sur les octets (ci-dessus)
+        let mut pages = 0;
+        art.map.for_each_occupied(|_, n| pages += (n.page_block() > 0) as usize);
+        assert!(census.len() > 201 + 66 + 33 + 10 + pages + 2, "{}", census.len());
     }
     drop(art);
     assert_eq!(radixox_lib::pool::live_bytes(), before);
@@ -851,4 +855,150 @@ fn gc_full_pass_moves_values_and_pins_shared() {
     }
     drop(held);
     assert!(radixox_lib::pool::verify_census(&art.gc_census()).is_ok());
+}
+
+/// Chemins sur le tas (`CompactPath` > 7 octets, MEMORY_ARCH.md §17) : la passe forcée les
+/// déplace aussi, l'arbre reste exact et le recensement les compte.
+#[test]
+fn gc_full_pass_moves_heap_paths() {
+    let mut art = OxidArt::new();
+    let keys: Vec<String> =
+        (0..2_000).map(|i| format!("{:x}-suffixe-assez-long-{i}", i * 7919)).collect();
+    for k in &keys {
+        art.set(sb(k), Value::String(sb("v")));
+    }
+    // préfixes communs longs : nœuds intermédiaires à préfixe sur le tas
+    for i in 0..500 {
+        art.set(sb(&format!("namespace-commun-tres-long:{i}:fin")), Value::String(sb("w")));
+    }
+    // conteneurs : petits blocs Hash / Set et débordements valart (objets de structure, §17.4)
+    for (k, n) in [("hs", 3), ("hb", 60)] {
+        let fv: Vec<_> = (0..n).map(|i| (sb(&format!("champ-{i}")), sb(&format!("valeur-{i}")))).collect();
+        art.cmd_hset(k.as_bytes(), &fv, None).unwrap();
+    }
+    for (k, n) in [("ss", 3), ("sb", 60)] {
+        let ms: Vec<_> = (0..n).map(|i| sb(&format!("membre-{i}"))).collect();
+        art.cmd_sadd(k.as_bytes(), &ms, None).unwrap();
+    }
+    let census0 = art.gc_census();
+    let s0 = radixox_lib::pool::gc_stats().unwrap_or_default();
+    art.gc_full_pass();
+    let s1 = radixox_lib::pool::gc_stats().unwrap_or_default();
+    for k in &keys {
+        assert_eq!(art.get(k.as_bytes()), Some(Value::String(sb("v"))), "{k}");
+    }
+    for i in 0..500 {
+        assert_eq!(art.get(format!("namespace-commun-tres-long:{i}:fin").as_bytes()), Some(Value::String(sb("w"))));
+    }
+    assert_eq!(art.cmd_hlen(b"hb").unwrap(), 60);
+    assert_eq!(art.cmd_hget(b"hb", b"champ-42").unwrap().unwrap().as_slice(), b"valeur-42");
+    assert_eq!(art.cmd_hget(b"hs", b"champ-2").unwrap().unwrap().as_slice(), b"valeur-2");
+    assert_eq!(art.cmd_scard(b"sb").unwrap(), 60);
+    assert_eq!(art.cmd_scard(b"ss").unwrap(), 3);
+    assert!(radixox_lib::pool::verify_census(&art.gc_census()).is_ok());
+    if radixox_lib::pool::ENABLED {
+        // chaque emplacement recensé a changé (tout était évacuable), et les chemins comptent
+        let census1 = art.gc_census();
+        assert_eq!(census0.len(), census1.len());
+        assert!(census0.iter().zip(&census1).all(|(a, b)| a.0 != b.0), "tout a bougé");
+        let path_bytes: usize = keys.iter().map(|k| (2 + k.len() + 1) & !1).sum::<usize>() / 2;
+        assert!((s1.evacuated_bytes - s0.evacuated_bytes) as usize >= path_bytes);
+    }
+}
+
+// ─── Compactage de la slab des nœuds (MEMORY_ARCH.md §17.2) ──────────────────
+
+/// 200K clés (dont des TTL), 3/4 supprimées au hasard, compactage par petites tranches :
+/// l'arbre reste exact (parents, radix, tags TTL : `check`), la fin de la slab est rendue.
+#[test]
+fn compaction_moves_nodes_and_releases_tail() {
+    let mut rng = Rng(0xC0FFEE);
+    let mut art = OxidArt::new();
+    art.set_now(1_000);
+    let keys: Vec<String> = (0..200_000).map(|_| format!("{:016x}{:08x}", rng.next(), rng.next() as u32)).collect();
+    for (i, k) in keys.iter().enumerate() {
+        let v = Value::String(sb(&format!("v{i}")));
+        if i % 7 == 0 {
+            art.set_ttl(sb(k), Duration::from_secs(3600), v);
+        } else {
+            art.set(sb(k), v);
+        }
+    }
+    let kept: Vec<usize> = (0..keys.len()).filter(|&i| rng.below(4) == 0).collect();
+    let keep: std::collections::HashSet<usize> = kept.iter().copied().collect();
+    for (i, k) in keys.iter().enumerate() {
+        if !keep.contains(&i) {
+            art.del(k.as_bytes());
+        }
+    }
+    art.check();
+    let holes = art.slab_holes_bytes();
+    assert!(holes > 3 << 20, "beaucoup de trous : {holes}");
+    let mut c = art.compact_want(false).expect("déclenchement");
+    let mut slices = 0;
+    let report = loop {
+        slices += 1;
+        if let Some(r) = art.compact_step(&mut c, 512) {
+            break r;
+        }
+    };
+    assert!(slices > 10, "par tranches ({slices})");
+    assert!(report.moved > 0 && report.released_bytes >= 2 << 20, "{report:?}");
+    art.check();
+    // Vidé jusqu'à `arrondi(occupés + 2 Mio de libre gardé, page)` : le reste des trous est
+    // ce libre, que les prochaines insertions comblent sans faute de page.
+    let page = (2u32 << 20) / 128;
+    let last = art.map.last_occupied().unwrap();
+    assert!(last < (art.map.len() + page).next_multiple_of(page), "fin vidée : dernier {last}");
+    assert!(art.slab_holes_bytes() < holes, "trous rebouchés");
+    for &i in &kept {
+        assert_eq!(art.get(keys[i].as_bytes()), Some(Value::String(sb(&format!("v{i}")))), "{}", keys[i]);
+        if i % 7 == 0 {
+            assert!(matches!(art.get_ttl(sb(&keys[i])), crate::TtlResult::KeyWithTtl(_)));
+        }
+    }
+    // L'arbre compacté accepte les écritures (les slots rendus refont des fautes de page).
+    for k in keys.iter().take(1000) {
+        art.set(sb(k), Value::String(sb("w")));
+    }
+    art.check();
+    // Sous le seuil : rien ne se déclenche ; `force` compacte tout.
+    assert!(art.compact_want(false).is_none());
+}
+
+/// Chaînes profondes créées en dernier, donc en fin de slab : nœuds et parents voisins,
+/// déplacés en même temps par le pipeline (MEMORY_ARCH.md §17.2), dans tous les ordres de
+/// validation. Tranches minuscules : le pipeline se vide et repart sans cesse.
+#[test]
+fn compaction_pipeline_moves_parents_and_children_together() {
+    let mut art = OxidArt::new();
+    // d'abord du remplissage, ensuite supprimé : les trous sont en bas
+    let filler: Vec<String> = (0..60_000).map(|i| format!("f{i:05}x")).collect();
+    for k in &filler {
+        art.set(sb(k), Value::String(sb("f")));
+    }
+    // puis des chaînes : chaque clé prolonge la précédente d'un caractère
+    let mut chain = Vec::new();
+    for root in 0..40 {
+        let mut k = format!("chain{root}:");
+        for d in 0..60 {
+            k.push((b'a' + (d % 26) as u8) as char);
+            art.set(sb(&k), Value::String(sb(&format!("{root}-{d}"))));
+            chain.push((k.clone(), format!("{root}-{d}")));
+        }
+    }
+    for k in &filler {
+        art.del(k.as_bytes());
+    }
+    let mut c = art.compact_want(true).expect("trous");
+    let mut slices = 0;
+    while art.compact_step(&mut c, 7).is_none() {
+        slices += 1;
+    }
+    assert!(slices > 100 && c.moved > 1000, "{slices} tranches, {} déplacés", c.moved);
+    art.check();
+    for (k, v) in &chain {
+        assert_eq!(art.get(k.as_bytes()), Some(Value::String(sb(v))), "{k}");
+    }
+    assert_eq!(art.map.last_occupied().unwrap() + 1, art.map.len(), "slab dense");
 }

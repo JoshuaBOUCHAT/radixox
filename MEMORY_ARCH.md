@@ -1278,3 +1278,194 @@ Chaque étape : tests verts, commit, push (règle du dépôt) ; mesure courte qu
    voyant pas les objets du pool) ramène la forme courte dans mimalloc et rend le GC inerte.
 8. Mettre à jour `ARCHITECTURE.md`, le README (configuration, `INFO`) et l'état en tête de
    ce document. **Fait le 2026-10-23.**
+
+---
+
+## 17. Objets de structure dans le pool (après la v1, 2026-10-23)
+
+Suite de §8.6 : les allocations de l'arbre quittent mimalloc pour devenir déplaçables par le
+GC. Mesure de départ (1M clés uuid4 base64 → 1M valeurs, + 100K `probe`, 1,1M clés en
+tout) : arène mimalloc 42 Mo, slab des nœuds 35 Mo, pool (valeurs) 28 Mo, RSS 122 Mo ;
+après suppression de la moitié par `UNLINK c*`, **rien de l'arbre n'est rendu** (RSS 114 Mo
+au bout de 16 s, seul le pool baisse). Recensement des tailles (test temporaire) :
+
+| objet | uuid b64 | YCSB `user<chiffres>` |
+|---|---|---|
+| suffixes `CompactPath` sur le tas | 1M (un par clé), tous ≤ 24 o, 24 Mo | 1M, 73 % ≤ 16 o, reste ≤ 24 o, 18 Mo |
+| pages des nœuds | 96K, 6,5 Mo, 87 % ≤ 64 o, max 768 o | 61K, 2,6 Mo, max 112 o |
+| préfixes `CompactPath` sur le tas | 0 | 0 |
+| nœuds (slab de 128 o) | 276K, 35 Mo | 411K, 53 Mo |
+
+### 17.1 `CompactPath` (fait, branche `pool-structures`)
+
+- Forme tas = un objet du pool des `SharedByte`, **sans compteur de références** (choix de
+  l'utilisateur : propriétaire unique, le `rc` serait 2 o par clé et un test pour rien).
+  Pointeur sur les données, en-tête lu à reculons en `u16` : forme courte `[len u16]`
+  (≤ 16 Kio, pool ou mimalloc sans pool), forme longue `[len_hi][len_lo | 0x8000]` dans
+  jemalloc. Données à adresse paire : le bit 0 distingue toujours le tas de l'inline.
+- `pool::short_alloc` / `short_free` / `short_shrink` (publics, choix pool ou mimalloc au
+  même endroit pour `SharedByte` et `CompactPath`), `pool::ENABLED`.
+- GC : trait `oxidart::gc::GcVisitor` (`bytes` + `path`, une closure sur `&mut SharedByte`
+  en est un) ; `Node::for_each_path_mut` (préfixe, suffixes des feuilles, `Loc.sfx`) ;
+  `CompactPath::gc_relocate` (jamais épinglé) ; `pool_slot` pour `verify_census`. Copies
+  bit à bit vérifiées : les images de save recopient le suffixe (`from_slice`), le transit
+  `Raw` de `node.rs` ne traverse pas de GC.
+- Mesure (même scénario) : arène mimalloc **12 Mo** (pages des nœuds seules), pool 56 Mo
+  (48,6 Mo vivants : valeurs + chemins), RSS chargé 120 Mo ; après suppression de la
+  moitié, RSS **96 Mo** au bout de 16 s (114 Mo avant), pool 32 Mo.
+
+### 17.2 Pages des nœuds (fait, branche `pool-structures`)
+
+- Deux curseurs de plus dans le **même** `Pool` (§17.3) : `STRUCT` et `STRUCT_SURVIVOR`,
+  qui n'allouent que des multiples de 8 et restent donc alignés sur 8 (les pages
+  contiennent des `u32` / `u64` lus alignés) ; leurs blocs ne mélangent pas les deux
+  alignements. Taille des pages inchangée (`alloc_class`, la marge de croissance).
+- `pool::struct_alloc` / `struct_free` : pool jusqu'à 16 Kio, jemalloc au-delà ou plage
+  pleine, mimalloc sans pool ; le `free` est aiguillé par l'appartenance à la plage (une
+  page n'a pas d'en-tête). `relocate8` et `struct_slot` pour le GC et le recensement ;
+  `GcVisitor::page`, `Node::page_mut` ; la page est visitée avant les valeurs et les
+  suffixes, lus ensuite à sa nouvelle place.
+- Mesure (scénario uuid de §17) : arène mimalloc **< 1 Mo**, RSS chargé **118 Mo**, après
+  suppression de la moitié **90 Mo** au bout de 16 s (pool 66 → 38 Mo).
+
+### 17.4 Petits blocs Hash/Set et débordements valart (fait, branche `pool-structures`)
+
+- `small.rs` : `struct_alloc` / `struct_free` (taille `8 + cap × W × 8`, déjà multiple de
+  8), `block_bytes` ; débordements valart (`overflow.rs`) : `struct_alloc` + remise à zéro
+  (le pool ne rend pas de mémoire à zéro), taille arrondie à 8 à l'allocation comme à la
+  libération (`child_cap × 4` peut ne pas l'être) ; en test de valart, toujours
+  l'allocateur système (ASan).
+- **Une seule passe de GC** (choix de l'utilisateur) : elle parcourt les nœuds, là où sont
+  les pointeurs. `visit_val` déplace le petit bloc (`GcVisitor::page`) puis visite ses
+  entrées à sa nouvelle place ; valart a son trait `ValVisitor` (`bytes`, `block`),
+  `gc_block` donne le bloc sans tag au visiteur et remet le tag ; oxidart fait la
+  passerelle (`Bridge`). Le bloc d'un nœud valart est visité avant ses entrées.
+- Plus aucune arène mimalloc dans le serveur. Mesure, 1M de Hash à un champ façon YCSB
+  (`user<chiffres>`, `field0`, 100 o) puis `UNLINK user1*` … `user5*` (56 % des clés) :
+  pool 178 → 74 Mo, slab des nœuds 53 → 29 Mo (compactage), **RSS 246 → 118 Mo** au bout
+  de 16 s.
+
+### 17.5 Suite
+
+1. **Compactage de la slab valart** (même mécanisme que §17.2 bis, idx d'enfants propres).
+2. ~~Publier `hislab` 0.2.5, fusionner `pool-structures` dans `main`~~ : fait le 2026-10-23.
+2. **Compactage HiSlab** (§9) : le plus gros poste restant (35 Mo uuid, 53 Mo YCSB) ; la
+   slab ne rétrécit jamais. **En arrière-plan** (tranches au repos, comme le GC), avec
+   **libération sur critères** (excédent tenu qui dure, comme le niveau B) — idée de
+   l'utilisateur, 2026-10-23, à reprendre plus tard. Spec (discussion du 2026-10-23) :
+   - **machine à états** : déclenchée sur critère de défragmentation, suit `occupés` et
+     `span` ; ne rend que la **fin** de la slab (adresse = `idx × 128`) : on déplace les
+     slots occupés les plus hauts vers les trous les plus bas, puis on rend les pages de
+     2 Mio (16 384 nœuds) devenues libres en fin. Une page de fin déjà vide se rend sans
+     rien déplacer ; vérifier que `insert` comble les trous par le bas (alors les
+     insertions aident) ;
+   - **critères (utilisateur), avec hystérésis** : déclenchement si le libre sous la fin
+     dépasse **3 Mio** (**4 Mio** au-delà de ~200–500 Mio de slab) ; une page n'est rendue
+     que s'il reste **≥ 2 Mio** libres ensuite ; si les insertions pendant le compactage
+     ont ramené le libre sous le seuil, on ne rend rien. Variante à mesurer : seuil
+     proportionnel `max(2 Mio, slab / 128)` ;
+   - **coût d'un déplacement** = lignes de cache touchées au hasard : copie (2 lignes
+     source + 2 destination) **4**, parent (`parent_idx` + radix → `set_child_idx`) **2**,
+     **+1 par enfant** (son `parent_idx`, jusqu'à 256) ; tranche ≤ **~4 096 unités**
+     (~200–400 µs si chaque défaut est payé à son tour). **Pipeline de 8 nœuds à déplacer**
+     (§9.2, correction de l'utilisateur) : pendant le lot courant, préchargement des
+     sources, des trous de destination, des parents et des enfants des 8 nœuds suivants,
+     dont les défauts se recouvrent ; coût par unité ≈ latence d'un défaut / profondeur du
+     pipeline. Un nœud n'est jamais coupé entre deux tranches (un 256 enfants = 262
+     unités). Le bit de TTL de la `TaggedHiSlab` suit le nœud. **À mesurer** : coût réel
+     par unité, avec et sans pipeline ;
+   - **interdits** : pendant une save (DFS et occupation T0 indexés par `idx`, §8.5) ; tant
+     qu'un job long (KEYS, `UNLINK prefix*`, libération de FLUSHDB) ou un curseur SCAN tient
+     des `idx` (v1 : attendre ; plus tard, les corriger) ; `root_idx` suit. La slab valart
+     (idx d'enfants à elle) se compacte à part, même mécanisme.
+
+### 17.2 bis Compactage de la slab des nœuds (fait, branche `pool-structures`)
+
+- `hislab` 0.2.5 (**publié** sur crates.io le 2026-10-23, tag `v0.2.5`) : `len`,
+  `last_occupied`, `move_down` (vers le plus petit trou, le tag TTL suit), `release_above`
+  (`MADV_DONTNEED` des pages de 2 Mio libres en fin, borne du plus haut slot touché).
+- `oxidart::compact` : `compact_want` (trous sous la fin > 3 Mio, 4 Mio au-delà de 256 Mio
+  de slab ; cible = `arrondi(occupés + 2 Mio, page)`, aucune passe si la cible n'est pas
+  sous la fin), `compact_step` (tranche bornée en unités), `relink` (parent ou `root_idx`,
+  `parent_idx` des enfants, tampon réutilisé), fin : rendu au-dessus de `max(dernier
+  occupé, occupés + libre gardé)` (les insertions pendant la passe sont prises en compte).
+- Serveur : déclenché par `Timer::Gc` quand aucune passe de GC ne tourne, ni save, ni job ;
+  tranches dans `run_jobs` et `idle_step` ; arrêtée sans rendu si une save ou un job
+  apparaît ; `INFO` `compact_*` ; journal sous `RADIXOX_GC_LOG`.
+- Tests : 200K clés dont TTL, 3/4 supprimées, compactage par tranches de 512 unités →
+  `check` (parents, radix, tags), contenu, TTL ; fuzz différentiels : compactage complet
+  forcé tous les 64 pas hors save (slab dense vérifiée, oracle d'accord).
+- Mesure (scénario uuid) : 51 536 nœuds déplacés, 12 Mio rendus ; slab 35 → 21 Mo ; RSS
+  après suppression de la moitié **74 Mo** au bout de 16 s (90 avant, 114 au départ).
+  **~120 ns par unité** sans pipeline (tranche de 4 096 unités = 489 µs) → tranche
+  ramenée à **1 024 unités**.
+- **Pipeline de machines à états** (conception de l'utilisateur, 2026-10-23) :
+  `oxidart::compact::PIPELINE` = 8 déplacements en vol, étapes `claim` (source la plus
+  haute non prise, trou le plus bas réservé par `reserve_lowest`, préchargement des deux)
+  → `Header` (préchargement du parent et de la page de la source) → `Links` (préchargement
+  de la ligne `parent_idx` de chaque enfant et de la page du parent, où l'entrée de
+  l'enfant peut se trouver ; sautée s'il n'y a rien à attendre) → `Commit` (copie
+  `move_to`, parent, enfants, d'un coup, `idx` relus à ce moment-là). Une machine finie
+  est remplacée au tour suivant ; le pipeline est vidé en fin de tranche. `hislab` :
+  `prev_occupied`, `reserve_lowest` / `unreserve`, `move_to`, `slot_ptr`. Test dédié :
+  chaînes profondes en fin de slab (nœud et parent en vol ensemble), tranches de 7 unités.
+- Mesure (scénario uuid, plus longue tranche de 1 024 unités) : **41 µs** (~40 ns par
+  unité) avec K = 8, 48 µs avec K = 1 (étapes préchargées, une seule machine) : ×3 par
+  rapport à la version sans pipeline, surtout grâce au préchargement par étapes ; K = 8 ne
+  gagne ici que 15 % (petite slab, haut de slab encore en cache) — à remesurer sur une
+  grosse slab froide.
+- **Remesure par le temps total** (`INFO compact_total_us`, 2026-10-23, L3 de 32 Mio,
+  profil `performance`) — ns par nœud déplacé :
+
+  | K | 1,1M clés (51 536 nœuds) | 5M clés (211 186 nœuds) |
+  |---|---|---|
+  | 1 | 127 | 135 |
+  | 2 | 92 | 116 |
+  | 4 | 88 | 109 |
+  | **8** | 116 (bruit, passe de 5 ms) | **83 – 87** (deux runs) |
+  | 16 | — | 127 – 135 (deux runs) |
+
+  K = 8 retenu (choix de l'utilisateur confirmé). Lecture (hypothèse, à confirmer par
+  `perf stat` : défauts L1, préchargements abandonnés) : un déplacement touche ~8 lignes,
+  K = 8 en demande déjà ~64 pour une vingtaine de tampons de défauts du L1 ; ~87 ns pour ~8
+  lignes ≈ 11 ns par ligne, la limite de parallélisme mémoire du cœur ; à K = 16 les
+  préchargements débordent et se gênent. Plus longue tranche de 1 024 unités sur la grosse
+  slab froide : 120–150 µs → tranche ramenée à **512 unités**.
+- **`perf stat` pendant le compactage seul** (banc temporaire, 5M clés, compteurs activés
+  par `--control` autour de la passe, 210 657 nœuds) — **l'hypothèse ci-dessus est
+  fausse** :
+
+  | K | ns/nœud | cycles | IPC | défauts L1 en vol (moy.) | remplissages DRAM |
+  |---|---|---|---|---|---|
+  | 1 | 157 | 179M | 1,44 | 2,4 | 0,6M |
+  | 8 | 91 | 104M | 2,43 | 6,1 | 1,0M |
+  | 16 | 126 | 143M | 1,75 | 5,5 | 1,4M |
+
+  Les tampons de défauts ne sont pas saturés (6 en vol sur ~24). À K = 8 la passe est
+  **limitée par les instructions** : ~1 200 instructions par déplacement (IPC 2,4 ≈ 500
+  cycles ≈ 91 ns), la mémoire est presque recouverte. K = 16 : distance de préchargement
+  trop longue (un tour ≈ 2 400 cycles), les lignes sont évincées du L1 avant usage
+  (remplissages DRAM +40 %, IPC 1,75). **Suite** : réduire les instructions par
+  déplacement — suspect principal `node.iter()`, qui décode toutes les entrées (feuilles
+  comprises) pour trouver les enfants, deux fois (étape `Links` et validation) ; parcours
+  par le bitmap des enfants seul ; à confirmer par `perf record`.
+
+### 17.3 Principe : des pages communes à tous les pools (utilisateur, 2026-10-23)
+
+Les blocs et les pages de 2 Mio sont un **système de pagination commun** : rendre 2 Mio au
+système pour un pool puis redemander 2 Mio juste après pour un autre est le contresens à
+éviter. Un « pool » est un curseur (ou une fenêtre) qui prend ses blocs dans le stock
+commun d'un seul `Pool` ; seul ce stock rend de la mémoire, sur une réserve **globale**.
+Déjà vrai pour `SharedByte` et `CompactPath` (même `Pool`) ; les pages des nœuds, les petits
+blocs Hash/Set et les débordements valart seront des curseurs de plus (alignement 8), pas
+un second allocateur. Deux nuances :
+
+- **affinité des pages par mobilité** : un bloc non déplaçable (pool court des temporaires,
+  buffers de connexion) épingle sa page pour le niveau B ; `take_block` doit regrouper les
+  blocs non déplaçables dans leurs propres pages, tout en puisant dans le même stock et la
+  même réserve ;
+- **HiSlab** : plage `mmap` à elle (adresse = `idx × 128`), donc pas de pages communes. La
+  partager demande une HiSlab par chunks de 2 Mio pris dans le `Pool` (table
+  `idx → chunk`) ; à trancher avec le compactage. D'ici là, une réserve globale (pool +
+  slab) éviterait au moins de rendre d'un côté ce que l'autre reprend.
+

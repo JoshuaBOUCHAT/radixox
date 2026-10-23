@@ -160,9 +160,9 @@ dependencies = [
 
 [[package]]
 name = "hislab"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d3306a410bba4417d965f3ad19e4b263fd95478dd8929799e6b1c097c903039"
+checksum = "775639e17925b05d3b14c6bde7291a8257c7614caf9215abe681eda8aa706d9f"
 dependencies = [
  "libc",
  "memmap2",

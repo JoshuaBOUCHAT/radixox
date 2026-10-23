@@ -31,9 +31,14 @@ const NONE: u32 = u32::MAX;
 /// Pages rendues au plus par appel de [`release_step`] (un `MADV_DONTNEED` de 2 Mio
 /// coûte quelques dizaines de µs).
 const RELEASE_BUDGET: u32 = 4;
-/// Curseurs et fenêtres : les allocations normales, les survivants du GC (§16.4).
+/// Curseurs et fenêtres : les allocations normales, les survivants du GC (§16.4), et les
+/// mêmes pour les objets de structure alignés sur 8 (pages des nœuds, §17) : un curseur
+/// qui n'alloue que des multiples de 8 reste aligné, ses blocs ne mélangent pas les deux.
 const MAIN: usize = 0;
 const SURVIVOR: usize = 1;
+const STRUCT: usize = 2;
+const STRUCT_SURVIVOR: usize = 3;
+const CURSORS: usize = 4;
 /// Une passe qui rend moins que ça suspend le déclenchement (§16.6).
 const WEAK_PASS: u64 = 2 << 20;
 const WEAK_PAUSE: Duration = Duration::from_secs(10);
@@ -154,8 +159,8 @@ pub struct Pool {
     by_free_mask: u32,
     empty_pages: VecDeque<(u32, Instant)>,
     released_pages: Vec<u32>,
-    cursors: [Cursor; 2],
-    windows: [Window; 2],
+    cursors: [Cursor; CURSORS],
+    windows: [Window; CURSORS],
     decay: Duration,
     reserve_div: u64,
     live_bytes: u64,
@@ -232,8 +237,8 @@ impl Pool {
             by_free_mask: 0,
             empty_pages: VecDeque::new(),
             released_pages: Vec::new(),
-            cursors: [NO_CURSOR; 2],
-            windows: [NO_WINDOW; 2],
+            cursors: [NO_CURSOR; CURSORS],
+            windows: [NO_WINDOW; CURSORS],
             decay,
             reserve_div: reserve_div.max(1),
             live_bytes: 0,
@@ -309,6 +314,25 @@ impl Pool {
     #[inline]
     pub fn alloc_survivor(&mut self, size: usize) -> *mut u8 {
         self.alloc_in(SURVIVOR, size)
+    }
+
+    /// Objet de structure aligné sur 8 (`size` multiple de 8, ≤ [`BLOCK`]).
+    #[inline]
+    pub fn alloc8(&mut self, size: usize) -> *mut u8 {
+        debug_assert!(size % 8 == 0);
+        self.alloc_in(STRUCT, size)
+    }
+
+    /// Destination du GC pour un objet de structure aligné sur 8.
+    #[inline]
+    pub fn alloc8_survivor(&mut self, size: usize) -> *mut u8 {
+        self.alloc_in(STRUCT_SURVIVOR, size)
+    }
+
+    /// `a` est dans la plage du pool.
+    #[inline]
+    pub fn owns(&self, a: usize) -> bool {
+        self.block_of_addr(a).is_some()
     }
 
     #[inline(always)]
@@ -389,7 +413,7 @@ impl Pool {
 
     /// Ferme tous les curseurs et fenêtres (passe forcée des tests).
     fn close_cursors(&mut self) {
-        for k in [MAIN, SURVIVOR] {
+        for k in 0..CURSORS {
             if self.cursors[k].block != NONE {
                 self.close_block(self.cursors[k].block);
                 self.cursors[k] = NO_CURSOR;
@@ -857,6 +881,122 @@ pub unsafe fn shrink(ptr: *mut u8, old: usize, new: usize) {
         None => unreachable!("shrink hors pool"),
     }
 }
+
+// ─── Formes courtes des `SharedByte` et des `CompactPath` d'oxidart ──────────
+
+/// Emplacement d'un objet en forme courte (≤ 16 Kio de données) : le pool, ou mimalloc sous
+/// `radixox_nopool` / `radixox_sysalloc` (ASan ne voit pas les objets du pool). Nul : le
+/// pool est plein, l'appelant passe en forme longue (jemalloc).
+///
+/// # Safety
+/// Mono-thread ; `size` pair et ≤ [`BLOCK`] ; libérer par [`short_free`] avec la même taille.
+#[cfg(not(any(radixox_nopool, radixox_sysalloc)))]
+#[inline]
+pub unsafe fn short_alloc(size: usize) -> *mut u8 {
+    unsafe { alloc(size) }
+}
+/// # Safety
+/// `base` vient de [`short_alloc`] avec cette `size`, pas encore rendu.
+#[cfg(not(any(radixox_nopool, radixox_sysalloc)))]
+#[inline]
+pub unsafe fn short_free(base: *mut u8, size: usize) {
+    unsafe { free(base, size) }
+}
+/// # Safety
+/// Voir [`Pool::shrink`] ; `base` vient de [`short_alloc`].
+#[cfg(not(any(radixox_nopool, radixox_sysalloc)))]
+#[inline]
+pub unsafe fn short_shrink(base: *mut u8, old: usize, new: usize) {
+    unsafe { shrink(base, old, new) }
+}
+// mi_malloc plutôt que MiMalloc.alloc : ce dernier passe par mi_malloc_aligned qui, sur
+// page vide, sur-alloue size+align-1 (106 B → bloc 128 au lieu de 112). mi_malloc
+// garantit déjà un alignement ≥ 8.
+#[cfg(any(radixox_nopool, radixox_sysalloc))]
+#[inline]
+pub unsafe fn short_alloc(size: usize) -> *mut u8 {
+    unsafe { crate::raw_alloc::malloc(size) }
+}
+#[cfg(any(radixox_nopool, radixox_sysalloc))]
+#[inline]
+pub unsafe fn short_free(base: *mut u8, _size: usize) {
+    unsafe { crate::raw_alloc::free(base) }
+}
+/// mimalloc : le bloc garde sa taille, rien à compter.
+#[cfg(any(radixox_nopool, radixox_sysalloc))]
+#[inline]
+pub unsafe fn short_shrink(_base: *mut u8, _old: usize, _new: usize) {}
+
+/// Objet de structure aligné sur 8 (pages des nœuds, §17) : le pool jusqu'à 16 Kio, sinon
+/// (ou plage pleine) jemalloc ; mimalloc sans pool. `size` multiple de 8.
+///
+/// # Safety
+/// Mono-thread ; libérer par [`struct_free`] avec la même taille.
+#[cfg(not(any(radixox_nopool, radixox_sysalloc)))]
+pub unsafe fn struct_alloc(size: usize) -> *mut u8 {
+    debug_assert!(size % 8 == 0 && size > 0);
+    if size <= crate::shared_byte::SharedByte::POOL_MAX_LEN {
+        let p = match global() {
+            Some(p) => p.alloc8(size),
+            None => init().map_or(null_mut(), |p| p.alloc8(size)),
+        };
+        if !p.is_null() {
+            return p;
+        }
+    }
+    unsafe { crate::raw_alloc::external::malloc(size) }
+}
+/// # Safety
+/// `ptr` vient de [`struct_alloc`] avec cette `size`, pas encore rendu.
+#[cfg(not(any(radixox_nopool, radixox_sysalloc)))]
+pub unsafe fn struct_free(ptr: *mut u8, size: usize) {
+    match global() {
+        // une page n'a pas d'en-tête : l'appartenance à la plage dit qui l'a allouée
+        Some(p) if p.owns(ptr as usize) => unsafe { p.free(ptr, size) },
+        _ => unsafe { crate::raw_alloc::external::free(ptr, size) },
+    }
+}
+#[cfg(any(radixox_nopool, radixox_sysalloc))]
+pub unsafe fn struct_alloc(size: usize) -> *mut u8 {
+    unsafe { crate::raw_alloc::malloc(size) }
+}
+#[cfg(any(radixox_nopool, radixox_sysalloc))]
+pub unsafe fn struct_free(ptr: *mut u8, _size: usize) {
+    unsafe { crate::raw_alloc::free(ptr) }
+}
+
+/// GC : si l'objet de structure `*ptr` (`size` octets) est dans un bloc marqué, le recopie
+/// au curseur des survivants alignés sur 8, rend l'ancien et réécrit `*ptr`. Rend les
+/// octets recopiés. Propriétaire unique : jamais épinglé.
+///
+/// # Safety
+/// `*ptr` vient de [`struct_alloc`] avec cette `size` ; personne d'autre n'en tient
+/// l'adresse.
+pub unsafe fn relocate8(ptr: &mut *mut u8, size: usize) -> usize {
+    let Some(p) = global() else { return 0 };
+    if !p.is_marked_addr(*ptr as usize) {
+        return 0;
+    }
+    let new = p.alloc8_survivor(size);
+    if new.is_null() {
+        return 0;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(*ptr, new, size);
+        p.free(*ptr, size);
+    }
+    *ptr = new;
+    p.note_evacuated(size);
+    size
+}
+
+/// Emplacement d'un objet de structure dans le pool, pour [`verify_census`].
+pub fn struct_slot(ptr: *const u8, size: usize) -> Option<(usize, usize)> {
+    global().filter(|p| p.owns(ptr as usize)).map(|_| (ptr as usize, size))
+}
+
+/// Le pool est compilé (ni `radixox_nopool` ni `radixox_sysalloc`).
+pub const ENABLED: bool = cfg!(not(any(radixox_nopool, radixox_sysalloc)));
 
 /// Destination d'un objet évacué. Nul : plage pleine, l'objet reste où il est.
 pub fn alloc_survivor(size: usize) -> *mut u8 {

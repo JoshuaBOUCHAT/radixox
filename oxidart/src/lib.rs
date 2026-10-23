@@ -45,6 +45,7 @@
 //! Ordered operations (`krange`, prefix scans) use unsigned byte order (`memcmp`), like Redis.
 
 
+pub mod compact;
 pub mod compact_path;
 pub mod compress;
 pub mod digest;
