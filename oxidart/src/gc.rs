@@ -40,28 +40,38 @@ impl GcPass {
         Self { phase: Phase::Oxidart, at: 0 }
     }
 
-    /// Une tranche d'au plus `budget` slots. Vrai quand la passe est finie.
-    pub fn step(&mut self, art: &mut OxidArt, budget: u32) -> bool {
-        let f = &mut |sb: &mut SharedByte| sb.gc_relocate();
-        let next = match self.phase {
-            Phase::Oxidart => art.gc_visit(self.at, budget, f),
-            // Testé à chaque tranche, pas seulement à l'entrée : une save peut démarrer
-            // entre deux tranches, et l'image d'un nœud valart copie ses `SharedByte` bit
-            // à bit. Valart sauté jusqu'à la passe suivante.
-            Phase::Valart if valart().is_saving() => None,
-            Phase::Valart => art.gc_visit_valart(self.at, budget, f),
-            Phase::Lists => art.gc_visit_lists(self.at, budget, f),
-        };
-        if let Some(at) = next {
-            self.at = at;
-            return false;
+    /// Une tranche : s'arrête au premier plafond atteint, `max_slots` slots visités ou
+    /// `max_bytes` octets recopiés (travail borné, donc coût par tour prévisible). Vrai
+    /// quand la passe est finie.
+    pub fn step(&mut self, art: &mut OxidArt, max_slots: u32, max_bytes: usize) -> bool {
+        /// Slots par appel aux énumérateurs : le plafond d'octets est vérifié entre deux.
+        const CHUNK: u32 = 256;
+        let mut moved = 0;
+        let mut slots = 0;
+        while slots < max_slots && moved < max_bytes {
+            let n = CHUNK.min(max_slots - slots);
+            slots += n;
+            let f = &mut |sb: &mut SharedByte| moved += sb.gc_relocate();
+            let next = match self.phase {
+                Phase::Oxidart => art.gc_visit(self.at, n, f),
+                // Testé à chaque tranche, pas seulement à l'entrée : une save peut démarrer
+                // entre deux tranches, et l'image d'un nœud valart copie ses `SharedByte`
+                // bit à bit. Valart sauté jusqu'à la passe suivante.
+                Phase::Valart if valart().is_saving() => None,
+                Phase::Valart => art.gc_visit_valart(self.at, n, f),
+                Phase::Lists => art.gc_visit_lists(self.at, n, f),
+            };
+            if let Some(at) = next {
+                self.at = at;
+                continue;
+            }
+            self.at = 0;
+            self.phase = match self.phase {
+                Phase::Oxidart => Phase::Valart,
+                Phase::Valart => Phase::Lists,
+                Phase::Lists => return true,
+            };
         }
-        self.at = 0;
-        self.phase = match self.phase {
-            Phase::Oxidart => Phase::Valart,
-            Phase::Valart => Phase::Lists,
-            Phase::Lists => return true,
-        };
         false
     }
 }
@@ -172,7 +182,7 @@ impl OxidArt {
         // production), et valart hors de sa propre save.
         let alone = unsafe { LIVE_TREES } == 1;
         let valart_saving = !alone || valart().is_saving();
-        let mut check = |slab: &'static str| {
+        let check = |slab: &'static str| {
             move |sb: &mut SharedByte| {
                 if sb.rc() != 1 {
                     Some((slab, sb.to_vec(), sb.rc()))
@@ -181,7 +191,7 @@ impl OxidArt {
                 }
             }
         };
-        let (mut a, mut b, mut c) = (check("oxidart"), check("valart"), check("listes"));
+        let (a, b, c) = (check("oxidart"), check("valart"), check("listes"));
         let mut at = Some(0);
         while let Some(from) = at {
             at = self.gc_visit(from, u32::MAX, &mut |sb| shared.extend(a(sb)));
@@ -211,11 +221,11 @@ impl OxidArt {
     /// pool : rien.
     pub fn gc_full_pass(&mut self) {
         use radixox_lib::pool;
-        if pool::gc_begin(1.0, true, std::time::Instant::now()) == 0 {
+        if pool::gc_begin(pool::Mark::All, std::time::Instant::now()) == 0 {
             return;
         }
         let mut pass = GcPass::new();
-        while !pass.step(self, u32::MAX) {}
+        while !pass.step(self, u32::MAX, usize::MAX) {}
         pool::gc_unmark_all();
     }
 }
