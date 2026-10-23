@@ -678,3 +678,108 @@ fn journal_position_roundtrip() {
     let mut back = OxidArt::new();
     assert_eq!(back.load_dump(&out).unwrap().pos, pos);
 }
+
+// ─── Écrasement sur place (MEMORY_ARCH.md §16.5) ─────────────────────────────
+
+fn str_ptr(art: &mut OxidArt, k: &str) -> (*const u8, Vec<u8>) {
+    match art.get(k.as_bytes()) {
+        Some(Value::String(s)) => (s.as_ptr(), s.to_vec()),
+        v => panic!("{k} : {v:?}"),
+    }
+}
+
+fn hash_ptr(art: &mut OxidArt, k: &str, f: &str) -> (*const u8, Vec<u8>) {
+    let v = art.cmd_hget(k.as_bytes(), f.as_bytes()).unwrap().unwrap();
+    (v.as_ptr(), v.to_vec())
+}
+
+#[test]
+fn overwrite_in_place_strings() {
+    let mut art = OxidArt::new();
+    // "user:" est la self-val du nœud "user:", "user:1" une feuille dessous.
+    for k in ["user:", "user:1", "user:2"] {
+        art.set(sb(k), Value::String(sb(&"a".repeat(100))));
+    }
+    for k in ["user:", "user:1"] {
+        let (p, _) = str_ptr(&mut art, k);
+        art.set(sb(k), Value::String(sb(&"b".repeat(100))));
+        assert_eq!(str_ptr(&mut art, k), (p, b"b".repeat(100)), "{k} : même taille, en place");
+        art.set(sb(k), Value::String(sb(&"c".repeat(40))));
+        assert_eq!(str_ptr(&mut art, k), (p, b"c".repeat(40)), "{k} : plus court, en place");
+        // 4 + 39 et 4 + 40 octets : même nombre de granules (2 o).
+        art.set(sb(k), Value::String(sb(&"d".repeat(39))));
+        assert_eq!(str_ptr(&mut art, k), (p, b"d".repeat(39)), "{k} : même nombre de granules");
+        // La capacité est celle de la valeur courante (39 → 44 o) : 41 octets réallouent.
+        art.set(sb(k), Value::String(sb(&"d".repeat(41))));
+        let (p2, _) = str_ptr(&mut art, k);
+        assert_ne!(p2, p, "{k} : un granule de plus");
+        let p = p2;
+        art.set(sb(k), Value::String(sb(&"d".repeat(41))));
+        assert_eq!(str_ptr(&mut art, k).0, p);
+        art.set(sb(k), Value::String(sb(&"e".repeat(200))));
+        let (q, v) = str_ptr(&mut art, k);
+        assert!(q != p && v == b"e".repeat(200), "{k} : plus long, nouvel objet");
+        // TTL posé : la feuille change de forme, valeur remplacée normalement.
+        art.set_ttl(sb(k), Duration::from_secs(60), Value::String(sb(&"f".repeat(200))));
+        assert_eq!(str_ptr(&mut art, k).1, b"f".repeat(200));
+        assert!(matches!(art.get_ttl(sb(k)), crate::TtlResult::KeyWithTtl(_)), "{k} : TTL posé");
+        // SET sans TTL après : TTL retiré, même si la valeur est écrasée sur place.
+        art.set(sb(k), Value::String(sb(&"g".repeat(200))));
+        assert_eq!(str_ptr(&mut art, k).1, b"g".repeat(200));
+        assert!(matches!(art.get_ttl(sb(k)), crate::TtlResult::KeyWithoutTtl), "{k} : TTL retiré");
+    }
+    // Partagé (une copie vit ailleurs) : jamais écrasé.
+    let held = art.get(b"user:2");
+    art.set(sb("user:2"), Value::String(sb(&"z".repeat(100))));
+    assert_eq!(held, Some(Value::String(sb(&"a".repeat(100)))));
+    assert_eq!(str_ptr(&mut art, "user:2").1, b"z".repeat(100));
+}
+
+#[test]
+fn overwrite_in_place_hashes() {
+    let mut art = OxidArt::new();
+    // "small" reste un petit bloc, "big" passe en valart (> SMALL_MAX champs).
+    for (k, n) in [("small", 4), ("big", 40)] {
+        let fields: Vec<_> = (0..n).map(|i| (sb(&format!("f{i}")), sb(&"a".repeat(100)))).collect();
+        art.cmd_hset(k.as_bytes(), &fields, None).unwrap();
+        drop(fields); // sinon chaque valeur stockée est partagée (rc == 2) : jamais écrasée
+        let (p, _) = hash_ptr(&mut art, k, "f3");
+        art.cmd_hset(k.as_bytes(), &[(sb("f3"), sb(&"b".repeat(100)))], None).unwrap();
+        assert_eq!(hash_ptr(&mut art, k, "f3"), (p, b"b".repeat(100)), "{k}");
+        art.cmd_hset(k.as_bytes(), &[(sb("f3"), sb(&"c".repeat(300)))], None).unwrap();
+        let (q, v) = hash_ptr(&mut art, k, "f3");
+        assert!(q != p && v == b"c".repeat(300), "{k} : plus long, nouvel objet");
+    }
+}
+
+/// Écrasements de même taille pendant une save : le dump garde les anciennes valeurs.
+#[test]
+fn overwrite_during_save_keeps_t0() {
+    let mut art = OxidArt::new();
+    art.set_now(1_000);
+    for i in 0..300 {
+        art.set(sb(&format!("key:{i}")), Value::String(sb(&format!("old-{i:04}-xxxxxxxx"))));
+    }
+    for (k, n) in [("small", 4), ("big", 40)] {
+        let fields: Vec<_> = (0..n).map(|i| (sb(&format!("f{i}")), sb(&format!("old-{i:04}")))).collect();
+        art.cmd_hset(k.as_bytes(), &fields, None).unwrap();
+    }
+    let expect = expected(&art);
+    let mut round = 0;
+    let got = save_all(&mut art, || 8, |a| {
+        round += 1;
+        for i in (round % 7..300).step_by(7) {
+            a.set(sb(&format!("key:{i}")), Value::String(sb(&format!("new-{i:04}-{round:08}"))));
+        }
+        for (k, n) in [("small", 4), ("big", 40)] {
+            let fields: Vec<_> = (0..n).map(|i| (sb(&format!("f{i}")), sb(&format!("n{round:03}{i:02}")))).collect();
+            a.cmd_hset(k.as_bytes(), &fields, None).unwrap();
+        }
+    });
+    assert_eq!(got, expect);
+    assert!(round > 1, "mutations entre les tranches");
+    // Après la save, plus rien ne retient les valeurs : écrasement sur place à nouveau.
+    let (p, _) = str_ptr(&mut art, "key:1");
+    art.set(sb("key:1"), Value::String(sb("new-0001-zzzzzzzz")));
+    assert_eq!(str_ptr(&mut art, "key:1").0, p);
+}

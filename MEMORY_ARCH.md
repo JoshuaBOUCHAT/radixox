@@ -1,6 +1,6 @@
 # Mémoire v2 — allocateur maison, GC par évacuation, compactage, maxmemory
 
-> **État : conception terminée (2026-10-22) ; v1 en cours, étapes 1 et 2 de §16.10 faites le 2026-10-23 (en-tête compact, jemalloc, objets externes ; pool sans GC derrière `--cfg radixox_pool`). La spécification de la v1, à suivre telle quelle, est en §16.** Mesures de départ : §13.1, §13.2. Ce document rassemble les décisions
+> **État : conception terminée (2026-10-22) ; v1 en cours, étapes 1 à 3 de §16.10 faites le 2026-10-23 (en-tête compact, jemalloc, objets externes ; pool sans GC derrière `--cfg radixox_pool` ; écrasement sur place). La spécification de la v1, à suivre telle quelle, est en §16.** Mesures de départ : §13.1, §13.2. Ce document rassemble les décisions
 > prises en discussion le 2026-10-07 (allocation des `SharedByte`, GC) et le 2026-10-21
 > (allocateur global d'abord, puis `maxmemory`), complétées le 2026-10-22 (objets moyens §6,
 > sélection et réserve du GC §8.2–8.3, noyau §11). §15 liste ce qui reste ouvert, §14 l'ordre
@@ -1154,8 +1154,24 @@ Chaque étape : tests verts, commit, push (règle du dépôt) ; mesure courte qu
      pool n'a rien alloué.
    Essai : 1M × 100 o → 104 o par valeur dans le pool, fragmentation 0,00, RSS 136 Mo ;
    FLUSHDB puis 12 s → 47 pages rendues (réserve 2), RSS 42 Mo.
+   **Sans GC, le pool ne tient pas les écrasements** (mesuré le 2026-10-23, comme prévu en
+   §14.1) : 1M × 100 o puis 5 s de SET au hasard → RSS 250 Mo contre 142 Mo pour mimalloc,
+   fragmentation 0,53 (presque aucun bloc ne se vide) ; YCSB A (`bench_compare.sh`) : pic
+   de RSS 2 119 Mo contre 1 569 Mo.
 3. **Écrasement sur place** (§16.5). Test : SET répétés de même taille → `live_bytes`
    stable, aucune allocation ; SET pendant une save → valeur sauvegardée = ancienne.
+   **Fait le 2026-10-23.** Au-delà de §16.5, branché aussi dans les **champs de Hash** (le
+   cas de YCSB A) : petit bloc (`HashMut::set`) et valart (`hash_set`, collisions
+   comprises). **Correction de §16.5 :** `rc == 1` ne protège que des captures qui clonent
+   (nœud oxidart, petit bloc, vue T0 des collisions). L'image d'un nœud valart
+   (`HashNode::image_copy`) copie ses `SharedByte` bit à bit (rc reste à 1, les remplacées
+   vivent par `deferred_bytes`) : valart refuse l'écrasement tant qu'une save est active.
+   Un test retire cette garde et voit le dump faux (`overwrite_during_save_keeps_t0`).
+   Pas d'écrasement si la présence du TTL d'une feuille change (elle changerait de
+   taille) : chemin normal. La capacité est celle de la valeur courante (un écrasement
+   plus court perd la fin). Mesure, 1M × 100 o puis 5 s de SET au hasard : même taille →
+   RSS 136 Mo stable, fragmentation 0,00 ; tailles de 50 à 150 o → 246 Mo, fragmentation
+   0,52 (le GC, étape 6).
 4. **`hislab`** : `slot_span`, `next_occupied` ; publication.
 5. **Énumérateurs** (§16.6) et `pool::verify` ; test différentiel en `radixox_gc_debug`
    avec l'audit d'unicité.

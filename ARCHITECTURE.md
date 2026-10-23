@@ -39,7 +39,7 @@ commencé :
    `_indices` de YCSB à 5 M clés. À trancher avec l'utilisateur : §13.2 ou variante à buckets.
 2. **Retirer du travail au thread métier** (RUNTIME_ARCH.md §17.6) : attente groupée auto,
    recv en `IOSQE_ASYNC`, fd de l'anneau enregistré ; puis peut-être threads réseau + SPSC.
-3. **Allocateur v2 + GC** : **en cours** (choix de l'utilisateur, 2026-10-22, avant le point 2). Spécification de la v1 dans MEMORY_ARCH.md §16, à suivre étape par étape (§16.10) ; étapes 1 (en-tête, jemalloc) et 2 (pool sans GC, `--cfg radixox_pool`) faites le 2026-10-23, suivante : écrasement sur place (étape 3).
+3. **Allocateur v2 + GC** : **en cours** (choix de l'utilisateur, 2026-10-22, avant le point 2). Spécification de la v1 dans MEMORY_ARCH.md §16, à suivre étape par étape (§16.10) ; étapes 1 (en-tête, jemalloc), 2 (pool sans GC, `--cfg radixox_pool`) et 3 (écrasement sur place) faites le 2026-10-23, suivante : `hislab` (`slot_span`, `next_occupied`, étape 4).
 4. **Save sous saturation** : plancher adaptatif, coût par clé à mesurer (SAVE_DESIGN.md,
    « Plafond de CPU du BGSAVE »).
 5. Persistance : comparaison mémoire avec Valkey (CoW de ses fils), worker de persistance,

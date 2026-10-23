@@ -1081,6 +1081,31 @@ impl Node {
         true
     }
 
+    /// Écrase en place les octets d'une feuille `Bytes` (MEMORY_ARCH.md §16.5) et pose
+    /// son TTL. `false`, rien de changé, si ce n'est pas une feuille `Bytes`, si la
+    /// présence du TTL change (la feuille changerait de taille) ou si
+    /// [`SharedByte::overwrite_from`] refuse.
+    pub(crate) fn overwrite_leaf_bytes(&mut self, radix: u8, src: &[u8], ttl: Option<u64>) -> bool {
+        let Some(e) = self.find(radix) else { return false };
+        let loc = self.loc_mut(e);
+        if loc.child || loc.ttl != ttl.is_some() {
+            return false;
+        }
+        unsafe {
+            if *loc.tag != Tag::Bytes {
+                return false;
+            }
+            let slot = loc.cells.add(loc.leaf_end - 8) as *mut ValUnion;
+            if !(*(*slot).bytes).overwrite_from(src) {
+                return false;
+            }
+            if let Some(exp) = ttl {
+                (loc.cells.add(loc.leaf_end - 16) as *mut u64).write(exp);
+            }
+        }
+        true
+    }
+
     /// Réécrit en place l'idx d'une entrée enfant. `false` si ce n'est pas un enfant.
     pub(crate) fn set_child_idx(&mut self, radix: u8, idx: u32) -> bool {
         let Some(e) = self.find(radix) else {

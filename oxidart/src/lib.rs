@@ -258,6 +258,20 @@ fn put_self(node: &mut Node, raw: RawVal, exp: Option<u64>) {
     }
 }
 
+/// Écrase sur place une self-val `Bytes` avec les octets de `raw` (`Bytes` aussi) et
+/// pose le TTL ; `raw` reste à l'appelant. MEMORY_ARCH.md §16.5.
+fn overwrite_self(node: &mut Node, raw: &RawVal, exp: Option<u64>) -> bool {
+    let Some(src) = raw.as_bytes() else { return false };
+    if node.tag != Tag::Bytes || !unsafe { (*node.val.bytes).overwrite_from(src) } {
+        return false;
+    }
+    match exp {
+        Some(exp) => node.exp_and_radix.set_exp(exp),
+        None => node.exp_and_radix.set_no_expiracy(),
+    }
+    true
+}
+
 /// Retire la self-val (propriété à l'appelant).
 fn take_self(node: &mut Node) -> (RawVal, Option<u64>) {
     debug_assert!(node.has_val());
@@ -697,6 +711,12 @@ impl OxidArt {
                 let before = node.has_any_ttl();
                 let node = self.node_mut(idx);
                 if node.has_val() {
+                    // Après `node_mut` : un nœud intact capturé par la save tient un
+                    // clone (rc == 2), l'écrasement est refusé tout seul.
+                    if overwrite_self(node, &raw, exp) {
+                        self.retag(idx, before);
+                        return true;
+                    }
                     drop(take_self(node));
                 } else {
                     self.key_count += 1;
@@ -747,6 +767,13 @@ impl OxidArt {
                 }
                 Step::SameLeaf { .. } => {
                     let before = self.node(idx).has_any_ttl();
+                    // Écrasement sur place, après `node_mut` (voir la self-val).
+                    if let Some(src) = raw.as_bytes()
+                        && self.node_mut(idx).overwrite_leaf_bytes(r, src, exp)
+                    {
+                        self.retag(idx, before);
+                        return true;
+                    }
                     let (tag, val) = raw.into_parts();
                     let updated = self.node_mut(idx).update_leaf(r, tag, val, exp);
                     debug_assert!(updated);

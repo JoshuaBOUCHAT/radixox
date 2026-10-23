@@ -52,7 +52,12 @@ impl HashMut<'_> {
                 Tag::Hash => valart().hash_set(self.val.idx, field, value),
                 Tag::HashSmall => {
                     if let Some(i) = small::find::<2>(self.val.ptr, &field) {
-                        small::entries_mut::<2>(self.val.ptr)[i][1] = value;
+                        // Écrasement sur place (MEMORY_ARCH.md §16.5) : l'image de save du
+                        // bloc clone ses entrées (rc == 2), l'écrasement se refuse seul.
+                        let cur = &mut small::entries_mut::<2>(self.val.ptr)[i][1];
+                        if !cur.overwrite_from(&value) {
+                            *cur = value;
+                        }
                         return false;
                     }
                     if let Err([field, value]) = small::push::<2>(&mut self.val.ptr, [field, value]) {

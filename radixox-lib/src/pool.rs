@@ -299,6 +299,18 @@ impl Pool {
         }
     }
 
+    /// L'emplacement `ptr` passe de `old` à `new` octets (écrasement sur place plus
+    /// court) : la fin devient un trou, compté comme tel.
+    ///
+    /// # Safety
+    /// `ptr` vivant, de taille `old` ≥ `new` > 0.
+    #[inline]
+    pub unsafe fn shrink(&mut self, ptr: *mut u8, old: usize, new: usize) {
+        let b = ((ptr as usize - self.base) >> BLOCK_SHIFT) as u32;
+        *self.live(b) -= ((old - new) / 2) as u16;
+        self.live_bytes -= (old - new) as u64;
+    }
+
     /// Objet d'un bloc encore ouvert : s'il était le dernier, le `top` recule ; si le
     /// bloc est vide, il repart de zéro.
     #[cold]
@@ -476,6 +488,16 @@ pub unsafe fn free(ptr: *mut u8, size: usize) {
     match unsafe { &mut *&raw mut POOL } {
         Some(p) => unsafe { p.free(ptr, size) },
         None => unreachable!("free hors pool"),
+    }
+}
+
+/// # Safety
+/// Voir [`Pool::shrink`] ; `ptr` vient de [`alloc`].
+#[inline]
+pub unsafe fn shrink(ptr: *mut u8, old: usize, new: usize) {
+    match unsafe { &mut *&raw mut POOL } {
+        Some(p) => unsafe { p.shrink(ptr, old, new) },
+        None => unreachable!("shrink hors pool"),
     }
 }
 

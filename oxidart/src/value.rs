@@ -328,6 +328,13 @@ impl RawVal {
         Self { tag, val }
     }
 
+    /// Les octets d'une valeur `Bytes`.
+    #[inline]
+    pub(crate) fn as_bytes(&self) -> Option<&[u8]> {
+        // SAFETY: tag et val construits ensemble.
+        (self.tag == Tag::Bytes).then(|| unsafe { self.val.bytes.as_slice() })
+    }
+
     /// Propriété transférée à l'appelant (rien n'est libéré).
     #[inline]
     pub(crate) fn into_parts(self) -> (Tag, ValUnion) {

@@ -107,6 +107,31 @@ impl SharedByte {
         if self.is_external() { self } else { Self::copy_of(&self, true) }
     }
 
+    /// Écrase les données en place (MEMORY_ARCH.md §16.5) : seulement si l'objet n'est
+    /// partagé avec personne (`rc == 1`), en forme courte, et si `src` tient dans son
+    /// emplacement. Faux : rien n'a changé, à l'appelant de remplacer l'objet.
+    ///
+    /// `rc == 1` ne protège que des copies qui clonent : une structure dont la capture
+    /// de save copie les `SharedByte` bit à bit (valart) doit refuser elle-même pendant
+    /// une save.
+    pub fn overwrite_from(&mut self, src: &[u8]) -> bool {
+        if self.rc() != 1 || self.is_external() || src.len() > Self::POOL_MAX_LEN {
+            return false;
+        }
+        let (old, new) = (Self::slot(self.len()), Self::slot(src.len()));
+        if new > old {
+            return false;
+        }
+        unsafe {
+            std::ptr::copy(src.as_ptr(), self.ptr.as_ptr(), src.len());
+            (self.ptr.as_ptr() as *mut u16).sub(2).write(src.len() as u16);
+            if new < old {
+                short_shrink(self.ptr.as_ptr().sub(Self::SHORT_HEADER), old, new);
+            }
+        }
+        true
+    }
+
     #[inline]
     pub fn is_external(&self) -> bool {
         self.len_lo() & Self::EXTERNAL != 0
@@ -208,6 +233,11 @@ unsafe fn short_alloc(size: usize) -> *mut u8 {
 unsafe fn short_free(base: *mut u8, size: usize) {
     unsafe { crate::pool::free(base, size) }
 }
+#[cfg(radixox_pool)]
+#[inline]
+unsafe fn short_shrink(base: *mut u8, old: usize, new: usize) {
+    unsafe { crate::pool::shrink(base, old, new) }
+}
 // mi_malloc plutôt que MiMalloc.alloc : ce dernier passe par mi_malloc_aligned qui, sur
 // page vide, sur-alloue size+align-1 (106 B → bloc 128 au lieu de 112). mi_malloc
 // garantit déjà un alignement ≥ 8.
@@ -221,6 +251,10 @@ unsafe fn short_alloc(size: usize) -> *mut u8 {
 unsafe fn short_free(base: *mut u8, _size: usize) {
     unsafe { mi_free(base) }
 }
+/// mimalloc : le bloc garde sa taille, rien à compter.
+#[cfg(not(radixox_pool))]
+#[inline]
+unsafe fn short_shrink(_base: *mut u8, _old: usize, _new: usize) {}
 
 impl Clone for SharedByte {
     #[inline]

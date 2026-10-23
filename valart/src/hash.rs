@@ -570,7 +570,14 @@ impl ValTrees {
                 return true;
             };
             if node.ctrl_of(slot) == ctrl && node.key(slot).as_slice() == field.as_slice() {
-                let old = std::mem::replace(self.hash_node_mut(idx).val_mut(slot), val);
+                // Écrasement sur place (MEMORY_ARCH.md §16.5), jamais pendant une save :
+                // l'image d'un nœud copie ses `SharedByte` bit à bit (rc reste à 1).
+                let saving = self.save.is_active();
+                let cur = self.hash_node_mut(idx).val_mut(slot);
+                if !saving && cur.overwrite_from(&val) {
+                    return false;
+                }
+                let old = std::mem::replace(cur, val);
                 self.dispose(idx, old);
                 return false;
             }
@@ -593,7 +600,10 @@ impl ValTrees {
         }
         let bucket = self.hash_collisions.get_mut(idx);
         if let Some(entry) = bucket.iter_mut().find(|(k, _)| k.as_slice() == field.as_slice()) {
-            entry.1 = val;
+            // La vue T0 des collisions clone (rc == 2) : l'écrasement se refuse seul.
+            if !entry.1.overwrite_from(&val) {
+                entry.1 = val;
+            }
             return false;
         }
         bucket.push((field, val));
