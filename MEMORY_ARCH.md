@@ -1397,6 +1397,24 @@ au bout de 16 s, seul le pool baisse). Recensement des tailles (test temporaire)
   rapport à la version sans pipeline, surtout grâce au préchargement par étapes ; K = 8 ne
   gagne ici que 15 % (petite slab, haut de slab encore en cache) — à remesurer sur une
   grosse slab froide.
+- **Remesure par le temps total** (`INFO compact_total_us`, 2026-10-23, L3 de 32 Mio,
+  profil `performance`) — ns par nœud déplacé :
+
+  | K | 1,1M clés (51 536 nœuds) | 5M clés (211 186 nœuds) |
+  |---|---|---|
+  | 1 | 127 | 135 |
+  | 2 | 92 | 116 |
+  | 4 | 88 | 109 |
+  | **8** | 116 (bruit, passe de 5 ms) | **83 – 87** (deux runs) |
+  | 16 | — | 127 – 135 (deux runs) |
+
+  K = 8 retenu (choix de l'utilisateur confirmé). Lecture (hypothèse, à confirmer par
+  `perf stat` : défauts L1, préchargements abandonnés) : un déplacement touche ~8 lignes,
+  K = 8 en demande déjà ~64 pour une vingtaine de tampons de défauts du L1 ; ~87 ns pour ~8
+  lignes ≈ 11 ns par ligne, la limite de parallélisme mémoire du cœur ; à K = 16 les
+  préchargements débordent et se gênent. Plus longue tranche de 1 024 unités sur la grosse
+  slab froide : 120–150 µs → viser **384–512 unités** si une tranche sous charge doit rester
+  vers 50 µs.
 
 ### 17.3 Principe : des pages communes à tous les pools (utilisateur, 2026-10-23)
 

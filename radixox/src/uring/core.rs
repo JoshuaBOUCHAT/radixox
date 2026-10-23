@@ -269,6 +269,8 @@ struct Gc {
     compact_moved: u64,
     compact_released: u64,
     compact_max_slice_us: u64,
+    /// Temps passé dans les tranches de compactage (µs, cumul).
+    compact_total_us: u64,
     enabled: bool,
     log: bool,
     /// Plus longue tranche depuis le démarrage (µs).
@@ -280,7 +282,7 @@ struct Gc {
 impl Gc {
     fn from_env() -> Self {
         let on = |name: &str, default: bool| std::env::var(name).map_or(default, |v| v != "0");
-        Self { pass: None, enabled: on("RADIXOX_GC", true), log: on("RADIXOX_GC_LOG", false), max_slice_us: 0, started: None, compact: None, compact_passes: 0, compact_moved: 0, compact_released: 0, compact_max_slice_us: 0 }
+        Self { pass: None, enabled: on("RADIXOX_GC", true), log: on("RADIXOX_GC_LOG", false), max_slice_us: 0, started: None, compact: None, compact_passes: 0, compact_moved: 0, compact_released: 0, compact_max_slice_us: 0, compact_total_us: 0 }
     }
 }
 
@@ -1798,12 +1800,13 @@ impl Core {
                 let _ = std::fmt::Write::write_fmt(
                     &mut info,
                     format_args!(
-                        "compact_running:{}\r\ncompact_passes:{}\r\ncompact_moved_nodes:{}\r\ncompact_released_bytes:{}\r\ncompact_max_slice_us:{}\r\ncompact_slab_holes_bytes:{}\r\n",
+                        "compact_running:{}\r\ncompact_passes:{}\r\ncompact_moved_nodes:{}\r\ncompact_released_bytes:{}\r\ncompact_max_slice_us:{}\r\ncompact_total_us:{}\r\ncompact_slab_holes_bytes:{}\r\n",
                         self.gc.compact.is_some() as u8,
                         self.gc.compact_passes,
                         self.gc.compact_moved,
                         self.gc.compact_released,
                         self.gc.compact_max_slice_us,
+                        self.gc.compact_total_us,
                         self.art.slab_holes_bytes(),
                     ),
                 );
@@ -2045,7 +2048,9 @@ impl Core {
         }
         let t0 = Instant::now();
         let done = self.art.compact_step(c, COMPACT_SLICE_UNITS);
-        self.gc.compact_max_slice_us = self.gc.compact_max_slice_us.max(t0.elapsed().as_micros() as u64);
+        let us = t0.elapsed().as_micros() as u64;
+        self.gc.compact_max_slice_us = self.gc.compact_max_slice_us.max(us);
+        self.gc.compact_total_us += us;
         if let Some(r) = done {
             self.gc.compact = None;
             self.gc.compact_passes += 1;
