@@ -1413,8 +1413,25 @@ au bout de 16 s, seul le pool baisse). Recensement des tailles (test temporaire)
   K = 8 en demande déjà ~64 pour une vingtaine de tampons de défauts du L1 ; ~87 ns pour ~8
   lignes ≈ 11 ns par ligne, la limite de parallélisme mémoire du cœur ; à K = 16 les
   préchargements débordent et se gênent. Plus longue tranche de 1 024 unités sur la grosse
-  slab froide : 120–150 µs → viser **384–512 unités** si une tranche sous charge doit rester
-  vers 50 µs.
+  slab froide : 120–150 µs → tranche ramenée à **512 unités**.
+- **`perf stat` pendant le compactage seul** (banc temporaire, 5M clés, compteurs activés
+  par `--control` autour de la passe, 210 657 nœuds) — **l'hypothèse ci-dessus est
+  fausse** :
+
+  | K | ns/nœud | cycles | IPC | défauts L1 en vol (moy.) | remplissages DRAM |
+  |---|---|---|---|---|---|
+  | 1 | 157 | 179M | 1,44 | 2,4 | 0,6M |
+  | 8 | 91 | 104M | 2,43 | 6,1 | 1,0M |
+  | 16 | 126 | 143M | 1,75 | 5,5 | 1,4M |
+
+  Les tampons de défauts ne sont pas saturés (6 en vol sur ~24). À K = 8 la passe est
+  **limitée par les instructions** : ~1 200 instructions par déplacement (IPC 2,4 ≈ 500
+  cycles ≈ 91 ns), la mémoire est presque recouverte. K = 16 : distance de préchargement
+  trop longue (un tour ≈ 2 400 cycles), les lignes sont évincées du L1 avant usage
+  (remplissages DRAM +40 %, IPC 1,75). **Suite** : réduire les instructions par
+  déplacement — suspect principal `node.iter()`, qui décode toutes les entrées (feuilles
+  comprises) pour trouver les enfants, deux fois (étape `Links` et validation) ; parcours
+  par le bitmap des enfants seul ; à confirmer par `perf record`.
 
 ### 17.3 Principe : des pages communes à tous les pools (utilisateur, 2026-10-23)
 

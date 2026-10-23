@@ -256,9 +256,9 @@ const GC_SLICE_SLOTS: u32 = 10_000;
 const GC_SLICE_BYTES: usize = 2 * radixox_lib::pool::BLOCK;
 
 /// Compactage de la slab des nœuds (MEMORY_ARCH.md §17.2) : unités par tranche (4 par
-/// copie, 2 par parent, 1 par enfant ≈ lignes de cache touchées). Mesuré sans pipeline :
-/// ~120 ns par unité (4 096 unités = 489 µs) ; 1 024 ≈ 120 µs, comme une tranche de GC.
-const COMPACT_SLICE_UNITS: u32 = 1024;
+/// copie, 2 par parent, 1 par enfant ≈ lignes de cache touchées). Pipeline de 8 sur une
+/// slab froide (5M clés) : 1 024 unités = 120–150 µs ; 512 vise ~50–70 µs sous charge.
+const COMPACT_SLICE_UNITS: u32 = 512;
 
 /// GC niveau A du pool, compactage de la slab des nœuds : passes en cours et réglages
 /// (`RADIXOX_GC`, `RADIXOX_GC_LOG`).
