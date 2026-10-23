@@ -241,7 +241,7 @@ pub fn info_stats(out: &mut String) {
 }
 
 /// Section `# Memory` d'`INFO` (MEMORY_ARCH.md §16.8) : objets externes (jemalloc), pool.
-pub fn info_memory(out: &mut String, gc_enabled: bool, gc_running: bool) {
+pub fn info_memory(out: &mut String, gc_enabled: bool, gc_running: bool, gc_max_slice_us: u64) {
     use radixox_lib::raw_alloc::external;
     use std::fmt::Write as _;
     let _ = write!(
@@ -272,7 +272,8 @@ pub fn info_memory(out: &mut String, gc_enabled: bool, gc_running: bool) {
             out,
             "gc_enabled:{}\r\ngc_running:{}\r\ngc_passes:{}\r\ngc_evacuated_objects:{}\r\n\
              gc_evacuated_bytes:{}\r\ngc_pinned:{}\r\ngc_unmarked_blocks:{}\r\ngc_fresh_pages:{}\r\n\
-             gc_last_pass_ms:{}\r\ngc_marked_blocks:{}\r\ngc_reserve_bytes:{reserve}\r\n",
+             gc_last_pass_ms:{}\r\ngc_marked_blocks:{}\r\ngc_reserve_bytes:{reserve}\r\n\
+             gc_max_slice_us:{gc_max_slice_us}\r\n",
             gc_enabled as u8,
             gc_running as u8,
             g.passes,

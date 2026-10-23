@@ -1,4 +1,4 @@
-use crate::raw_alloc::{external, free as mi_free, malloc as mi_malloc};
+use crate::raw_alloc::external;
 use std::borrow::Borrow;
 
 use std::ops::Deref;
@@ -136,24 +136,25 @@ impl SharedByte {
     /// survivants et l'ancien emplacement rendu. Tenu ailleurs (`rc > 1`) : épinglé,
     /// laissé en place. À n'appeler que sur un emplacement que l'arbre est seul à voir
     /// (énumérateurs du GC) : `self` est réécrit vers les mêmes octets.
-    pub fn gc_relocate(&mut self) {
+    /// Rend les octets recopiés (0 : rien à faire, épinglé, ou plage pleine).
+    pub fn gc_relocate(&mut self) -> usize {
         #[cfg(radixox_pool)]
         {
             if self.is_external() {
-                return;
+                return 0;
             }
             let base = self.header_ptr() as *mut u8;
             if !crate::pool::is_marked(base as usize) {
-                return;
+                return 0;
             }
             if self.rc() != 1 {
                 crate::pool::note_pinned();
-                return;
+                return 0;
             }
             let size = Self::slot(self.len());
             let new = crate::pool::alloc_survivor(size);
             if new.is_null() {
-                return; // plage pleine : l'objet reste
+                return 0; // plage pleine : l'objet reste
             }
             unsafe {
                 std::ptr::copy_nonoverlapping(base, new, size);
@@ -162,7 +163,10 @@ impl SharedByte {
                 drop(std::mem::replace(self, moved));
             }
             crate::pool::note_evacuated(size);
+            size
         }
+        #[cfg(not(radixox_pool))]
+        0
     }
 
     /// Emplacement dans le pool (adresse de l'en-tête, taille), `None` hors pool
@@ -284,12 +288,12 @@ unsafe fn short_shrink(base: *mut u8, old: usize, new: usize) {
 #[cfg(not(radixox_pool))]
 #[inline]
 unsafe fn short_alloc(size: usize) -> *mut u8 {
-    unsafe { mi_malloc(size) }
+    unsafe { crate::raw_alloc::malloc(size) }
 }
 #[cfg(not(radixox_pool))]
 #[inline]
 unsafe fn short_free(base: *mut u8, _size: usize) {
-    unsafe { mi_free(base) }
+    unsafe { crate::raw_alloc::free(base) }
 }
 /// mimalloc : le bloc garde sa taille, rien à compter.
 #[cfg(not(radixox_pool))]

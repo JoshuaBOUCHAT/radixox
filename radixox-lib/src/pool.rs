@@ -162,8 +162,6 @@ pub struct Pool {
     held_blocks: u64,
     sync_faults: u64,
     range_full: u64,
-    /// Octets alloués par les commandes (survivants exclus), cumul : budget du GC.
-    allocated: u64,
     /// Blocs marqués et passes déjà traversées.
     marked_list: Vec<(u32, u8)>,
     gc: GcStats,
@@ -242,7 +240,6 @@ impl Pool {
             held_blocks: 0,
             sync_faults: 0,
             range_full: 0,
-            allocated: 0,
             marked_list: Vec::new(),
             gc: GcStats::default(),
             pass_started: None,
@@ -272,11 +269,6 @@ impl Pool {
     /// Réserve : `max(2 pages, vivants / div)` (§16.6), gardée même vide.
     pub fn reserve(&self) -> u64 {
         (2 * PAGE as u64).max(self.live_bytes / self.reserve_div)
-    }
-
-    /// Octets alloués par les commandes depuis la création (survivants exclus).
-    pub fn allocated(&self) -> u64 {
-        self.allocated
     }
 
     #[inline]
@@ -310,7 +302,6 @@ impl Pool {
     /// Emplacement de `size` octets (pair, ≤ [`BLOCK`]). Nul si la plage est pleine.
     #[inline]
     pub fn alloc(&mut self, size: usize) -> *mut u8 {
-        self.allocated += size as u64;
         self.alloc_in(MAIN, size)
     }
 
@@ -916,11 +907,6 @@ pub fn gc_unmark_all() {
     if let Some(p) = global() {
         p.gc_unmark_all();
     }
-}
-
-/// Octets alloués par les commandes (cumul), réserve : budget du GC sous charge.
-pub fn gc_budget_inputs() -> Option<(u64, u64)> {
-    global().map(|p| (p.allocated(), p.reserve()))
 }
 
 /// `None` tant que le pool n'a servi à rien (ou s'il est désactivé).

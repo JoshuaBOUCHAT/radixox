@@ -1244,6 +1244,23 @@ Chaque étape : tests verts, commit, push (règle du dépôt) ; mesure courte qu
      7 (12 + 4 Mio). Deux passes `Pages` (102 puis 52 blocs, 8 ms et 1 ms) après les passes
      de niveau A au repos. Débit non comparé (profil `powersave`, mesures bruitées : 168 K à
      228 K ops/s selon le passage, sans changement de code).
+   - **Tranches à travail fixe** (choix de l'utilisateur, 2026-10-23) : une tranche
+     s'arrête au premier plafond atteint, **10 000 slots visités ou 2 blocs (128 Kio)
+     recopiés**, la même sous charge (une par tour, dans `run_jobs`) et au repos
+     (enchaînées dans `idle_step`). Remplace le budget `max(64, alloués × N / R)` de §16.6 :
+     les temporaires (arguments, rendus aussitôt) gonflaient « alloués » sans consommer de
+     bloc, et le GC travaillait trop par tour sous charge. `INFO` : `gc_max_slice_us`, pour
+     régler les plafonds sur mesure (ordre de grandeur attendu : 100–200 µs pour 10 000
+     slots). Le compteur `allocated` du chemin chaud est retiré.
+   - **bench_compare.sh (YCSB A, 500 K enregistrements, 2026-10-23, avant les tranches
+     fixes)** : 1 cœur, pool = mimalloc (231 K contre 227 K ops/s, p99 838 contre 863 µs,
+     RSS 191 contre 183 Mo) ; 3 cœurs, pool −8 % une fois ramené au Valkey de chaque run
+     (ratio 1,17 contre 1,26), GC coupé compris (1,15). `perf` (qualitatif, machine
+     chargée) : allocation + libération du pool ≈ mimalloc sur la boucle (~1,7 % contre
+     ~2,2 %) ; le surplus = GC sous charge (`gc_relocate` + `gc_slice` ≈ 3,5 %), passes
+     déclenchées au repos (creux de 10 ms du client) pour reboucher les trous laissés par
+     les temporaires du chargement. À remesurer avec les tranches fixes ; la vraie racine
+     est le pool court des temporaires (§5).
 7. **Pool + GC activés par défaut** (`radixox_pool` retiré, `radixox_nopool` devient
    l'interrupteur) une fois les critères de §8.7 tenus : RSS après −90 % puis GC
    ≤ vivants × 1,15 + R ; écrasements au hasard 30 s : RSS stable à ±15 % ; débit et

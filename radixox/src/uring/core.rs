@@ -248,17 +248,20 @@ const MEM_RELEASE_AGAIN: Duration = Duration::from_millis(10);
 const GC_CHECK_EVERY: Duration = Duration::from_millis(100);
 /// Au repos : rien reçu depuis 10 ms.
 const GC_IDLE_AFTER: Duration = Duration::from_millis(10);
-/// Slots par tranche au repos ; sous charge, le budget suit les allocations du tour.
-const GC_IDLE_SLICE: u32 = 512;
-const GC_LOAD_MIN_SLICE: u32 = 64;
+/// Une tranche s'arrête au premier plafond atteint : slots visités ou octets recopiés.
+/// Même tranche sous charge (une par tour) et au repos (enchaînées tant que personne
+/// n'attend). Ordres de grandeur : ~10–20 ns par slot, ~10–20 µs pour 128 Kio ; à
+/// régler sur `gc_max_slice_us`.
+const GC_SLICE_SLOTS: u32 = 10_000;
+const GC_SLICE_BYTES: usize = 2 * radixox_lib::pool::BLOCK;
 
 /// GC niveau A du pool : passe en cours et réglages (`RADIXOX_GC`, `RADIXOX_GC_LOG`).
 struct Gc {
     pass: Option<oxidart::gc::GcPass>,
     enabled: bool,
     log: bool,
-    /// Octets alloués par les commandes au tour précédent (budget sous charge).
-    alloc_mark: u64,
+    /// Plus longue tranche depuis le démarrage (µs).
+    max_slice_us: u64,
     /// Début de la passe en cours et compteurs à ce moment (journal).
     started: Option<(Instant, radixox_lib::pool::GcStats)>,
 }
@@ -266,7 +269,7 @@ struct Gc {
 impl Gc {
     fn from_env() -> Self {
         let on = |name: &str, default: bool| std::env::var(name).map_or(default, |v| v != "0");
-        Self { pass: None, enabled: on("RADIXOX_GC", true), log: on("RADIXOX_GC_LOG", false), alloc_mark: 0, started: None }
+        Self { pass: None, enabled: on("RADIXOX_GC", true), log: on("RADIXOX_GC_LOG", false), max_slice_us: 0, started: None }
     }
 }
 
@@ -1779,7 +1782,7 @@ impl Core {
                 info.push_str("\r\n");
                 crate::exec::info_stats(&mut info);
                 info.push_str("\r\n");
-                crate::exec::info_memory(&mut info, self.gc.enabled, self.gc.pass.is_some());
+                crate::exec::info_memory(&mut info, self.gc.enabled, self.gc.pass.is_some(), self.gc.max_slice_us);
                 extend_encode(&mut self.outs[s].out, &Frame::BulkString(SharedByte::from_slice(info.as_bytes())));
             }
             After::Subscribe(channels) => self.subscribe(slot, &channels),
@@ -1982,7 +1985,7 @@ impl Core {
         self.conn_job_step();
         self.free_step();
         self.bgsave_slice();
-        self.gc_load_slice();
+        self.gc_slice();
     }
 
     /// Une étape de travail de fond quand personne n'attend : ni client ici,
@@ -1991,7 +1994,7 @@ impl Core {
     /// Un client parqué d'abord, puis la libération, puis la save. Rend `true`
     /// s'il reste du travail de fond.
     pub fn idle_step(&mut self) -> bool {
-        let _ = self.conn_job_step() || self.free_step() || self.bgsave_idle_slice() || self.gc_slice(GC_IDLE_SLICE);
+        let _ = self.conn_job_step() || self.free_step() || self.bgsave_idle_slice() || self.gc_slice();
         self.has_background()
     }
 
@@ -2010,7 +2013,6 @@ impl Core {
         if n == 0 {
             return; // rien de marquable : passe faible, déclenchement suspendu
         }
-        self.gc.alloc_mark = pool::gc_budget_inputs().map_or(0, |(a, _)| a);
         self.gc.pass = Some(oxidart::gc::GcPass::new());
         self.gc.started = Some((now, pool::gc_stats().unwrap_or_default()));
         if self.gc.log {
@@ -2019,11 +2021,14 @@ impl Core {
         }
     }
 
-    /// Une tranche de la passe en cours, au plus `budget` slots. Faux sans passe.
-    fn gc_slice(&mut self, budget: u32) -> bool {
+    /// Une tranche de la passe en cours. Faux sans passe.
+    fn gc_slice(&mut self) -> bool {
         use radixox_lib::pool;
         let Some(pass) = self.gc.pass.as_mut() else { return false };
-        if !pass.step(&mut self.art, budget) {
+        let t0 = Instant::now();
+        let done = pass.step(&mut self.art, GC_SLICE_SLOTS, GC_SLICE_BYTES);
+        self.gc.max_slice_us = self.gc.max_slice_us.max(t0.elapsed().as_micros() as u64);
+        if !done {
             return true;
         }
         self.gc.pass = None;
@@ -2045,20 +2050,6 @@ impl Core {
         true
     }
 
-    /// Sous charge, une fois par tour : le budget suit les allocations du tour,
-    /// `max(64, alloués × N / réserve)`, pour que la passe finisse avant que les
-    /// allocations aient consommé la réserve.
-    fn gc_load_slice(&mut self) {
-        if self.gc.pass.is_none() {
-            return;
-        }
-        let (alloc, reserve) = radixox_lib::pool::gc_budget_inputs().unwrap_or((0, 1));
-        let tour = alloc.saturating_sub(self.gc.alloc_mark);
-        self.gc.alloc_mark = alloc;
-        let n = self.art.gc_slot_span();
-        let budget = (tour as u128 * n as u128 / reserve.max(1) as u128).clamp(GC_LOAD_MIN_SLICE as u128, u32::MAX as u128);
-        self.gc_slice(budget as u32);
-    }
 
     fn conn_job_step(&mut self) -> bool {
         let Some((slot, epoch, mut job)) = self.conn_jobs.pop_front() else { return false };
