@@ -858,6 +858,54 @@ pub unsafe fn shrink(ptr: *mut u8, old: usize, new: usize) {
     }
 }
 
+// ─── Formes courtes des `SharedByte` et des `CompactPath` d'oxidart ──────────
+
+/// Emplacement d'un objet en forme courte (≤ 16 Kio de données) : le pool, ou mimalloc sous
+/// `radixox_nopool` / `radixox_sysalloc` (ASan ne voit pas les objets du pool). Nul : le
+/// pool est plein, l'appelant passe en forme longue (jemalloc).
+///
+/// # Safety
+/// Mono-thread ; `size` pair et ≤ [`BLOCK`] ; libérer par [`short_free`] avec la même taille.
+#[cfg(not(any(radixox_nopool, radixox_sysalloc)))]
+#[inline]
+pub unsafe fn short_alloc(size: usize) -> *mut u8 {
+    unsafe { alloc(size) }
+}
+/// # Safety
+/// `base` vient de [`short_alloc`] avec cette `size`, pas encore rendu.
+#[cfg(not(any(radixox_nopool, radixox_sysalloc)))]
+#[inline]
+pub unsafe fn short_free(base: *mut u8, size: usize) {
+    unsafe { free(base, size) }
+}
+/// # Safety
+/// Voir [`Pool::shrink`] ; `base` vient de [`short_alloc`].
+#[cfg(not(any(radixox_nopool, radixox_sysalloc)))]
+#[inline]
+pub unsafe fn short_shrink(base: *mut u8, old: usize, new: usize) {
+    unsafe { shrink(base, old, new) }
+}
+// mi_malloc plutôt que MiMalloc.alloc : ce dernier passe par mi_malloc_aligned qui, sur
+// page vide, sur-alloue size+align-1 (106 B → bloc 128 au lieu de 112). mi_malloc
+// garantit déjà un alignement ≥ 8.
+#[cfg(any(radixox_nopool, radixox_sysalloc))]
+#[inline]
+pub unsafe fn short_alloc(size: usize) -> *mut u8 {
+    unsafe { crate::raw_alloc::malloc(size) }
+}
+#[cfg(any(radixox_nopool, radixox_sysalloc))]
+#[inline]
+pub unsafe fn short_free(base: *mut u8, _size: usize) {
+    unsafe { crate::raw_alloc::free(base) }
+}
+/// mimalloc : le bloc garde sa taille, rien à compter.
+#[cfg(any(radixox_nopool, radixox_sysalloc))]
+#[inline]
+pub unsafe fn short_shrink(_base: *mut u8, _old: usize, _new: usize) {}
+
+/// Le pool est compilé (ni `radixox_nopool` ni `radixox_sysalloc`).
+pub const ENABLED: bool = cfg!(not(any(radixox_nopool, radixox_sysalloc)));
+
 /// Destination d'un objet évacué. Nul : plage pleine, l'objet reste où il est.
 pub fn alloc_survivor(size: usize) -> *mut u8 {
     global().map_or(null_mut(), |p| p.alloc_survivor(size))

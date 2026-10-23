@@ -10,8 +10,37 @@
 use radixox_lib::shared_byte::SharedByte;
 
 use crate::OxidArt;
+use crate::compact_path::CompactPath;
 use crate::small;
 use crate::value::{Tag, ValUnion, list_slab, valart};
+
+/// Ce que les énumérateurs donnent à voir : les `SharedByte` de l'arbre et ses chemins sur le
+/// tas (`CompactPath`, MEMORY_ARCH.md §17). Une closure sur `&mut SharedByte` est un visiteur
+/// qui ignore les chemins.
+pub trait GcVisitor {
+    fn bytes(&mut self, sb: &mut SharedByte);
+    fn path(&mut self, _p: &mut CompactPath) {}
+}
+
+impl<F: FnMut(&mut SharedByte)> GcVisitor for F {
+    fn bytes(&mut self, sb: &mut SharedByte) {
+        self(sb)
+    }
+}
+
+/// Visiteur de la passe : relocalise tout ce qui est dans un bloc marqué.
+struct Relocate {
+    moved: usize,
+}
+
+impl GcVisitor for Relocate {
+    fn bytes(&mut self, sb: &mut SharedByte) {
+        self.moved += sb.gc_relocate();
+    }
+    fn path(&mut self, p: &mut CompactPath) {
+        self.moved += p.gc_relocate();
+    }
+}
 
 /// Une passe du GC niveau A en cours (MEMORY_ARCH.md §16.6) : phase et slot où reprendre.
 /// Le pool a marqué les blocs à évacuer ; chaque `SharedByte` visité est relocalisé s'il
@@ -46,20 +75,19 @@ impl GcPass {
     pub fn step(&mut self, art: &mut OxidArt, max_slots: u32, max_bytes: usize) -> bool {
         /// Slots par appel aux énumérateurs : le plafond d'octets est vérifié entre deux.
         const CHUNK: u32 = 256;
-        let mut moved = 0;
+        let mut v = Relocate { moved: 0 };
         let mut slots = 0;
-        while slots < max_slots && moved < max_bytes {
+        while slots < max_slots && v.moved < max_bytes {
             let n = CHUNK.min(max_slots - slots);
             slots += n;
-            let f = &mut |sb: &mut SharedByte| moved += sb.gc_relocate();
             let next = match self.phase {
-                Phase::Oxidart => art.gc_visit(self.at, n, f),
+                Phase::Oxidart => art.gc_visit(self.at, n, &mut v),
                 // Testé à chaque tranche, pas seulement à l'entrée : une save peut démarrer
                 // entre deux tranches, et l'image d'un nœud valart copie ses `SharedByte`
                 // bit à bit. Valart sauté jusqu'à la passe suivante.
                 Phase::Valart if valart().is_saving() => None,
-                Phase::Valart => art.gc_visit_valart(self.at, n, f),
-                Phase::Lists => art.gc_visit_lists(self.at, n, f),
+                Phase::Valart => art.gc_visit_valart(self.at, n, &mut |sb| v.bytes(sb)),
+                Phase::Lists => art.gc_visit_lists(self.at, n, &mut |sb| v.bytes(sb)),
             };
             if let Some(at) = next {
                 self.at = at;
@@ -113,7 +141,7 @@ fn visit_val(tag: Tag, val: &mut ValUnion, f: &mut impl FnMut(&mut SharedByte)) 
 impl OxidArt {
     /// Slots occupés des nœuds à partir de `from`, au plus `budget` ; rend le slot où
     /// reprendre, `None` à la fin.
-    pub fn gc_visit(&mut self, from: u32, budget: u32, f: &mut impl FnMut(&mut SharedByte)) -> Option<u32> {
+    pub fn gc_visit(&mut self, from: u32, budget: u32, v: &mut impl GcVisitor) -> Option<u32> {
         let mut at = from;
         for _ in 0..budget {
             let i = self.map.next_occupied(at)?;
@@ -121,7 +149,8 @@ impl OxidArt {
             // pointeur vers les mêmes octets n'est pas une mutation (MEMORY_ARCH.md §8.5).
             // Seule exception au point de passage unique des mutations.
             let node = unsafe { self.map.get_unchecked_mut(i) };
-            node.for_each_val_mut(|tag, val| visit_val(tag, val, f));
+            node.for_each_val_mut(|tag, val| visit_val(tag, val, &mut |sb| v.bytes(sb)));
+            node.for_each_path_mut(|p| v.path(p));
             at = i + 1;
         }
         Some(at)
@@ -152,20 +181,20 @@ impl OxidArt {
 
     /// Tous les `SharedByte` de l'arbre, d'un coup (tests, vérificateur). Valart sauté
     /// pendant une save de valart, comme le GC.
-    pub fn gc_visit_all(&mut self, f: &mut impl FnMut(&mut SharedByte)) {
+    pub fn gc_visit_all(&mut self, v: &mut impl GcVisitor) {
         let mut at = Some(0);
         while let Some(from) = at {
-            at = self.gc_visit(from, u32::MAX, f);
+            at = self.gc_visit(from, u32::MAX, v);
         }
         if !valart().is_saving() {
             let mut at = Some(0);
             while let Some(from) = at {
-                at = self.gc_visit_valart(from, u32::MAX, f);
+                at = self.gc_visit_valart(from, u32::MAX, &mut |sb| v.bytes(sb));
             }
         }
         let mut at = Some(0);
         while let Some(from) = at {
-            at = self.gc_visit_lists(from, u32::MAX, f);
+            at = self.gc_visit_lists(from, u32::MAX, &mut |sb| v.bytes(sb));
         }
     }
 
@@ -194,7 +223,7 @@ impl OxidArt {
         let (a, b, c) = (check("oxidart"), check("valart"), check("listes"));
         let mut at = Some(0);
         while let Some(from) = at {
-            at = self.gc_visit(from, u32::MAX, &mut |sb| shared.extend(a(sb)));
+            at = self.gc_visit(from, u32::MAX, &mut |sb: &mut SharedByte| shared.extend(a(sb)));
         }
         // valart est global : sa save peut être celle d'un autre arbre du processus (tests).
         let mut at = (!valart_saving).then_some(0);
@@ -211,9 +240,18 @@ impl OxidArt {
     /// Emplacements dans le pool de tous les `SharedByte` de l'arbre, pour
     /// `radixox_lib::pool::verify_census`.
     pub fn gc_census(&mut self) -> Vec<(usize, usize)> {
-        let mut out = Vec::new();
-        self.gc_visit_all(&mut |sb: &mut SharedByte| out.extend(sb.pool_slot()));
-        out
+        struct Census(Vec<(usize, usize)>);
+        impl GcVisitor for Census {
+            fn bytes(&mut self, sb: &mut SharedByte) {
+                self.0.extend(sb.pool_slot());
+            }
+            fn path(&mut self, p: &mut CompactPath) {
+                self.0.extend(p.pool_slot());
+            }
+        }
+        let mut c = Census(Vec::new());
+        self.gc_visit_all(&mut c);
+        c.0
     }
 
     /// Passe complète forcée (tests, `radixox_gc_debug`) : tous les blocs fermés non vides

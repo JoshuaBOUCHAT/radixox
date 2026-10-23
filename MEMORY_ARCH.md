@@ -1278,3 +1278,48 @@ Chaque étape : tests verts, commit, push (règle du dépôt) ; mesure courte qu
    voyant pas les objets du pool) ramène la forme courte dans mimalloc et rend le GC inerte.
 8. Mettre à jour `ARCHITECTURE.md`, le README (configuration, `INFO`) et l'état en tête de
    ce document. **Fait le 2026-10-23.**
+
+---
+
+## 17. Objets de structure dans le pool (après la v1, 2026-10-23)
+
+Suite de §8.6 : les allocations de l'arbre quittent mimalloc pour devenir déplaçables par le
+GC. Mesure de départ (1M clés uuid4 base64 → 1M valeurs, + 100K `probe`, 1,1M clés en
+tout) : arène mimalloc 42 Mo, slab des nœuds 35 Mo, pool (valeurs) 28 Mo, RSS 122 Mo ;
+après suppression de la moitié par `UNLINK c*`, **rien de l'arbre n'est rendu** (RSS 114 Mo
+au bout de 16 s, seul le pool baisse). Recensement des tailles (test temporaire) :
+
+| objet | uuid b64 | YCSB `user<chiffres>` |
+|---|---|---|
+| suffixes `CompactPath` sur le tas | 1M (un par clé), tous ≤ 24 o, 24 Mo | 1M, 73 % ≤ 16 o, reste ≤ 24 o, 18 Mo |
+| pages des nœuds | 96K, 6,5 Mo, 87 % ≤ 64 o, max 768 o | 61K, 2,6 Mo, max 112 o |
+| préfixes `CompactPath` sur le tas | 0 | 0 |
+| nœuds (slab de 128 o) | 276K, 35 Mo | 411K, 53 Mo |
+
+### 17.1 `CompactPath` (fait, branche `pool-structures`)
+
+- Forme tas = un objet du pool des `SharedByte`, **sans compteur de références** (choix de
+  l'utilisateur : propriétaire unique, le `rc` serait 2 o par clé et un test pour rien).
+  Pointeur sur les données, en-tête lu à reculons en `u16` : forme courte `[len u16]`
+  (≤ 16 Kio, pool ou mimalloc sans pool), forme longue `[len_hi][len_lo | 0x8000]` dans
+  jemalloc. Données à adresse paire : le bit 0 distingue toujours le tas de l'inline.
+- `pool::short_alloc` / `short_free` / `short_shrink` (publics, choix pool ou mimalloc au
+  même endroit pour `SharedByte` et `CompactPath`), `pool::ENABLED`.
+- GC : trait `oxidart::gc::GcVisitor` (`bytes` + `path`, une closure sur `&mut SharedByte`
+  en est un) ; `Node::for_each_path_mut` (préfixe, suffixes des feuilles, `Loc.sfx`) ;
+  `CompactPath::gc_relocate` (jamais épinglé) ; `pool_slot` pour `verify_census`. Copies
+  bit à bit vérifiées : les images de save recopient le suffixe (`from_slice`), le transit
+  `Raw` de `node.rs` ne traverse pas de GC.
+- Mesure (même scénario) : arène mimalloc **12 Mo** (pages des nœuds seules), pool 56 Mo
+  (48,6 Mo vivants : valeurs + chemins), RSS chargé 120 Mo ; après suppression de la
+  moitié, RSS **96 Mo** au bout de 16 s (114 Mo avant), pool 32 Mo.
+
+### 17.2 Suite
+
+1. **Pages des nœuds** dans le pool : alignement 8 (elles contiennent des `u32` / `u64` lus
+   alignés), taille déjà multiple de 8 (`pg_block8`) → curseur à part dont toutes les
+   allocations sont des multiples de 8 ; taille exacte au lieu des classes mimalloc
+   (`alloc_class`). Petits blocs Hash/Set et débordements valart (tag de 3 bits : 8) idem.
+2. **Compactage HiSlab** (§9) : le plus gros poste restant (35 Mo uuid, 53 Mo YCSB) ; la
+   slab ne rétrécit jamais.
+

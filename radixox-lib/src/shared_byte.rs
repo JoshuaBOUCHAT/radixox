@@ -57,7 +57,7 @@ impl SharedByte {
             let short = if external || len > Self::POOL_MAX_LEN {
                 std::ptr::null_mut()
             } else {
-                short_alloc(Self::slot(len))
+                crate::pool::short_alloc(Self::slot(len))
             };
             let data = if !short.is_null() {
                 (short as *mut u16).write(len as u16);
@@ -127,7 +127,7 @@ impl SharedByte {
             std::ptr::copy(src.as_ptr(), self.ptr.as_ptr(), src.len());
             (self.ptr.as_ptr() as *mut u16).sub(2).write(src.len() as u16);
             if new < old {
-                short_shrink(self.ptr.as_ptr().sub(Self::SHORT_HEADER), old, new);
+                crate::pool::short_shrink(self.ptr.as_ptr().sub(Self::SHORT_HEADER), old, new);
             }
         }
         true
@@ -173,7 +173,7 @@ impl SharedByte {
     /// Emplacement dans le pool (adresse de l'en-tête, taille), `None` hors pool
     /// (forme longue, ou forme courte dans mimalloc). Vérificateur du GC.
     pub fn pool_slot(&self) -> Option<(usize, usize)> {
-        (cfg!(not(any(radixox_nopool, radixox_sysalloc))) && !self.is_external())
+        (crate::pool::ENABLED && !self.is_external())
             .then(|| (self.header_ptr() as usize, Self::slot(self.len())))
     }
 
@@ -261,46 +261,11 @@ impl SharedByte {
                 let size = Self::LONG_HEADER + self.len();
                 external::free(self.ptr.as_ptr().sub(Self::LONG_HEADER), size);
             } else {
-                short_free(self.ptr.as_ptr().sub(Self::SHORT_HEADER), Self::slot(self.len()));
+                crate::pool::short_free(self.ptr.as_ptr().sub(Self::SHORT_HEADER), Self::slot(self.len()));
             }
         }
     }
 }
-
-/// Forme courte : le pool, ou mimalloc sous `radixox_nopool` / `radixox_sysalloc`. Nul →
-/// forme longue.
-#[cfg(not(any(radixox_nopool, radixox_sysalloc)))]
-#[inline]
-unsafe fn short_alloc(size: usize) -> *mut u8 {
-    unsafe { crate::pool::alloc(size) }
-}
-#[cfg(not(any(radixox_nopool, radixox_sysalloc)))]
-#[inline]
-unsafe fn short_free(base: *mut u8, size: usize) {
-    unsafe { crate::pool::free(base, size) }
-}
-#[cfg(not(any(radixox_nopool, radixox_sysalloc)))]
-#[inline]
-unsafe fn short_shrink(base: *mut u8, old: usize, new: usize) {
-    unsafe { crate::pool::shrink(base, old, new) }
-}
-// mi_malloc plutôt que MiMalloc.alloc : ce dernier passe par mi_malloc_aligned qui, sur
-// page vide, sur-alloue size+align-1 (106 B → bloc 128 au lieu de 112). mi_malloc
-// garantit déjà un alignement ≥ 8.
-#[cfg(any(radixox_nopool, radixox_sysalloc))]
-#[inline]
-unsafe fn short_alloc(size: usize) -> *mut u8 {
-    unsafe { crate::raw_alloc::malloc(size) }
-}
-#[cfg(any(radixox_nopool, radixox_sysalloc))]
-#[inline]
-unsafe fn short_free(base: *mut u8, _size: usize) {
-    unsafe { crate::raw_alloc::free(base) }
-}
-/// mimalloc : le bloc garde sa taille, rien à compter.
-#[cfg(any(radixox_nopool, radixox_sysalloc))]
-#[inline]
-unsafe fn short_shrink(_base: *mut u8, _old: usize, _new: usize) {}
 
 impl Clone for SharedByte {
     #[inline]

@@ -628,6 +628,7 @@ struct Loc {
     child_off: usize,
     child: bool,
     ttl: bool,
+    sfx: bool,
 }
 
 impl Loc {
@@ -641,6 +642,7 @@ impl Loc {
             child_off: if child { seg.child_off(i) } else { 0 },
             child,
             ttl: seg.t.bit(i),
+            sfx: seg.s.bit(i),
         }
     }
 }
@@ -1051,6 +1053,20 @@ impl Node {
             let loc = self.loc_mut(e);
             if !loc.child {
                 unsafe { f(*loc.tag, &mut *(loc.cells.add(loc.leaf_end - 8) as *mut ValUnion)) };
+            }
+        }
+    }
+
+    /// Chemins du nœud en place, préfixe puis suffixes des feuilles (GC, MEMORY_ARCH.md
+    /// §17). À ne réécrire que vers les mêmes octets.
+    pub(crate) fn for_each_path_mut(&mut self, mut f: impl FnMut(&mut CompactPath)) {
+        f(&mut self.prefix);
+        for e in 0..self.len() {
+            let loc = self.loc_mut(e);
+            if !loc.child && loc.sfx {
+                // record d'une feuille : [suffixe][TTL ?][valeur], collé à `leaf_end`
+                let at = loc.leaf_end - 8 * (2 + loc.ttl as usize);
+                unsafe { f(&mut *(loc.cells.add(at) as *mut CompactPath)) };
             }
         }
     }

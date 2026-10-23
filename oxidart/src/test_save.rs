@@ -852,3 +852,38 @@ fn gc_full_pass_moves_values_and_pins_shared() {
     drop(held);
     assert!(radixox_lib::pool::verify_census(&art.gc_census()).is_ok());
 }
+
+/// Chemins sur le tas (`CompactPath` > 7 octets, MEMORY_ARCH.md §17) : la passe forcée les
+/// déplace aussi, l'arbre reste exact et le recensement les compte.
+#[test]
+fn gc_full_pass_moves_heap_paths() {
+    let mut art = OxidArt::new();
+    let keys: Vec<String> =
+        (0..2_000).map(|i| format!("{:x}-suffixe-assez-long-{i}", i * 7919)).collect();
+    for k in &keys {
+        art.set(sb(k), Value::String(sb("v")));
+    }
+    // préfixes communs longs : nœuds intermédiaires à préfixe sur le tas
+    for i in 0..500 {
+        art.set(sb(&format!("namespace-commun-tres-long:{i}:fin")), Value::String(sb("w")));
+    }
+    let census0 = art.gc_census();
+    let s0 = radixox_lib::pool::gc_stats().unwrap_or_default();
+    art.gc_full_pass();
+    let s1 = radixox_lib::pool::gc_stats().unwrap_or_default();
+    for k in &keys {
+        assert_eq!(art.get(k.as_bytes()), Some(Value::String(sb("v"))), "{k}");
+    }
+    for i in 0..500 {
+        assert_eq!(art.get(format!("namespace-commun-tres-long:{i}:fin").as_bytes()), Some(Value::String(sb("w"))));
+    }
+    assert!(radixox_lib::pool::verify_census(&art.gc_census()).is_ok());
+    if radixox_lib::pool::ENABLED {
+        // chaque emplacement recensé a changé (tout était évacuable), et les chemins comptent
+        let census1 = art.gc_census();
+        assert_eq!(census0.len(), census1.len());
+        assert!(census0.iter().zip(&census1).all(|(a, b)| a.0 != b.0), "tout a bougé");
+        let path_bytes: usize = keys.iter().map(|k| (2 + k.len() + 1) & !1).sum::<usize>() / 2;
+        assert!((s1.evacuated_bytes - s0.evacuated_bytes) as usize >= path_bytes);
+    }
+}
