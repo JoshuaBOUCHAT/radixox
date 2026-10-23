@@ -14,7 +14,7 @@ categories = ["data-structures"]
 bytes.workspace = true
 smallvec.workspace = true
 ordered-float = "5.1.0"
-hislab = { version = "0.2.3", features = ["rand"] }
+hislab = { version = "0.2.4", path = "../../hislab", features = ["rand"] }
 radixox-lib = { workspace = true }
 valart = { workspace = true }
 mimalloc = { workspace = true }
@@ -37,3 +37,6 @@ regex = ["dep:regex-automata"]
 [dev-dependencies]
 # Ancien arbre, oracle des tests différentiels (retiré à la publication).
 oxidart-legacy = { path = "../oxidart-legacy", features = ["regex"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(radixox_pool)'] }
