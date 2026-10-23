@@ -817,3 +817,38 @@ fn gc_census_matches_tree_bytes() {
     drop(art);
     assert_eq!(radixox_lib::pool::live_bytes(), before);
 }
+
+/// Passe de GC forcée : avec le pool, chaque valeur que l'arbre est seul à tenir change
+/// d'adresse et garde ses octets ; une valeur tenue ailleurs (rc > 1) reste en place.
+#[test]
+fn gc_full_pass_moves_values_and_pins_shared() {
+    let mut art = OxidArt::new();
+    for i in 0..300 {
+        art.set(sb(&format!("k:{i}")), Value::String(sb(&format!("valeur-{i}-{}", "z".repeat(i % 50)))));
+    }
+    let fv: Vec<_> = (0..20).map(|i| (sb(&format!("f{i}")), sb(&format!("v{i}")))).collect();
+    art.cmd_hset(b"h", &fv, None).unwrap();
+    drop(fv);
+    let before: Vec<_> = (0..300).map(|i| str_ptr(&mut art, &format!("k:{i}"))).collect();
+    let (hp, _) = hash_ptr(&mut art, "h", "f7");
+    let held = art.get(b"k:5"); // rc == 2 pendant la passe
+    let stats0 = radixox_lib::pool::gc_stats().unwrap_or_default();
+    art.gc_full_pass();
+    let stats1 = radixox_lib::pool::gc_stats().unwrap_or_default();
+    for (i, (p, v)) in before.iter().enumerate() {
+        let (q, w) = str_ptr(&mut art, &format!("k:{i}"));
+        assert_eq!(&w, v, "k:{i} : octets");
+        if cfg!(radixox_pool) {
+            assert_eq!(q == *p, i == 5, "k:{i} : déplacée sauf l'épinglée");
+        }
+    }
+    assert_eq!(hash_ptr(&mut art, "h", "f7").1, b"v7");
+    if cfg!(radixox_pool) {
+        assert_ne!(hash_ptr(&mut art, "h", "f7").0, hp, "valart aussi");
+        assert!(stats1.evacuated_objects - stats0.evacuated_objects >= 300 - 1 + 40);
+        assert!(stats1.pinned > stats0.pinned);
+        assert_eq!(radixox_lib::pool::gc_stats().unwrap().marked_blocks, 0);
+    }
+    drop(held);
+    assert!(radixox_lib::pool::verify_census(&art.gc_census()).is_ok());
+}

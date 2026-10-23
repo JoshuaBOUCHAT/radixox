@@ -218,6 +218,15 @@ fn gc_check(art: &mut OxidArt, seed: u64, step: usize) {
     if let Err(e) = radixox_lib::pool::verify_census(&art.gc_census()) {
         panic!("compteurs du pool (seed {seed}, pas {step}) : {e}");
     }
+    // Avec le pool : une passe de GC complète après chaque opération (MEMORY_ARCH.md
+    // §16.10, étape 6) ; tout objet que l'arbre est seul à tenir change d'adresse, un
+    // pointeur périmé lit le motif 0xDB sous `radixox_gc_debug`.
+    if cfg!(radixox_pool) {
+        art.gc_full_pass();
+        if let Err(e) = radixox_lib::pool::verify_census(&art.gc_census()) {
+            panic!("compteurs du pool après GC (seed {seed}, pas {step}) : {e}");
+        }
+    }
 }
 
 fn sb(k: &[u8]) -> SharedByte {

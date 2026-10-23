@@ -1,6 +1,6 @@
 # Mémoire v2 — allocateur maison, GC par évacuation, compactage, maxmemory
 
-> **État : conception terminée (2026-10-22) ; v1 en cours, étapes 1 à 5 de §16.10 faites le 2026-10-23 (en-tête compact, jemalloc, objets externes ; pool sans GC derrière `--cfg radixox_pool` ; écrasement sur place ; `hislab` 0.2.4 ; énumérateurs, vérificateur et audit d'unicité). La spécification de la v1, à suivre telle quelle, est en §16.** Mesures de départ : §13.1, §13.2. Ce document rassemble les décisions
+> **État : conception terminée (2026-10-22) ; v1 en cours, étapes 1 à 6 de §16.10 faites le 2026-10-23 (en-tête compact, jemalloc, objets externes ; pool derrière `--cfg radixox_pool` ; écrasement sur place ; `hislab` 0.2.4 ; énumérateurs, vérificateur et audit d'unicité ; GC niveau A). Reste l'étape 7 (activation par défaut) : critère du RSS après suppressions non tenu sans niveau B (§16.10, étape 6). La spécification de la v1, à suivre telle quelle, est en §16.** Mesures de départ : §13.1, §13.2. Ce document rassemble les décisions
 > prises en discussion le 2026-10-07 (allocation des `SharedByte`, GC) et le 2026-10-21
 > (allocateur global d'abord, puis `maxmemory`), complétées le 2026-10-22 (objets moyens §6,
 > sélection et réserve du GC §8.2–8.3, noyau §11). §15 liste ce qui reste ouvert, §14 l'ordre
@@ -1202,6 +1202,31 @@ Chaque étape : tests verts, commit, push (règle du dépôt) ; mesure courte qu
    entre chaque commande (différentiel), passe pendant une save (dump identique à celui
    d'une save sans GC), objet épinglé tout le long d'une passe puis relâché, valeur ratée
    (recompression derrière le curseur) rattrapée à la passe suivante.
+   **Fait le 2026-10-23.** Pool : marquage (`gc_begin`), curseur et fenêtre des survivants,
+   fin de passe (`gc_end_pass`), démarquage à la libération d'un bloc ; relocalisation par
+   `SharedByte::gc_relocate` ; pilote `oxidart::gc::GcPass` (oxidart → valart → listes) ;
+   cœur : `Timer::Gc`, tranches dans `run_jobs` et `idle_step`, `INFO` (`gc_*`),
+   `RADIXOX_GC`, `RADIXOX_GC_LOG`. Écarts à §16.6 :
+   - **déclenchement par un timer de 100 ms** (`run_jobs` et `idle_step` ne tournent que
+     s'il y a déjà du travail : sans timer, aucune passe ne démarrerait) ;
+   - **au repos = rien reçu depuis 10 ms** (`last_rx`), pas « `idle_step` appelé » ;
+   - **la save de valart est testée à chaque tranche** de la phase valart, pas seulement à
+     l'entrée : une save peut démarrer entre deux tranches, et l'image d'un nœud valart
+     copie ses `SharedByte` bit à bit. C'est `ValTrees::is_saving` (valart est global) ;
+   - **aucun bloc marquable = passe faible** : déclenchement suspendu 10 s (sinon un
+     marquage à vide toutes les 100 ms) ;
+   - passe forcée des tests (`gc_full_pass`) : ferme d'abord tous les curseurs, marque tous
+     les blocs non vides sans limite de réserve, démarque à la fin ; lancée après **chaque
+     opération** des tests différentiels dès que le pool est compilé (pas seulement en
+     `radixox_gc_debug`), saves en cours comprises : le dump reste exact.
+   Mesures (1M × 100 o, `taskset` serveur sur le CPU 0, profil `powersave`) : 5 s de SET
+   de 50 à 150 o au hasard → fragmentation **0,05** (0,52 sans GC), tenu 109 Mo pour
+   104 Mo vivants, 20 passes de ~280 ms sous charge, 228 K ops/s p99 0,35 ms (pas d'A/B
+   encore) ; DEL de 90 % puis 3 s de repos → tenu **10,5 Mo** pour 10,4 Mo vivants ; après
+   le délai, 59 pages rendues, RSS 80 Mo. **Limite** : ces 161 blocs restent épars sur 20
+   pages (une page ne se rend qu'entière) ; le critère de l'étape 7 (« RSS après −90 % puis
+   GC ≤ vivants × 1,15 + R ») demande de regrouper les survivants (niveau B, ou le choix de
+   page de §15 : allouer dans la page la plus occupée).
 7. **Pool + GC activés par défaut** (`radixox_pool` retiré, `radixox_nopool` devient
    l'interrupteur) une fois les critères de §8.7 tenus : RSS après −90 % puis GC
    ≤ vivants × 1,15 + R ; écrasements au hasard 30 s : RSS stable à ±15 % ; débit et

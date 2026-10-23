@@ -1,10 +1,15 @@
-//! Pool des `SharedByte` en forme courte (MEMORY_ARCH.md §16.3, §16.4).
+//! Pool des `SharedByte` en forme courte (MEMORY_ARCH.md §16.3, §16.4, §16.6).
 //!
 //! Plage virtuelle réservée une fois, pages de 2 Mio (huge pages), blocs de 64 Kio.
 //! Allocation par bump, un compteur de granules vivants par bloc, sans en-tête de bloc :
 //! libérer = décrémenter ; un bloc dont le compteur tombe à 0 se réutilise tel quel ; une
 //! page dont les 32 blocs sont libres depuis `RADIXOX_MEMORY_DECAY` secondes est rendue au
-//! système au-delà de la réserve. Pas de GC ici (étape 6).
+//! système au-delà de la réserve.
+//!
+//! GC niveau A (§16.6) : le pool décide quand une passe démarre et marque les blocs creux ;
+//! le parcours des structures (oxidart) déplace chaque objet d'un bloc marqué vers le
+//! curseur des survivants (`SharedByte::gc_relocate`) ; un bloc évacué tombe à 0 et se
+//! libère par le chemin normal.
 //!
 //! Mono-thread : état global en `static mut` (ARCHITECTURE.md §1, `RUST_TEST_THREADS=1`).
 //! Les tests construisent leurs propres [`Pool`], plus petits.
@@ -26,6 +31,14 @@ const NONE: u32 = u32::MAX;
 /// Pages rendues au plus par appel de [`release_step`] (un `MADV_DONTNEED` de 2 Mio
 /// coûte quelques dizaines de µs).
 const RELEASE_BUDGET: u32 = 4;
+/// Curseurs et fenêtres : les allocations normales, les survivants du GC (§16.4).
+const MAIN: usize = 0;
+const SURVIVOR: usize = 1;
+/// Une passe qui rend moins que ça suspend le déclenchement (§16.6).
+const WEAK_PASS: u64 = 2 << 20;
+const WEAK_PAUSE: Duration = Duration::from_secs(10);
+/// Passes qu'un bloc marqué traverse sans se vider avant d'être démarqué.
+const MAX_MARKED_PASSES: u8 = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PageKind {
@@ -46,18 +59,24 @@ struct PageState {
 }
 
 /// Curseur bump : bloc courant, `top`, `end` (adresses).
+#[derive(Clone, Copy)]
 struct Cursor {
     block: u32,
     top: usize,
     end: usize,
 }
 
+const NO_CURSOR: Cursor = Cursor { block: NONE, top: 0, end: 0 };
+
 /// Fenêtre Best-Fit des emplacements > M : 8 blocs ouverts, reste de chacun en granules
 /// (0 = case vide) ; le `top` d'une case se déduit de son reste.
+#[derive(Clone, Copy)]
 struct Window {
     block: [u32; WINDOW],
     rest: [u16; WINDOW],
 }
+
+const NO_WINDOW: Window = Window { block: [NONE; WINDOW], rest: [0; WINDOW] };
 
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Stats {
@@ -74,6 +93,32 @@ pub struct Stats {
     pub range_full: u64,
 }
 
+#[derive(Clone, Copy, Default, Debug)]
+pub struct GcStats {
+    pub running: bool,
+    pub passes: u64,
+    pub evacuated_objects: u64,
+    pub evacuated_bytes: u64,
+    /// Objets d'un bloc marqué tenus ailleurs (rc > 1) : pas déplacés.
+    pub pinned: u64,
+    /// Blocs démarqués après [`MAX_MARKED_PASSES`] passes sans se vider.
+    pub unmarked_blocks: u64,
+    /// Pages prises faute de bloc libre pendant une passe.
+    pub fresh_pages: u64,
+    pub last_pass_ms: u64,
+    /// Blocs marqués en ce moment.
+    pub marked_blocks: u64,
+}
+
+/// Fin d'une passe, pour le journal.
+#[derive(Clone, Copy, Debug)]
+pub struct PassReport {
+    pub freed_bytes: u64,
+    pub still_marked: u64,
+    pub unmarked: u64,
+    pub ms: u64,
+}
+
 pub struct Pool {
     base: usize,
     nb_pages: u32,
@@ -81,20 +126,31 @@ pub struct Pool {
     live: *mut u16,
     /// Bloc courant d'un curseur : un compteur à 0 ne le libère pas.
     open: *mut u64,
-    maps: [(*mut u8, usize); 3],
+    /// Bloc à évacuer par la passe en cours (ou la suivante).
+    marked: *mut u64,
+    maps: [(*mut u8, usize); 4],
     pages: Vec<PageState>,
     next_page: u32,
     pages_with_free: Vec<u32>,
     empty_pages: VecDeque<(u32, Instant)>,
     released_pages: Vec<u32>,
-    main: Cursor,
-    medium: Window,
+    cursors: [Cursor; 2],
+    windows: [Window; 2],
     decay: Duration,
     reserve_div: u64,
     live_bytes: u64,
     held_blocks: u64,
     sync_faults: u64,
     range_full: u64,
+    /// Octets alloués par les commandes (survivants exclus), cumul : budget du GC.
+    allocated: u64,
+    /// Blocs marqués et passes déjà traversées.
+    marked_list: Vec<(u32, u8)>,
+    gc: GcStats,
+    pass_started: Option<Instant>,
+    /// Blocs marqués libérés depuis le début de la passe.
+    freed_in_pass: u64,
+    suspended_until: Option<Instant>,
 }
 
 /// `mmap` anonyme `MAP_NORESERVE` : rien n'est engagé avant d'être touché.
@@ -112,45 +168,63 @@ fn map(len: usize) -> Option<*mut u8> {
     (p != libc::MAP_FAILED).then_some(p as *mut u8)
 }
 
+#[inline]
+fn bit(bits: *mut u64, b: u32) -> bool {
+    unsafe { *bits.add(b as usize / 64) & (1 << (b % 64)) != 0 }
+}
+
+#[inline]
+fn set_bit(bits: *mut u64, b: u32, on: bool) {
+    let w = unsafe { &mut *bits.add(b as usize / 64) };
+    if on { *w |= 1 << (b % 64) } else { *w &= !(1 << (b % 64)) }
+}
+
 impl Pool {
     /// Plage de `virt` octets (arrondie à la page). `None` si un `mmap` échoue.
     pub fn new(virt: usize, decay: Duration, reserve_div: u64) -> Option<Self> {
         let nb_pages = (virt / PAGE).clamp(1, (u32::MAX / BLOCKS_PER_PAGE) as usize) as u32;
         let virt = nb_pages as usize * PAGE;
         let nb_blocks = nb_pages as usize * BLOCKS_PER_PAGE as usize;
-        let range = map(virt + PAGE)?;
-        let base = (range as usize).next_multiple_of(PAGE);
+        let bits_len = nb_blocks.div_ceil(64) * 8;
+        let lens = [virt + PAGE, nb_blocks * 2, bits_len, bits_len];
+        let mut maps = [(null_mut(), 0); 4];
+        for (i, &len) in lens.iter().enumerate() {
+            let Some(p) = map(len) else {
+                for &(p, len) in &maps[..i] {
+                    unsafe { libc::munmap(p as *mut _, len) };
+                }
+                return None;
+            };
+            maps[i] = (p, len);
+        }
+        let base = (maps[0].0 as usize).next_multiple_of(PAGE);
         unsafe { libc::madvise(base as *mut _, virt, libc::MADV_HUGEPAGE) };
-        let (live_len, open_len) = (nb_blocks * 2, nb_blocks.div_ceil(64) * 8);
-        let unmap = |p: *mut u8, len| unsafe { libc::munmap(p as *mut _, len) };
-        let Some(live) = map(live_len) else {
-            unmap(range, virt + PAGE);
-            return None;
-        };
-        let Some(open) = map(open_len) else {
-            unmap(range, virt + PAGE);
-            unmap(live, live_len);
-            return None;
-        };
         Some(Self {
             base,
             nb_pages,
-            live: live as *mut u16,
-            open: open as *mut u64,
-            maps: [(range, virt + PAGE), (live, live_len), (open, open_len)],
+            live: maps[1].0 as *mut u16,
+            open: maps[2].0 as *mut u64,
+            marked: maps[3].0 as *mut u64,
+            maps,
             pages: Vec::new(),
             next_page: 0,
             pages_with_free: Vec::new(),
             empty_pages: VecDeque::new(),
             released_pages: Vec::new(),
-            main: Cursor { block: NONE, top: 0, end: 0 },
-            medium: Window { block: [NONE; WINDOW], rest: [0; WINDOW] },
+            cursors: [NO_CURSOR; 2],
+            windows: [NO_WINDOW; 2],
             decay,
             reserve_div: reserve_div.max(1),
             live_bytes: 0,
             held_blocks: 0,
             sync_faults: 0,
             range_full: 0,
+            allocated: 0,
+            marked_list: Vec::new(),
+            gc: GcStats::default(),
+            pass_started: None,
+            freed_in_pass: 0,
+            suspended_until: None,
         })
     }
 
@@ -167,14 +241,30 @@ impl Pool {
         }
     }
 
+    pub fn gc_stats(&self) -> GcStats {
+        GcStats { marked_blocks: self.marked_list.len() as u64, ..self.gc }
+    }
+
     /// Réserve : `max(2 pages, vivants / div)` (§16.6), gardée même vide.
     pub fn reserve(&self) -> u64 {
         (2 * PAGE as u64).max(self.live_bytes / self.reserve_div)
     }
 
+    /// Octets alloués par les commandes depuis la création (survivants exclus).
+    pub fn allocated(&self) -> u64 {
+        self.allocated
+    }
+
     #[inline]
     fn block_addr(&self, b: u32) -> usize {
         self.base + ((b as usize) << BLOCK_SHIFT)
+    }
+
+    /// Bloc de l'adresse `a`, `None` hors de la plage.
+    #[inline]
+    fn block_of_addr(&self, a: usize) -> Option<u32> {
+        let off = a.wrapping_sub(self.base);
+        (off < self.nb_pages as usize * PAGE).then_some((off >> BLOCK_SHIFT) as u32)
     }
 
     #[inline]
@@ -184,23 +274,35 @@ impl Pool {
 
     #[inline]
     fn is_open(&self, b: u32) -> bool {
-        unsafe { *self.open.add(b as usize / 64) & (1 << (b % 64)) != 0 }
+        bit(self.open, b)
     }
 
+    /// L'objet d'en-tête `a` est dans un bloc marqué.
     #[inline]
-    fn set_open(&mut self, b: u32, on: bool) {
-        let w = unsafe { &mut *self.open.add(b as usize / 64) };
-        if on { *w |= 1 << (b % 64) } else { *w &= !(1 << (b % 64)) }
+    pub fn is_marked_addr(&self, a: usize) -> bool {
+        self.block_of_addr(a).is_some_and(|b| bit(self.marked, b))
     }
 
     /// Emplacement de `size` octets (pair, ≤ [`BLOCK`]). Nul si la plage est pleine.
     #[inline]
     pub fn alloc(&mut self, size: usize) -> *mut u8 {
+        self.allocated += size as u64;
+        self.alloc_in(MAIN, size)
+    }
+
+    /// Destination du GC : curseur et fenêtre à part, les survivants restent denses.
+    #[inline]
+    pub fn alloc_survivor(&mut self, size: usize) -> *mut u8 {
+        self.alloc_in(SURVIVOR, size)
+    }
+
+    #[inline(always)]
+    fn alloc_in(&mut self, k: usize, size: usize) -> *mut u8 {
         debug_assert!(size % 2 == 0 && size <= BLOCK);
         if size > MEDIUM {
-            return self.alloc_medium(size);
+            return self.alloc_medium(k, size);
         }
-        let c = &mut self.main;
+        let c = &mut self.cursors[k];
         if c.top + size <= c.end {
             let p = c.top;
             c.top += size;
@@ -209,25 +311,25 @@ impl Pool {
             self.live_bytes += size as u64;
             return p as *mut u8;
         }
-        self.alloc_main_slow(size)
+        self.alloc_bump_slow(k, size)
     }
 
     #[cold]
-    fn alloc_main_slow(&mut self, size: usize) -> *mut u8 {
-        if self.main.block != NONE {
-            self.close_block(self.main.block);
-            self.main = Cursor { block: NONE, top: 0, end: 0 };
+    fn alloc_bump_slow(&mut self, k: usize, size: usize) -> *mut u8 {
+        if self.cursors[k].block != NONE {
+            self.close_block(self.cursors[k].block);
+            self.cursors[k] = NO_CURSOR;
         }
         let Some(b) = self.take_block() else { return null_mut() };
         let a = self.block_addr(b);
-        self.main = Cursor { block: b, top: a, end: a + BLOCK };
-        self.alloc(size)
+        self.cursors[k] = Cursor { block: b, top: a, end: a + BLOCK };
+        self.alloc_in(k, size)
     }
 
     #[inline(never)]
-    fn alloc_medium(&mut self, size: usize) -> *mut u8 {
+    fn alloc_medium(&mut self, k: usize, size: usize) -> *mut u8 {
         let g = (size / 2) as u16;
-        let w = &self.medium;
+        let w = &self.windows[k];
         let mut best: Option<usize> = None;
         for i in 0..WINDOW {
             if w.rest[i] >= g && best.is_none_or(|j| w.rest[i] < w.rest[j]) {
@@ -238,41 +340,56 @@ impl Pool {
             Some(i) => i,
             None => {
                 let Some(b) = self.take_block() else { return null_mut() };
-                let w = &self.medium;
+                let w = &self.windows[k];
                 let i = match w.rest.iter().position(|&r| r == 0) {
                     Some(i) => i,
                     None => {
                         let j = (0..WINDOW).min_by_key(|&j| w.rest[j]).unwrap();
-                        self.close_case(j);
+                        self.close_case(k, j);
                         j
                     }
                 };
-                self.medium.block[i] = b;
-                self.medium.rest[i] = (BLOCK / 2) as u16;
+                self.windows[k].block[i] = b;
+                self.windows[k].rest[i] = (BLOCK / 2) as u16;
                 i
             }
         };
-        let b = self.medium.block[i];
-        let p = self.block_addr(b) + BLOCK - self.medium.rest[i] as usize * 2;
-        self.medium.rest[i] -= g;
+        let b = self.windows[k].block[i];
+        let p = self.block_addr(b) + BLOCK - self.windows[k].rest[i] as usize * 2;
+        self.windows[k].rest[i] -= g;
         *self.live(b) += g;
         self.live_bytes += size as u64;
-        if (self.medium.rest[i] as usize) * 2 < MEDIUM {
-            self.close_case(i);
+        if (self.windows[k].rest[i] as usize) * 2 < MEDIUM {
+            self.close_case(k, i);
         }
         p as *mut u8
     }
 
-    fn close_case(&mut self, i: usize) {
-        let b = self.medium.block[i];
-        self.medium.block[i] = NONE;
-        self.medium.rest[i] = 0;
+    fn close_case(&mut self, k: usize, i: usize) {
+        let b = self.windows[k].block[i];
+        self.windows[k].block[i] = NONE;
+        self.windows[k].rest[i] = 0;
         self.close_block(b);
+    }
+
+    /// Ferme tous les curseurs et fenêtres (passe forcée des tests).
+    fn close_cursors(&mut self) {
+        for k in [MAIN, SURVIVOR] {
+            if self.cursors[k].block != NONE {
+                self.close_block(self.cursors[k].block);
+                self.cursors[k] = NO_CURSOR;
+            }
+            for i in 0..WINDOW {
+                if self.windows[k].rest[i] != 0 {
+                    self.close_case(k, i);
+                }
+            }
+        }
     }
 
     /// Le bloc quitte son curseur ; vide, il est libéré.
     fn close_block(&mut self, b: u32) {
-        self.set_open(b, false);
+        set_bit(self.open, b, false);
         if *self.live(b) == 0 {
             self.release_block(b);
         }
@@ -315,24 +432,29 @@ impl Pool {
     /// bloc est vide, il repart de zéro.
     #[cold]
     fn rewind(&mut self, b: u32, addr: usize, size: usize, empty: bool) {
-        if self.main.block == b {
-            if empty {
-                self.main.top = self.block_addr(b);
-            } else if addr + size == self.main.top {
-                self.main.top = addr;
-            }
-            return;
-        }
-        let end = self.block_addr(b) + BLOCK;
-        for i in 0..WINDOW {
-            if self.medium.block[i] == b {
-                let top = end - self.medium.rest[i] as usize * 2;
+        let start = self.block_addr(b);
+        for c in &mut self.cursors {
+            if c.block == b {
                 if empty {
-                    self.medium.rest[i] = (BLOCK / 2) as u16;
-                } else if addr + size == top {
-                    self.medium.rest[i] += (size / 2) as u16;
+                    c.top = start;
+                } else if addr + size == c.top {
+                    c.top = addr;
                 }
                 return;
+            }
+        }
+        let end = start + BLOCK;
+        for w in &mut self.windows {
+            for i in 0..WINDOW {
+                if w.block[i] == b {
+                    let top = end - w.rest[i] as usize * 2;
+                    if empty {
+                        w.rest[i] = (BLOCK / 2) as u16;
+                    } else if addr + size == top {
+                        w.rest[i] += (size / 2) as u16;
+                    }
+                    return;
+                }
             }
         }
     }
@@ -358,10 +480,10 @@ impl Pool {
         let p = if let Some((p, _)) = self.empty_pages.pop_back() {
             p
         } else if let Some(p) = self.released_pages.pop() {
-            self.sync_faults += 1;
+            self.page_fault();
             p
         } else if self.next_page < self.nb_pages {
-            self.sync_faults += 1;
+            self.page_fault();
             self.pages.push(PageState { free_mask: 0, state: PageKind::Active, in_stack: false });
             self.next_page += 1;
             self.next_page - 1
@@ -379,19 +501,30 @@ impl Pool {
         Some(self.open_block(p * BLOCKS_PER_PAGE))
     }
 
+    fn page_fault(&mut self) {
+        self.sync_faults += 1;
+        if self.gc.running {
+            self.gc.fresh_pages += 1;
+        }
+    }
+
     fn open_block(&mut self, b: u32) -> u32 {
-        self.set_open(b, true);
+        set_bit(self.open, b, true);
         self.held_blocks += 1;
         b
     }
 
-    /// Compteur à 0, bloc fermé : retour dans le masque de sa page. En débogage, rempli
-    /// de `0xDB` : un pointeur périmé lit un motif reconnaissable.
+    /// Compteur à 0, bloc fermé : retour dans le masque de sa page (démarqué s'il l'était).
+    /// En débogage, rempli de `0xDB` : un pointeur périmé lit un motif reconnaissable.
     fn release_block(&mut self, b: u32) {
         #[cfg(radixox_gc_debug)]
         unsafe {
             std::ptr::write_bytes(self.block_addr(b) as *mut u8, 0xDB, BLOCK)
         };
+        if bit(self.marked, b) {
+            set_bit(self.marked, b, false);
+            self.freed_in_pass += 1;
+        }
         self.held_blocks -= 1;
         let p = b / BLOCKS_PER_PAGE;
         let ps = &mut self.pages[p as usize];
@@ -426,6 +559,122 @@ impl Pool {
             n += 1;
         }
         false
+    }
+
+    // ─── GC niveau A (§16.6) ──────────────────────────────────────────────────
+
+    /// Déclenchement : `Some(seuil de densité)` si une passe doit démarrer. Au repos dès
+    /// 5 % de fragmentation (seuil 90 %) ; sous charge à 15 %, 8 Mio récupérables et moins
+    /// de blocs libres que la réserve (seuil 75 %).
+    pub fn gc_want(&self, idle: bool, now: Instant) -> Option<f64> {
+        if self.gc.running || self.suspended_until.is_some_and(|t| now < t) || self.held_blocks == 0 {
+            return None;
+        }
+        let held = self.held_blocks * BLOCK as u64;
+        let frag = 1.0 - self.live_bytes as f64 / held as f64;
+        if idle {
+            return (frag > 0.05).then_some(0.90);
+        }
+        let recoverable = held - self.live_bytes;
+        let pages_held = (self.next_page as u64 - self.released_pages.len() as u64) * BLOCKS_PER_PAGE as u64;
+        let free = (pages_held - self.held_blocks) * BLOCK as u64;
+        (frag > 0.15 && recoverable >= 8 << 20 && free < self.reserve()).then_some(0.75)
+    }
+
+    /// Début de passe : marque, par densité croissante, les blocs fermés sous `threshold`
+    /// tant que leurs octets vivants tiennent dans la réserve (ceux encore marqués de la
+    /// passe précédente comptent). `all` : tous les blocs non vides, curseurs fermés
+    /// d'abord, sans limite de réserve (tests). Rend
+    /// le nombre de blocs marqués ; à 0, la passe compte comme faible et rien ne démarre.
+    pub fn gc_begin(&mut self, threshold: f64, all: bool, now: Instant) -> usize {
+        if all {
+            self.close_cursors(); // les blocs ouverts aussi : passe exhaustive
+        }
+        let limit = (threshold * (BLOCK / 2) as f64) as u16;
+        let mut budget = self.reserve();
+        let mut sum: u64 = self.marked_list.iter().map(|&(b, _)| unsafe { *self.live.add(b as usize) } as u64 * 2).sum();
+        let mut cand = Vec::new();
+        for p in 0..self.next_page {
+            let ps = self.pages[p as usize];
+            if ps.state != PageKind::Active {
+                continue;
+            }
+            for i in 0..BLOCKS_PER_PAGE {
+                let b = p * BLOCKS_PER_PAGE + i;
+                let live = unsafe { *self.live.add(b as usize) };
+                if ps.free_mask & (1 << i) == 0 && !self.is_open(b) && !bit(self.marked, b) && live > 0 && (all || live < limit) {
+                    cand.push((live, b));
+                }
+            }
+        }
+        cand.sort_unstable();
+        if all {
+            budget = u64::MAX;
+        }
+        for (live, b) in cand {
+            if sum + live as u64 * 2 > budget {
+                break;
+            }
+            sum += live as u64 * 2;
+            set_bit(self.marked, b, true);
+            self.marked_list.push((b, 0));
+        }
+        if self.marked_list.is_empty() {
+            self.suspended_until = Some(now + WEAK_PAUSE);
+            return 0;
+        }
+        self.gc.running = true;
+        self.freed_in_pass = 0;
+        self.pass_started = Some(now);
+        self.marked_list.len()
+    }
+
+    /// Fin de passe : un bloc encore marqué après [`MAX_MARKED_PASSES`] passes est
+    /// démarqué ; une passe qui a rendu moins de 2 Mio suspend le déclenchement 10 s.
+    pub fn gc_end_pass(&mut self, now: Instant) -> PassReport {
+        let marked = self.marked;
+        let mut unmarked = 0;
+        self.marked_list.retain_mut(|(b, passes)| {
+            if !bit(marked, *b) {
+                return false; // vidé et libéré
+            }
+            *passes += 1;
+            if *passes >= MAX_MARKED_PASSES {
+                set_bit(marked, *b, false);
+                unmarked += 1;
+                return false;
+            }
+            true
+        });
+        let freed = self.freed_in_pass * BLOCK as u64;
+        if freed < WEAK_PASS {
+            self.suspended_until = Some(now + WEAK_PAUSE);
+        }
+        let ms = self.pass_started.take().map_or(0, |t| now.saturating_duration_since(t).as_millis() as u64);
+        self.gc.running = false;
+        self.gc.passes += 1;
+        self.gc.unmarked_blocks += unmarked;
+        self.gc.last_pass_ms = ms;
+        PassReport { freed_bytes: freed, still_marked: self.marked_list.len() as u64, unmarked, ms }
+    }
+
+    /// Démarque tout, sans compter de passe (tests : passe forcée).
+    pub fn gc_unmark_all(&mut self) {
+        for &(b, _) in &self.marked_list {
+            set_bit(self.marked, b, false);
+        }
+        self.marked_list.clear();
+        self.gc.running = false;
+        self.pass_started = None;
+    }
+
+    pub fn note_pinned(&mut self) {
+        self.gc.pinned += 1;
+    }
+
+    pub fn note_evacuated(&mut self, size: usize) {
+        self.gc.evacuated_objects += 1;
+        self.gc.evacuated_bytes += size as u64;
     }
 
     #[cfg(test)]
@@ -473,6 +722,12 @@ fn init() -> Option<&'static mut Pool> {
     }
 }
 
+/// Le pool global, s'il a déjà servi.
+#[inline]
+fn global() -> Option<&'static mut Pool> {
+    unsafe { (*&raw mut POOL).as_mut() }
+}
+
 /// Emplacement du pool global. Nul : pool indisponible ou plage pleine, l'appelant
 /// alloue en externe.
 ///
@@ -480,7 +735,7 @@ fn init() -> Option<&'static mut Pool> {
 /// Mono-thread ; `size` pair et ≤ [`BLOCK`].
 #[inline]
 pub unsafe fn alloc(size: usize) -> *mut u8 {
-    match unsafe { &mut *&raw mut POOL } {
+    match global() {
         Some(p) => p.alloc(size),
         None => init().map_or(null_mut(), |p| p.alloc(size)),
     }
@@ -490,7 +745,7 @@ pub unsafe fn alloc(size: usize) -> *mut u8 {
 /// `ptr` vient de [`alloc`] avec la même `size`, pas encore rendu.
 #[inline]
 pub unsafe fn free(ptr: *mut u8, size: usize) {
-    match unsafe { &mut *&raw mut POOL } {
+    match global() {
         Some(p) => unsafe { p.free(ptr, size) },
         None => unreachable!("free hors pool"),
     }
@@ -500,10 +755,75 @@ pub unsafe fn free(ptr: *mut u8, size: usize) {
 /// Voir [`Pool::shrink`] ; `ptr` vient de [`alloc`].
 #[inline]
 pub unsafe fn shrink(ptr: *mut u8, old: usize, new: usize) {
-    match unsafe { &mut *&raw mut POOL } {
+    match global() {
         Some(p) => unsafe { p.shrink(ptr, old, new) },
         None => unreachable!("shrink hors pool"),
     }
+}
+
+/// Destination d'un objet évacué. Nul : plage pleine, l'objet reste où il est.
+pub fn alloc_survivor(size: usize) -> *mut u8 {
+    global().map_or(null_mut(), |p| p.alloc_survivor(size))
+}
+
+/// L'objet d'en-tête `a` est à évacuer.
+#[inline]
+pub fn is_marked(a: usize) -> bool {
+    global().is_some_and(|p| p.is_marked_addr(a))
+}
+
+pub fn note_pinned() {
+    if let Some(p) = global() {
+        p.note_pinned();
+    }
+}
+
+pub fn note_evacuated(size: usize) {
+    if let Some(p) = global() {
+        p.note_evacuated(size);
+    }
+}
+
+/// Depuis la boucle, au repos (timer) : rend les pages vides en trop. Vrai s'il en
+/// reste à rendre tout de suite.
+pub fn release_step(now: Instant) -> bool {
+    global().is_some_and(|p| p.release_step(now, RELEASE_BUDGET))
+}
+
+/// Voir [`Pool::gc_want`] (`None` sans pool).
+pub fn gc_want(idle: bool, now: Instant) -> Option<f64> {
+    global().and_then(|p| p.gc_want(idle, now))
+}
+
+/// Voir [`Pool::gc_begin`] (0 sans pool).
+pub fn gc_begin(threshold: f64, all: bool, now: Instant) -> usize {
+    global().map_or(0, |p| p.gc_begin(threshold, all, now))
+}
+
+/// Voir [`Pool::gc_end_pass`].
+pub fn gc_end_pass(now: Instant) -> Option<PassReport> {
+    global().map(|p| p.gc_end_pass(now))
+}
+
+/// Voir [`Pool::gc_unmark_all`].
+pub fn gc_unmark_all() {
+    if let Some(p) = global() {
+        p.gc_unmark_all();
+    }
+}
+
+/// Octets alloués par les commandes (cumul), réserve : budget du GC sous charge.
+pub fn gc_budget_inputs() -> Option<(u64, u64)> {
+    global().map(|p| (p.allocated(), p.reserve()))
+}
+
+/// `None` tant que le pool n'a servi à rien (ou s'il est désactivé).
+pub fn stats() -> Option<(Stats, u64)> {
+    global().map(|p| (p.stats(), p.reserve()))
+}
+
+pub fn gc_stats() -> Option<GcStats> {
+    global().map(|p| p.gc_stats())
 }
 
 /// Vérificateur (MEMORY_ARCH.md §16.8) : `slots` = les emplacements que tient l'arbre
@@ -511,7 +831,7 @@ pub unsafe fn shrink(ptr: *mut u8, old: usize, new: usize) {
 /// dépasse jamais le compteur `live` (l'égalité n'est pas exigée : des objets vivent hors
 /// de l'arbre). Rend le total des octets recensés.
 pub fn verify_census(slots: &[(usize, usize)]) -> Result<u64, String> {
-    let Some(p) = (unsafe { (*&raw const POOL).as_ref() }) else {
+    let Some(p) = global() else {
         return if slots.is_empty() { Ok(0) } else { Err("emplacements recensés sans pool".into()) };
     };
     let end = p.base + p.nb_pages as usize * PAGE;
@@ -539,21 +859,7 @@ pub fn verify_census(slots: &[(usize, usize)]) -> Result<u64, String> {
 
 /// Octets vivants du pool global (0 sans pool).
 pub fn live_bytes() -> u64 {
-    unsafe { (*&raw const POOL).as_ref().map_or(0, |p| p.live_bytes) }
-}
-
-/// Depuis la boucle, au repos (timer) : rend les pages vides en trop. Vrai s'il en
-/// reste à rendre tout de suite.
-pub fn release_step(now: Instant) -> bool {
-    match unsafe { &mut *&raw mut POOL } {
-        Some(p) => p.release_step(now, RELEASE_BUDGET),
-        None => false,
-    }
-}
-
-/// `None` tant que le pool n'a servi à rien (ou s'il est désactivé).
-pub fn stats() -> Option<(Stats, u64)> {
-    unsafe { (*&raw const POOL).as_ref().map(|p| (p.stats(), p.reserve())) }
+    global().map_or(0, |p| p.live_bytes)
 }
 
 #[cfg(test)]
@@ -694,7 +1000,77 @@ mod tests {
         for _ in 0..8 {
             p.alloc(60_000);
         }
-        assert_eq!(p.medium.block.iter().filter(|&&b| b != NONE).count(), WINDOW);
-        assert!(p.medium.rest.iter().all(|&r| r as usize * 2 >= MEDIUM));
+        assert_eq!(p.windows[MAIN].block.iter().filter(|&&b| b != NONE).count(), WINDOW);
+        assert!(p.windows[MAIN].rest.iter().all(|&r| r as usize * 2 >= MEDIUM));
+    }
+
+    /// Blocs fermés à moitié vides : marqués par densité croissante dans la limite de la
+    /// réserve ; les survivants vont dans leur propre bloc ; un bloc évacué est libéré et
+    /// démarqué ; un bloc qui ne se vide pas est démarqué après deux passes.
+    #[test]
+    fn gc_marks_evacuates_and_unmarks() {
+        let mut p = pool(8);
+        let per_block = BLOCK / 100;
+        // 10 blocs pleins d'objets de 100 o, puis on en libère une part croissante.
+        let objs: Vec<Vec<*mut u8>> = (0..10).map(|_| (0..per_block).map(|_| p.alloc(100)).collect()).collect();
+        p.alloc(100); // ferme le 10e bloc
+        for (i, blk) in objs.iter().enumerate() {
+            for &x in blk.iter().skip(i % 5 + 1).step_by(2) {
+                unsafe { p.free(x, 100) }; // ~moitié libérée, densités voisines
+            }
+        }
+        let now = Instant::now();
+        assert!(p.gc_want(true, now).is_some(), "au repos, fragmentation > 5 %");
+        let n = p.gc_begin(0.90, false, now);
+        assert!(n > 0 && n <= 10);
+        // Évacuation à la main de tout ce qui reste dans les blocs marqués.
+        let marked: Vec<u32> = p.marked_list.iter().map(|&(b, _)| b).collect();
+        let held_before = p.stats().held_blocks;
+        // Les objets vivants d'un bloc marqué : ceux qu'on n'a pas libérés.
+        for (i, blk) in objs.iter().enumerate() {
+            let freed: std::collections::HashSet<usize> =
+                blk.iter().skip(i % 5 + 1).step_by(2).map(|&x| x as usize).collect();
+            for &x in blk {
+                if !freed.contains(&(x as usize)) && p.is_marked_addr(x as usize) {
+                    let y = p.alloc_survivor(100);
+                    assert!(!p.is_marked_addr(y as usize), "survivant hors des blocs marqués");
+                    unsafe { p.free(x, 100) };
+                }
+            }
+        }
+        // n blocs rendus, au plus n/2 + 1 blocs de survivants (moitié pleins avant)
+        assert!(p.stats().held_blocks <= held_before - n as u64 + (n as u64 / 2 + 1), "blocs marqués rendus");
+        assert!(marked.iter().all(|&b| !bit(p.marked, b)), "libérés donc démarqués");
+        let r = p.gc_end_pass(now);
+        assert_eq!(r.freed_bytes, n as u64 * BLOCK as u64);
+        assert_eq!(r.still_marked, 0);
+
+        // Un bloc marqué qui ne se vide pas (objet épinglé) : démarqué après deux passes.
+        let later = now + Duration::from_secs(60);
+        let m = p.gc_begin(1.0, true, later);
+        assert!(m > 0);
+        assert_eq!(p.gc_end_pass(later).still_marked, m as u64);
+        let r = p.gc_end_pass(later);
+        assert_eq!((r.still_marked, r.unmarked), (0, m as u64));
+        assert_eq!(p.gc_stats().marked_blocks, 0);
+    }
+
+    #[test]
+    fn gc_under_load_needs_pressure_and_weak_pass_suspends() {
+        let mut p = pool(16);
+        let per_block = BLOCK / 100;
+        let objs: Vec<*mut u8> = (0..200 * per_block).map(|_| p.alloc(100)).collect();
+        p.alloc(100);
+        for &x in objs.iter().step_by(2) {
+            unsafe { p.free(x, 100) };
+        }
+        let now = Instant::now();
+        // ~50 % de fragmentation, ~6 Mio récupérables : sous le seuil de 8 Mio.
+        assert_eq!(p.gc_want(false, now), None);
+        assert_eq!(p.gc_want(true, now), Some(0.90));
+        // Rien sous 10 % de densité : passe faible, déclenchement suspendu 10 s.
+        assert_eq!(p.gc_begin(0.10, false, now), 0);
+        assert_eq!(p.gc_want(true, now + Duration::from_secs(5)), None);
+        assert!(p.gc_want(true, now + Duration::from_secs(11)).is_some());
     }
 }

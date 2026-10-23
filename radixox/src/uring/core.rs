@@ -243,6 +243,32 @@ const SWEEP_SLOTS: usize = 1024;
 /// pages par appel, l'appel suivant tout de suite après s'il en reste.
 const MEM_RELEASE_EVERY: Duration = Duration::from_secs(1);
 const MEM_RELEASE_AGAIN: Duration = Duration::from_millis(10);
+/// Déclenchement du GC (MEMORY_ARCH.md §16.6) : par timer, comme le rendu des pages ;
+/// `run_jobs` et `idle_step` ne tournent que s'il y a déjà du travail.
+const GC_CHECK_EVERY: Duration = Duration::from_millis(100);
+/// Au repos : rien reçu depuis 10 ms.
+const GC_IDLE_AFTER: Duration = Duration::from_millis(10);
+/// Slots par tranche au repos ; sous charge, le budget suit les allocations du tour.
+const GC_IDLE_SLICE: u32 = 512;
+const GC_LOAD_MIN_SLICE: u32 = 64;
+
+/// GC niveau A du pool : passe en cours et réglages (`RADIXOX_GC`, `RADIXOX_GC_LOG`).
+struct Gc {
+    pass: Option<oxidart::gc::GcPass>,
+    enabled: bool,
+    log: bool,
+    /// Octets alloués par les commandes au tour précédent (budget sous charge).
+    alloc_mark: u64,
+    /// Début de la passe en cours et compteurs à ce moment (journal).
+    started: Option<(Instant, radixox_lib::pool::GcStats)>,
+}
+
+impl Gc {
+    fn from_env() -> Self {
+        let on = |name: &str, default: bool| std::env::var(name).map_or(default, |v| v != "0");
+        Self { pass: None, enabled: on("RADIXOX_GC", true), log: on("RADIXOX_GC_LOG", false), alloc_mark: 0, started: None }
+    }
+}
 
 /// Échéances du tas de timers (RUNTIME_ARCH.md §9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -255,6 +281,7 @@ enum Timer {
     /// Échéance d'un `WAIT`.
     Wait,
     MemRelease,
+    Gc,
 }
 
 /// Suite à donner après l'exécution d'une frame.
@@ -395,6 +422,7 @@ pub struct Core {
     /// Dernière réception, toutes connexions : sans réception depuis 1 ms, le
     /// BGSAVE n'est plus plafonné (le thread est libre).
     last_rx: Instant,
+    gc: Gc,
     /// Saves automatiques, dernière save, écritures depuis.
     persist: Persistence,
     /// Flux de commandes, si `cfg.journal` ou l'AOF.
@@ -441,6 +469,7 @@ impl Core {
         let mut timers = BinaryHeap::new();
         timers.push(Reverse((now + EVICT_EVERY, Timer::Evict)));
         timers.push(Reverse((now + MEM_RELEASE_EVERY, Timer::MemRelease)));
+        timers.push(Reverse((now + GC_CHECK_EVERY, Timer::Gc)));
         if cfg.idle_timeout.is_some() {
             timers.push(Reverse((now + SWEEP_EVERY, Timer::Sweep)));
         }
@@ -471,6 +500,7 @@ impl Core {
             subs: HashMap::new(),
             save_share: cpu_share(),
             last_rx: now,
+            gc: Gc::from_env(),
             persist: Persistence::new(cfg.save_rules.clone(), cfg.stop_writes_on_bgsave_error, now),
             journal: cfg.journal.then(Stream::default),
             aof: None,
@@ -774,6 +804,10 @@ impl Core {
                     let next = if more { MEM_RELEASE_AGAIN } else { MEM_RELEASE_EVERY };
                     self.timers.push(Reverse((self.now + next, Timer::MemRelease)));
                 }
+                Timer::Gc => {
+                    self.gc_trigger();
+                    self.timers.push(Reverse((self.now + GC_CHECK_EVERY, Timer::Gc)));
+                }
                 Timer::Aof => {
                     if let Some(w) = &mut self.aof {
                         w.tick();
@@ -867,6 +901,7 @@ impl Core {
         !self.conn_jobs.is_empty()
             || !self.jobs.is_empty()
             || self.bgsave.as_ref().is_some_and(|b| b.wants_slice())
+            || self.gc.pass.is_some()
     }
 
     pub fn mode(&self, slot: Slot) -> Mode {
@@ -1744,7 +1779,7 @@ impl Core {
                 info.push_str("\r\n");
                 crate::exec::info_stats(&mut info);
                 info.push_str("\r\n");
-                crate::exec::info_memory(&mut info);
+                crate::exec::info_memory(&mut info, self.gc.enabled, self.gc.pass.is_some());
                 extend_encode(&mut self.outs[s].out, &Frame::BulkString(SharedByte::from_slice(info.as_bytes())));
             }
             After::Subscribe(channels) => self.subscribe(slot, &channels),
@@ -1882,7 +1917,7 @@ impl Core {
     /// libération, BGSAVE) : la boucle doit envoyer les réponses du tour avant
     /// de la faire (RUNTIME_ARCH.md §2).
     pub fn has_jobs(&self) -> bool {
-        !self.conn_jobs.is_empty() || !self.jobs.is_empty() || self.bgsave_slice_due()
+        !self.conn_jobs.is_empty() || !self.jobs.is_empty() || self.bgsave_slice_due() || self.gc.pass.is_some()
     }
 
     /// Une tranche de BGSAVE est à faire à ce tour-ci (pas de tranche à
@@ -1947,6 +1982,7 @@ impl Core {
         self.conn_job_step();
         self.free_step();
         self.bgsave_slice();
+        self.gc_load_slice();
     }
 
     /// Une étape de travail de fond quand personne n'attend : ni client ici,
@@ -1955,8 +1991,73 @@ impl Core {
     /// Un client parqué d'abord, puis la libération, puis la save. Rend `true`
     /// s'il reste du travail de fond.
     pub fn idle_step(&mut self) -> bool {
-        let _ = self.conn_job_step() || self.free_step() || self.bgsave_idle_slice();
+        let _ = self.conn_job_step() || self.free_step() || self.bgsave_idle_slice() || self.gc_slice(GC_IDLE_SLICE);
         self.has_background()
+    }
+
+    // ── GC niveau A du pool (MEMORY_ARCH.md §16.6) ───────────────────────
+
+    /// Timer : démarre une passe si le pool la demande (fragmentation, réserve).
+    fn gc_trigger(&mut self) {
+        use radixox_lib::pool;
+        if !self.gc.enabled || self.gc.pass.is_some() {
+            return;
+        }
+        let idle = self.now.saturating_duration_since(self.last_rx) >= GC_IDLE_AFTER;
+        let Some(threshold) = pool::gc_want(idle, self.now) else { return };
+        let now = Instant::now();
+        let n = pool::gc_begin(threshold, false, now);
+        if n == 0 {
+            return; // rien de marquable : passe faible, déclenchement suspendu
+        }
+        self.gc.alloc_mark = pool::gc_budget_inputs().map_or(0, |(a, _)| a);
+        self.gc.pass = Some(oxidart::gc::GcPass::new());
+        self.gc.started = Some((now, pool::gc_stats().unwrap_or_default()));
+        if self.gc.log {
+            let how = if idle { "au repos" } else { "sous charge" };
+            eprintln!("[gc] passe : {n} blocs marqués (densité < {:.0} %, {how})", threshold * 100.0);
+        }
+    }
+
+    /// Une tranche de la passe en cours, au plus `budget` slots. Faux sans passe.
+    fn gc_slice(&mut self, budget: u32) -> bool {
+        use radixox_lib::pool;
+        let Some(pass) = self.gc.pass.as_mut() else { return false };
+        if !pass.step(&mut self.art, budget) {
+            return true;
+        }
+        self.gc.pass = None;
+        let r = pool::gc_end_pass(Instant::now());
+        if self.gc.log
+            && let (Some(r), Some((_, s0)), Some(s1)) = (r, self.gc.started.take(), pool::gc_stats())
+        {
+            eprintln!(
+                "[gc] fin : {} évacués ({} o), {} épinglés, {} Kio de blocs rendus, {} restent marqués, {} démarqués, {} ms",
+                s1.evacuated_objects - s0.evacuated_objects,
+                s1.evacuated_bytes - s0.evacuated_bytes,
+                s1.pinned - s0.pinned,
+                r.freed_bytes >> 10,
+                r.still_marked,
+                r.unmarked,
+                r.ms
+            );
+        }
+        true
+    }
+
+    /// Sous charge, une fois par tour : le budget suit les allocations du tour,
+    /// `max(64, alloués × N / réserve)`, pour que la passe finisse avant que les
+    /// allocations aient consommé la réserve.
+    fn gc_load_slice(&mut self) {
+        if self.gc.pass.is_none() {
+            return;
+        }
+        let (alloc, reserve) = radixox_lib::pool::gc_budget_inputs().unwrap_or((0, 1));
+        let tour = alloc.saturating_sub(self.gc.alloc_mark);
+        self.gc.alloc_mark = alloc;
+        let n = self.art.gc_slot_span();
+        let budget = (tour as u128 * n as u128 / reserve.max(1) as u128).clamp(GC_LOAD_MIN_SLICE as u128, u32::MAX as u128);
+        self.gc_slice(budget as u32);
     }
 
     fn conn_job_step(&mut self) -> bool {

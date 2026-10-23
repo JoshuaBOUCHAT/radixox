@@ -132,6 +132,39 @@ impl SharedByte {
         true
     }
 
+    /// GC (MEMORY_ARCH.md §16.6) : un objet d'un bloc marqué est recopié au curseur des
+    /// survivants et l'ancien emplacement rendu. Tenu ailleurs (`rc > 1`) : épinglé,
+    /// laissé en place. À n'appeler que sur un emplacement que l'arbre est seul à voir
+    /// (énumérateurs du GC) : `self` est réécrit vers les mêmes octets.
+    pub fn gc_relocate(&mut self) {
+        #[cfg(radixox_pool)]
+        {
+            if self.is_external() {
+                return;
+            }
+            let base = self.header_ptr() as *mut u8;
+            if !crate::pool::is_marked(base as usize) {
+                return;
+            }
+            if self.rc() != 1 {
+                crate::pool::note_pinned();
+                return;
+            }
+            let size = Self::slot(self.len());
+            let new = crate::pool::alloc_survivor(size);
+            if new.is_null() {
+                return; // plage pleine : l'objet reste
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(base, new, size);
+                let moved = Self { ptr: NonNull::new_unchecked(new.add(Self::SHORT_HEADER)) };
+                // rc 1 → 0 : l'ancien emplacement est rendu par le chemin normal.
+                drop(std::mem::replace(self, moved));
+            }
+            crate::pool::note_evacuated(size);
+        }
+    }
+
     /// Emplacement dans le pool (adresse de l'en-tête, taille), `None` hors pool
     /// (forme longue, ou forme courte dans mimalloc). Vérificateur du GC.
     pub fn pool_slot(&self) -> Option<(usize, usize)> {

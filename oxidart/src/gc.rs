@@ -13,6 +13,59 @@ use crate::OxidArt;
 use crate::small;
 use crate::value::{Tag, ValUnion, list_slab, valart};
 
+/// Une passe du GC niveau A en cours (MEMORY_ARCH.md §16.6) : phase et slot où reprendre.
+/// Le pool a marqué les blocs à évacuer ; chaque `SharedByte` visité est relocalisé s'il
+/// en fait partie.
+#[derive(Debug)]
+pub struct GcPass {
+    phase: Phase,
+    at: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase {
+    Oxidart,
+    Valart,
+    Lists,
+}
+
+impl Default for GcPass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GcPass {
+    pub fn new() -> Self {
+        Self { phase: Phase::Oxidart, at: 0 }
+    }
+
+    /// Une tranche d'au plus `budget` slots. Vrai quand la passe est finie.
+    pub fn step(&mut self, art: &mut OxidArt, budget: u32) -> bool {
+        let f = &mut |sb: &mut SharedByte| sb.gc_relocate();
+        let next = match self.phase {
+            Phase::Oxidart => art.gc_visit(self.at, budget, f),
+            // Testé à chaque tranche, pas seulement à l'entrée : une save peut démarrer
+            // entre deux tranches, et l'image d'un nœud valart copie ses `SharedByte` bit
+            // à bit. Valart sauté jusqu'à la passe suivante.
+            Phase::Valart if valart().is_saving() => None,
+            Phase::Valart => art.gc_visit_valart(self.at, budget, f),
+            Phase::Lists => art.gc_visit_lists(self.at, budget, f),
+        };
+        if let Some(at) = next {
+            self.at = at;
+            return false;
+        }
+        self.at = 0;
+        self.phase = match self.phase {
+            Phase::Oxidart => Phase::Valart,
+            Phase::Valart => Phase::Lists,
+            Phase::Lists => return true,
+        };
+        false
+    }
+}
+
 /// Arbres vivants du processus. Valart, les listes et les ZSet sont des slabs globaux,
 /// communs à tous les arbres : avec plusieurs arbres (tests à plusieurs nœuds), un audit
 /// ne sait pas à qui appartient ce qu'il y voit.
@@ -151,5 +204,18 @@ impl OxidArt {
         let mut out = Vec::new();
         self.gc_visit_all(&mut |sb: &mut SharedByte| out.extend(sb.pool_slot()));
         out
+    }
+
+    /// Passe complète forcée (tests, `radixox_gc_debug`) : tous les blocs fermés non vides
+    /// marqués puis évacués ; ce qui reste marqué (objets épinglés) est démarqué. Sans
+    /// pool : rien.
+    pub fn gc_full_pass(&mut self) {
+        use radixox_lib::pool;
+        if pool::gc_begin(1.0, true, std::time::Instant::now()) == 0 {
+            return;
+        }
+        let mut pass = GcPass::new();
+        while !pass.step(self, u32::MAX) {}
+        pool::gc_unmark_all();
     }
 }
