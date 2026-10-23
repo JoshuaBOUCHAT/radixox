@@ -1321,5 +1321,26 @@ au bout de 16 s, seul le pool baisse). Recensement des tailles (test temporaire)
    allocations sont des multiples de 8 ; taille exacte au lieu des classes mimalloc
    (`alloc_class`). Petits blocs Hash/Set et débordements valart (tag de 3 bits : 8) idem.
 2. **Compactage HiSlab** (§9) : le plus gros poste restant (35 Mo uuid, 53 Mo YCSB) ; la
-   slab ne rétrécit jamais.
+   slab ne rétrécit jamais. **En arrière-plan** (tranches au repos, comme le GC), avec
+   **libération sur critères** (excédent tenu qui dure, comme le niveau B) — idée de
+   l'utilisateur, 2026-10-23, à reprendre plus tard.
+
+### 17.3 Principe : des pages communes à tous les pools (utilisateur, 2026-10-23)
+
+Les blocs et les pages de 2 Mio sont un **système de pagination commun** : rendre 2 Mio au
+système pour un pool puis redemander 2 Mio juste après pour un autre est le contresens à
+éviter. Un « pool » est un curseur (ou une fenêtre) qui prend ses blocs dans le stock
+commun d'un seul `Pool` ; seul ce stock rend de la mémoire, sur une réserve **globale**.
+Déjà vrai pour `SharedByte` et `CompactPath` (même `Pool`) ; les pages des nœuds, les petits
+blocs Hash/Set et les débordements valart seront des curseurs de plus (alignement 8), pas
+un second allocateur. Deux nuances :
+
+- **affinité des pages par mobilité** : un bloc non déplaçable (pool court des temporaires,
+  buffers de connexion) épingle sa page pour le niveau B ; `take_block` doit regrouper les
+  blocs non déplaçables dans leurs propres pages, tout en puisant dans le même stock et la
+  même réserve ;
+- **HiSlab** : plage `mmap` à elle (adresse = `idx × 128`), donc pas de pages communes. La
+  partager demande une HiSlab par chunks de 2 Mio pris dans le `Pool` (table
+  `idx → chunk`) ; à trancher avec le compactage. D'ici là, une réserve globale (pool +
+  slab) éviterait au moins de rendre d'un côté ce que l'autre reprend.
 
