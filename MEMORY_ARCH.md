@@ -1323,7 +1323,29 @@ au bout de 16 s, seul le pool baisse). Recensement des tailles (test temporaire)
 2. **Compactage HiSlab** (§9) : le plus gros poste restant (35 Mo uuid, 53 Mo YCSB) ; la
    slab ne rétrécit jamais. **En arrière-plan** (tranches au repos, comme le GC), avec
    **libération sur critères** (excédent tenu qui dure, comme le niveau B) — idée de
-   l'utilisateur, 2026-10-23, à reprendre plus tard.
+   l'utilisateur, 2026-10-23, à reprendre plus tard. Spec (discussion du 2026-10-23) :
+   - **machine à états** : déclenchée sur critère de défragmentation, suit `occupés` et
+     `span` ; ne rend que la **fin** de la slab (adresse = `idx × 128`) : on déplace les
+     slots occupés les plus hauts vers les trous les plus bas, puis on rend les pages de
+     2 Mio (16 384 nœuds) devenues libres en fin. Une page de fin déjà vide se rend sans
+     rien déplacer ; vérifier que `insert` comble les trous par le bas (alors les
+     insertions aident) ;
+   - **critères (utilisateur), avec hystérésis** : déclenchement si le libre sous la fin
+     dépasse **3 Mio** (**4 Mio** au-delà de ~200–500 Mio de slab) ; une page n'est rendue
+     que s'il reste **≥ 2 Mio** libres ensuite ; si les insertions pendant le compactage
+     ont ramené le libre sous le seuil, on ne rend rien. Variante à mesurer : seuil
+     proportionnel `max(2 Mio, slab / 128)` ;
+   - **coût d'un déplacement** = lignes de cache touchées au hasard : copie (2 lignes
+     source + 2 destination) **4**, parent (`parent_idx` + radix → `set_child_idx`) **2**,
+     **+1 par enfant** (son `parent_idx`, jusqu'à 256) ; tranche ≤ **~4 096 unités**
+     (~200–400 µs sans préchargement, ~50–80 µs si les enfants sont préchargés par lots de
+     8 comme §9.2 : accès indépendants) ; un nœud n'est jamais coupé entre deux tranches
+     (un 256 enfants = 262 unités). Le bit de TTL de la `TaggedHiSlab` suit le nœud.
+     **À mesurer** : coût réel par unité, avec et sans préchargement ;
+   - **interdits** : pendant une save (DFS et occupation T0 indexés par `idx`, §8.5) ; tant
+     qu'un job long (KEYS, `UNLINK prefix*`, libération de FLUSHDB) ou un curseur SCAN tient
+     des `idx` (v1 : attendre ; plus tard, les corriger) ; `root_idx` suit. La slab valart
+     (idx d'enfants à elle) se compacte à part, même mécanisme.
 
 ### 17.3 Principe : des pages communes à tous les pools (utilisateur, 2026-10-23)
 
