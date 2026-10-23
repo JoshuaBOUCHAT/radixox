@@ -1057,6 +1057,12 @@ impl Node {
         }
     }
 
+    /// Début de la page (en-tête, puis enfants), `None` sans page : préchargement.
+    #[inline]
+    pub(crate) fn page_start(&self) -> Option<*const u8> {
+        (self.pg_block8 > 0).then_some(self.ptr.as_ptr() as *const u8)
+    }
+
     /// Page du nœud (pointeur en place, taille), `None` sans page (GC, MEMORY_ARCH.md §17).
     /// À ne réécrire que vers une copie exacte de la page.
     pub(crate) fn page_mut(&mut self) -> Option<(&mut *mut u8, usize)> {

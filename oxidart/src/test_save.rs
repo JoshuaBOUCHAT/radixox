@@ -950,3 +950,40 @@ fn compaction_moves_nodes_and_releases_tail() {
     // Sous le seuil : rien ne se déclenche ; `force` compacte tout.
     assert!(art.compact_want(false).is_none());
 }
+
+/// Chaînes profondes créées en dernier, donc en fin de slab : nœuds et parents voisins,
+/// déplacés en même temps par le pipeline (MEMORY_ARCH.md §17.2), dans tous les ordres de
+/// validation. Tranches minuscules : le pipeline se vide et repart sans cesse.
+#[test]
+fn compaction_pipeline_moves_parents_and_children_together() {
+    let mut art = OxidArt::new();
+    // d'abord du remplissage, ensuite supprimé : les trous sont en bas
+    let filler: Vec<String> = (0..60_000).map(|i| format!("f{i:05}x")).collect();
+    for k in &filler {
+        art.set(sb(k), Value::String(sb("f")));
+    }
+    // puis des chaînes : chaque clé prolonge la précédente d'un caractère
+    let mut chain = Vec::new();
+    for root in 0..40 {
+        let mut k = format!("chain{root}:");
+        for d in 0..60 {
+            k.push((b'a' + (d % 26) as u8) as char);
+            art.set(sb(&k), Value::String(sb(&format!("{root}-{d}"))));
+            chain.push((k.clone(), format!("{root}-{d}")));
+        }
+    }
+    for k in &filler {
+        art.del(k.as_bytes());
+    }
+    let mut c = art.compact_want(true).expect("trous");
+    let mut slices = 0;
+    while art.compact_step(&mut c, 7).is_none() {
+        slices += 1;
+    }
+    assert!(slices > 100 && c.moved > 1000, "{slices} tranches, {} déplacés", c.moved);
+    art.check();
+    for (k, v) in &chain {
+        assert_eq!(art.get(k.as_bytes()), Some(Value::String(sb(v))), "{k}");
+    }
+    assert_eq!(art.map.last_occupied().unwrap() + 1, art.map.len(), "slab dense");
+}

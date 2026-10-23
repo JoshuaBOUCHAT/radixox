@@ -1381,7 +1381,22 @@ au bout de 16 s, seul le pool baisse). Recensement des tailles (test temporaire)
 - Mesure (scénario uuid) : 51 536 nœuds déplacés, 12 Mio rendus ; slab 35 → 21 Mo ; RSS
   après suppression de la moitié **74 Mo** au bout de 16 s (90 avant, 114 au départ).
   **~120 ns par unité** sans pipeline (tranche de 4 096 unités = 489 µs) → tranche
-  ramenée à **1 024 unités** (~120 µs). Suite : le pipeline de 8 nœuds (§17.2).
+  ramenée à **1 024 unités**.
+- **Pipeline de machines à états** (conception de l'utilisateur, 2026-10-23) :
+  `oxidart::compact::PIPELINE` = 8 déplacements en vol, étapes `claim` (source la plus
+  haute non prise, trou le plus bas réservé par `reserve_lowest`, préchargement des deux)
+  → `Header` (préchargement du parent et de la page de la source) → `Links` (préchargement
+  de la ligne `parent_idx` de chaque enfant et de la page du parent, où l'entrée de
+  l'enfant peut se trouver ; sautée s'il n'y a rien à attendre) → `Commit` (copie
+  `move_to`, parent, enfants, d'un coup, `idx` relus à ce moment-là). Une machine finie
+  est remplacée au tour suivant ; le pipeline est vidé en fin de tranche. `hislab` :
+  `prev_occupied`, `reserve_lowest` / `unreserve`, `move_to`, `slot_ptr`. Test dédié :
+  chaînes profondes en fin de slab (nœud et parent en vol ensemble), tranches de 7 unités.
+- Mesure (scénario uuid, plus longue tranche de 1 024 unités) : **41 µs** (~40 ns par
+  unité) avec K = 8, 48 µs avec K = 1 (étapes préchargées, une seule machine) : ×3 par
+  rapport à la version sans pipeline, surtout grâce au préchargement par étapes ; K = 8 ne
+  gagne ici que 15 % (petite slab, haut de slab encore en cache) — à remesurer sur une
+  grosse slab froide.
 
 ### 17.3 Principe : des pages communes à tous les pools (utilisateur, 2026-10-23)
 

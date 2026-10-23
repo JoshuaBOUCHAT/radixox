@@ -7,12 +7,24 @@
 //! `parent_idx` de chaque enfant. Coût d'un déplacement en lignes de cache touchées au
 //! hasard : 4 (copie) + 2 (parent) + 1 par enfant ; une tranche est bornée en unités.
 //!
+//! **Pipeline** (MEMORY_ARCH.md §17.2) : [`PIPELINE`] déplacements en vol, chacun une petite
+//! machine à états ; à chaque tour, chacun fait le travail dont les données sont arrivées
+//! et précharge celles de son étape suivante, si bien que les défauts de cache des K
+//! déplacements se recouvrent. Une machine qui finit est remplacée par le nœud suivant ; un
+//! nœud sans page ou dont le parent n'a pas de page saute une étape. La validation (copie,
+//! parent, enfants) se fait d'un coup et relit les `idx` à ce moment-là : deux machines qui
+//! déplacent un nœud et son parent restent justes dans tous les ordres, un préchargement
+//! parti sur une ancienne adresse ne coûte qu'un défaut. Le pipeline est vidé en fin de
+//! tranche : aucune réservation ne survit à une commande.
+//!
 //! Interdit pendant une save (son parcours et son occupation T0 sont indexés par `idx`) et
 //! tant que quelqu'un tient des `idx` de nœuds entre deux tranches (jobs) : c'est au
 //! pilote (le serveur) de ne pas l'avancer dans ces cas.
 
+use radixox_lib::prefetch::prefetch_l1;
+
 use crate::OxidArt;
-use crate::node::EntryRef;
+use crate::node::{EntryRef, Node};
 
 /// Slots par page de 2 Mio (nœuds de 128 o).
 const PAGE_SLOTS: u32 = (2 << 20) / 128;
@@ -21,6 +33,33 @@ const PAGE_SLOTS: u32 = (2 << 20) / 128;
 const KEEP_FREE_SLOTS: u32 = PAGE_SLOTS;
 /// Coût fixe d'un déplacement (copie + parent), en lignes de cache.
 const MOVE_COST: u32 = 6;
+/// Déplacements en vol.
+pub const PIPELINE: usize = 8;
+
+/// Étape suivante d'un déplacement en vol.
+#[derive(Clone, Copy)]
+enum Stage {
+    /// Source et destination préchargées : lire l'en-tête de la source.
+    Header,
+    /// Parent et page de la source préchargés : lire les enfants.
+    Links,
+    /// Tout est préchargé : valider.
+    Commit,
+}
+
+#[derive(Clone, Copy)]
+struct Mover {
+    src: u32,
+    dst: u32,
+    stage: Stage,
+}
+
+#[inline(always)]
+fn prefetch_node(art: &OxidArt, idx: u32) {
+    let p = art.map.slot_ptr(idx) as *const u8;
+    prefetch_l1(p);
+    prefetch_l1(p.wrapping_add(64));
+}
 
 /// Déclenchement : trous sous la fin au-delà de 3 Mio, 4 Mio pour une slab de plus de
 /// 256 Mio (critères de l'utilisateur).
@@ -69,24 +108,105 @@ impl OxidArt {
         (target < span).then(|| Compaction { target, keep, moved: 0, children: Vec::new() })
     }
 
-    /// Une tranche d'au plus `budget` unités. `Some` quand la passe est finie : la fin de
-    /// la slab est rendue au-dessus de ce qui est occupé, en gardant le libre prévu.
+    /// Une tranche d'au plus `budget` unités, en pipeline. `Some` quand la passe est finie :
+    /// la fin de la slab est rendue au-dessus de ce qui est occupé, en gardant le libre
+    /// prévu.
     pub fn compact_step(&mut self, c: &mut Compaction, budget: u32) -> Option<CompactReport> {
+        let mut movers: [Option<Mover>; PIPELINE] = [None; PIPELINE];
         let mut spent = 0;
-        while spent < budget {
-            let Some(src) = self.map.last_occupied() else { break };
-            if src < c.target {
+        // prochaine source : sous la plus basse déjà prise, en partant de la fin
+        let mut scan = self.map.last_occupied().map_or(0, |l| l + 1);
+        let mut exhausted = false;
+        loop {
+            let mut in_flight = false;
+            for slot in movers.iter_mut() {
+                if slot.is_none() && !exhausted && spent < budget {
+                    match self.claim(c, &mut scan) {
+                        Some(m) => *slot = Some(m),
+                        None => exhausted = true,
+                    }
+                } else if let Some(m) = slot {
+                    if let Some(cost) = self.advance(m, &mut c.children) {
+                        spent += cost;
+                        c.moved += 1;
+                        *slot = None;
+                    }
+                }
+                in_flight |= slot.is_some();
+            }
+            if !in_flight && (exhausted || spent >= budget) {
                 break;
             }
-            // SAFETY: `src` occupé ; aucune référence dans la slab n'est vivante ici.
-            let Some(dst) = (unsafe { self.map.move_down(src) }) else { break };
-            spent += MOVE_COST + self.relink(src, dst, &mut c.children);
-            c.moved += 1;
         }
-        if spent < budget {
-            return Some(self.finish_compaction(c));
+        exhausted.then(|| self.finish_compaction(c))
+    }
+
+    /// Prend la prochaine source (la plus haute non prise) et réserve le plus bas trou ;
+    /// précharge les deux. `None` : plus rien à descendre sous la cible.
+    fn claim(&mut self, c: &Compaction, scan: &mut u32) -> Option<Mover> {
+        let src = self.map.prev_occupied(*scan)?;
+        if src < c.target {
+            return None;
         }
-        None
+        // SAFETY: rempli par `move_to` à la validation, dans cette tranche, ou rendu.
+        let dst = unsafe { self.map.reserve_lowest() };
+        if dst >= src || dst >= c.target {
+            unsafe { self.map.unreserve(dst) };
+            return None;
+        }
+        *scan = src;
+        prefetch_node(self, src);
+        prefetch_node(self, dst);
+        Some(Mover { src, dst, stage: Stage::Header })
+    }
+
+    /// Une étape d'un déplacement. `Some(coût)` quand il est validé.
+    fn advance(&mut self, m: &mut Mover, children: &mut Vec<(u8, u32)>) -> Option<u32> {
+        // SAFETY: `m.src` est occupé jusqu'à la validation (seule cette machine le déplace).
+        let node = unsafe { self.map.get_unchecked(m.src) };
+        match m.stage {
+            Stage::Header => {
+                if node.parent_idx != u32::MAX {
+                    prefetch_node(self, node.parent_idx);
+                }
+                if let Some(p) = node.page_start() {
+                    prefetch_l1(p);
+                }
+                m.stage = Stage::Links;
+                None
+            }
+            Stage::Links => {
+                let mut fetched = false;
+                for (_, e) in node.iter() {
+                    if let EntryRef::Child(ch) = e {
+                        let at = self.map.slot_ptr(ch) as *const u8;
+                        prefetch_l1(at.wrapping_add(std::mem::offset_of!(Node, parent_idx)));
+                        fetched = true;
+                    }
+                }
+                if node.parent_idx != u32::MAX {
+                    // l'entrée de l'enfant peut être dans la page du parent
+                    let parent = unsafe { self.map.get_unchecked(node.parent_idx) };
+                    if let Some(p) = parent.page_start() {
+                        prefetch_l1(p);
+                        fetched = true;
+                    }
+                }
+                if fetched {
+                    m.stage = Stage::Commit;
+                    return None;
+                }
+                // rien de plus à attendre : un tour de moins
+                Some(self.commit(m, children))
+            }
+            Stage::Commit => Some(self.commit(m, children)),
+        }
+    }
+
+    fn commit(&mut self, m: &Mover, children: &mut Vec<(u8, u32)>) -> u32 {
+        // SAFETY: `src` occupé, `dst` réservé par `claim` ; aucune référence vivante.
+        unsafe { self.map.move_to(m.src, m.dst) };
+        MOVE_COST + self.relink(m.src, m.dst, children)
     }
 
     /// Le nœud `src` est maintenant en `dst` : son parent et ses enfants pointent dessus.
