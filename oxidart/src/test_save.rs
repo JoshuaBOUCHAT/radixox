@@ -890,3 +890,63 @@ fn gc_full_pass_moves_heap_paths() {
         assert!((s1.evacuated_bytes - s0.evacuated_bytes) as usize >= path_bytes);
     }
 }
+
+// ─── Compactage de la slab des nœuds (MEMORY_ARCH.md §17.2) ──────────────────
+
+/// 200K clés (dont des TTL), 3/4 supprimées au hasard, compactage par petites tranches :
+/// l'arbre reste exact (parents, radix, tags TTL : `check`), la fin de la slab est rendue.
+#[test]
+fn compaction_moves_nodes_and_releases_tail() {
+    let mut rng = Rng(0xC0FFEE);
+    let mut art = OxidArt::new();
+    art.set_now(1_000);
+    let keys: Vec<String> = (0..200_000).map(|_| format!("{:016x}{:08x}", rng.next(), rng.next() as u32)).collect();
+    for (i, k) in keys.iter().enumerate() {
+        let v = Value::String(sb(&format!("v{i}")));
+        if i % 7 == 0 {
+            art.set_ttl(sb(k), Duration::from_secs(3600), v);
+        } else {
+            art.set(sb(k), v);
+        }
+    }
+    let kept: Vec<usize> = (0..keys.len()).filter(|&i| rng.below(4) == 0).collect();
+    let keep: std::collections::HashSet<usize> = kept.iter().copied().collect();
+    for (i, k) in keys.iter().enumerate() {
+        if !keep.contains(&i) {
+            art.del(k.as_bytes());
+        }
+    }
+    art.check();
+    let holes = art.slab_holes_bytes();
+    assert!(holes > 3 << 20, "beaucoup de trous : {holes}");
+    let mut c = art.compact_want(false).expect("déclenchement");
+    let mut slices = 0;
+    let report = loop {
+        slices += 1;
+        if let Some(r) = art.compact_step(&mut c, 512) {
+            break r;
+        }
+    };
+    assert!(slices > 10, "par tranches ({slices})");
+    assert!(report.moved > 0 && report.released_bytes >= 2 << 20, "{report:?}");
+    art.check();
+    // Vidé jusqu'à `arrondi(occupés + 2 Mio de libre gardé, page)` : le reste des trous est
+    // ce libre, que les prochaines insertions comblent sans faute de page.
+    let page = (2u32 << 20) / 128;
+    let last = art.map.last_occupied().unwrap();
+    assert!(last < (art.map.len() + page).next_multiple_of(page), "fin vidée : dernier {last}");
+    assert!(art.slab_holes_bytes() < holes, "trous rebouchés");
+    for &i in &kept {
+        assert_eq!(art.get(keys[i].as_bytes()), Some(Value::String(sb(&format!("v{i}")))), "{}", keys[i]);
+        if i % 7 == 0 {
+            assert!(matches!(art.get_ttl(sb(&keys[i])), crate::TtlResult::KeyWithTtl(_)));
+        }
+    }
+    // L'arbre compacté accepte les écritures (les slots rendus refont des fautes de page).
+    for k in keys.iter().take(1000) {
+        art.set(sb(k), Value::String(sb("w")));
+    }
+    art.check();
+    // Sous le seuil : rien ne se déclenche ; `force` compacte tout.
+    assert!(art.compact_want(false).is_none());
+}

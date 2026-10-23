@@ -1362,6 +1362,27 @@ au bout de 16 s, seul le pool baisse). Recensement des tailles (test temporaire)
      des `idx` (v1 : attendre ; plus tard, les corriger) ; `root_idx` suit. La slab valart
      (idx d'enfants à elle) se compacte à part, même mécanisme.
 
+### 17.2 bis Compactage de la slab des nœuds (fait, branche `pool-structures`)
+
+- `hislab` 0.2.5 (pas encore publié, la branche en dépend par chemin) : `len`,
+  `last_occupied`, `move_down` (vers le plus petit trou, le tag TTL suit), `release_above`
+  (`MADV_DONTNEED` des pages de 2 Mio libres en fin, borne du plus haut slot touché).
+- `oxidart::compact` : `compact_want` (trous sous la fin > 3 Mio, 4 Mio au-delà de 256 Mio
+  de slab ; cible = `arrondi(occupés + 2 Mio, page)`, aucune passe si la cible n'est pas
+  sous la fin), `compact_step` (tranche bornée en unités), `relink` (parent ou `root_idx`,
+  `parent_idx` des enfants, tampon réutilisé), fin : rendu au-dessus de `max(dernier
+  occupé, occupés + libre gardé)` (les insertions pendant la passe sont prises en compte).
+- Serveur : déclenché par `Timer::Gc` quand aucune passe de GC ne tourne, ni save, ni job ;
+  tranches dans `run_jobs` et `idle_step` ; arrêtée sans rendu si une save ou un job
+  apparaît ; `INFO` `compact_*` ; journal sous `RADIXOX_GC_LOG`.
+- Tests : 200K clés dont TTL, 3/4 supprimées, compactage par tranches de 512 unités →
+  `check` (parents, radix, tags), contenu, TTL ; fuzz différentiels : compactage complet
+  forcé tous les 64 pas hors save (slab dense vérifiée, oracle d'accord).
+- Mesure (scénario uuid) : 51 536 nœuds déplacés, 12 Mio rendus ; slab 35 → 21 Mo ; RSS
+  après suppression de la moitié **74 Mo** au bout de 16 s (90 avant, 114 au départ).
+  **~120 ns par unité** sans pipeline (tranche de 4 096 unités = 489 µs) → tranche
+  ramenée à **1 024 unités** (~120 µs). Suite : le pipeline de 8 nœuds (§17.2).
+
 ### 17.3 Principe : des pages communes à tous les pools (utilisateur, 2026-10-23)
 
 Les blocs et les pages de 2 Mio sont un **système de pagination commun** : rendre 2 Mio au

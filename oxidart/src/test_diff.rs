@@ -210,6 +210,28 @@ fn deep_pairs(v: &[(SharedByte, SharedByte)]) -> Vec<(SharedByte, SharedByte)> {
     v.iter().map(|(a, b)| (fresh(a), fresh(b))).collect()
 }
 
+/// Tous les 64 pas, hors save : compactage complet forcé de la slab des nœuds (MEMORY_ARCH.md
+/// §17.2) ; `check` et la comparaison avec l'oracle suivent.
+fn compact_check(art: &mut OxidArt, step: usize, saving: bool) {
+    if saving || step % 64 != 63 {
+        return;
+    }
+    if let Some(mut c) = art.compact_want(true) {
+        let r = loop {
+            if let Some(r) = art.compact_step(&mut c, 64) {
+                break r;
+            }
+        };
+        COMPACT_MOVED.with(|m| m.set(m.get() + r.moved));
+        assert_eq!(art.map.last_occupied().map_or(0, |l| l + 1), art.map.len(), "slab dense après compactage");
+    }
+}
+
+thread_local! {
+    /// Nœuds déplacés par `compact_check` : les fuzz doivent en déplacer.
+    static COMPACT_MOVED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Après chaque opération : audit d'unicité du GC (MEMORY_ARCH.md §16.9), hors save
 /// chaque `SharedByte` de l'arbre a `rc == 1`.
 fn gc_check(art: &mut OxidArt, seed: u64, step: usize) {
@@ -463,6 +485,7 @@ fn fuzz(seed: u64, ops: usize, keys: Keys, stats: &mut Stats) {
                 stats.saves += 1;
             }
         }
+        compact_check(&mut new, step, saving.is_some());
         new.check();
         gc_check(&mut new, seed, step);
         if step % 16 == 0 {
@@ -580,6 +603,7 @@ fn diff_vs_legacy() {
         eprintln!("{keys:?} : {stats:?}");
         assert!(stats.saves >= 16 && stats.krange > 100 && stats.deln > 5);
     }
+    assert!(COMPACT_MOVED.with(|m| m.get()) > 0, "le compactage a déplacé des nœuds");
 }
 
 /// Conteneurs : 5 clés, surtout des opérations Hash et Set, pour traverser
@@ -675,6 +699,7 @@ fn fuzz_containers(seed: u64, ops: usize, seen: &mut [usize; 4]) {
             new.finish_save();
             assert_eq!(content_dump(&s.out), s.want, "save sous mutations (seed {seed})");
         }
+        compact_check(&mut new, step, saving.is_some());
         new.check();
         gc_check(&mut new, seed, step);
         assert_eq!(content_new(&new, b""), content_old(&old, b""), "contenu (seed {seed}, pas {step})");

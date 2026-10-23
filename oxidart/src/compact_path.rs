@@ -44,7 +44,7 @@ impl CompactPath {
     }
 
     /// Longueur de la forme tas (`None` : inline).
-    #[inline]
+    #[cfg(test)]
     pub(crate) fn heap_len(&self) -> Option<usize> {
         self.is_heap().then(|| self.heap_slice_len())
     }

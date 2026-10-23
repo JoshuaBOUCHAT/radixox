@@ -12,7 +12,7 @@ categories = ["data-structures"]
 
 [dependencies]
 radixox-lib = { workspace = true }
-hislab = { version = "0.2.4", features = ["rand"] }
+hislab = { version = "0.2.5", path = "../../hislab", features = ["rand"] }
 foldhash = "0.2"
 mimalloc = { workspace = true }
 libmimalloc-sys = { workspace = true }

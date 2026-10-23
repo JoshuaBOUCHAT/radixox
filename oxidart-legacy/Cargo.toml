@@ -15,7 +15,7 @@ publish = false
 bytes.workspace = true
 smallvec.workspace = true
 ordered-float = "5.1.0"
-hislab = { version = "0.2.4", features = ["rand"] }
+hislab = { version = "0.2.5", path = "../../hislab", features = ["rand"] }
 radixox-lib = { workspace = true }
 valart = { workspace = true }
 mimalloc = { workspace = true }
