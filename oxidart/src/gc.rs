@@ -211,7 +211,7 @@ impl OxidArt {
     /// pool : rien.
     pub fn gc_full_pass(&mut self) {
         use radixox_lib::pool;
-        if pool::gc_begin(1.0, true, std::time::Instant::now()) == 0 {
+        if pool::gc_begin(pool::Mark::All, std::time::Instant::now()) == 0 {
             return;
         }
         let mut pass = GcPass::new();

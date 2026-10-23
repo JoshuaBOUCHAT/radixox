@@ -1227,6 +1227,23 @@ Chaque étape : tests verts, commit, push (règle du dépôt) ; mesure courte qu
    pages (une page ne se rend qu'entière) ; le critère de l'étape 7 (« RSS après −90 % puis
    GC ≤ vivants × 1,15 + R ») demande de regrouper les survivants (niveau B, ou le choix de
    page de §15 : allouer dans la page la plus occupée).
+   **Branche `gc-page-occupancy` (2026-10-23, décision à valider par l'utilisateur)** :
+   - `take_block` prend dans la **page la plus occupée** : pages actives trouées en listes
+     doublement chaînées par nombre de blocs libres (1 à 31) + masque des listes non vides,
+     O(1) exact (remplace la pile LIFO paresseuse et `in_stack`). Seul, sans effet mesuré
+     sur le scénario « DEL 90 % » (20 et 23 pages actives) : après une suppression
+     uniforme, toutes les pages sont à ~10 %, marquer bloc par bloc ne vide aucune page ;
+   - **niveau B réduit au marquage** (`Mark::Pages`) : au repos, si les pages actives
+     dépassent `vivants × 1,15 + R` (+ 1 page de marge) alors que les blocs ne sont plus
+     fragmentés, une passe marque **tous** les blocs des pages les plus creuses (denses
+     compris, pages sans bloc ouvert, dans la réserve) ; ces pages sortent des listes
+     (`evacuating`) pour que les survivants n'y retournent pas, et y reviennent en fin de
+     passe si elles ne se sont pas vidées ;
+   - mesure, même scénario : **6 pages actives au lieu de 20**, RSS 52 Mo au lieu de 80 ;
+     pool = 6 pages + 2 de réserve = 16 Mio pour 10,4 Mo vivants, soit le critère de l'étape
+     7 (12 + 4 Mio). Deux passes `Pages` (102 puis 52 blocs, 8 ms et 1 ms) après les passes
+     de niveau A au repos. Débit non comparé (profil `powersave`, mesures bruitées : 168 K à
+     228 K ops/s selon le passage, sans changement de code).
 7. **Pool + GC activés par défaut** (`radixox_pool` retiré, `radixox_nopool` devient
    l'interrupteur) une fois les critères de §8.7 tenus : RSS après −90 % puis GC
    ≤ vivants × 1,15 + R ; écrasements au hasard 30 s : RSS stable à ±15 % ; débit et

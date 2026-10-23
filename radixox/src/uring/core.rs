@@ -2004,9 +2004,9 @@ impl Core {
             return;
         }
         let idle = self.now.saturating_duration_since(self.last_rx) >= GC_IDLE_AFTER;
-        let Some(threshold) = pool::gc_want(idle, self.now) else { return };
+        let Some(mark) = pool::gc_want(idle, self.now) else { return };
         let now = Instant::now();
-        let n = pool::gc_begin(threshold, false, now);
+        let n = pool::gc_begin(mark, now);
         if n == 0 {
             return; // rien de marquable : passe faible, déclenchement suspendu
         }
@@ -2015,7 +2015,7 @@ impl Core {
         self.gc.started = Some((now, pool::gc_stats().unwrap_or_default()));
         if self.gc.log {
             let how = if idle { "au repos" } else { "sous charge" };
-            eprintln!("[gc] passe : {n} blocs marqués (densité < {:.0} %, {how})", threshold * 100.0);
+            eprintln!("[gc] passe : {n} blocs marqués ({mark:?}, {how})");
         }
     }
 
