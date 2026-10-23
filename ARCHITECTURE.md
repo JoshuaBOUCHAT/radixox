@@ -39,7 +39,7 @@ commencé :
    `_indices` de YCSB à 5 M clés. À trancher avec l'utilisateur : §13.2 ou variante à buckets.
 2. **Retirer du travail au thread métier** (RUNTIME_ARCH.md §17.6) : attente groupée auto,
    recv en `IOSQE_ASYNC`, fd de l'anneau enregistré ; puis peut-être threads réseau + SPSC.
-3. **Allocateur v2 + GC** : **v1 faite et active par défaut** (2026-10-23, MEMORY_ARCH.md §16.10). Suites : pool court des temporaires (§5, la cause du travail du GC après un chargement et du p99.9 +6 à 20 % à 3 cœurs), objets de structure, compactage HiSlab, `maxmemory`.
+3. **Allocateur v2 + GC** : **v1 faite et active par défaut** (2026-10-23, MEMORY_ARCH.md §16.10), **plus les objets de structure** (chemins, pages des nœuds, petits blocs, débordements valart : tout l'arbre dans le pool, plus d'arène mimalloc) **et le compactage en arrière-plan de la slab des nœuds** (pipeline de 8, §17). Suites : pool court des temporaires (§5 : fragmentation du chargement, p99.9 +6 à 20 % à 3 cœurs), compactage de la slab valart, plafond de la réserve, `maxmemory`.
 4. **Save sous saturation** : plancher adaptatif, coût par clé à mesurer (SAVE_DESIGN.md,
    « Plafond de CPU du BGSAVE »).
 5. Persistance : comparaison mémoire avec Valkey (CoW de ses fils), worker de persistance,

@@ -14,7 +14,7 @@ categories = ["data-structures"]
 bytes.workspace = true
 smallvec.workspace = true
 ordered-float = "5.1.0"
-hislab = { version = "0.2.5", path = "../../hislab", features = ["rand"] }
+hislab = { version = "0.2.5", features = ["rand"] }
 radixox-lib = { workspace = true }
 valart = { workspace = true }
 mimalloc = { workspace = true }

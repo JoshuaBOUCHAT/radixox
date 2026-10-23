@@ -1348,7 +1348,7 @@ au bout de 16 s, seul le pool baisse). Recensement des tailles (test temporaire)
 ### 17.5 Suite
 
 1. **Compactage de la slab valart** (même mécanisme que §17.2 bis, idx d'enfants propres).
-2. Publier `hislab` 0.2.5, puis fusionner `pool-structures` dans `main`.
+2. ~~Publier `hislab` 0.2.5, fusionner `pool-structures` dans `main`~~ : fait le 2026-10-23.
 2. **Compactage HiSlab** (§9) : le plus gros poste restant (35 Mo uuid, 53 Mo YCSB) ; la
    slab ne rétrécit jamais. **En arrière-plan** (tranches au repos, comme le GC), avec
    **libération sur critères** (excédent tenu qui dure, comme le niveau B) — idée de
@@ -1381,7 +1381,7 @@ au bout de 16 s, seul le pool baisse). Recensement des tailles (test temporaire)
 
 ### 17.2 bis Compactage de la slab des nœuds (fait, branche `pool-structures`)
 
-- `hislab` 0.2.5 (pas encore publié, la branche en dépend par chemin) : `len`,
+- `hislab` 0.2.5 (**publié** sur crates.io le 2026-10-23, tag `v0.2.5`) : `len`,
   `last_occupied`, `move_down` (vers le plus petit trou, le tag TTL suit), `release_above`
   (`MADV_DONTNEED` des pages de 2 Mio libres en fin, borne du plus haut slot touché).
 - `oxidart::compact` : `compact_want` (trous sous la fin > 3 Mio, 4 Mio au-delà de 256 Mio
