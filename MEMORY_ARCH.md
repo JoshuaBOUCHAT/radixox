@@ -1173,9 +1173,8 @@ Chaque étape : tests verts, commit, push (règle du dépôt) ; mesure courte qu
    RSS 136 Mo stable, fragmentation 0,00 ; tailles de 50 à 150 o → 246 Mo, fragmentation
    0,52 (le GC, étape 6).
 4. **`hislab`** : `slot_span`, `next_occupied` ; publication.
-   **Fait le 2026-10-23** (hislab af853d3, 0.2.4). **Pas publié** : le workspace dépend de
-   `~/rust/hislab` par chemin (`path` + `version`), à publier avant le prochain
-   `cargo publish` de radixox (décision de l'utilisateur).
+   **Fait le 2026-10-23** (hislab af853d3, 0.2.4), **publié sur crates.io** le même jour
+   (tag `v0.2.4`) ; le workspace en dépend depuis crates.io.
 5. **Énumérateurs** (§16.6) et `pool::verify` ; test différentiel en `radixox_gc_debug`
    avec l'audit d'unicité.
    **Fait le 2026-10-23** (`oxidart/src/gc.rs`). `gc_visit` / `gc_visit_valart` /
