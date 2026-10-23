@@ -1345,7 +1345,30 @@ au bout de 16 s, seul le pool baisse). Recensement des tailles (test temporaire)
   pool 178 → 74 Mo, slab des nœuds 53 → 29 Mo (compactage), **RSS 246 → 118 Mo** au bout
   de 16 s.
 
-### 17.5 Suite
+### 17.5 Mémoire contre Valkey (2026-10-23, `main` 875fb11)
+
+Méthode (scripts du scratchpad, non versionnés) : 1M clés par scénario, mêmes données et
+mêmes clés supprimées pour tous (RadixOx `UNLINK prefix*`, Valkey `SCAN MATCH` + `UNLINK`),
+un cœur chacun, sans persistance, RSS stabilisé (15 s ; 30 s pour Valkey avec
+`activedefrag`, qui travaille progressivement). Tailles de valeurs en cloche (normale bornée)
+à la demande de l'utilisateur : des valeurs toutes à 100 o tombent dans une seule classe de
+jemalloc et avantagent Valkey sur les suppressions groupées (avec 100 o fixes : Valkey
+164 → 94 Mo, RadixOx 140 → 86 Mo). Valkey 9.1.2 compilé depuis les sources (jemalloc
+modifié ; le paquet d'Arch, compilé avec le jemalloc du système, refuse `activedefrag`),
+`active-defrag-ignore-bytes 1mb`.
+
+| scénario | RadixOx | Valkey | Valkey `activedefrag` |
+|---|---|---|---|
+| chaînes `key:N` 0–200 o, suppression 56 % | **142 → 86** | 170 → 138 | 168 → 102 |
+| UUID → UUID 22 o, suppression 50 % | 108 → 70 | 93 → 93 | **93 → 66** |
+| Hash à un champ 0–200 o, suppression 56 % | **246 → 118** | 330 → 330 | 329 → 168 |
+| chaînes 0–200 o puis réécriture 100–300 o | **142 → 258** | 168 → 342 | 168 → 287 |
+
+Pics (`VmHWM`) : RadixOx 142 / 114 / 246 / 258, Valkey `activedefrag` 168 / 96 / 329 /
+341. Cas faible de RadixOx : clés aléatoires courtes (peu de préfixes communs). Non mesuré :
+le CPU de chaque mécanisme ; un seul passage par case.
+
+### 17.6 Suite
 
 1. **Compactage de la slab valart** (même mécanisme que §17.2 bis, idx d'enfants propres).
 2. ~~Publier `hislab` 0.2.5, fusionner `pool-structures` dans `main`~~ : fait le 2026-10-23.

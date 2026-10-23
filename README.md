@@ -320,8 +320,8 @@ What drives these numbers:
   costs **16 B per key**; on random keys each node holds only two or three keys and the tree
   costs 60–100 B per key, which is about what Valkey's hash table and key strings cost: hence
   the tie on UUIDs. The −20 % above is the best case.
-- **Values**: a string is a separate allocation (100 B → 112 B in mimalloc); with large
-  values both servers converge.
+- **Values**: a string is a separate allocation in RadixOx's pool (100 B → 104 B: a 4-byte
+  header, no size classes); with large values both servers converge.
 - **Small hashes and sets** (up to 8 entries) are one compact block of field/value pointers
   instead of a tree. One-field hashes are much smaller than in Valkey; hashes with several
   short fields are larger, because each field and value stays a separately allocated
@@ -329,6 +329,32 @@ What drives these numbers:
 - **Connections** (measured with the previous I/O layer, which kept three 64 KiB buffers per
   connection): the new loop receives into one 2 MB ring shared by all connections, and keeps
   per connection only its pending replies and the fragment of a split command.
+
+#### After deletes and rewrites (2026-10-23)
+
+What production does to memory: values of mixed sizes, deletes spread over the keyspace,
+values rewritten with other sizes. 1M keys per scenario, the same data and the same deleted
+keys for every server (RadixOx: `UNLINK prefix*`; Valkey: `SCAN MATCH` + `UNLINK`), one
+core each, no persistence. RSS in MB, measured once the server has settled (15 s; 30 s for
+Valkey with active defragmentation, which works gradually). Valkey 9.1.2 built from source
+(its patched jemalloc: the distribution package cannot enable `activedefrag`), with
+`active-defrag-ignore-bytes 1mb` so that defragmentation runs at this size.
+
+| Scenario | RadixOx loaded → after | Valkey loaded → after | Valkey `activedefrag` loaded → after |
+|---|---|---|---|
+| strings `key:N`, sizes 0–200 B (bell), delete 56 % | **142 → 86** | 170 → 138 | 168 → 102 |
+| random UUID → UUID (22 B), delete 50 % | 108 → 70 | 93 → 93 | **93 → 66** |
+| one-field hashes (YCSB-like), 0–200 B, delete 56 % | **246 → 118** | 330 → 330 | 329 → 168 |
+| strings 0–200 B, then all rewritten with 100–300 B | **142 → 258** | 168 → 342 | 168 → 287 |
+
+- Deleted memory goes back to the system: values, key suffixes, node pages and small
+  hashes live in one pool that RadixOx compacts in its idle moments, and the node slab is
+  compacted and shrunk too. Without `activedefrag`, Valkey keeps everything after scattered
+  deletes; with it, it gets back most of it.
+- Short random keys (UUIDs) are RadixOx's weak case: few shared prefixes, so the tree costs
+  more than Valkey's hash table (+15 MB loaded).
+- Not measured here: the CPU spent by RadixOx's compaction and by Valkey's defragmentation.
+  One run per cell.
 
 Tree cost per key on other key shapes (in-process, 1M keys, integer values):
 
