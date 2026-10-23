@@ -655,6 +655,19 @@ Environment variables:
 | `RADIXOX_IOWQ_WORKERS` / `RADIXOX_IOWQ_CPUS` | `1` / unset | io-wq network workers at most, and the CPUs they may run on (e.g. `1,7`) |
 | `RADIXOX_FILE_CPUS` | unset | run the dump's writes and fsync on an io-wq worker pinned to these CPUs (e.g. `1`), off the server's core; io-wq has one CPU mask, the union of this and `RADIXOX_IOWQ_CPUS` |
 | `RADIXOX_MIN_WAIT_US` / `RADIXOX_WAIT_NR` | off / `32` | experimental: when idle, let the kernel wait up to this many µs for `WAIT_NR` completions before waking the loop for one (lower CPU per command, same throughput unless the loop is the bottleneck) |
+| `RADIXOX_GC` | `1` | `0`: no compaction of the value pool (pages that empty by themselves are still returned) |
+| `RADIXOX_GC_LOG` | `0` | `1`: one stderr line per compaction pass |
+| `RADIXOX_GC_RESERVE_DIV` | `16` | blocks kept in reserve for compaction: `max(4 MiB, live / div)` |
+| `RADIXOX_MEMORY_DECAY` | `10` | seconds an empty 2 MiB page beyond the reserve is kept before being returned to the system |
+| `RADIXOX_POOL_VIRT_GB` | `256` | virtual range reserved for the value pool (nothing is committed until used) |
+
+### Memory
+
+Values up to 16 KiB live in RadixOx's own pool: 64 KiB bump blocks on 2 MiB huge pages, a
+live counter per block, compacted in the loop's idle moments (and in bounded slices under
+load). Memory freed by deletions goes back to the system, which mimalloc alone never did after
+scattered deletions. Larger values go to jemalloc. `INFO` shows `mem_pool_*` and `gc_*`. Build
+with `RUSTFLAGS="--cfg radixox_nopool"` to use mimalloc for everything instead.
 
 ### Security
 

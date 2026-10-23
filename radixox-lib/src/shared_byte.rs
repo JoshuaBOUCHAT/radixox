@@ -15,7 +15,8 @@ use crate::prefetch::PreFetch;
 /// ```
 ///
 /// La forme longue est allouée par jemalloc ([`external`]) ; la courte par le pool
-/// ([`crate::pool`]) sous `--cfg radixox_pool`, sinon par mimalloc.
+/// ([`crate::pool`]) par défaut, par mimalloc sous `--cfg radixox_nopool` ou
+/// `--cfg radixox_sysalloc` (ASan ne voit pas les objets du pool).
 #[repr(transparent)]
 pub struct SharedByte {
     ptr: NonNull<u8>,
@@ -138,7 +139,7 @@ impl SharedByte {
     /// (énumérateurs du GC) : `self` est réécrit vers les mêmes octets.
     /// Rend les octets recopiés (0 : rien à faire, épinglé, ou plage pleine).
     pub fn gc_relocate(&mut self) -> usize {
-        #[cfg(radixox_pool)]
+        #[cfg(not(any(radixox_nopool, radixox_sysalloc)))]
         {
             if self.is_external() {
                 return 0;
@@ -165,14 +166,14 @@ impl SharedByte {
             crate::pool::note_evacuated(size);
             size
         }
-        #[cfg(not(radixox_pool))]
+        #[cfg(any(radixox_nopool, radixox_sysalloc))]
         0
     }
 
     /// Emplacement dans le pool (adresse de l'en-tête, taille), `None` hors pool
     /// (forme longue, ou forme courte dans mimalloc). Vérificateur du GC.
     pub fn pool_slot(&self) -> Option<(usize, usize)> {
-        (cfg!(radixox_pool) && !self.is_external())
+        (cfg!(not(any(radixox_nopool, radixox_sysalloc))) && !self.is_external())
             .then(|| (self.header_ptr() as usize, Self::slot(self.len())))
     }
 
@@ -266,18 +267,19 @@ impl SharedByte {
     }
 }
 
-/// Forme courte : le pool (`--cfg radixox_pool`) ou mimalloc. Nul → forme longue.
-#[cfg(radixox_pool)]
+/// Forme courte : le pool, ou mimalloc sous `radixox_nopool` / `radixox_sysalloc`. Nul →
+/// forme longue.
+#[cfg(not(any(radixox_nopool, radixox_sysalloc)))]
 #[inline]
 unsafe fn short_alloc(size: usize) -> *mut u8 {
     unsafe { crate::pool::alloc(size) }
 }
-#[cfg(radixox_pool)]
+#[cfg(not(any(radixox_nopool, radixox_sysalloc)))]
 #[inline]
 unsafe fn short_free(base: *mut u8, size: usize) {
     unsafe { crate::pool::free(base, size) }
 }
-#[cfg(radixox_pool)]
+#[cfg(not(any(radixox_nopool, radixox_sysalloc)))]
 #[inline]
 unsafe fn short_shrink(base: *mut u8, old: usize, new: usize) {
     unsafe { crate::pool::shrink(base, old, new) }
@@ -285,18 +287,18 @@ unsafe fn short_shrink(base: *mut u8, old: usize, new: usize) {
 // mi_malloc plutôt que MiMalloc.alloc : ce dernier passe par mi_malloc_aligned qui, sur
 // page vide, sur-alloue size+align-1 (106 B → bloc 128 au lieu de 112). mi_malloc
 // garantit déjà un alignement ≥ 8.
-#[cfg(not(radixox_pool))]
+#[cfg(any(radixox_nopool, radixox_sysalloc))]
 #[inline]
 unsafe fn short_alloc(size: usize) -> *mut u8 {
     unsafe { crate::raw_alloc::malloc(size) }
 }
-#[cfg(not(radixox_pool))]
+#[cfg(any(radixox_nopool, radixox_sysalloc))]
 #[inline]
 unsafe fn short_free(base: *mut u8, _size: usize) {
     unsafe { crate::raw_alloc::free(base) }
 }
 /// mimalloc : le bloc garde sa taille, rien à compter.
-#[cfg(not(radixox_pool))]
+#[cfg(any(radixox_nopool, radixox_sysalloc))]
 #[inline]
 unsafe fn short_shrink(_base: *mut u8, _old: usize, _new: usize) {}
 

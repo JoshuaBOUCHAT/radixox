@@ -16,4 +16,4 @@ tikv-jemalloc-sys = { workspace = true }
 libc = "0.2"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(radixox_sysalloc)', 'cfg(radixox_pool)', 'cfg(radixox_gc_debug)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(radixox_sysalloc)', 'cfg(radixox_nopool)', 'cfg(radixox_gc_debug)'] }

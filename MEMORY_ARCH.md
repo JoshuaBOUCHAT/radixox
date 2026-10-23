@@ -1,6 +1,6 @@
 # Mémoire v2 — allocateur maison, GC par évacuation, compactage, maxmemory
 
-> **État : conception terminée (2026-10-22) ; v1 en cours, étapes 1 à 6 de §16.10 faites le 2026-10-23 (en-tête compact, jemalloc, objets externes ; pool derrière `--cfg radixox_pool` ; écrasement sur place ; `hislab` 0.2.4 ; énumérateurs, vérificateur et audit d'unicité ; GC niveau A). Reste l'étape 7 (activation par défaut) : critère du RSS après suppressions non tenu sans niveau B (§16.10, étape 6). La spécification de la v1, à suivre telle quelle, est en §16.** Mesures de départ : §13.1, §13.2. Ce document rassemble les décisions
+> **État : conception terminée (2026-10-22) ; v1 faite le 2026-10-23 : étapes 1 à 8 de §16.10, **pool et GC actifs par défaut** (`--cfg radixox_nopool` pour revenir à mimalloc), avec page la plus occupée, marquage par pages au repos et tranches à travail fixe (§16.10, étape 6). La spécification de la v1, à suivre telle quelle, est en §16.** Mesures de départ : §13.1, §13.2. Ce document rassemble les décisions
 > prises en discussion le 2026-10-07 (allocation des `SharedByte`, GC) et le 2026-10-21
 > (allocateur global d'abord, puis `maxmemory`), complétées le 2026-10-22 (objets moyens §6,
 > sélection et réserve du GC §8.2–8.3, noyau §11). §15 liste ce qui reste ouvert, §14 l'ordre
@@ -1272,5 +1272,9 @@ Chaque étape : tests verts, commit, push (règle du dépôt) ; mesure courte qu
    l'interrupteur) une fois les critères de §8.7 tenus : RSS après −90 % puis GC
    ≤ vivants × 1,15 + R ; écrasements au hasard 30 s : RSS stable à ±15 % ; débit et
    p99.9 identiques à mimalloc ; première requête après un creux ≤ une tranche.
+   **Fait le 2026-10-23, sur décision de l'utilisateur**, sans attendre le pool court : le
+   critère « p99.9 identique » n'est pas strictement tenu (+6 à 20 % à 3 cœurs, débit −1 à
+   −2 %, étape 6). `radixox_pool` retiré ; `radixox_nopool` (ou `radixox_sysalloc`, ASan ne
+   voyant pas les objets du pool) ramène la forme courte dans mimalloc et rend le GC inerte.
 8. Mettre à jour `ARCHITECTURE.md`, le README (configuration, `INFO`) et l'état en tête de
-   ce document.
+   ce document. **Fait le 2026-10-23.**

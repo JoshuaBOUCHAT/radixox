@@ -251,7 +251,7 @@ pub fn info_memory(out: &mut String, gc_enabled: bool, gc_running: bool, gc_max_
         external::objects(),
         external::background_thread() as u8
     );
-    // Pool (MEMORY_ARCH.md §16.8) : absent tant qu'il n'a rien alloué, ou sans `--cfg radixox_pool`.
+    // Pool (MEMORY_ARCH.md §16.8) : absent tant qu'il n'a rien alloué, ou sous `--cfg radixox_nopool`.
     if let Some((st, reserve)) = radixox_lib::pool::stats() {
         let held = st.held_blocks * radixox_lib::pool::BLOCK as u64;
         let frag = if held == 0 { 0.0 } else { 1.0 - st.live_bytes as f64 / held as f64 };

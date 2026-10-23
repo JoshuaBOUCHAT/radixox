@@ -810,7 +810,7 @@ fn gc_census_matches_tree_bytes() {
     let census = art.gc_census();
     let total = radixox_lib::pool::verify_census(&census).unwrap();
     assert_eq!(total, radixox_lib::pool::live_bytes() - before);
-    if cfg!(radixox_pool) {
+    if cfg!(not(any(radixox_nopool, radixox_sysalloc))) {
         // 201 chaînes + 2 × (3 + 30) champs et valeurs + 33 membres + 10 éléments
         assert_eq!(census.len(), 201 + 66 + 33 + 10);
     }
@@ -838,12 +838,12 @@ fn gc_full_pass_moves_values_and_pins_shared() {
     for (i, (p, v)) in before.iter().enumerate() {
         let (q, w) = str_ptr(&mut art, &format!("k:{i}"));
         assert_eq!(&w, v, "k:{i} : octets");
-        if cfg!(radixox_pool) {
+        if cfg!(not(any(radixox_nopool, radixox_sysalloc))) {
             assert_eq!(q == *p, i == 5, "k:{i} : déplacée sauf l'épinglée");
         }
     }
     assert_eq!(hash_ptr(&mut art, "h", "f7").1, b"v7");
-    if cfg!(radixox_pool) {
+    if cfg!(not(any(radixox_nopool, radixox_sysalloc))) {
         assert_ne!(hash_ptr(&mut art, "h", "f7").0, hp, "valart aussi");
         assert!(stats1.evacuated_objects - stats0.evacuated_objects >= 300 - 1 + 40);
         assert!(stats1.pinned > stats0.pinned);
