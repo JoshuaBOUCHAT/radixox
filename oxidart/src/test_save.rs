@@ -783,3 +783,37 @@ fn overwrite_during_save_keeps_t0() {
     art.set(sb("key:1"), Value::String(sb("new-0001-zzzzzzzz")));
     assert_eq!(str_ptr(&mut art, "key:1").0, p);
 }
+
+// ─── Énumérateurs du GC (MEMORY_ARCH.md §16.6) ───────────────────────────────
+
+/// Les énumérateurs voient exactement les objets du pool que tient l'arbre : le
+/// recensement égale les octets vivants ajoutés par l'arbre (sans pool : 0 et 0).
+#[test]
+fn gc_census_matches_tree_bytes() {
+    let before = radixox_lib::pool::live_bytes();
+    let mut art = OxidArt::new();
+    for i in 0..200 {
+        art.set(sb(&format!("s:{i}")), Value::String(sb(&"x".repeat(i * 7))));
+    }
+    art.set(sb("s:"), Value::String(sb("self-val"))); // self-val du nœud "s:"
+    art.set(sb("big"), Value::String(sb(&"y".repeat(20_000)))); // externe
+    for (k, n) in [("h:small", 3), ("h:big", 30)] {
+        let fv: Vec<_> = (0..n).map(|i| (sb(&format!("f{i}")), sb(&format!("v{i}")))).collect();
+        art.cmd_hset(k.as_bytes(), &fv, None).unwrap();
+    }
+    for (k, n) in [("set:small", 3), ("set:big", 30)] {
+        let ms: Vec<_> = (0..n).map(|i| sb(&format!("m{i}"))).collect();
+        art.cmd_sadd(k.as_bytes(), &ms, None).unwrap();
+    }
+    art.set(sb("l"), Value::List((0..10).map(|i| sb(&format!("e{i}"))).collect::<VecDeque<_>>()));
+    assert!(art.gc_audit_unique().is_empty());
+    let census = art.gc_census();
+    let total = radixox_lib::pool::verify_census(&census).unwrap();
+    assert_eq!(total, radixox_lib::pool::live_bytes() - before);
+    if cfg!(radixox_pool) {
+        // 201 chaînes + 2 × (3 + 30) champs et valeurs + 33 membres + 10 éléments
+        assert_eq!(census.len(), 201 + 66 + 33 + 10);
+    }
+    drop(art);
+    assert_eq!(radixox_lib::pool::live_bytes(), before);
+}

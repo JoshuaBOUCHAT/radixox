@@ -108,6 +108,23 @@ impl HashNode {
         self.count == 0
     }
 
+    /// Tous les `SharedByte` du nœud en place, clés et valeurs, inline puis débordement
+    /// (GC, MEMORY_ARCH.md §16.6). À ne réécrire que vers les mêmes octets.
+    pub(crate) fn for_each_sb_mut(&mut self, f: &mut impl FnMut(&mut SharedByte)) {
+        for i in 0..self.count as usize {
+            unsafe {
+                f(&mut *self.key_ptr_mut(i));
+                f(&mut *self.val_ptr_mut(i));
+            }
+        }
+        if let Some(ov) = self.overflow.as_mut() {
+            for i in 0..ov.len() {
+                f(ov.key_mut(i));
+                f(ov.val_mut(i));
+            }
+        }
+    }
+
     #[inline]
     fn slot_at(&self, n: usize) -> Slot {
         let count = self.count as usize;

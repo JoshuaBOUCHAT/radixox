@@ -48,6 +48,7 @@
 pub mod compact_path;
 pub mod compress;
 pub mod digest;
+pub mod gc;
 pub mod error;
 pub mod new_node;
 
@@ -159,6 +160,7 @@ pub struct OxidArt {
     pub(crate) key_count: usize,
     /// FLUSHDB faits ([`detach_all`](Self::detach_all)) : voir `Detached::flushes`.
     flushes: u64,
+    _live: gc::LiveTree,
 }
 
 impl Default for OxidArt {
@@ -314,6 +316,7 @@ impl OxidArt {
             save: OxidSave::default(),
             key_count: 0,
             flushes: 0,
+            _live: gc::LiveTree::new(),
         }
     }
 

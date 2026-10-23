@@ -177,6 +177,13 @@ impl SetOverflow {
         unsafe { &*self.keys_ptr().add(i) }
     }
 
+    /// Clé en place : seulement pour la réécrire vers les mêmes octets (GC).
+    #[inline]
+    pub fn key_mut(&mut self, i: usize) -> &mut SharedByte {
+        debug_assert!(i < self.len());
+        unsafe { &mut *self.keys_ptr().add(i) }
+    }
+
     #[inline]
     pub fn has_child(&self, i: usize) -> bool {
         unsafe { (*self.bitmap_ptr().add(i / 8) >> (i % 8)) & 1 != 0 }
@@ -649,6 +656,13 @@ impl HashOverflow {
     pub fn val_mut(&mut self, i: usize) -> &mut SharedByte {
         debug_assert!(i < self.len());
         unsafe { &mut *self.vals_ptr().add(i) }
+    }
+
+    /// Clé en place : seulement pour la réécrire vers les mêmes octets (GC).
+    #[inline]
+    pub fn key_mut(&mut self, i: usize) -> &mut SharedByte {
+        debug_assert!(i < self.len());
+        unsafe { &mut *self.keys_ptr().add(i) }
     }
 
     #[inline]

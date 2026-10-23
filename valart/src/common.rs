@@ -62,6 +62,11 @@ impl<T: Clone> CollisionBuckets<T> {
 }
 
 impl<T> CollisionBuckets<T> {
+    /// Toutes les entrées des buckets vivants (pas la vue T0), en place (GC).
+    pub(crate) fn for_each_mut(&mut self, mut f: impl FnMut(&mut T)) {
+        self.buckets.iter_mut().flatten().for_each(&mut f);
+    }
+
     pub(crate) fn alloc(&mut self, first: T) -> u32 {
         match self.free.pop() {
             Some(idx) => {

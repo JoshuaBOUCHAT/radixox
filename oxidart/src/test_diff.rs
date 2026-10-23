@@ -195,6 +195,31 @@ fn save_all_old(art: &mut Old) -> Vec<u8> {
     out
 }
 
+/// Copie indépendante : comme les arguments d'une commande du serveur, que l'arbre est
+/// seul à garder ensuite. Sans elle, les vecteurs du fuzz et l'oracle partagent chaque
+/// valeur avec l'arbre et l'audit d'unicité n'a pas de sens.
+fn fresh(b: &SharedByte) -> SharedByte {
+    SharedByte::from_slice(b.as_slice())
+}
+
+fn deep(v: &[SharedByte]) -> Vec<SharedByte> {
+    v.iter().map(fresh).collect()
+}
+
+fn deep_pairs(v: &[(SharedByte, SharedByte)]) -> Vec<(SharedByte, SharedByte)> {
+    v.iter().map(|(a, b)| (fresh(a), fresh(b))).collect()
+}
+
+/// Après chaque opération : audit d'unicité du GC (MEMORY_ARCH.md §16.9), hors save
+/// chaque `SharedByte` de l'arbre a `rc == 1`.
+fn gc_check(art: &mut OxidArt, seed: u64, step: usize) {
+    let shared = art.gc_audit_unique();
+    assert!(shared.is_empty(), "SharedByte partagés (seed {seed}, pas {step}) : {:?}", &shared[..shared.len().min(5)]);
+    if let Err(e) = radixox_lib::pool::verify_census(&art.gc_census()) {
+        panic!("compteurs du pool (seed {seed}, pas {step}) : {e}");
+    }
+}
+
 fn sb(k: &[u8]) -> SharedByte {
     SharedByte::from_slice(k)
 }
@@ -255,7 +280,7 @@ fn fuzz(seed: u64, ops: usize, keys: Keys, stats: &mut Stats) {
                 let val = if rng.gen_bool(0.3) {
                     Value::Int(rng.gen_range(-50..50))
                 } else {
-                    Value::String(pool[rng.gen_range(0..pool.len())].clone())
+                    Value::String(fresh(&pool[rng.gen_range(0..pool.len())]))
                 };
                 if rng.gen_bool(0.25) {
                     let d = Duration::from_secs(rng.gen_range(0..20));
@@ -269,7 +294,7 @@ fn fuzz(seed: u64, ops: usize, keys: Keys, stats: &mut Stats) {
             6 => {
                 let cond = [None, Some(true), Some(false)][rng.gen_range(0..3)];
                 let ttl = rng.gen_bool(0.3).then(|| Duration::from_secs(rng.gen_range(0..20)));
-                let val = Value::String(pool[rng.gen_range(0..pool.len())].clone());
+                let val = Value::String(fresh(&pool[rng.gen_range(0..pool.len())]));
                 let a = new.set_cond(k, ttl, val.clone(), cond);
                 let b = old.set_cond(k, ttl, to_old(&val), cond);
                 assert_eq!(a, b, "set_cond {key:?} {cond:?}");
@@ -300,11 +325,11 @@ fn fuzz(seed: u64, ops: usize, keys: Keys, stats: &mut Stats) {
             17 => {
                 let n = rng.gen_range(1..5);
                 let fv: Vec<(SharedByte, SharedByte)> = (0..n)
-                    .map(|_| (fields[rng.gen_range(0..fields.len())].clone(), pool[rng.gen_range(0..pool.len())].clone()))
+                    .map(|_| (fresh(&fields[rng.gen_range(0..fields.len())]), fresh(&pool[rng.gen_range(0..pool.len())])))
                     .collect();
                 let ttl = rng.gen_bool(0.2).then(|| now + rng.gen_range(0..20));
                 let a = format!("{:?}", new.cmd_hset(k, &fv, ttl));
-                let b = format!("{:?}", old.cmd_hset(k, &fv, ttl));
+                let b = format!("{:?}", old.cmd_hset(k, &deep_pairs(&fv), ttl));
                 assert_eq!(a, b, "hset {key:?}");
             }
             18 => {
@@ -318,14 +343,14 @@ fn fuzz(seed: u64, ops: usize, keys: Keys, stats: &mut Stats) {
                 assert_eq!(format!("{a:?}"), format!("{b:?}"), "hgetall {key:?}");
             }
             19 => {
-                let fs = [fields[rng.gen_range(0..fields.len())].clone()];
+                let fs = [fresh(&fields[rng.gen_range(0..fields.len())])];
                 assert_eq!(format!("{:?}", new.cmd_hdel(k, &fs)), format!("{:?}", old.cmd_hdel(k, &fs)), "hdel");
             }
             20 => {
-                let m = [members[rng.gen_range(0..members.len())].clone()];
+                let m = [fresh(&members[rng.gen_range(0..members.len())])];
                 if rng.gen_bool(0.6) {
                     let a = format!("{:?}", new.cmd_sadd(k, &m, None));
-                    assert_eq!(a, format!("{:?}", old.cmd_sadd(k, &m, None)), "sadd {key:?}");
+                    assert_eq!(a, format!("{:?}", old.cmd_sadd(k, &deep(&m), None)), "sadd {key:?}");
                 } else {
                     let a = format!("{:?}", new.cmd_srem(k, &m));
                     assert_eq!(a, format!("{:?}", old.cmd_srem(k, &m)), "srem {key:?}");
@@ -336,15 +361,15 @@ fn fuzz(seed: u64, ops: usize, keys: Keys, stats: &mut Stats) {
                 assert_eq!(format!("{:?}", new.cmd_scard(k)), format!("{:?}", old.cmd_scard(k)), "scard");
             }
             21 => {
-                let m = pool[rng.gen_range(0..pool.len())].clone();
+                let m = fresh(&pool[rng.gen_range(0..pool.len())]);
                 if rng.gen_bool(0.6) {
                     let sm = [(rng.gen_range(-3..3) as f64, m)];
                     let a = format!("{:?}", new.cmd_zadd(sb(k), &sm, None));
-                    assert_eq!(a, format!("{:?}", old.cmd_zadd(sb(k), &sm, None)), "zadd {key:?}");
+                    assert_eq!(a, format!("{:?}", old.cmd_zadd(sb(k), &sm.iter().map(|(s, m)| (*s, fresh(m))).collect::<Vec<_>>(), None)), "zadd {key:?}");
                 } else {
                     let ms = [m];
                     let a = format!("{:?}", new.cmd_zrem(k, &ms));
-                    assert_eq!(a, format!("{:?}", old.cmd_zrem(k, &ms)), "zrem {key:?}");
+                    assert_eq!(a, format!("{:?}", old.cmd_zrem(k, &deep(&ms))), "zrem {key:?}");
                 }
                 let a = new.cmd_zrange(k, 0, -1, true).map(rbytes);
                 let b = old.cmd_zrange(k, 0, -1, true).map(rbytes);
@@ -430,6 +455,7 @@ fn fuzz(seed: u64, ops: usize, keys: Keys, stats: &mut Stats) {
             }
         }
         new.check();
+        gc_check(&mut new, seed, step);
         if step % 16 == 0 {
             assert_eq!(content_new(&new, b""), content_old(&old, b""), "contenu (seed {seed}, pas {step})");
         }
@@ -466,6 +492,7 @@ fn fuzz(seed: u64, ops: usize, keys: Keys, stats: &mut Stats) {
     back.set_now(now);
     back.load_dump(&dump_old).expect("reload du dump ancien");
     back.check();
+    assert!(back.gc_audit_unique().is_empty(), "SharedByte partagés après reload");
     assert_eq!(content_new(&back, b""), want, "reload v2 ← ancien");
     let mut back_old = Old::new();
     back_old.set_now(now);
@@ -527,7 +554,8 @@ fn gen_glob(rng: &mut StdRng, key: &[u8]) -> Vec<u8> {
 
 fn to_old(v: &Value) -> oxidart_legacy::Value {
     match v {
-        Value::String(b) => oxidart_legacy::Value::String(b.clone()),
+        // copie : l'oracle ne partage rien avec l'arbre testé (audit d'unicité)
+        Value::String(b) => oxidart_legacy::Value::String(fresh(b)),
         Value::Int(n) => oxidart_legacy::Value::Int(*n),
         _ => unreachable!("le fuzz ne pose que des String/Int par set"),
     }
@@ -563,37 +591,37 @@ fn fuzz_containers(seed: u64, ops: usize, seen: &mut [usize; 4]) {
     for step in 0..ops {
         let k = keys[rng.gen_range(0..keys.len())];
         let pick = |rng: &mut StdRng, n: usize| -> Vec<SharedByte> {
-            (0..rng.gen_range(1..=n)).map(|_| names[rng.gen_range(0..names.len())].clone()).collect()
+            (0..rng.gen_range(1..=n)).map(|_| fresh(&names[rng.gen_range(0..names.len())])).collect()
         };
         match rng.gen_range(0..12) {
             0..=2 => {
                 let fv: Vec<(SharedByte, SharedByte)> = pick(&mut rng, 4)
                     .into_iter()
-                    .map(|f| (f, vals[rng.gen_range(0..vals.len())].clone()))
+                    .map(|f| (f, fresh(&vals[rng.gen_range(0..vals.len())])))
                     .collect();
                 let ttl = rng.gen_bool(0.1).then(|| 1_000 + rng.gen_range(0..50));
-                assert_eq!(format!("{:?}", new.cmd_hset(k, &fv, ttl)), format!("{:?}", old.cmd_hset(k, &fv, ttl)), "hset");
+                assert_eq!(format!("{:?}", new.cmd_hset(k, &fv, ttl)), format!("{:?}", old.cmd_hset(k, &deep_pairs(&fv), ttl)), "hset");
             }
             3 => {
                 let fs = pick(&mut rng, 3);
                 assert_eq!(format!("{:?}", new.cmd_hdel(k, &fs)), format!("{:?}", old.cmd_hdel(k, &fs)), "hdel");
             }
             4 => {
-                let f = names[rng.gen_range(0..names.len())].clone();
+                let f = fresh(&names[rng.gen_range(0..names.len())]);
                 let d = rng.gen_range(-3..3);
                 assert_eq!(
                     format!("{:?}", new.cmd_hincrby(k, f.clone(), d).ok()),
-                    format!("{:?}", old.cmd_hincrby(k, f, d).ok()),
+                    format!("{:?}", old.cmd_hincrby(k, fresh(&f), d).ok()),
                     "hincrby"
                 );
             }
             5..=6 => {
                 let ms = pick(&mut rng, 4);
-                assert_eq!(format!("{:?}", new.cmd_sadd(k, &ms, None)), format!("{:?}", old.cmd_sadd(k, &ms, None)), "sadd");
+                assert_eq!(format!("{:?}", new.cmd_sadd(k, &ms, None)), format!("{:?}", old.cmd_sadd(k, &deep(&ms), None)), "sadd");
             }
             7 => {
                 let ms = pick(&mut rng, 3);
-                assert_eq!(format!("{:?}", new.cmd_srem(k, &ms)), format!("{:?}", old.cmd_srem(k, &ms)), "srem");
+                assert_eq!(format!("{:?}", new.cmd_srem(k, &ms)), format!("{:?}", old.cmd_srem(k, &deep(&ms))), "srem");
             }
             8 => {
                 let f = &names[rng.gen_range(0..names.len())];
@@ -639,6 +667,7 @@ fn fuzz_containers(seed: u64, ops: usize, seen: &mut [usize; 4]) {
             assert_eq!(content_dump(&s.out), s.want, "save sous mutations (seed {seed})");
         }
         new.check();
+        gc_check(&mut new, seed, step);
         assert_eq!(content_new(&new, b""), content_old(&old, b""), "contenu (seed {seed}, pas {step})");
         let mut path = Vec::new();
         new.walk(new.root_idx, &mut path, |_, tag, _, _| match tag {
@@ -661,6 +690,7 @@ fn fuzz_containers(seed: u64, ops: usize, seen: &mut [usize; 4]) {
     back.set_now(new.now);
     back.load_dump(&dump_new).expect("reload");
     back.check();
+    assert!(back.gc_audit_unique().is_empty(), "SharedByte partagés après reload");
     assert_eq!(content_new(&back, b""), want, "reload des conteneurs");
     let mut back_old = Old::new();
     back_old.set_now(new.now);

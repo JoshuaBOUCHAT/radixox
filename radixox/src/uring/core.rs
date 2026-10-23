@@ -1584,6 +1584,8 @@ impl Core {
                     // FLUSHDB : toutes les clés changent (le `dirty` de Redis).
                     persist.note_writes(if matches!(cmd, Cmd::FlushDb) { art.len() as u64 } else { weight });
                 }
+                #[cfg(radixox_gc_debug)]
+                GC_DEBUG_RAW.with(|r| *r.borrow_mut() = raw.to_vec());
                 let Some(stream) = journal.as_mut() else {
                     afters.push((slot, run_cmd(cmd, art, o, job_budget)));
                     continue;
@@ -2244,6 +2246,20 @@ fn aof_misconf(err: &str) -> Frame {
     Frame::Error(format!("MISCONF Errors writing to the AOF file: {err}"))
 }
 
+/// `RADIXOX_GC_AUDIT=0` coupe l'audit (O(arbre) par commande) : les tests à garantie
+/// temporelle (AOF `continuous`, marge de 200 ms) ne tiennent pas ce ralentissement.
+#[cfg(radixox_gc_debug)]
+fn gc_debug_audit_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RADIXOX_GC_AUDIT").map_or(true, |v| v != "0"))
+}
+
+#[cfg(radixox_gc_debug)]
+thread_local! {
+    /// Frame en cours d'exécution, pour le message de l'audit d'unicité.
+    static GC_DEBUG_RAW: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Exécute une commande d'une connexion.
 fn run_cmd(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) -> After {
     // Mode abonné : seules les commandes Pub/Sub, PING et QUIT passent.
@@ -2267,11 +2283,24 @@ fn run_cmd(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) 
         }
     }
     let barrier = cmd.is_barrier();
-    match execute_into(cmd, art, &mut o.client, &mut o.out) {
+    let after = match execute_into(cmd, art, &mut o.client, &mut o.out) {
         Executed::Done if barrier => After::Barrier,
         Executed::Done => After::Continue,
         Executed::Runtime(cmd) => runtime(cmd, art, o, job_budget),
+    };
+    // Audit d'unicité du GC (MEMORY_ARCH.md §16.9) : les arguments sont empruntés au
+    // buffer de réception, l'arbre est seul à tenir ce qu'il garde. Pas si un job est
+    // parqué : il peut tenir des clones entre deux tranches.
+    #[cfg(radixox_gc_debug)]
+    if !matches!(after, After::Park(_)) && gc_debug_audit_on() {
+        let shared = art.gc_audit_unique();
+        if !shared.is_empty() {
+            let raw = GC_DEBUG_RAW.with(|r| r.borrow().escape_ascii().to_string());
+            eprintln!("radixox_gc_debug : après {raw:.300} : SharedByte partagés : {:?}", &shared[..shared.len().min(5)]);
+            panic!("audit d'unicité");
+        }
     }
+    after
 }
 
 /// Commandes qui dépendent du runtime. KEYS et UNLINK s'exécutent encore d'une

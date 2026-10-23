@@ -1,6 +1,6 @@
 # Mémoire v2 — allocateur maison, GC par évacuation, compactage, maxmemory
 
-> **État : conception terminée (2026-10-22) ; v1 en cours, étapes 1 à 3 de §16.10 faites le 2026-10-23 (en-tête compact, jemalloc, objets externes ; pool sans GC derrière `--cfg radixox_pool` ; écrasement sur place). La spécification de la v1, à suivre telle quelle, est en §16.** Mesures de départ : §13.1, §13.2. Ce document rassemble les décisions
+> **État : conception terminée (2026-10-22) ; v1 en cours, étapes 1 à 5 de §16.10 faites le 2026-10-23 (en-tête compact, jemalloc, objets externes ; pool sans GC derrière `--cfg radixox_pool` ; écrasement sur place ; `hislab` 0.2.4 ; énumérateurs, vérificateur et audit d'unicité). La spécification de la v1, à suivre telle quelle, est en §16.** Mesures de départ : §13.1, §13.2. Ce document rassemble les décisions
 > prises en discussion le 2026-10-07 (allocation des `SharedByte`, GC) et le 2026-10-21
 > (allocateur global d'abord, puis `maxmemory`), complétées le 2026-10-22 (objets moyens §6,
 > sélection et réserve du GC §8.2–8.3, noyau §11). §15 liste ce qui reste ouvert, §14 l'ordre
@@ -1173,8 +1173,31 @@ Chaque étape : tests verts, commit, push (règle du dépôt) ; mesure courte qu
    RSS 136 Mo stable, fragmentation 0,00 ; tailles de 50 à 150 o → 246 Mo, fragmentation
    0,52 (le GC, étape 6).
 4. **`hislab`** : `slot_span`, `next_occupied` ; publication.
+   **Fait le 2026-10-23** (hislab af853d3, 0.2.4). **Pas publié** : le workspace dépend de
+   `~/rust/hislab` par chemin (`path` + `version`), à publier avant le prochain
+   `cargo publish` de radixox (décision de l'utilisateur).
 5. **Énumérateurs** (§16.6) et `pool::verify` ; test différentiel en `radixox_gc_debug`
    avec l'audit d'unicité.
+   **Fait le 2026-10-23** (`oxidart/src/gc.rs`). `gc_visit` / `gc_visit_valart` /
+   `gc_visit_lists` (contrat de §16.6 ; les collisions de valart sont visitées d'un coup en
+   fin de slab), `gc_visit_all`, `gc_census` + `pool::verify_census` : par bloc, recensé ≤
+   `live` (l'égalité est impossible quand d'autres objets vivent hors de l'arbre, l'oracle
+   des tests différentiels alloue dans le même pool) ; égalité exacte du total dans un test
+   dédié (`gc_census_matches_tree_bytes`). Blocs libérés remplis de `0xDB` sous
+   `radixox_gc_debug`.
+   **Audit d'unicité** (`gc_audit_unique`) après chaque opération des tests différentiels
+   et, sous `radixox_gc_debug`, après chaque commande du serveur (`run_cmd`, sauf job
+   parqué ; `RADIXOX_GC_AUDIT=0` le coupe). **Aucun partage dans l'arbre trouvé.** Les cas
+   vus étaient légitimes et sont exclus : save en cours, **et feuilles d'images après
+   `end_save` tant que `drain_deferred` ne les a pas vidées** (`save.leftover`, clones) ;
+   valart et les listes sont des slabs globaux, audités seulement quand un seul `OxidArt`
+   vit dans le processus (compteur `LiveTree` ; tests à plusieurs nœuds) et valart hors de
+   **sa** save (`ValTrees::is_saving`, pas celle de l'arbre : c'est aussi la condition du
+   GC). Le harnais différentiel donne désormais des copies indépendantes à l'arbre testé et
+   à l'oracle, comme le serveur. Deux tests d'intégration à garantie temporelle
+   (`kill9_continuous_keeps_an_exact_prefix`, marge de 200 ms ; `restart_reloads_the_dump`,
+   TTL) ne tiennent pas l'audit O(arbre) par commande : verts avec `RADIXOX_GC_AUDIT=0`
+   (remplissage `0xDB` toujours actif).
 6. **GC niveau A** : marquage, passe, cadence, save, journal, `INFO`. Tests : passe forcée
    entre chaque commande (différentiel), passe pendant une save (dump identique à celui
    d'une save sans GC), objet épinglé tout le long d'une passe puis relâché, valeur ratée

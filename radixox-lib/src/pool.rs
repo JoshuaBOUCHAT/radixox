@@ -385,8 +385,13 @@ impl Pool {
         b
     }
 
-    /// Compteur à 0, bloc fermé : retour dans le masque de sa page.
+    /// Compteur à 0, bloc fermé : retour dans le masque de sa page. En débogage, rempli
+    /// de `0xDB` : un pointeur périmé lit un motif reconnaissable.
     fn release_block(&mut self, b: u32) {
+        #[cfg(radixox_gc_debug)]
+        unsafe {
+            std::ptr::write_bytes(self.block_addr(b) as *mut u8, 0xDB, BLOCK)
+        };
         self.held_blocks -= 1;
         let p = b / BLOCKS_PER_PAGE;
         let ps = &mut self.pages[p as usize];
@@ -499,6 +504,42 @@ pub unsafe fn shrink(ptr: *mut u8, old: usize, new: usize) {
         Some(p) => unsafe { p.shrink(ptr, old, new) },
         None => unreachable!("shrink hors pool"),
     }
+}
+
+/// Vérificateur (MEMORY_ARCH.md §16.8) : `slots` = les emplacements que tient l'arbre
+/// (`SharedByte::pool_slot`). Chacun doit être dans la plage ; par bloc, leur somme ne
+/// dépasse jamais le compteur `live` (l'égalité n'est pas exigée : des objets vivent hors
+/// de l'arbre). Rend le total des octets recensés.
+pub fn verify_census(slots: &[(usize, usize)]) -> Result<u64, String> {
+    let Some(p) = (unsafe { (*&raw const POOL).as_ref() }) else {
+        return if slots.is_empty() { Ok(0) } else { Err("emplacements recensés sans pool".into()) };
+    };
+    let end = p.base + p.nb_pages as usize * PAGE;
+    let mut per_block = std::collections::HashMap::<u32, u64>::new();
+    let mut total = 0;
+    for &(a, size) in slots {
+        if a < p.base || a + size > end || a % 2 != 0 || size % 2 != 0 {
+            return Err(format!("emplacement {a:#x} ({size} o) hors plage ou mal aligné"));
+        }
+        let b = ((a - p.base) >> BLOCK_SHIFT) as u32;
+        if (a + size - 1 - p.base) >> BLOCK_SHIFT != b as usize {
+            return Err(format!("emplacement {a:#x} ({size} o) à cheval sur deux blocs"));
+        }
+        *per_block.entry(b).or_default() += size as u64 / 2;
+        total += size as u64;
+    }
+    for (b, g) in per_block {
+        let live = unsafe { *p.live.add(b as usize) } as u64;
+        if g > live {
+            return Err(format!("bloc {b} : {g} granules recensés, compteur {live}"));
+        }
+    }
+    Ok(total)
+}
+
+/// Octets vivants du pool global (0 sans pool).
+pub fn live_bytes() -> u64 {
+    unsafe { (*&raw const POOL).as_ref().map_or(0, |p| p.live_bytes) }
 }
 
 /// Depuis la boucle, au repos (timer) : rend les pages vides en trop. Vrai s'il en

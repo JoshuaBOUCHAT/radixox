@@ -92,7 +92,7 @@ fn zset_slab() -> &'static mut HiSlab<InnerZCommand> {
     }
 }
 #[inline]
-fn list_slab() -> &'static mut HiSlab<VecDeque<SharedByte>> {
+pub(crate) fn list_slab() -> &'static mut HiSlab<VecDeque<SharedByte>> {
     #[allow(static_mut_refs)]
     unsafe {
         LIST_SLAB.assume_init_mut()

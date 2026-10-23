@@ -1041,6 +1041,20 @@ impl Node {
         }
     }
 
+    /// Valeurs du nœud en place, self-val puis feuilles (GC, MEMORY_ARCH.md §16.6).
+    /// À ne réécrire que vers les mêmes octets.
+    pub(crate) fn for_each_val_mut(&mut self, mut f: impl FnMut(Tag, &mut ValUnion)) {
+        if self.has_val() {
+            f(self.tag, &mut self.val);
+        }
+        for e in 0..self.len() {
+            let loc = self.loc_mut(e);
+            if !loc.child {
+                unsafe { f(*loc.tag, &mut *(loc.cells.add(loc.leaf_end - 8) as *mut ValUnion)) };
+            }
+        }
+    }
+
     /// Valeur d'une feuille, en place. Invalide dès la prochaine mutation.
     pub(crate) fn leaf_val_mut(&mut self, radix: u8) -> Option<(&mut Tag, &mut ValUnion)> {
         let e = self.find(radix)?;

@@ -132,6 +132,13 @@ impl SharedByte {
         true
     }
 
+    /// Emplacement dans le pool (adresse de l'en-tête, taille), `None` hors pool
+    /// (forme longue, ou forme courte dans mimalloc). Vérificateur du GC.
+    pub fn pool_slot(&self) -> Option<(usize, usize)> {
+        (cfg!(radixox_pool) && !self.is_external())
+            .then(|| (self.header_ptr() as usize, Self::slot(self.len())))
+    }
+
     #[inline]
     pub fn is_external(&self) -> bool {
         self.len_lo() & Self::EXTERNAL != 0

@@ -179,6 +179,42 @@ impl ValTrees {
         });
     }
 
+    /// GC (MEMORY_ARCH.md §16.6) : visite les `SharedByte` des slots occupés à partir
+    /// de `from`, au plus `budget` slots ; rend le slot où reprendre, `None` à la fin.
+    /// Les zones de collision (rares) sont visitées d'un coup, une fois les slots finis.
+    ///
+    /// Accès sans `before_write` : réécrire un pointeur vers les mêmes octets n'est pas
+    /// une mutation. **Jamais pendant une save** : l'image d'un nœud copie ses
+    /// `SharedByte` bit à bit, déplacer l'original laisserait l'image pointer sur un
+    /// emplacement libéré.
+    pub fn gc_visit(&mut self, from: u32, budget: u32, f: &mut impl FnMut(&mut SharedByte)) -> Option<u32> {
+        debug_assert!(!self.save.is_active(), "GC de valart pendant une save");
+        let mut at = from;
+        for _ in 0..budget {
+            let Some(i) = self.nodes.next_occupied(at) else {
+                self.hash_collisions.for_each_mut(|(k, v)| {
+                    f(k);
+                    f(v);
+                });
+                self.set_collisions.for_each_mut(&mut *f);
+                return None;
+            };
+            let node = unsafe { self.nodes.get_unchecked_mut(i) };
+            match node.tag() {
+                NodeType::Hash => unsafe { &mut node.hash }.for_each_sb_mut(f),
+                NodeType::Set => unsafe { &mut node.set }.for_each_sb_mut(f),
+                NodeType::ZSet => unreachable!("ZSet node not implemented yet"),
+            }
+            at = i + 1;
+        }
+        Some(at)
+    }
+
+    /// Slots couverts par le slab des nœuds (budget du GC).
+    pub fn slot_span(&self) -> u32 {
+        self.nodes.slot_span()
+    }
+
     /// Seul point où une clé/valeur sortie du nœud `node` est détruite.
     #[inline]
     fn dispose(&mut self, node: u32, bytes: SharedByte) {
