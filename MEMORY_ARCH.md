@@ -1314,12 +1314,24 @@ au bout de 16 s, seul le pool baisse). Recensement des tailles (test temporaire)
   (48,6 Mo vivants : valeurs + chemins), RSS chargé 120 Mo ; après suppression de la
   moitié, RSS **96 Mo** au bout de 16 s (114 Mo avant), pool 32 Mo.
 
-### 17.2 Suite
+### 17.2 Pages des nœuds (fait, branche `pool-structures`)
 
-1. **Pages des nœuds** dans le pool : alignement 8 (elles contiennent des `u32` / `u64` lus
-   alignés), taille déjà multiple de 8 (`pg_block8`) → curseur à part dont toutes les
-   allocations sont des multiples de 8 ; taille exacte au lieu des classes mimalloc
-   (`alloc_class`). Petits blocs Hash/Set et débordements valart (tag de 3 bits : 8) idem.
+- Deux curseurs de plus dans le **même** `Pool` (§17.3) : `STRUCT` et `STRUCT_SURVIVOR`,
+  qui n'allouent que des multiples de 8 et restent donc alignés sur 8 (les pages
+  contiennent des `u32` / `u64` lus alignés) ; leurs blocs ne mélangent pas les deux
+  alignements. Taille des pages inchangée (`alloc_class`, la marge de croissance).
+- `pool::struct_alloc` / `struct_free` : pool jusqu'à 16 Kio, jemalloc au-delà ou plage
+  pleine, mimalloc sans pool ; le `free` est aiguillé par l'appartenance à la plage (une
+  page n'a pas d'en-tête). `relocate8` et `struct_slot` pour le GC et le recensement ;
+  `GcVisitor::page`, `Node::page_mut` ; la page est visitée avant les valeurs et les
+  suffixes, lus ensuite à sa nouvelle place.
+- Mesure (scénario uuid de §17) : arène mimalloc **< 1 Mo**, RSS chargé **118 Mo**, après
+  suppression de la moitié **90 Mo** au bout de 16 s (pool 66 → 38 Mo).
+
+### 17.4 Suite
+
+1. **Petits blocs Hash/Set** (`small.rs`) et **débordements valart** (tag de 3 bits :
+   alignement 8) : même chemin que les pages (`struct_alloc`, `relocate8`, énumérateurs).
 2. **Compactage HiSlab** (§9) : le plus gros poste restant (35 Mo uuid, 53 Mo YCSB) ; la
    slab ne rétrécit jamais. **En arrière-plan** (tranches au repos, comme le GC), avec
    **libération sur critères** (excédent tenu qui dure, comme le niveau B) — idée de

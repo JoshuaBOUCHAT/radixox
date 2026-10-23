@@ -26,7 +26,7 @@ use std::mem::ManuallyDrop;
 use std::ptr::{self, NonNull};
 
 use radixox_lib::prefetch::prefetch_l1;
-use radixox_lib::raw_alloc::{free as mi_free, malloc as mi_malloc};
+use radixox_lib::pool;
 
 use crate::ExpAndRadix;
 use crate::compact_path::CompactPath;
@@ -1057,6 +1057,14 @@ impl Node {
         }
     }
 
+    /// Page du nœud (pointeur en place, taille), `None` sans page (GC, MEMORY_ARCH.md §17).
+    /// À ne réécrire que vers une copie exacte de la page.
+    pub(crate) fn page_mut(&mut self) -> Option<(&mut *mut u8, usize)> {
+        let size = self.block();
+        // NonNull<u8> et *mut u8 ont la même représentation
+        (size > 0).then(|| (unsafe { &mut *(&mut self.ptr as *mut NonNull<u8> as *mut *mut u8) }, size))
+    }
+
     /// Chemins du nœud en place, préfixe puis suffixes des feuilles (GC, MEMORY_ARCH.md
     /// §17). À ne réécrire que vers les mêmes octets.
     pub(crate) fn for_each_path_mut(&mut self, mut f: impl FnMut(&mut CompactPath)) {
@@ -1236,7 +1244,8 @@ impl Node {
                 debug_assert!(kids + leaves == 0);
                 trash()
             } else {
-                let p = NonNull::new(mi_malloc(new_block)).expect("page alloc");
+                // Pool des structures, aligné sur 8 (MEMORY_ARCH.md §17).
+                let p = NonNull::new(pool::struct_alloc(new_block)).expect("page alloc");
                 if old_block > 0 {
                     debug_assert!(head + kids + leaves <= new_block);
                     let old = self.ptr.as_ptr();
@@ -1250,7 +1259,7 @@ impl Node {
                 p
             };
             if old_block > 0 {
-                mi_free(self.ptr.as_ptr());
+                pool::struct_free(self.ptr.as_ptr(), old_block);
             }
             self.ptr = new_ptr;
         }
@@ -1498,7 +1507,7 @@ impl Node {
             out.push(raw);
         }
         if self.pg_block8 > 0 {
-            unsafe { mi_free(self.ptr.as_ptr()) };
+            unsafe { pool::struct_free(self.ptr.as_ptr(), self.block()) };
         }
         self.ptr = trash();
         self.pg_block8 = 0;

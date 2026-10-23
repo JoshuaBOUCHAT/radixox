@@ -811,8 +811,11 @@ fn gc_census_matches_tree_bytes() {
     let total = radixox_lib::pool::verify_census(&census).unwrap();
     assert_eq!(total, radixox_lib::pool::live_bytes() - before);
     if cfg!(not(any(radixox_nopool, radixox_sysalloc))) {
-        // 201 chaînes + 2 × (3 + 30) champs et valeurs + 33 membres + 10 éléments
-        assert_eq!(census.len(), 201 + 66 + 33 + 10);
+        // 201 chaînes + 2 × (3 + 30) champs et valeurs + 33 membres + 10 éléments, plus les
+        // pages des nœuds (§17)
+        let mut pages = 0;
+        art.map.for_each_occupied(|_, n| pages += (n.page_block() > 0) as usize);
+        assert_eq!(census.len(), 201 + 66 + 33 + 10 + pages);
     }
     drop(art);
     assert_eq!(radixox_lib::pool::live_bytes(), before);

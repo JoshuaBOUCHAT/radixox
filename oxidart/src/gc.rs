@@ -1,4 +1,5 @@
-//! Énumérateurs du GC (MEMORY_ARCH.md §16.6) : chaque `SharedByte` que tient l'arbre,
+//! Énumérateurs du GC (MEMORY_ARCH.md §16.6, §17) : chaque `SharedByte`, chemin sur le tas
+//! et page de nœud que tient l'arbre,
 //! par un parcours linéaire des slabs qui ne connaît que le layout (pas de pointeur
 //! arrière, pas de logique métier). Trois slabs : les nœuds d'oxidart (self-val, feuilles,
 //! petits conteneurs), les nœuds de valart (champs et membres), les listes. Les ZSet ne
@@ -20,6 +21,8 @@ use crate::value::{Tag, ValUnion, list_slab, valart};
 pub trait GcVisitor {
     fn bytes(&mut self, sb: &mut SharedByte);
     fn path(&mut self, _p: &mut CompactPath) {}
+    /// Objet de structure aligné sur 8 (page d'un nœud) : pointeur en place et taille.
+    fn page(&mut self, _ptr: &mut *mut u8, _size: usize) {}
 }
 
 impl<F: FnMut(&mut SharedByte)> GcVisitor for F {
@@ -39,6 +42,10 @@ impl GcVisitor for Relocate {
     }
     fn path(&mut self, p: &mut CompactPath) {
         self.moved += p.gc_relocate();
+    }
+    fn page(&mut self, ptr: &mut *mut u8, size: usize) {
+        // SAFETY: page d'un nœud, allouée par `struct_alloc`, seul le nœud la tient.
+        self.moved += unsafe { radixox_lib::pool::relocate8(ptr, size) };
     }
 }
 
@@ -149,6 +156,10 @@ impl OxidArt {
             // pointeur vers les mêmes octets n'est pas une mutation (MEMORY_ARCH.md §8.5).
             // Seule exception au point de passage unique des mutations.
             let node = unsafe { self.map.get_unchecked_mut(i) };
+            // la page d'abord : valeurs et suffixes sont ensuite lus à sa nouvelle place
+            if let Some((ptr, size)) = node.page_mut() {
+                v.page(ptr, size);
+            }
             node.for_each_val_mut(|tag, val| visit_val(tag, val, &mut |sb| v.bytes(sb)));
             node.for_each_path_mut(|p| v.path(p));
             at = i + 1;
@@ -247,6 +258,9 @@ impl OxidArt {
             }
             fn path(&mut self, p: &mut CompactPath) {
                 self.0.extend(p.pool_slot());
+            }
+            fn page(&mut self, ptr: &mut *mut u8, size: usize) {
+                self.0.extend(radixox_lib::pool::struct_slot(*ptr, size));
             }
         }
         let mut c = Census(Vec::new());
