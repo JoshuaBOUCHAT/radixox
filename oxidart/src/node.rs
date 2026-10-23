@@ -118,7 +118,9 @@ union Body {
     wide: WideMeta,
 }
 
-#[repr(C, align(64))]
+/// Aligné sur 128 (sa taille) : un nœud = deux lignes de cache entières, copie vectorielle
+/// alignée au compactage (MEMORY_ARCH.md §17.2 bis).
+#[repr(C, align(128))]
 pub(crate) struct Node {
     // ── ligne 1 : tout ce que lit la descente ──
     /// Page, ou `TRASH`.
@@ -143,7 +145,7 @@ pub(crate) struct Node {
     body: Body,
 }
 
-const _: () = assert!(size_of::<Node>() == 128);
+const _: () = assert!(size_of::<Node>() == 128 && align_of::<Node>() == 128);
 const _: () = assert!(std::mem::offset_of!(Node, body) == 64);
 
 // ─── Entrées ─────────────────────────────────────────────────────────────────
