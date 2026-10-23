@@ -14,8 +14,8 @@ use crate::prefetch::PreFetch;
 /// forme longue : [len_hi u16][len_lo u16][rc u16][données…]  bit 15 de len_lo = EXTERNE
 /// ```
 ///
-/// La forme longue est allouée par jemalloc ([`external`]) ; la courte encore par
-/// mimalloc, en attendant le pool (§16.10, étape 2).
+/// La forme longue est allouée par jemalloc ([`external`]) ; la courte par le pool
+/// ([`crate::pool`]) sous `--cfg radixox_pool`, sinon par mimalloc.
 #[repr(transparent)]
 pub struct SharedByte {
     ptr: NonNull<u8>,
@@ -53,25 +53,31 @@ impl SharedByte {
     unsafe fn alloc(len: usize, external: bool) -> Self {
         assert!(len <= Self::MAX_LEN);
         unsafe {
-            let data = if external || len > Self::POOL_MAX_LEN {
+            let short = if external || len > Self::POOL_MAX_LEN {
+                std::ptr::null_mut()
+            } else {
+                short_alloc(Self::slot(len))
+            };
+            let data = if !short.is_null() {
+                (short as *mut u16).write(len as u16);
+                short.add(Self::SHORT_HEADER)
+            } else {
+                // Forme longue : demandée, trop grande, ou pool plein (repli).
                 let base = external::malloc(Self::LONG_HEADER + len);
                 assert!(!base.is_null());
                 (base as *mut u16).write((len >> 15) as u16);
                 (base as *mut u16).add(1).write(Self::EXTERNAL | (len as u16 & 0x7FFF));
                 base.add(Self::LONG_HEADER)
-            } else {
-                // mi_malloc plutôt que MiMalloc.alloc : ce dernier passe par
-                // mi_malloc_aligned qui, sur page vide, sur-alloue size+align-1
-                // (106 B → bloc 128 au lieu de 112). mi_malloc garantit déjà
-                // un alignement ≥ 8.
-                let base = mi_malloc(Self::SHORT_HEADER + len);
-                assert!(!base.is_null());
-                (base as *mut u16).write(len as u16);
-                base.add(Self::SHORT_HEADER)
             };
             (data as *mut u16).sub(1).write(1);
             Self { ptr: NonNull::new_unchecked(data) }
         }
+    }
+
+    /// Emplacement d'un objet en forme courte : en-tête + données, arrondi au granule (2 o).
+    #[inline]
+    fn slot(len: usize) -> usize {
+        (Self::SHORT_HEADER + len + 1) & !1
     }
 
     fn copy_of(data: &[u8], external: bool) -> Self {
@@ -185,10 +191,35 @@ impl SharedByte {
                 let size = Self::LONG_HEADER + self.len();
                 external::free(self.ptr.as_ptr().sub(Self::LONG_HEADER), size);
             } else {
-                mi_free(self.ptr.as_ptr().sub(Self::SHORT_HEADER));
+                short_free(self.ptr.as_ptr().sub(Self::SHORT_HEADER), Self::slot(self.len()));
             }
         }
     }
+}
+
+/// Forme courte : le pool (`--cfg radixox_pool`) ou mimalloc. Nul → forme longue.
+#[cfg(radixox_pool)]
+#[inline]
+unsafe fn short_alloc(size: usize) -> *mut u8 {
+    unsafe { crate::pool::alloc(size) }
+}
+#[cfg(radixox_pool)]
+#[inline]
+unsafe fn short_free(base: *mut u8, size: usize) {
+    unsafe { crate::pool::free(base, size) }
+}
+// mi_malloc plutôt que MiMalloc.alloc : ce dernier passe par mi_malloc_aligned qui, sur
+// page vide, sur-alloue size+align-1 (106 B → bloc 128 au lieu de 112). mi_malloc
+// garantit déjà un alignement ≥ 8.
+#[cfg(not(radixox_pool))]
+#[inline]
+unsafe fn short_alloc(size: usize) -> *mut u8 {
+    unsafe { mi_malloc(size) }
+}
+#[cfg(not(radixox_pool))]
+#[inline]
+unsafe fn short_free(base: *mut u8, _size: usize) {
+    unsafe { mi_free(base) }
 }
 
 impl Clone for SharedByte {

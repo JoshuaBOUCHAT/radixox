@@ -240,7 +240,7 @@ pub fn info_stats(out: &mut String) {
     let _ = write!(out, "# Stats\r\nscan_cursors:{}\r\n", scan::active_cursors());
 }
 
-/// Section `# Memory` d'`INFO` (MEMORY_ARCH.md §16.8) : objets externes (jemalloc).
+/// Section `# Memory` d'`INFO` (MEMORY_ARCH.md §16.8) : objets externes (jemalloc), pool.
 pub fn info_memory(out: &mut String) {
     use radixox_lib::raw_alloc::external;
     use std::fmt::Write as _;
@@ -251,6 +251,23 @@ pub fn info_memory(out: &mut String) {
         external::objects(),
         external::background_thread() as u8
     );
+    // Pool (MEMORY_ARCH.md §16.8) : absent tant qu'il n'a rien alloué, ou sans `--cfg radixox_pool`.
+    if let Some((st, reserve)) = radixox_lib::pool::stats() {
+        let held = st.held_blocks * radixox_lib::pool::BLOCK as u64;
+        let frag = if held == 0 { 0.0 } else { 1.0 - st.live_bytes as f64 / held as f64 };
+        let _ = write!(
+            out,
+            "mem_pool_live_bytes:{}\r\nmem_pool_held_bytes:{held}\r\nmem_pool_fragmentation:{frag:.2}\r\n\
+             mem_pool_pages_active:{}\r\nmem_pool_pages_empty:{}\r\nmem_pool_pages_released:{}\r\n\
+             mem_pool_sync_faults:{}\r\nmem_pool_range_full:{}\r\nmem_pool_reserve_bytes:{reserve}\r\n",
+            st.live_bytes,
+            st.pages_active,
+            st.pages_empty,
+            st.pages_released,
+            st.sync_faults,
+            st.range_full,
+        );
+    }
 }
 
 pub fn encode_krange(buf: &mut Vec<u8>, range: &oxidart::krange::RangeOut<'_>) {

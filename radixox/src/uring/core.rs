@@ -238,6 +238,11 @@ const AOF_EVERY: Duration = Duration::from_secs(1);
 /// Réplication : reconnexion des cibles perdues, horloge envoyée aux réplicas.
 const REPL_EVERY: Duration = Duration::from_secs(1);
 const SWEEP_SLOTS: usize = 1024;
+/// Rendu au système des pages vides du pool (MEMORY_ARCH.md §16.3) : par timer et non
+/// depuis `idle_step`, qui ne tourne que s'il y a du travail de fond ; au plus quelques
+/// pages par appel, l'appel suivant tout de suite après s'il en reste.
+const MEM_RELEASE_EVERY: Duration = Duration::from_secs(1);
+const MEM_RELEASE_AGAIN: Duration = Duration::from_millis(10);
 
 /// Échéances du tas de timers (RUNTIME_ARCH.md §9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -249,6 +254,7 @@ enum Timer {
     Repl,
     /// Échéance d'un `WAIT`.
     Wait,
+    MemRelease,
 }
 
 /// Suite à donner après l'exécution d'une frame.
@@ -434,6 +440,7 @@ impl Core {
         let now = Instant::now();
         let mut timers = BinaryHeap::new();
         timers.push(Reverse((now + EVICT_EVERY, Timer::Evict)));
+        timers.push(Reverse((now + MEM_RELEASE_EVERY, Timer::MemRelease)));
         if cfg.idle_timeout.is_some() {
             timers.push(Reverse((now + SWEEP_EVERY, Timer::Sweep)));
         }
@@ -761,6 +768,11 @@ impl Core {
                 Timer::Sweep => {
                     self.sweep_idle();
                     self.timers.push(Reverse((self.now + SWEEP_EVERY, Timer::Sweep)));
+                }
+                Timer::MemRelease => {
+                    let more = radixox_lib::pool::release_step(self.now);
+                    let next = if more { MEM_RELEASE_AGAIN } else { MEM_RELEASE_EVERY };
+                    self.timers.push(Reverse((self.now + next, Timer::MemRelease)));
                 }
                 Timer::Aof => {
                     if let Some(w) = &mut self.aof {

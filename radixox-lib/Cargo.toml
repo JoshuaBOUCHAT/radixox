@@ -13,6 +13,7 @@ categories = ["network-programming", "parser-implementations"]
 mimalloc = { workspace = true }
 libmimalloc-sys = { workspace = true }
 tikv-jemalloc-sys = { workspace = true }
+libc = "0.2"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(radixox_sysalloc)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(radixox_sysalloc)', 'cfg(radixox_pool)'] }

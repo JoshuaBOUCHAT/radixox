@@ -1,6 +1,6 @@
 # Mémoire v2 — allocateur maison, GC par évacuation, compactage, maxmemory
 
-> **État : conception terminée (2026-10-22) ; v1 en cours, étape 1 de §16.10 faite le 2026-10-23 (en-tête compact, jemalloc, objets externes). La spécification de la v1, à suivre telle quelle, est en §16.** Mesures de départ : §13.1, §13.2. Ce document rassemble les décisions
+> **État : conception terminée (2026-10-22) ; v1 en cours, étapes 1 et 2 de §16.10 faites le 2026-10-23 (en-tête compact, jemalloc, objets externes ; pool sans GC derrière `--cfg radixox_pool`). La spécification de la v1, à suivre telle quelle, est en §16.** Mesures de départ : §13.1, §13.2. Ce document rassemble les décisions
 > prises en discussion le 2026-10-07 (allocation des `SharedByte`, GC) et le 2026-10-21
 > (allocateur global d'abord, puis `maxmemory`), complétées le 2026-10-22 (objets moyens §6,
 > sélection et réserve du GC §8.2–8.3, noyau §11). §15 liste ce qui reste ouvert, §14 l'ordre
@@ -847,6 +847,23 @@ Ajouts du 2026-10-22 (pas encore tranchés) :
   `defrag=defer+madvise`, une faute sur une région `MADV_HUGEPAGE` peut lancer une
   compaction directe du noyau sur le thread fautif (vu : machine à ~500 Mo libres pendant un
   jeu).
+Ajout du 2026-10-23 (après l'étape 1, à reprendre plus tard) :
+
+- **Objets hors de l'arbre : externes en v1, provisoire.** Tout l'état est pseudo-statique
+  (slabs en `static mut`, cœur unique) : le GC peut visiter n'importe quelle structure, il
+  suffit d'un énumérateur, pas seulement l'arbre. Deux pistes pour sortir les membres de
+  ZSet, canaux Pub/Sub et noms de client de jemalloc :
+  - **les visiter** : énumérateurs pour `ZSET_SLAB`, `subs` / `channels`, `Client::name`.
+    Pour le ZSet, un membre est à deux endroits (`sorted` et `scores`, `rc == 2`) : un
+    visiteur propre au ZSet déplace les deux ensemble (mêmes octets, donc ni l'ordre ni le
+    hachage ne changent ; écrire une clé de `BTreeSet` / `HashMap` en place demande de
+    l'`unsafe`) ; ou attendre le ZSet sur HiSlab (ANALYSE_ART_UNIFIE.md §13), où un membre
+    n'aurait qu'un emplacement propriétaire ;
+  - **des blocs réservés aux objets longs** (pool par durée de vie, M3) : bien pour Pub/Sub
+    et les noms (peu de mouvement, volume négligeable) ; mauvais pour un ZSet qui bouge
+    sans être visité (un bloc bump ne se réutilise que vide, collectionneur de coupons
+    comme en §14.1, là où jemalloc réutilise les trous un par un).
+
 - **Le GC a besoin de repos sur la boucle** : il tourne par le même chemin que la save
   (tranches au repos + plancher). Les gains de RUNTIME_ARCH.md §17.6 (envois et recv
   délégués, attente groupée) sont ce qui lui donne ce repos sous charge.
@@ -1124,6 +1141,19 @@ Chaque étape : tests verts, commit, push (règle du dépôt) ; mesure courte qu
 2. **Pool** (§16.3, §16.4) sans GC, derrière `--cfg radixox_pool` (désactivé par défaut à
    cette étape). Tests unitaires du pool : rembobinage du `top`, réutilisation d'un bloc à
    0, page vide puis rendue, plage pleine → externe, fenêtre Best-Fit.
+   **Fait le 2026-10-23** (`radixox-lib/src/pool.rs`). Écarts à §16.3–16.4 :
+   - `release_step` tourne sur un **timer** du cœur (`Timer::MemRelease`, 1 s ; 10 ms
+     tant qu'il en reste), au plus 4 pages par appel : `idle_step` ne tourne que s'il y a
+     du travail de fond, une boucle au repos complet n'aurait jamais rendu ses pages ;
+   - `PageState` porte un drapeau `in_stack` : une page n'est jamais deux fois dans
+     `pages_with_free` (la suppression paresseuse seule laissait des doublons s'accumuler) ;
+   - un bloc **ouvert** dont le compteur tombe à 0 repart du début (le `top` revient à la
+     base du bloc), pas seulement quand l'objet libéré est le dernier ;
+   - le curseur `survivor` et le bitmap `marked` attendent l'étape 6 (GC) ;
+   - `INFO` : les `mem_pool_*` de §16.8 (+ `mem_pool_reserve_bytes`), absents tant que le
+     pool n'a rien alloué.
+   Essai : 1M × 100 o → 104 o par valeur dans le pool, fragmentation 0,00, RSS 136 Mo ;
+   FLUSHDB puis 12 s → 47 pages rendues (réserve 2), RSS 42 Mo.
 3. **Écrasement sur place** (§16.5). Test : SET répétés de même taille → `live_bytes`
    stable, aucune allocation ; SET pendant une save → valeur sauvegardée = ancienne.
 4. **`hislab`** : `slot_span`, `next_occupied` ; publication.
