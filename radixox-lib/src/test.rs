@@ -22,6 +22,90 @@ const _: () =
 const _: () =
     assert!(std::mem::size_of::<MaybeUninit<SharedByte>>() == std::mem::size_of::<SharedByte>());
 
+// ── SharedByte : en-tête compact (MEMORY_ARCH.md §16.2) ───────────────────────
+
+fn pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i * 31 + 7) as u8).collect()
+}
+
+#[test]
+fn shared_byte_lengths_and_forms() {
+    use crate::raw_alloc::external;
+    let g = SharedByte::POOL_MAX_LEN;
+    for len in [0, 1, 2, 3, g - 1, g, g + 1, 1 << 20] {
+        let data = pattern(len);
+        let (b0, o0) = (external::bytes(), external::objects());
+        let sb = SharedByte::from_slice(&data);
+        assert_eq!(sb.len(), len);
+        assert_eq!(sb.as_slice(), &data[..]);
+        assert_eq!(sb.rc(), 1);
+        assert_eq!(sb.as_ptr() as usize % 2, 0, "données paires");
+        assert_eq!(sb.is_external(), len > g, "len {len}");
+        if len > g {
+            assert_eq!(external::bytes() - b0, 6 + len as u64);
+            assert_eq!(external::objects() - o0, 1);
+        }
+        drop(sb);
+        assert_eq!((external::bytes(), external::objects()), (b0, o0));
+    }
+}
+
+#[test]
+fn shared_byte_forced_external() {
+    use crate::raw_alloc::external;
+    for len in [0, 1, 100, SharedByte::POOL_MAX_LEN] {
+        let data = pattern(len);
+        let o0 = external::objects();
+        let sb = SharedByte::from_slice_external(&data);
+        assert!(sb.is_external());
+        assert_eq!((sb.len(), sb.as_slice()), (len, &data[..]));
+        assert_eq!(external::objects() - o0, 1);
+
+        // into_external : copie depuis la forme courte, rien depuis la longue
+        let short = SharedByte::from_slice(&data);
+        assert!(!short.is_external());
+        let ext = short.into_external();
+        assert!(ext.is_external());
+        assert_eq!(ext.as_slice(), &data[..]);
+        let p = ext.as_ptr();
+        let same = ext.into_external();
+        assert_eq!(same.as_ptr(), p);
+        drop((sb, same));
+        assert_eq!(external::objects(), o0);
+    }
+}
+
+/// `_rjem_malloc_conf` est bien vu par jemalloc (symbole exporté depuis une rlib).
+#[cfg(not(radixox_sysalloc))]
+#[test]
+fn jemalloc_background_thread_on() {
+    drop(SharedByte::from_slice_external(b"init"));
+    assert!(crate::raw_alloc::external::background_thread());
+}
+
+#[test]
+fn shared_byte_to_uppercase() {
+    for external in [false, true] {
+        let mk = |d: &[u8]| {
+            if external { SharedByte::from_slice_external(d) } else { SharedByte::from_slice(d) }
+        };
+        // non partagé : sur place
+        let mut a = mk(b"get");
+        let p = a.as_ptr();
+        a.to_uppercase();
+        assert_eq!((a.as_slice(), a.as_ptr()), (&b"GET"[..], p));
+
+        // partagé : copie de même forme, l'original intact
+        let mut b = mk(b"hset");
+        let keep = b.clone();
+        b.to_uppercase();
+        assert_eq!(b.as_slice(), b"HSET");
+        assert_eq!(keep.as_slice(), b"hset");
+        assert_eq!((b.rc(), keep.rc()), (1, 1));
+        assert_eq!(b.is_external(), external);
+    }
+}
+
 // ── SmallVec ─────────────────────────────────────────────────────────────────
 
 #[test]

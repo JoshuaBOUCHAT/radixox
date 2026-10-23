@@ -12,6 +12,7 @@ categories = ["network-programming", "parser-implementations"]
 [dependencies]
 mimalloc = { workspace = true }
 libmimalloc-sys = { workspace = true }
+tikv-jemalloc-sys = { workspace = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(radixox_sysalloc)'] }

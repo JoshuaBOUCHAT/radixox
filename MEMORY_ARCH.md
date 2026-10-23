@@ -1,6 +1,6 @@
 # Mémoire v2 — allocateur maison, GC par évacuation, compactage, maxmemory
 
-> **État : conception terminée (2026-10-22), rien d'implémenté. La spécification de la v1, à suivre telle quelle, est en §16.** Mesures de départ : §13.1, §13.2. Ce document rassemble les décisions
+> **État : conception terminée (2026-10-22) ; v1 en cours, étape 1 de §16.10 faite le 2026-10-23 (en-tête compact, jemalloc, objets externes). La spécification de la v1, à suivre telle quelle, est en §16.** Mesures de départ : §13.1, §13.2. Ce document rassemble les décisions
 > prises en discussion le 2026-10-07 (allocation des `SharedByte`, GC) et le 2026-10-21
 > (allocateur global d'abord, puis `maxmemory`), complétées le 2026-10-22 (objets moyens §6,
 > sélection et réserve du GC §8.2–8.3, noyau §11). §15 liste ce qui reste ouvert, §14 l'ordre
@@ -1115,6 +1115,12 @@ Chaque étape : tests verts, commit, push (règle du dépôt) ; mesure courte qu
 1. **En-tête** (§16.2) + jemalloc pour > G + `from_slice_external` / `into_external` et
    leurs branchements (§16.9) ; le reste encore dans mimalloc. Mesure : débit et RSS sur
    `scripts/bench_vs_valkey.sh` (pas de régression).
+   **Fait le 2026-10-23.** tikv-jemalloc-sys 0.6.1 (jemalloc 5.3.0), `_rjem_malloc_conf`
+   exporté depuis `raw_alloc.rs` ; `INFO` relit `background_thread` (l'état effectif,
+   plutôt que `opt.background_thread`) et le thread `jemalloc_bg_thd` est bien là dans le
+   binaire release. `free` des externes par `sdallocx` (taille connue). `OwnedByte` n'est
+   plus `Send`. ZSet : un membre existant garde l'objet stocké (aucune copie au changement
+   de score), seuls les nouveaux sont convertis.
 2. **Pool** (§16.3, §16.4) sans GC, derrière `--cfg radixox_pool` (désactivé par défaut à
    cette étape). Tests unitaires du pool : rembobinage du `top`, réutilisation d'un bloc à
    0, page vide puis rendue, plage pleine → externe, fenêtre Best-Fit.

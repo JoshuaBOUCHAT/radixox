@@ -240,6 +240,19 @@ pub fn info_stats(out: &mut String) {
     let _ = write!(out, "# Stats\r\nscan_cursors:{}\r\n", scan::active_cursors());
 }
 
+/// Section `# Memory` d'`INFO` (MEMORY_ARCH.md §16.8) : objets externes (jemalloc).
+pub fn info_memory(out: &mut String) {
+    use radixox_lib::raw_alloc::external;
+    use std::fmt::Write as _;
+    let _ = write!(
+        out,
+        "# Memory\r\nmem_external_bytes:{}\r\nmem_external_objects:{}\r\nmem_external_bg_thread:{}\r\n",
+        external::bytes(),
+        external::objects(),
+        external::background_thread() as u8
+    );
+}
+
 pub fn encode_krange(buf: &mut Vec<u8>, range: &oxidart::krange::RangeOut<'_>) {
     use oxidart::krange::RangeVal;
     use radixox_lib::shared_frame::{encode_array_len, encode_bulk};

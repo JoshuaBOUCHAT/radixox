@@ -66,13 +66,16 @@ impl InnerZCommand {
                     if vec[pos].0 == score {
                         return false; // same score, nothing to do
                     }
-                    vec.remove(pos);
-                    // Re-insert at correct sorted position.
+                    // Re-insert at correct sorted position, en gardant le membre
+                    // stocké (déjà externe) plutôt que l'argument.
+                    let (_, member) = vec.remove(pos);
                     let new_pos =
                         vec.partition_point(|(s, m)| (*s, m.as_ref()) < (score, member.as_ref()));
                     vec.insert(new_pos, (score, member));
                     return false; // existing member, score updated
                 }
+                // Membres externes : le GC ne visite pas les ZSet (MEMORY_ARCH.md §16.9).
+                let member = member.into_external();
                 // New member — promote or push.
                 if vec.len() >= THRESHOLD {
                     let cap = vec.len() + 1;

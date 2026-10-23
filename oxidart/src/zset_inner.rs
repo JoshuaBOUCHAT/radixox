@@ -32,20 +32,20 @@ impl ZSetInner {
     pub fn insert(&mut self, score: f64, member: SharedByte) -> bool {
         let score = OrderedFloat(score);
 
-        // Remove old entry if exists (score might have changed)
-        if let Some(&old_score) = self.scores.get(&member) {
-            if old_score != score {
-                // Score changed - remove old sorted entry
-                self.sorted.remove(&(old_score, member.clone()));
-            } else {
-                // Same score - no change needed
-                return false;
+        // Membre déjà là : on garde celui qui est stocké. Membre nouveau : externe,
+        // le GC ne visite pas les ZSet (MEMORY_ARCH.md §16.9).
+        let (member, is_new) = match self.scores.get(&member) {
+            Some(&old_score) if old_score == score => return false,
+            Some(&old_score) => {
+                let (old, _) = self.scores.remove_entry(&member).unwrap();
+                self.sorted.remove(&(old_score, old.clone()));
+                (old, false)
             }
-        }
-
-        // Insert new entry
+            None => (member.into_external(), true),
+        };
         self.sorted.insert((score, member.clone()));
-        self.scores.insert(member, score).is_none()
+        self.scores.insert(member, score);
+        is_new
     }
 
     /// Remove a member. Returns true if the member existed.

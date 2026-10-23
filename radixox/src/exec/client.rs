@@ -14,6 +14,7 @@ pub struct Client {
     pub authed: bool,
     /// CLIENT ID : unique sur la vie du processus, croissant.
     pub id: u64,
+    /// Externe : vit hors de l'arbre, le GC ne le voit pas (MEMORY_ARCH.md §16.9).
     pub name: Option<SharedByte>,
 }
 
@@ -86,7 +87,7 @@ pub fn cmd_hello(args: &[&[u8]], client: &mut Client) -> Frame {
         if !valid_name(name) {
             return Frame::Error(BAD_NAME.into());
         }
-        client.name = (!name.is_empty()).then(|| SharedByte::from_slice(name));
+        client.name = (!name.is_empty()).then(|| SharedByte::from_slice_external(name));
     }
     Frame::Array(vec![
         bulk(b"server"),
@@ -123,7 +124,7 @@ pub fn cmd_client(args: &[&[u8]], client: &mut Client) -> Frame {
         if !valid_name(name) {
             return Frame::Error(BAD_NAME.into());
         }
-        client.name = (!name.is_empty()).then(|| SharedByte::from_slice(name));
+        client.name = (!name.is_empty()).then(|| SharedByte::from_slice_external(name));
         ok()
     } else if is(b"getname") {
         if !rest.is_empty() {

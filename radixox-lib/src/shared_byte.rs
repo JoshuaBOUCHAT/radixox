@@ -1,62 +1,109 @@
-use crate::raw_alloc::{free as mi_free, malloc as mi_malloc};
+use crate::raw_alloc::{external, free as mi_free, malloc as mi_malloc};
 use std::borrow::Borrow;
 
 use std::ops::Deref;
 use std::ptr::NonNull;
 
-use crate::prefetch::{PreFetch, PreFetchPtr};
+use crate::prefetch::PreFetch;
 
+/// `ptr` pointe sur les **données** ; l'en-tête est lu à reculons, en `u16` alignés
+/// (l'adresse des données est toujours paire). MEMORY_ARCH.md §16.2 :
+///
+/// ```text
+/// forme courte : [len_lo u16][rc u16][données…]              len ≤ POOL_MAX_LEN
+/// forme longue : [len_hi u16][len_lo u16][rc u16][données…]  bit 15 de len_lo = EXTERNE
+/// ```
+///
+/// La forme longue est allouée par jemalloc ([`external`]) ; la courte encore par
+/// mimalloc, en attendant le pool (§16.10, étape 2).
 #[repr(transparent)]
 pub struct SharedByte {
     ptr: NonNull<u8>,
 }
 
 impl SharedByte {
-    // layout heap : [len:u32 | rc:u16 | pad:2 | data:u8...]
-    const HEADER_SIZE: usize = 6;
-
-    #[inline]
-    fn len_ptr(&self) -> *mut u32 {
-        self.ptr.as_ptr() as *mut u32
-    }
+    const SHORT_HEADER: usize = 4;
+    const LONG_HEADER: usize = 6;
+    const EXTERNAL: u16 = 0x8000;
+    /// G : au-delà, toute valeur est externe.
+    pub const POOL_MAX_LEN: usize = 16 * 1024;
+    /// 2³¹ − 1 : `len_hi` porte 16 bits, `len_lo` 15.
+    pub const MAX_LEN: usize = (1 << 31) - 1;
 
     #[inline]
     fn rc_ptr(&self) -> *mut u16 {
-        unsafe { (self.ptr.as_ptr() as *mut u16).add(2) }
+        unsafe { (self.ptr.as_ptr() as *mut u16).sub(1) }
+    }
+
+    #[inline]
+    fn len_lo(&self) -> u16 {
+        unsafe { (self.ptr.as_ptr() as *const u16).sub(2).read() }
     }
 
     #[inline]
     fn data_ptr(&self) -> *const u8 {
-        unsafe { self.ptr.as_ptr().add(Self::HEADER_SIZE) }
+        self.ptr.as_ptr()
+    }
+
+    /// Alloue un objet de `len` octets, en-tête écrit et `rc == 1`, données non
+    /// initialisées. `external` force la forme longue.
+    ///
+    /// # Safety
+    /// L'appelant écrit les `len` octets de données avant toute lecture.
+    unsafe fn alloc(len: usize, external: bool) -> Self {
+        assert!(len <= Self::MAX_LEN);
+        unsafe {
+            let data = if external || len > Self::POOL_MAX_LEN {
+                let base = external::malloc(Self::LONG_HEADER + len);
+                assert!(!base.is_null());
+                (base as *mut u16).write((len >> 15) as u16);
+                (base as *mut u16).add(1).write(Self::EXTERNAL | (len as u16 & 0x7FFF));
+                base.add(Self::LONG_HEADER)
+            } else {
+                // mi_malloc plutôt que MiMalloc.alloc : ce dernier passe par
+                // mi_malloc_aligned qui, sur page vide, sur-alloue size+align-1
+                // (106 B → bloc 128 au lieu de 112). mi_malloc garantit déjà
+                // un alignement ≥ 8.
+                let base = mi_malloc(Self::SHORT_HEADER + len);
+                assert!(!base.is_null());
+                (base as *mut u16).write(len as u16);
+                base.add(Self::SHORT_HEADER)
+            };
+            (data as *mut u16).sub(1).write(1);
+            Self { ptr: NonNull::new_unchecked(data) }
+        }
+    }
+
+    fn copy_of(data: &[u8], external: bool) -> Self {
+        unsafe {
+            let sb = Self::alloc(data.len(), external);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), sb.ptr.as_ptr(), data.len());
+            sb
+        }
     }
 
     pub fn from_byte(data: impl Deref<Target = [u8]>) -> Self {
-        assert!(data.len() <= u32::MAX as usize);
-
-        unsafe {
-            // mi_malloc plutôt que MiMalloc.alloc : ce dernier passe par
-            // mi_malloc_aligned qui, sur page vide, sur-alloue size+align-1
-            // (106 B → bloc 128 au lieu de 112). mi_malloc garantit déjà
-            // un alignement ≥ 8.
-            let total = Self::HEADER_SIZE + data.len();
-            let ptr = mi_malloc(total) as *mut u8;
-            assert!(!ptr.is_null());
-
-            // écrire len
-            (ptr as *mut u32).write(data.len() as u32);
-            // écrire rc
-            (ptr.add(4) as *mut u16).write(1);
-
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(Self::HEADER_SIZE), data.len());
-
-            Self {
-                ptr: NonNull::new_unchecked(ptr),
-            }
-        }
+        Self::copy_of(&data, false)
     }
     #[inline]
     pub fn from_slice(data: impl AsRef<[u8]>) -> Self {
-        Self::from_byte(data.as_ref())
+        Self::copy_of(data.as_ref(), false)
+    }
+
+    /// Toujours la forme longue, quelle que soit la taille : pour les `SharedByte` qui
+    /// vivent longtemps hors de l'arbre, que le GC ne voit pas (MEMORY_ARCH.md §16.9).
+    pub fn from_slice_external(data: impl AsRef<[u8]>) -> Self {
+        Self::copy_of(data.as_ref(), true)
+    }
+
+    /// `self` en forme longue : copie si l'objet est en forme courte, sinon rien.
+    pub fn into_external(self) -> Self {
+        if self.is_external() { self } else { Self::copy_of(&self, true) }
+    }
+
+    #[inline]
+    pub fn is_external(&self) -> bool {
+        self.len_lo() & Self::EXTERNAL != 0
     }
 
     #[allow(clippy::should_implement_trait)]
@@ -64,14 +111,27 @@ impl SharedByte {
         Self::from_slice(s.as_bytes())
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
-        unsafe { self.len_ptr().read() as usize }
+        let lo = self.len_lo();
+        if lo & Self::EXTERNAL == 0 {
+            lo as usize
+        } else {
+            let hi = unsafe { (self.ptr.as_ptr() as *const u16).sub(3).read() };
+            ((hi as usize) << 15) | (lo & 0x7FFF) as usize
+        }
     }
 
     /// Prefetch de l'en-tête et du début des données.
     #[inline]
     pub fn prefetch(&self) {
-        crate::prefetch::prefetch_l1(self.ptr.as_ptr());
+        crate::prefetch::prefetch_l1(self.header_ptr());
+    }
+
+    /// Début de l'en-tête (des deux formes, la ligne de cache de `len_lo` et `rc`).
+    #[inline]
+    fn header_ptr(&self) -> *const u8 {
+        unsafe { self.ptr.as_ptr().sub(Self::SHORT_HEADER) }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -91,36 +151,41 @@ impl SharedByte {
     }
 
     /// Uppercases the bytes in-place if `rc == 1`, otherwise allocates a new
-    /// buffer, copies uppercase in one pass, and decrements rc on the old allocation.
+    /// buffer (same form), copies uppercase in one pass, and decrements rc on the old allocation.
     ///
     /// After this call, `as_slice()` is guaranteed to be ASCII-uppercase.
     pub fn to_uppercase(&mut self) {
         let len = self.len();
         if self.rc() == 1 {
             unsafe {
-                let data = self.ptr.as_ptr().add(Self::HEADER_SIZE);
+                let data = self.ptr.as_ptr();
                 for i in 0..len {
                     *data.add(i) = (*data.add(i)).to_ascii_uppercase();
                 }
             }
         } else {
             unsafe {
-                let new_ptr = mi_malloc(Self::HEADER_SIZE + len) as *mut u8;
-                assert!(!new_ptr.is_null());
-                (new_ptr as *mut u32).write(len as u32);
-                (new_ptr.add(4) as *mut u16).write(1);
-                let src = self.ptr.as_ptr().add(Self::HEADER_SIZE);
-                let dst = new_ptr.add(Self::HEADER_SIZE);
+                let new = Self::alloc(len, self.is_external());
+                let src = self.data_ptr();
+                let dst = new.ptr.as_ptr();
                 for i in 0..len {
                     *dst.add(i) = (*src.add(i)).to_ascii_uppercase();
                 }
-
-                // Pas `self.ptr = new_ptr` : réécrire le champ (NonNull est Copy)
-                // ne drop rien, l'ancien buffer garderait son rc et fuirait.
                 // Assigner `*self` drop l'ancienne valeur → décrémente son rc.
-                *self = Self {
-                    ptr: NonNull::new_unchecked(new_ptr),
-                };
+                *self = new;
+            }
+        }
+    }
+
+    /// Dernier `drop` : rend l'objet à son allocateur, aiguillé par le bit EXTERNE.
+    #[cold]
+    unsafe fn dealloc(&self) {
+        unsafe {
+            if self.is_external() {
+                let size = Self::LONG_HEADER + self.len();
+                external::free(self.ptr.as_ptr().sub(Self::LONG_HEADER), size);
+            } else {
+                mi_free(self.ptr.as_ptr().sub(Self::SHORT_HEADER));
             }
         }
     }
@@ -153,7 +218,7 @@ impl Drop for SharedByte {
             }
             *rc -= 1;
             if *rc == 0 {
-                mi_free(self.ptr.as_ptr() as *mut u8);
+                self.dealloc();
             }
         }
     }
@@ -209,11 +274,12 @@ impl PreFetch for SharedByte {
     where
         Self: Sized,
     {
-        self.ptr.ptr_prefetch();
+        crate::prefetch::prefetch_l1(self.header_ptr());
     }
 }
 
-///Represente l'invariant rc == 1 donc vue que un owner alors Send
+/// Un `SharedByte` à un seul propriétaire (rc == 1). Pas `Send` : l'allocateur des
+/// `SharedByte` est mono-thread (MEMORY_ARCH.md §15, worker de persistance).
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
@@ -243,7 +309,6 @@ impl Clone for OwnedByte {
         Self(SharedByte::from_slice(self.0.as_slice()))
     }
 }
-unsafe impl Send for OwnedByte {}
 impl Into<SharedByte> for OwnedByte {
     fn into(self) -> SharedByte {
         self.0

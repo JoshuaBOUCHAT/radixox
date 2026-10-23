@@ -1729,6 +1729,8 @@ impl Core {
                 self.repl_info(&mut info);
                 info.push_str("\r\n");
                 crate::exec::info_stats(&mut info);
+                info.push_str("\r\n");
+                crate::exec::info_memory(&mut info);
                 extend_encode(&mut self.outs[s].out, &Frame::BulkString(SharedByte::from_slice(info.as_bytes())));
             }
             After::Subscribe(channels) => self.subscribe(slot, &channels),
@@ -1775,8 +1777,10 @@ impl Core {
             let o = &mut self.outs[s];
             // Déjà abonné : pas compté deux fois (comme Redis).
             if !o.channels.contains(ch) {
+                // Externe : vit hors de l'arbre, le GC ne le voit pas (MEMORY_ARCH.md §16.9).
+                let ch = ch.clone().into_external();
                 o.channels.push(ch.clone());
-                self.subs.entry(ch.clone()).or_default().push((slot, epoch));
+                self.subs.entry(ch).or_default().push((slot, epoch));
             }
             let o = &mut self.outs[s];
             encode_sub_reply(&mut o.out, b"subscribe", Some(ch), o.channels.len());
