@@ -555,6 +555,38 @@ les descentes entrelacées (à mesurer).
 Politiques v1 envisagées : `noeviction`, `allkeys-lru`, `volatile-lru` (CLOCK),
 `volatile-ttl` (bitmap TTL existant). LFU plus tard (compteur à 2 bits, ou CLOCK-Pro).
 
+### 10.2 bis Compteur dans la valeur (décisions de l'utilisateur, 2026-10-23)
+
+Remplace le tableau à part de §10.2 pour les chaînes et les conteneurs (le tableau reste
+l'option des entiers, qui n'ont pas d'en-tête).
+
+- **Où** : dans l'objet, pas dans le nœud — le nœud n'a aucun octet libre (128 o, ligne 1
+  pleine, ligne 2 = cellules ; vérifié par `offset_of!`) et une feuille inline paierait une
+  cellule de 8 o. Chaînes : l'en-tête du `SharedByte` (la ligne de la valeur, lue de toute
+  façon pour répondre). Conteneurs : l'en-tête du petit bloc Hash / Set (6 octets libres)
+  ou la racine valart ; les champs et membres ne paient rien. Budget accepté : de l'ordre
+  de 2 o par clé (« 10M clés = 20 Mio, largement respectable »).
+- **Niche de `rc`** : `rc` passe de 16 à 8 bits, les 8 bits libérés portent le compteur
+  (0 o de plus). Prérequis : **les lectures ne clonent plus** les `SharedByte`. `GET`,
+  `HGET`, `MGET`, `HGETALL`… encodent depuis `&SharedByte` / `&[u8]` (on lit pour recopier
+  dans la réponse puis on relâche : le clone n'apporte rien et coûte deux écritures dans
+  l'en-tête par lecture — un gain en soi, éviction ou pas). Détenteurs légitimes restants :
+  l'arbre, l'image de save, les rares commandes qui gardent une valeur (jobs, Pub/Sub) →
+  `rc` reste à quelques unités ; `debug_assert` dans `clone` sous le seuil, saturation
+  conservée en release.
+- **Politique** : LFU par compteur de Morris sur 8 bits (comme Redis), **décroissance par
+  l'aiguille de balayage** (pas d'horodatage) ; CLOCK = le même compteur réduit à « touché
+  depuis le passage de l'aiguille ».
+- **Feature cargo `eviction`** (`radixox-lib`, relayée par `oxidart` et `radixox` :
+  `cargo install radixox --features eviction`) : désactivée, le chemin de lecture n'écrit
+  rien de plus ; les deux configurations compilent et passent les tests.
+- **Balayage** : réutilise les énumérateurs du GC (`GcVisitor`) — un visiteur de plus qui
+  lit et fait décroître les compteurs et note les candidats.
+- **`volatile-*` très rapides** : les nœuds qui portent une clé avec TTL sont déjà tagués
+  dans la `TaggedHiSlab` ; l'aiguille de `volatile-lfu` / `volatile-lru` / `volatile-ttl`
+  ne parcourt **que les nœuds tagués**, jamais les clés sans TTL ; `volatile-ttl` lit
+  l'échéance déjà dans la feuille.
+
 ### 10.3 Déclenchement
 
 - **Deux niveaux** : l'éviction de fond démarre à `maxmemory − réserve − marge` ; la
