@@ -1328,10 +1328,27 @@ au bout de 16 s, seul le pool baisse). Recensement des tailles (test temporaire)
 - Mesure (scénario uuid de §17) : arène mimalloc **< 1 Mo**, RSS chargé **118 Mo**, après
   suppression de la moitié **90 Mo** au bout de 16 s (pool 66 → 38 Mo).
 
-### 17.4 Suite
+### 17.4 Petits blocs Hash/Set et débordements valart (fait, branche `pool-structures`)
 
-1. **Petits blocs Hash/Set** (`small.rs`) et **débordements valart** (tag de 3 bits :
-   alignement 8) : même chemin que les pages (`struct_alloc`, `relocate8`, énumérateurs).
+- `small.rs` : `struct_alloc` / `struct_free` (taille `8 + cap × W × 8`, déjà multiple de
+  8), `block_bytes` ; débordements valart (`overflow.rs`) : `struct_alloc` + remise à zéro
+  (le pool ne rend pas de mémoire à zéro), taille arrondie à 8 à l'allocation comme à la
+  libération (`child_cap × 4` peut ne pas l'être) ; en test de valart, toujours
+  l'allocateur système (ASan).
+- **Une seule passe de GC** (choix de l'utilisateur) : elle parcourt les nœuds, là où sont
+  les pointeurs. `visit_val` déplace le petit bloc (`GcVisitor::page`) puis visite ses
+  entrées à sa nouvelle place ; valart a son trait `ValVisitor` (`bytes`, `block`),
+  `gc_block` donne le bloc sans tag au visiteur et remet le tag ; oxidart fait la
+  passerelle (`Bridge`). Le bloc d'un nœud valart est visité avant ses entrées.
+- Plus aucune arène mimalloc dans le serveur. Mesure, 1M de Hash à un champ façon YCSB
+  (`user<chiffres>`, `field0`, 100 o) puis `UNLINK user1*` … `user5*` (56 % des clés) :
+  pool 178 → 74 Mo, slab des nœuds 53 → 29 Mo (compactage), **RSS 246 → 118 Mo** au bout
+  de 16 s.
+
+### 17.5 Suite
+
+1. **Compactage de la slab valart** (même mécanisme que §17.2 bis, idx d'enfants propres).
+2. Publier `hislab` 0.2.5, puis fusionner `pool-structures` dans `main`.
 2. **Compactage HiSlab** (§9) : le plus gros poste restant (35 Mo uuid, 53 Mo YCSB) ; la
    slab ne rétrécit jamais. **En arrière-plan** (tranches au repos, comme le GC), avec
    **libération sur critères** (excédent tenu qui dure, comme le niveau B) — idée de

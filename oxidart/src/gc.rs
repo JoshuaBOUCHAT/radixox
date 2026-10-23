@@ -21,7 +21,8 @@ use crate::value::{Tag, ValUnion, list_slab, valart};
 pub trait GcVisitor {
     fn bytes(&mut self, sb: &mut SharedByte);
     fn path(&mut self, _p: &mut CompactPath) {}
-    /// Objet de structure aligné sur 8 (page d'un nœud) : pointeur en place et taille.
+    /// Objet de structure aligné sur 8 (page d'un nœud, petit bloc Hash / Set, débordement
+    /// valart) : pointeur en place et taille.
     fn page(&mut self, _ptr: &mut *mut u8, _size: usize) {}
 }
 
@@ -93,7 +94,7 @@ impl GcPass {
                 // entre deux tranches, et l'image d'un nœud valart copie ses `SharedByte`
                 // bit à bit. Valart sauté jusqu'à la passe suivante.
                 Phase::Valart if valart().is_saving() => None,
-                Phase::Valart => art.gc_visit_valart(self.at, n, &mut |sb| v.bytes(sb)),
+                Phase::Valart => art.gc_visit_valart(self.at, n, &mut v),
                 Phase::Lists => art.gc_visit_lists(self.at, n, &mut |sb| v.bytes(sb)),
             };
             if let Some(at) = next {
@@ -133,12 +134,22 @@ impl Drop for LiveTree {
 }
 
 /// Les `SharedByte` d'une valeur.
-fn visit_val(tag: Tag, val: &mut ValUnion, f: &mut impl FnMut(&mut SharedByte)) {
+/// Les objets d'une valeur : son `SharedByte`, ou le petit bloc d'un Hash / Set (objet de
+/// structure, déplacé d'abord) puis ses entrées, lues à sa nouvelle place.
+fn visit_val(tag: Tag, val: &mut ValUnion, v: &mut impl GcVisitor) {
     unsafe {
         match tag {
-            Tag::Bytes => f(&mut *val.bytes),
-            Tag::HashSmall => small::entries_mut::<2>(val.ptr).iter_mut().flatten().for_each(f),
-            Tag::SetSmall => small::entries_mut::<1>(val.ptr).iter_mut().flatten().for_each(f),
+            Tag::Bytes => v.bytes(&mut *val.bytes),
+            Tag::HashSmall => {
+                let size = small::block_bytes::<2>(val.ptr);
+                v.page(&mut val.ptr, size);
+                small::entries_mut::<2>(val.ptr).iter_mut().flatten().for_each(|sb| v.bytes(sb));
+            }
+            Tag::SetSmall => {
+                let size = small::block_bytes::<1>(val.ptr);
+                v.page(&mut val.ptr, size);
+                small::entries_mut::<1>(val.ptr).iter_mut().flatten().for_each(|sb| v.bytes(sb));
+            }
             // Int, conteneurs par idx (visités dans leur slab)
             _ => {}
         }
@@ -160,7 +171,7 @@ impl OxidArt {
             if let Some((ptr, size)) = node.page_mut() {
                 v.page(ptr, size);
             }
-            node.for_each_val_mut(|tag, val| visit_val(tag, val, &mut |sb| v.bytes(sb)));
+            node.for_each_val_mut(|tag, val| visit_val(tag, val, v));
             node.for_each_path_mut(|p| v.path(p));
             at = i + 1;
         }
@@ -169,8 +180,19 @@ impl OxidArt {
 
     /// Même contrat que [`Self::gc_visit`], sur les nœuds de valart. Jamais pendant une
     /// save (voir `ValTrees::gc_visit`).
-    pub fn gc_visit_valart(&mut self, from: u32, budget: u32, f: &mut impl FnMut(&mut SharedByte)) -> Option<u32> {
-        valart().gc_visit(from, budget, f)
+    pub fn gc_visit_valart(&mut self, from: u32, budget: u32, v: &mut impl GcVisitor) -> Option<u32> {
+        /// Le visiteur d'oxidart vu par valart : les blocs de débordement sont des objets de
+        /// structure comme les pages.
+        struct Bridge<'a, V>(&'a mut V);
+        impl<V: GcVisitor> valart::ValVisitor for Bridge<'_, V> {
+            fn bytes(&mut self, sb: &mut SharedByte) {
+                self.0.bytes(sb);
+            }
+            fn block(&mut self, ptr: &mut *mut u8, size: usize) {
+                self.0.page(ptr, size);
+            }
+        }
+        valart().gc_visit(from, budget, &mut Bridge(v))
     }
 
     /// Même contrat que [`Self::gc_visit`], sur les listes.
@@ -200,7 +222,7 @@ impl OxidArt {
         if !valart().is_saving() {
             let mut at = Some(0);
             while let Some(from) = at {
-                at = self.gc_visit_valart(from, u32::MAX, &mut |sb| v.bytes(sb));
+                at = self.gc_visit_valart(from, u32::MAX, v);
             }
         }
         let mut at = Some(0);
@@ -239,7 +261,7 @@ impl OxidArt {
         // valart est global : sa save peut être celle d'un autre arbre du processus (tests).
         let mut at = (!valart_saving).then_some(0);
         while let Some(from) = at {
-            at = self.gc_visit_valart(from, u32::MAX, &mut |sb| shared.extend(b(sb)));
+            at = self.gc_visit_valart(from, u32::MAX, &mut |sb: &mut SharedByte| shared.extend(b(sb)));
         }
         let mut at = alone.then_some(0);
         while let Some(from) = at {

@@ -812,10 +812,11 @@ fn gc_census_matches_tree_bytes() {
     assert_eq!(total, radixox_lib::pool::live_bytes() - before);
     if cfg!(not(any(radixox_nopool, radixox_sysalloc))) {
         // 201 chaînes + 2 × (3 + 30) champs et valeurs + 33 membres + 10 éléments, plus les
-        // pages des nœuds (§17)
+        // pages des nœuds, les 2 petits blocs Hash / Set et les débordements valart (§17) ;
+        // l'égalité stricte porte sur les octets (ci-dessus)
         let mut pages = 0;
         art.map.for_each_occupied(|_, n| pages += (n.page_block() > 0) as usize);
-        assert_eq!(census.len(), 201 + 66 + 33 + 10 + pages);
+        assert!(census.len() > 201 + 66 + 33 + 10 + pages + 2, "{}", census.len());
     }
     drop(art);
     assert_eq!(radixox_lib::pool::live_bytes(), before);
@@ -870,6 +871,15 @@ fn gc_full_pass_moves_heap_paths() {
     for i in 0..500 {
         art.set(sb(&format!("namespace-commun-tres-long:{i}:fin")), Value::String(sb("w")));
     }
+    // conteneurs : petits blocs Hash / Set et débordements valart (objets de structure, §17.4)
+    for (k, n) in [("hs", 3), ("hb", 60)] {
+        let fv: Vec<_> = (0..n).map(|i| (sb(&format!("champ-{i}")), sb(&format!("valeur-{i}")))).collect();
+        art.cmd_hset(k.as_bytes(), &fv, None).unwrap();
+    }
+    for (k, n) in [("ss", 3), ("sb", 60)] {
+        let ms: Vec<_> = (0..n).map(|i| sb(&format!("membre-{i}"))).collect();
+        art.cmd_sadd(k.as_bytes(), &ms, None).unwrap();
+    }
     let census0 = art.gc_census();
     let s0 = radixox_lib::pool::gc_stats().unwrap_or_default();
     art.gc_full_pass();
@@ -880,6 +890,11 @@ fn gc_full_pass_moves_heap_paths() {
     for i in 0..500 {
         assert_eq!(art.get(format!("namespace-commun-tres-long:{i}:fin").as_bytes()), Some(Value::String(sb("w"))));
     }
+    assert_eq!(art.cmd_hlen(b"hb").unwrap(), 60);
+    assert_eq!(art.cmd_hget(b"hb", b"champ-42").unwrap().unwrap().as_slice(), b"valeur-42");
+    assert_eq!(art.cmd_hget(b"hs", b"champ-2").unwrap().unwrap().as_slice(), b"valeur-2");
+    assert_eq!(art.cmd_scard(b"sb").unwrap(), 60);
+    assert_eq!(art.cmd_scard(b"ss").unwrap(), 3);
     assert!(radixox_lib::pool::verify_census(&art.gc_census()).is_ok());
     if radixox_lib::pool::ENABLED {
         // chaque emplacement recensé a changé (tout était évacuable), et les chemins comptent

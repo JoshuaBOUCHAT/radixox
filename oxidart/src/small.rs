@@ -18,7 +18,7 @@
 use std::mem::ManuallyDrop;
 use std::ptr;
 
-use radixox_lib::raw_alloc::{free as mi_free, malloc as mi_malloc};
+use radixox_lib::pool;
 use radixox_lib::shared_byte::SharedByte;
 
 /// Au-delà, le conteneur passe en valart.
@@ -51,11 +51,28 @@ unsafe fn cap(p: *const u8) -> usize {
     unsafe { *p.add(1) as usize }
 }
 
+/// Taille du bloc vivant `p` (multiple de 8).
+///
+/// # Safety
+/// `p` est un bloc vivant.
+#[inline]
+pub(crate) unsafe fn block_bytes<const W: usize>(p: *const u8) -> usize {
+    bytes_for::<W>(unsafe { cap(p) })
+}
+
+/// # Safety
+/// `p` est un bloc vivant, possédé, dont les entrées sont déjà sorties ou libérées.
+#[inline]
+unsafe fn free_block<const W: usize>(p: *mut u8) {
+    unsafe { pool::struct_free(p, block_bytes::<W>(p)) }
+}
+
 /// Bloc vide de capacité `cap` (≤ [`SMALL_MAX`]).
 pub(crate) fn alloc<const W: usize>(cap: usize) -> *mut u8 {
     debug_assert!((1..=SMALL_MAX).contains(&cap));
     unsafe {
-        let p = mi_malloc(bytes_for::<W>(cap));
+        // Pool des structures, aligné sur 8 (MEMORY_ARCH.md §17.4) ; taille multiple de 8.
+        let p = pool::struct_alloc(bytes_for::<W>(cap));
         assert!(!p.is_null(), "petit conteneur : allocation");
         *p = 0;
         *p.add(1) = cap as u8;
@@ -116,7 +133,7 @@ pub(crate) unsafe fn push<const W: usize>(p: &mut *mut u8, e: [SharedByte; W]) -
             let q = alloc::<W>(n * 2);
             ptr::copy_nonoverlapping(slots::<W>(*p), slots::<W>(q), n);
             *q = n as u8;
-            mi_free(*p);
+            free_block::<W>(*p);
             *p = q;
         }
         slots::<W>(*p).add(n).write(e);
@@ -153,7 +170,7 @@ pub(crate) unsafe fn into_entries<const W: usize>(p: *mut u8) -> Vec<[SharedByte
         for i in 0..n {
             out.push(slots::<W>(p).add(i).read());
         }
-        mi_free(p);
+        free_block::<W>(p);
         out
     }
 }
