@@ -5,12 +5,13 @@
 #
 #   rx-Nc   RadixOx : boucle sur le 1er CPU de SERVER_CPUS, N−1 workers io-wq
 #           (envois async) sur les suivants ; rx-1c = boucle seule
-#   vk-Nt   Valkey io-threads N sur les N premiers CPU de SERVER_CPUS, bio sur
-#           le suivant (ou le dernier)
+#   vk-Nt   Valkey io-threads N sur les N premiers CPU de SERVER_CPUS, ses
+#           threads bio (au repos dans ce bench) sur les mêmes CPU
 #
 #   scripts/bench_zipf.sh                         # ~2 min 30
 #   TEST_TIME=5 PIPELINES=64 scripts/bench_zipf.sh   # essai rapide
 #   CONFIGS="rx-1c vk-1t" ZIPF=1.2 scripts/bench_zipf.sh
+#   SERVER_CORES=3 CONFIGS="rx-2c rx-3c" scripts/bench_zipf.sh   # même client que vk-3t
 #   CONFIGS="rx-3c vk-3t" scripts/bench_zipf.sh    # 3 cœurs physiques
 #   SERVER_CPUS=0,1,6 MT_CPUS=2-5 CONFIGS="vk-3t" scripts/bench_zipf.sh   # à la main
 #   VALKEY_BIN=…/valkey-src/src/valkey-server scripts/bench_zipf.sh
@@ -20,8 +21,9 @@
 #   donnés : le serveur prend un thread par cœur physique, les cœurs
 #   performants d'abord (cpu_capacity la plus haute ; sur un hybride Intel, les
 #   cœurs efficaces sont aussi listés dans /sys/devices/cpu_atom/cpus) ; autant
-#   de cœurs que le plus grand N de CONFIGS, plus un pour les threads bio de
-#   Valkey. Les jumeaux SMT de ces cœurs restent libres ; memtier prend tous les
+#   de cœurs que SERVER_CORES (défaut : le plus grand N de CONFIGS). Les
+#   placements, donc le CPU du client, ne dépendent que de ce nombre : pour
+#   comparer deux lancements, garder le même SERVER_CORES. Les jumeaux SMT de ces cœurs restent libres ; memtier prend tous les
 #   CPU des autres cœurs.
 # - memtier : un thread par CPU de MT_CPUS (MT_THREADS), MT_CONNS (80)
 #   connexions en tout, --distinct-client-seed --randomize. Si ses CPU passent
@@ -73,12 +75,10 @@ cores() {
 expand() { local a; for a in ${1//,/ }; do if [[ $a == *-* ]]; then seq "${a%-*}" "${a#*-}"; else echo "$a"; fi; done; }
 
 if [ -z "${SERVER_CPUS:-}" ] || [ -z "${MT_CPUS:-}" ]; then
-  need=0; vk=0
-  for cfg in $CONFIGS; do
-    n=${cfg//[!0-9]/}; (( ${n:-0} > need )) && need=$n
-    [[ $cfg == vk-* ]] && vk=1
-  done
-  need=$((need + vk))
+  need=${SERVER_CORES:-0}
+  if [ -z "${SERVER_CORES:-}" ]; then
+    for cfg in $CONFIGS; do n=${cfg//[!0-9]/}; (( ${n:-0} > need )) && need=$n; done
+  fi
   mapfile -t CORES < <(cores)
   (( need < ${#CORES[@]} )) || { echo "il faut $need cœurs physiques pour le serveur et au moins un pour memtier ; la machine en a ${#CORES[@]}" >&2; exit 1; }
   srv=(); mt=()
@@ -124,10 +124,9 @@ start() {
     env "${env[@]}" RADIXOX_PORT="$PORT" RADIXOX_SAVE="" RADIXOX_DIR="$dir" \
       systemd-run --user --scope -q -p MemoryMax="$MEM_MAX" "$RX_BIN" >"$dir/log" 2>&1 &
   else
-    local bio=${cpus[$(( n < ${#cpus[@]} ? n : ${#cpus[@]} - 1 ))]}
-    systemd-run --user --scope -q -p MemoryMax="$MEM_MAX" taskset -c "$used,$bio" "$VALKEY_BIN" \
+    systemd-run --user --scope -q -p MemoryMax="$MEM_MAX" taskset -c "$used" "$VALKEY_BIN" \
       --port "$PORT" --bind 127.0.0.1 --save "" --appendonly no \
-      --io-threads "$n" --server-cpulist "$used" --bio-cpulist "$bio" --dir "$dir" >"$dir/log" 2>&1 &
+      --io-threads "$n" --server-cpulist "$used" --bio-cpulist "$used" --dir "$dir" >"$dir/log" 2>&1 &
   fi
   for _ in $(seq 100); do redis-cli -p "$PORT" PING >/dev/null 2>&1 && break; sleep 0.1; done
   SPID=$(ss -ltnp | grep ":$PORT " | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
@@ -155,7 +154,7 @@ for cfg in $CONFIGS; do
     snap > "$OUT/s1"
     read -r rss_now rss_peak <<< "$(rss)"
     {
-      awk -v c="$cfg" -v p="$p" '/^Totals/{printf "%-6s pipeline %-3s %10.0f ops/s   p50 %6s   p99 %6s   p99.9 %6s ms\n", c, p, $2, $(NF-3), $(NF-2), $(NF-1)}' "$OUT/$cfg.p$p.txt"
+      awk -v c="$cfg" -v p="$p" '/^Totals/{printf "%-6s pipeline %-3s %10.0f ops/s   moy %6.3f   p50 %6.3f   p99 %6.3f   p99.9 %6.3f ms\n", c, p, $2, $(NF-4), $(NF-3), $(NF-2), $(NF-1)}' "$OUT/$cfg.p$p.txt"
       join "$OUT/s0" "$OUT/s1" | awk -v show="$SHOW" -v rl="$RSS_LOAD" -v rn="$rss_now" -v rp="$rss_peak" 'BEGIN{n=split(show, l, "\n"); for (k=1; k<=n; k++) {split(l[k], f, " "); role[f[2]]=f[1]; ord[k]=f[2]}}
         {u=$6-$2; s=$7-$3; q=$8-$4; i=$9-$5; t=u+s+q+i; if (t>0) line[$1]=sprintf("         %-5s %-7s occupé %3.0f %%  user %3.0f  noyau %3.0f  softirq %3.0f", $1, role[$1], 100*(u+s+q)/t, 100*u/t, 100*s/t, 100*q/t)}
         {if (role[$1]=="memtier" && t>0) {mt+=100*(u+s+q)/t; nm++}}
