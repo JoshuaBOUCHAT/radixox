@@ -131,6 +131,14 @@ struct Server {
     /// Attente groupée (expérimental) : `(want, µs)`, le noyau attend `want`
     /// complétions pendant au plus `µs` avant de rendre la main pour une seule.
     min_wait: Option<(u32, u32)>,
+    /// Anneau en SQPOLL (`RADIXOX_SQPOLL_CPU`, RUNTIME_ARCH.md §6.4 bis) : un thread
+    /// noyau lit la SQ et fait tourner nos recv ; sans `DEFER_TASKRUN`, les CQE
+    /// arrivent dans la CQ sans `enter` de notre part.
+    sqpoll: bool,
+    /// SQPOLL : au repos, la boucle surveille la CQ pendant au plus cette durée
+    /// avant de s'endormir dans `enter` (`RADIXOX_SQPOLL_SPIN_US`). Sinon chaque
+    /// CQE coûte au thread SQPOLL un réveil de la boucle.
+    spin: Duration,
     /// `signalfd` de SIGINT / SIGTERM (save à l'arrêt).
     signals: Option<Signals>,
     /// Adresses des `connect` en vol (liens de réplication) : lues par le
@@ -568,12 +576,29 @@ impl Server {
             .next_deadline()
             .map_or(IDLE_WORK_MAX, |t| t.saturating_duration_since(Instant::now()).min(IDLE_WORK_MAX));
         let end = tsc::Deadline::after(budget);
-        while !self.ring.submission().taskrun() && self.core.quiet() && self.core.idle_step() && !end.passed() {}
+        while !self.work_waiting() && self.core.quiet() && self.core.idle_step() && !end.passed() {}
+    }
+
+    /// Le noyau a du travail pour nous. Avec `DEFER_TASKRUN` : `IORING_SQ_TASKRUN`
+    /// (les complétions n'existent qu'à notre `enter`) ; en SQPOLL, le thread
+    /// noyau les écrit lui-même : la CQ n'est pas vide.
+    fn work_waiting(&mut self) -> bool {
+        if self.sqpoll { !self.ring.completion().is_empty() } else { self.ring.submission().taskrun() }
     }
 
     /// Soumet et attend au moins une complétion, au plus jusqu'à la prochaine
     /// échéance de timer.
     fn wait(&mut self) -> io::Result<usize> {
+        if self.sqpoll && !self.spin.is_zero() {
+            let budget = self.core.next_deadline().map_or(self.spin, |t| t.saturating_duration_since(Instant::now()).min(self.spin));
+            let end = tsc::Deadline::after(budget);
+            while !end.passed() {
+                if !self.ring.completion().is_empty() {
+                    return Ok(0);
+                }
+                std::hint::spin_loop();
+            }
+        }
         let timeout = self
             .core
             .next_deadline()
@@ -584,6 +609,14 @@ impl Server {
         let mut flags = EnterFlags::GETEVENTS | EnterFlags::EXT_ARG;
         if self.no_iowait {
             flags |= EnterFlags::NO_IOWAIT;
+        }
+        if self.sqpoll {
+            // Le thread noyau s'est endormi (`sq_thread_idle` sans SQE) : le réveiller
+            // pour qu'il prenne ce qu'on vient d'écrire.
+            std::sync::atomic::fence(Ordering::SeqCst);
+            if self.ring.submission().need_wakeup() {
+                flags |= EnterFlags::SQ_WAKEUP;
+            }
         }
         let to_submit = self.ring.submission().len() as u32;
         // SAFETY: `args` vit pendant l'appel.
@@ -804,13 +837,27 @@ fn env_yes(name: &str, default: bool) -> bool {
     std::env::var(name).map_or(default, |v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
-fn build_ring() -> io::Result<IoUring> {
-    IoUring::builder()
-        .setup_single_issuer()
-        .setup_defer_taskrun()
-        .setup_taskrun_flag()
-        .setup_cqsize(CQ_ENTRIES)
-        .build(SQ_ENTRIES)
+/// `RADIXOX_SQPOLL_CPU=<cpu>` : SQPOLL épinglé sur ce CPU (`RADIXOX_SQPOLL_IDLE_MS`,
+/// défaut 1000, avant qu'il ne s'endorme ; la boucle, elle, surveille la CQ
+/// `RADIXOX_SQPOLL_SPIN_US`, défaut 1000, avant de s'endormir). Le thread noyau tourne en attente active
+/// et prend la soumission et la réception (copie comprise) ; à combiner avec
+/// `RADIXOX_SEND_ASYNC` pour que les envois partent sur io-wq.
+fn sqpoll_from_env() -> Option<(u32, u32)> {
+    let cpu = std::env::var("RADIXOX_SQPOLL_CPU").ok()?.trim().parse().ok()?;
+    let idle = std::env::var("RADIXOX_SQPOLL_IDLE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+    Some((cpu, idle))
+}
+
+fn build_ring(sqpoll: Option<(u32, u32)>) -> io::Result<IoUring> {
+    let mut b = IoUring::builder();
+    b.setup_single_issuer().setup_cqsize(CQ_ENTRIES);
+    match sqpoll {
+        // Incompatible avec `DEFER_TASKRUN` et `TASKRUN_FLAG` : le travail des
+        // complétions tourne dans le thread SQPOLL.
+        Some((cpu, idle)) => b.setup_sqpoll(idle).setup_sqpoll_cpu(cpu),
+        None => b.setup_defer_taskrun().setup_taskrun_flag(),
+    };
+    b.build(SQ_ENTRIES)
         .map_err(|e| {
             io::Error::new(
                 e.kind(),
@@ -874,7 +921,11 @@ fn main() -> io::Result<()> {
         None
     };
 
-    let ring = build_ring()?;
+    let sqpoll = sqpoll_from_env();
+    let ring = build_ring(sqpoll)?;
+    if let Some((cpu, idle)) = sqpoll {
+        println!("SQPOLL : thread noyau sur le CPU {cpu}, endormi après {idle} ms sans travail");
+    }
     let mut cfg = Config::default();
     if let Some(w) = std::env::var("RADIXOX_PREFETCH").ok().and_then(|v| v.parse::<usize>().ok()) {
         cfg.prefetch = w.max(1);
@@ -940,7 +991,8 @@ fn main() -> io::Result<()> {
 
     // Avec l'AOF, le flux suffit à l'arrêt : pas de save par défaut.
     let signals = Signals::install(core.autosave_on() && !aof_on, aof_on)?;
-    let mut server = Server { ring, bufring, core, listener, ops: Vec::new(), no_iowait, send_async, recv_async, file_async, min_wait,
+    let mut server = Server { ring, bufring, core, listener, ops: Vec::new(), no_iowait, send_async, recv_async, file_async, min_wait, sqpoll: sqpoll.is_some(),
+        spin: Duration::from_micros(std::env::var("RADIXOX_SQPOLL_SPIN_US").ok().and_then(|v| v.parse().ok()).unwrap_or(1000)),
         signals,
         connects: Default::default(),
         stop: None,

@@ -750,6 +750,42 @@ plafond io-wq   : 1 par défaut ; +1 si on reste saturé alors que les sends son
 - Alternative écartée : notre propre thread d'envoi alimenté par `IORING_OP_MSG_RING`
   (contrôle total, mais un deuxième thread userland, contraire au mono-thread).
 
+### 6.4 bis Mode SQPOLL (`RADIXOX_SQPOLL_CPU`, 2026-10-24)
+
+Option pour qui accepte de brûler des cœurs : `RADIXOX_SQPOLL_CPU=<cpu>` crée l'anneau en
+SQPOLL (thread noyau épinglé, `RADIXOX_SQPOLL_IDLE_MS`, défaut 1000), **sans
+`DEFER_TASKRUN` ni `TASKRUN_FLAG`** (incompatibles). À combiner avec `RADIXOX_SEND_ASYNC` :
+- le thread SQPOLL lit la SQ et exécute le travail des complétions de nos requêtes (le
+  recv multishot, copie comprise, tourne dans **son** contexte) ; il écrit les CQE ;
+- les workers io-wq font les envois ;
+- la boucle ne fait **aucun appel système** tant qu'elle a du travail : elle écrit des SQE
+  et lit la CQ en mémoire. Au repos, elle surveille la CQ pendant `RADIXOX_SQPOLL_SPIN_US`
+  (défaut 1000) puis dort dans `enter(GETEVENTS)` (avec `SQ_WAKEUP` si le thread s'est
+  endormi).
+- Ce qui change dans le code (`uringloop.rs`, rien dans le cœur) : `build_ring`, le signal
+  du travail au repos (`work_waiting` : CQ non vide au lieu d'`IORING_SQ_TASKRUN`), et
+  `wait`. Testé : grosses valeurs, pipeline, BGSAVE.
+
+Mesures (loopback, Ryzen 7600X, `scripts/bench_zipf.sh`, Zipf 0,99, 80 conns ; `rx-Ns` =
+boucle, SQPOLL, N−2 workers d'envoi) :
+
+| | rx-3c (boucle + 2 workers) | rx-3s (boucle + SQPOLL + 1 worker) |
+|---|---|---|
+| pipeline 64 | 3,62 M, p99 1,91 ms ; boucle 91 % dont noyau 15 | **4,00 M, p99 1,52 ms ; boucle 100 % user, 0 noyau** |
+| sans pipeline | **646 K** (client saturé) | 299–310 K : le seul worker d'envoi sature (~300 K envois/s par worker) |
+
+À 4 cœurs sans pipeline (client sur 4 CPU, saturé ou presque) : rx-4c 467 K, rx-4s 413 K,
+rx-3c 405 K. L'occupation ne dit rien en SQPOLL (boucle et thread noyau en attente
+active) ; au profil, le thread SQPOLL fait ~60 % de travail utile à 429 K ops/s
+(`io_sq_tw` : recv, complétions ; le reste tourne à vide dans `io_sq_thread`) →
+**plafond estimé ~700 K sans pipeline** pour un thread SQPOLL sur ce CPU (non mesuré
+directement : le client sature avant).
+
+Lecture : en pipeline, SQPOLL retire tout le noyau de la boucle (+10 % de débit, latence
+meilleure). Sans pipeline, il ne parallélise pas la réception : un seul thread la fait
+pour toutes les connexions. Le million sans pipeline passe par plusieurs threads réseau
+(§17.6, piste 4). La ligne SQ_POLL du §14 reste vraie pour le mode par défaut.
+
 ### 6.5 Signaux de diagnostic (exposés dans `INFO`)
 
 | Signal | Mesure |
@@ -1615,7 +1651,7 @@ la boucle maison. Mesures §12.4. Suite : étape 7+ (optimisations, chacune mesu
 | Option | Raison |
 |---|---|
 | Runtime à futures maison (`RawTask`, `fn_poll`, `syscall_nb`, `CURRENT_TASK`) | garde la machinerie des futures sans en avoir besoin ; le multishot y est pénible à modéliser |
-| SQ_POLL (même en option) | incompatible avec `DEFER_TASKRUN` ; brûle un vCPU en permanence, souvent le frère SMT du nôtre, compté dans le quota du conteneur. Réservé à une machine dédiée ultra-basse latence : non maintenu (2026-10-19) |
+| SQ_POLL par défaut | incompatible avec `DEFER_TASKRUN` ; brûle un vCPU en permanence, souvent le frère SMT du nôtre, compté dans le quota du conteneur. Revenu le 2026-10-24 **en option** (`RADIXOX_SQPOLL_CPU`, §6.4 bis) pour les machines dédiées |
 | ACCEPT_DIRECT | optimise l'ouverture, pas le flux ; perd l'adresse du client, `setsockopt` classique, le choix des slots, le message « max clients » (§4.1). `TCP_NODELAY` serait hérité du listener, mais ça ne règle qu'un des quatre points |
 | `WRITE_FIXED` / tampons enregistrés pour les sends ordinaires | un send copie de toute façon ; réservé à `SEND_ZC` et au dump `O_DIRECT` (§6.3) |
 | Anneau non incrémental en repli | noyau ≥ 6.12 imposé (§11) |

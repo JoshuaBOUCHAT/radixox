@@ -5,6 +5,8 @@
 #
 #   rx-Nc   RadixOx : boucle sur le 1er CPU de SERVER_CPUS, N−1 workers io-wq
 #           (envois async) sur les suivants ; rx-1c = boucle seule
+#   rx-Ns   RadixOx en SQPOLL : boucle sur le 1er CPU, thread SQPOLL (soumission et
+#           réception) sur le 2e, N−2 workers io-wq pour les envois sur les suivants
 #   vk-Nt   Valkey io-threads N sur les N premiers CPU de SERVER_CPUS, ses
 #           threads bio (au repos dans ce bench) sur les mêmes CPU
 #
@@ -113,14 +115,17 @@ start() {
   local cfg=$1 dir="$OUT/$1"
   rm -rf "$dir"; mkdir -p "$dir"
   local cpus; IFS=, read -ra cpus <<< "$SERVER_CPUS"
-  [[ $cfg =~ ^(rx|vk)-([0-9]+)[ct]$ ]] || { echo "configuration inconnue : $cfg (rx-Nc ou vk-Nt)" >&2; exit 1; }
-  local kind=${BASH_REMATCH[1]} n=${BASH_REMATCH[2]}
+  [[ $cfg =~ ^(rx|vk)-([0-9]+)([cst])$ ]] || { echo "configuration inconnue : $cfg (rx-Nc, rx-Ns ou vk-Nt)" >&2; exit 1; }
+  local kind=${BASH_REMATCH[1]} n=${BASH_REMATCH[2]} mode=${BASH_REMATCH[3]}
+  [[ $kind$mode == rxc || $kind$mode == rxs || $kind$mode == vkt ]] || { echo "configuration inconnue : $cfg" >&2; exit 1; }
+  [[ $mode != s ]] || (( n >= 2 )) || { echo "$cfg : SQPOLL demande au moins 2 CPU" >&2; exit 1; }
   (( n >= 1 && n <= ${#cpus[@]} )) || { echo "$cfg : N entre 1 et ${#cpus[@]} (SERVER_CPUS=$SERVER_CPUS)" >&2; exit 1; }
   local used; used=$(IFS=,; echo "${cpus[*]:0:n}")
   if [ "$kind" = rx ]; then
-    local env=(RADIXOX_CPU_PIN="${cpus[0]}")
-    if (( n > 1 )); then
-      env+=(RADIXOX_SEND_ASYNC=1 RADIXOX_IOWQ_WORKERS=$((n - 1)) RADIXOX_IOWQ_CPUS="$(IFS=,; echo "${cpus[*]:1:n-1}")")
+    local env=(RADIXOX_CPU_PIN="${cpus[0]}") first=1
+    if [ "$mode" = s ]; then env+=(RADIXOX_SQPOLL_CPU="${cpus[1]}"); first=2; fi
+    if (( n > first )); then
+      env+=(RADIXOX_SEND_ASYNC=1 RADIXOX_IOWQ_WORKERS=$((n - first)) RADIXOX_IOWQ_CPUS="$(IFS=,; echo "${cpus[*]:first:n-first}")")
     fi
     env "${env[@]}" RADIXOX_PORT="$PORT" RADIXOX_SAVE="" RADIXOX_DIR="$dir" \
       systemd-run --user --scope -q -p MemoryMax="$MEM_MAX" "$RX_BIN" >"$dir/log" 2>&1 &
