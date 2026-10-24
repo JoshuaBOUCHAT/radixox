@@ -29,7 +29,7 @@ radixox-lib/    SharedByte, parseur RESP (cmd.rs) et encodeur, barrière de save
 radixox/        lib : `exec` (commandes, encodage, jobs, BGSAVE), `uring` (cœur sans I/O
                 de la boucle + faux noyau) ; binaire `radixox` (src/bin/uringloop.rs,
                 couche io_uring) ; tests d'intégration
-scripts/        bench_vs_valkey.sh (référence du README), stress_save.sh
+scripts/        bench_vs_valkey.sh (référence du README), bench_zipf.sh (accès Zipf, CPU par cœur), stress_save.sh
 ```
 
 `hislab` (slab mmap + THP) est une crate séparée : `~/rust/hislab`.
