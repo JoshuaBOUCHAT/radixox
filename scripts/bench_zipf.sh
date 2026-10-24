@@ -11,12 +11,20 @@
 #   scripts/bench_zipf.sh                         # ~2 min 30
 #   TEST_TIME=5 PIPELINES=64 scripts/bench_zipf.sh   # essai rapide
 #   CONFIGS="rx-1c vk-1t" ZIPF=1.2 scripts/bench_zipf.sh
-#   CONFIGS="rx-3c vk-3t" scripts/bench_zipf.sh    # CPU 0, 1, 6
-#   SERVER_CPUS=0,1,2 MT_CPUS=3-5 CONFIGS="vk-3t" scripts/bench_zipf.sh
+#   CONFIGS="rx-3c vk-3t" scripts/bench_zipf.sh    # 3 cœurs physiques
+#   SERVER_CPUS=0,1,6 MT_CPUS=2-5 CONFIGS="vk-3t" scripts/bench_zipf.sh   # à la main
 #   VALKEY_BIN=…/valkey-src/src/valkey-server scripts/bench_zipf.sh
 #
 # - Un serveur à la fois, 1M clés préchargées (une fois chacune, pipeline 64).
-# - memtier sur MT_CPUS (2–5), --distinct-client-seed --randomize.
+# - Placement automatique (topologie lue dans sysfs), sauf SERVER_CPUS / MT_CPUS
+#   donnés : le serveur prend un thread par cœur physique, les cœurs
+#   performants d'abord (cpu_capacity la plus haute ; sur un hybride Intel, les
+#   cœurs efficaces sont aussi listés dans /sys/devices/cpu_atom/cpus) ; autant
+#   de cœurs que le plus grand N de CONFIGS, plus un pour les threads bio de
+#   Valkey. Les jumeaux SMT de ces cœurs restent libres ; memtier prend tous les
+#   CPU des autres cœurs.
+# - memtier : MT_THREADS (4) × MT_CLIENTS (20) connexions, --distinct-client-seed
+#   --randomize.
 # - Charge user / noyau / softirq de chaque CPU lue dans /proc/stat pendant la
 #   mesure : le coût CPU par opération compte autant que le débit (le thread
 #   d'E/S de Valkey tourne en attente active).
@@ -31,10 +39,8 @@ KEYS="${KEYS:-1000000}"
 ZIPF="${ZIPF:-0.99}"
 PIPELINES="${PIPELINES:-1 64}"
 CONFIGS="${CONFIGS:-rx-1c rx-2c vk-1t vk-2t}"
-# CPU du serveur, dans l'ordre où on les prend (défaut : cœurs physiques 0 et 1
-# puis leurs jumeaux SMT 6 et 7, hors des CPU de memtier).
-SERVER_CPUS="${SERVER_CPUS:-0,1,6,7}"
-MT_CPUS="${MT_CPUS:-2-5}"
+MT_THREADS="${MT_THREADS:-4}"
+MT_CLIENTS="${MT_CLIENTS:-20}"
 RX_BIN="${RX_BIN:-$ROOT/target/release/radixox}"
 VALKEY_BIN="${VALKEY_BIN:-valkey-server}"
 PORT="${PORT:-6440}"
@@ -44,6 +50,44 @@ MEM_MAX="${MEM_MAX:-4G}"
 command -v memtier_benchmark >/dev/null
 SUMMARY="$OUT/summary.txt"
 : > "$SUMMARY"
+
+# Cœurs physiques en ligne, un par ligne : « classe premier_cpu cpus » (classe
+# P = performant, E = efficace), P d'abord puis par numéro de CPU.
+cores() {
+  local atom="" d c cap
+  [ -r /sys/devices/cpu_atom/cpus ] && atom=$(cat /sys/devices/cpu_atom/cpus)
+  for d in /sys/devices/system/cpu/cpu[0-9]*; do
+    c=${d##*cpu}
+    [ "$(cat "$d/online" 2>/dev/null || echo 1)" = 1 ] || continue
+    cap=$(cat "$d/cpu_capacity" 2>/dev/null || echo 1024)
+    if [ -n "$atom" ] && expand "$atom" | grep -qx "$c"; then cap=0; fi
+    echo "$c $cap $(cat "$d/topology/core_cpus_list" 2>/dev/null || echo "$c")"
+  done | awk '{if (!($3 in first) || $1 < first[$3]) first[$3]=$1; if ($2 > cap[$3]) cap[$3]=$2; if ($2 > max) max=$2}
+    END{for (k in first) printf "%s %d %s\n", (cap[k] >= 0.9*max ? "P" : "E"), first[k], k}' |
+    sort -k1,1r -k2,2n
+}
+
+# Liste « 0,1,6 » ou « 2-5 » → un CPU par ligne
+expand() { local a; for a in ${1//,/ }; do if [[ $a == *-* ]]; then seq "${a%-*}" "${a#*-}"; else echo "$a"; fi; done; }
+
+if [ -z "${SERVER_CPUS:-}" ] || [ -z "${MT_CPUS:-}" ]; then
+  need=0; vk=0
+  for cfg in $CONFIGS; do
+    n=${cfg//[!0-9]/}; (( ${n:-0} > need )) && need=$n
+    [[ $cfg == vk-* ]] && vk=1
+  done
+  need=$((need + vk))
+  mapfile -t CORES < <(cores)
+  (( need < ${#CORES[@]} )) || { echo "il faut $need cœurs physiques pour le serveur et au moins un pour memtier ; la machine en a ${#CORES[@]}" >&2; exit 1; }
+  srv=(); mt=()
+  for i in "${!CORES[@]}"; do
+    read -r cls first list <<< "${CORES[$i]}"
+    if (( i < need )); then srv+=("$first"); else mt+=($(expand "$list")); fi
+  done
+  SERVER_CPUS="${SERVER_CPUS:-$(IFS=,; echo "${srv[*]}")}"
+  MT_CPUS="${MT_CPUS:-$(IFS=,; echo "${mt[*]}")}"
+  echo "topologie : $(printf '%s\n' "${CORES[@]}" | awk '{n[$1]++} END{printf "%d cœurs P, %d cœurs E", n["P"], n["E"]}') ; serveur sur $SERVER_CPUS (jumeaux SMT libres), memtier sur $MT_CPUS"
+fi
 
 # cpu, user, noyau, irq+softirq, idle+iowait
 snap() { awk '/^cpu[0-9]+ /{print $1, $2+$3, $4, $7+$8, $5+$6}' /proc/stat; }
@@ -87,8 +131,7 @@ stop() {
 }
 trap stop EXIT
 
-# CPU affichés : ceux du serveur, puis ceux de memtier (listes « 0,1,6 » ou « 2-5 »)
-expand() { local a; for a in ${1//,/ }; do if [[ $a == *-* ]]; then seq "${a%-*}" "${a#*-}"; else echo "$a"; fi; done; }
+# CPU affichés : ceux du serveur, puis ceux de memtier
 SHOW=$( { expand "$SERVER_CPUS" | sed 's/^/serveur cpu/'; expand "$MT_CPUS" | sed 's/^/memtier cpu/'; } )
 
 echo "Zipf $ZIPF, $KEYS clés, ${TEST_TIME} s par cas ; résultats : $OUT" | tee -a "$SUMMARY"
@@ -97,7 +140,7 @@ for cfg in $CONFIGS; do
   mt --threads 1 --clients 1 --pipeline 64 --key-pattern P:P --ratio 1:0 --requests allkeys >/dev/null
   for p in $PIPELINES; do
     snap > "$OUT/s0"
-    mt --threads 4 --clients 20 --pipeline "$p" --key-pattern Z:Z --key-zipf-exp "$ZIPF" \
+    mt --threads "$MT_THREADS" --clients "$MT_CLIENTS" --pipeline "$p" --key-pattern Z:Z --key-zipf-exp "$ZIPF" \
        --ratio 1:4 --test-time "$TEST_TIME" > "$OUT/$cfg.p$p.txt"
     snap > "$OUT/s1"
     {
