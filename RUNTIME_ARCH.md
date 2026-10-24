@@ -726,7 +726,12 @@ Ryzen 7600X, `scripts/bench_zipf.sh`, Zipf 0,99, sans pipeline, 80 conns, sends 
   active** ; au-delà de ~1 000 conns actives, à revoir.
 - Avec SQPOLL (§6.4 bis) en plus, rx-4s : sans pipeline 467 K (multishot) contre 372 K,
   pipeline 64 3,61 M contre 3,25 M. Le passage de main ne coûte plus rien à la boucle, mais
-  les workers s'usent davantage (93–95 % contre 81–84 %) : perte aussi.
+  les workers s'usent davantage (93–95 % contre 81–84 %) : perte aussi. Profil (`perf -p`,
+  4 s, 322 K contre 440 K) : la copie passe bien sur les workers (`io_recv` sur `iou-wrk`),
+  mais le thread SQPOLL relaie chaque réveil de poll vers io-wq et coûte **plus** par op
+  (~1,5 µs contre ~1,3 µs en multishot) ; workers ~5,5 µs/op contre ~3,8 ; p50 0,26 ms
+  contre 0,12 (deux sauts de plus par requête). Le relais coûte plus que la copie qu'il
+  déplace : cette voie ne lève pas le plafond du thread SQPOLL.
 - Conclusion : io-wq n'est pas le bon outil pour la réception. Pour décharger le recv, il
   faut que chaque thread réseau garde un multishot sur **son propre anneau** (piste 4 du
   §17.6, threads réseau + SPSC). Lire la CQ sans `enter` (anneau sans `DEFER_TASKRUN`,
