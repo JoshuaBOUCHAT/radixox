@@ -1934,7 +1934,9 @@ CPU) :
    (attente active de quelques µs, puis futex). Contraintes : `SharedByte` non `Send` (rc
    non atomique) → octets possédés aux frontières ; allocateur v2 mono-thread ; garder le
    mode mono-thread pur. Proche du design « 2 threads » de mai, écarté alors : demande un
-   vrai document de conception.
+   vrai document de conception. **Écrit le 2026-10-24 : [`NET_THREADS_DESIGN.md`](NET_THREADS_DESIGN.md)**
+   (threads IO qui parsent, pointeurs dans leurs tampons, ack = réponse, repli epoll,
+   dimensionnement) ; non implémenté.
 
 Écarté de nouveau : SQPOLL (§14 : incompatible avec `DEFER_TASKRUN`, mesuré sans gain de
 débit) ; « que les workers io-wq lisent la SQ » (impossible : `SINGLE_ISSUER`, tête de SQ
