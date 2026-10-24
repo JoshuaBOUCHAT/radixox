@@ -717,6 +717,16 @@ Ryzen 7600X, `scripts/bench_zipf.sh`, Zipf 0,99, sans pipeline, 80 conns, sends 
   réponse) : chaque recv paie la tentative à vide et l'armement d'un poll sur le worker
   (`io_arm_poll_handler`), puis la relance. Le relais n'est évité que si les données sont
   déjà là, c'est-à-dire en pipeline, où la boucle n'a pas besoin d'aide.
+- **Tampons** : un worker io-wq qui choisit un tampon de l'anneau le réserve **en entier**
+  dès le choix (sélection hors `uring_lock`), et le garde tant que le recv attend des
+  données. Avec 64 × 32 Ko et 80 conns en pipeline 64 : `ENOBUFS` en boucle (le compteur
+  `available` ne voit pas ces réservations), puis blocage même en attendant qu'un tampon
+  revienne (cause non établie). Le mode met donc l'anneau à 1 024 × 4 Ko et ne réarme
+  plus sur `ENOBUFS` (`Config::recv_oneshot`) : **au moins un tampon par connexion
+  active** ; au-delà de ~1 000 conns actives, à revoir.
+- Avec SQPOLL (§6.4 bis) en plus, rx-4s : sans pipeline 467 K (multishot) contre 372 K,
+  pipeline 64 3,61 M contre 3,25 M. Le passage de main ne coûte plus rien à la boucle, mais
+  les workers s'usent davantage (93–95 % contre 81–84 %) : perte aussi.
 - Conclusion : io-wq n'est pas le bon outil pour la réception. Pour décharger le recv, il
   faut que chaque thread réseau garde un multishot sur **son propre anneau** (piste 4 du
   §17.6, threads réseau + SPSC). Lire la CQ sans `enter` (anneau sans `DEFER_TASKRUN`,

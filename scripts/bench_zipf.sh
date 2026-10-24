@@ -54,6 +54,7 @@ MEM_MAX="${MEM_MAX:-4G}"
 
 [ -x "$RX_BIN" ] || cargo build -q --release -p radixox --manifest-path "$ROOT/Cargo.toml"
 command -v memtier_benchmark >/dev/null
+mkdir -p "$OUT"
 SUMMARY="$OUT/summary.txt"
 : > "$SUMMARY"
 

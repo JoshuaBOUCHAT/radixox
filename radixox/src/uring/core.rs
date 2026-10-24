@@ -52,6 +52,11 @@ pub struct Config {
     pub reserved: u32,
     pub bufs: Bid,
     pub buf_size: u32,
+    /// Recv simples sur io-wq (`RADIXOX_RECV_ASYNC`) : le noyau réserve un tampon
+    /// entier dès qu'un worker le choisit, et le garde tant que le recv attend des
+    /// données. `available` ne le voit pas : sur `ENOBUFS`, attendre qu'un
+    /// tampon revienne au lieu de réarmer (sinon boucle sans fin, RUNTIME_ARCH.md §6.4).
+    pub recv_oneshot: bool,
     /// Frame incomplète d'une connexion, au plus (`client-query-buffer-limit`).
     pub query_limit: usize,
     /// Commandes par tour de boucle, au plus (garde-fou du budget de tour).
@@ -110,6 +115,7 @@ impl Default for Config {
             // de défauts L1 en moins (mesuré, RUNTIME_ARCH.md §12.4).
             bufs: 64,
             buf_size: 32 << 10,
+            recv_oneshot: false,
             query_limit: 1 << 30,
             // Taille d'une tranche de tour : entre deux tranches, les réponses des
             // connexions qui ont fini partent (la boucle rappelle `run_batch`).
@@ -1232,7 +1238,7 @@ impl Core {
                 // Un tampon a pu revenir entre l'échec du noyau et ce CQE (morceau
                 // sans frame complète, rendu aussitôt) : sinon, on attend le prochain.
                 if self.outs[s].mode == Mode::Normal && !self.ins[s].broken {
-                    if self.bufs.any_available() {
+                    if !self.cfg.recv_oneshot && self.bufs.any_available() {
                         self.arm_recv(slot);
                     } else {
                         self.starved.push(slot);

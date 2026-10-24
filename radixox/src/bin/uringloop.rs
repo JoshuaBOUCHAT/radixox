@@ -931,6 +931,13 @@ fn main() -> io::Result<()> {
         cfg.prefetch = w.max(1);
     }
     // Anneau de réception (RUNTIME_ARCH.md §5.1) : nombre et taille des tampons.
+    // Recv simples sur io-wq : chaque recv en vol réserve un tampon entier, il en
+    // faut au moins un par connexion active ; plus nombreux et plus petits.
+    if env_yes("RADIXOX_RECV_ASYNC", false) {
+        cfg.recv_oneshot = true;
+        cfg.bufs = 1024;
+        cfg.buf_size = 4 << 10;
+    }
     if let Some(n) = std::env::var("RADIXOX_RING_BUFS").ok().and_then(|v| v.parse::<u16>().ok()) {
         cfg.bufs = n.max(1);
     }
