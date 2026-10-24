@@ -796,6 +796,26 @@ meilleure). Sans pipeline, il ne parallélise pas la réception : un seul thread
 pour toutes les connexions. Le million sans pipeline passe par plusieurs threads réseau
 (§17.6, piste 4). La ligne SQ_POLL du §14 reste vraie pour le mode par défaut.
 
+**Coût par opération, recv contre send** (rx-4s sans pipeline, 440 K ops/s, `perf record -p`
+4 s, 2026-10-24) :
+
+| thread | CPU | rôle | coût / op |
+|---|---|---|---|
+| workers io-wq (×2) | 1,69 | send | **~3,8 µs** |
+| SQPOLL | 1,03 (≈ 0,58 utile) | recv multishot en task_work, soumission | ~1,3 µs |
+| boucle | 1,0 (attente active) | métier | — |
+
+Le send coûte trois fois le recv **à cause du loopback** : le send exécute aussi toute la
+réception du pair (`net_rx_action` → `process_backlog` → `tcp_v4_rcv`, 40 % du temps des
+workers) et netfilter deux fois (`nf_hook_slow`, 26 % : conntrack de firewalld sur `lo`).
+Symétriquement, le send de memtier paie notre traitement TCP de réception, et notre recv
+n'est plus qu'une copie depuis la file. Sur une vraie carte, le send s'arrête au pilote et
+la réception TCP passe en softirq sur le CPU de l'IRQ (RSS) : la répartition change, à
+mesurer à deux machines. Multishot sous SQPOLL : la requête appartient au thread SQPOLL,
+le réveil du poll y pose le task_work (`io_sq_tw` → `io_poll_task_func` → `io_recv`), la
+requête reste armée ; elle ne peut pas aller sur io-wq (la version simple + ASYNC perd,
+§6.4).
+
 ### 6.5 Signaux de diagnostic (exposés dans `INFO`)
 
 | Signal | Mesure |
