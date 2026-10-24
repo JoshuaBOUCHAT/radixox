@@ -29,6 +29,8 @@
 # - Charge user / noyau / softirq de chaque CPU lue dans /proc/stat pendant la
 #   mesure : le coût CPU par opération compte autant que le débit (le thread
 #   d'E/S de Valkey tourne en attente active).
+# - RSS du serveur (/proc/PID/status) : après le préchargement, après chaque
+#   mesure, et pic depuis le démarrage (VmHWM).
 # - Un seul passage par cas : ordre de grandeur, pas de médiane.
 # - Résultats dans $OUT/summary.txt.
 set -euo pipefail
@@ -93,6 +95,9 @@ MT_THREADS="${MT_THREADS:-$(expand "$MT_CPUS" | wc -l)}"
 MT_CLIENTS=$(( (MT_CONNS + MT_THREADS - 1) / MT_THREADS ))
 echo "memtier : $MT_THREADS threads × $MT_CLIENTS clients"
 
+# RSS du serveur en Mo : « VmRSS VmHWM »
+rss() { awk '/^VmRSS/{r=$2} /^VmHWM/{h=$2} END{printf "%.0f %.0f", r/1024, h/1024}' "/proc/$SPID/status"; }
+
 # cpu, user, noyau, irq+softirq, idle+iowait
 snap() { awk '/^cpu[0-9]+ /{print $1, $2+$3, $4, $7+$8, $5+$6}' /proc/stat; }
 
@@ -142,17 +147,20 @@ echo "Zipf $ZIPF, $KEYS clés, ${TEST_TIME} s par cas ; résultats : $OUT" | tee
 for cfg in $CONFIGS; do
   start "$cfg"
   mt --threads 1 --clients 1 --pipeline 64 --key-pattern P:P --ratio 1:0 --requests allkeys >/dev/null
+  read -r RSS_LOAD _ <<< "$(rss)"
   for p in $PIPELINES; do
     snap > "$OUT/s0"
     mt --threads "$MT_THREADS" --clients "$MT_CLIENTS" --pipeline "$p" --key-pattern Z:Z --key-zipf-exp "$ZIPF" \
        --ratio 1:4 --test-time "$TEST_TIME" > "$OUT/$cfg.p$p.txt"
     snap > "$OUT/s1"
+    read -r rss_now rss_peak <<< "$(rss)"
     {
       awk -v c="$cfg" -v p="$p" '/^Totals/{printf "%-6s pipeline %-3s %10.0f ops/s   p50 %6s   p99 %6s   p99.9 %6s ms\n", c, p, $2, $(NF-3), $(NF-2), $(NF-1)}' "$OUT/$cfg.p$p.txt"
-      join "$OUT/s0" "$OUT/s1" | awk -v show="$SHOW" 'BEGIN{n=split(show, l, "\n"); for (k=1; k<=n; k++) {split(l[k], f, " "); role[f[2]]=f[1]; ord[k]=f[2]}}
+      join "$OUT/s0" "$OUT/s1" | awk -v show="$SHOW" -v rl="$RSS_LOAD" -v rn="$rss_now" -v rp="$rss_peak" 'BEGIN{n=split(show, l, "\n"); for (k=1; k<=n; k++) {split(l[k], f, " "); role[f[2]]=f[1]; ord[k]=f[2]}}
         {u=$6-$2; s=$7-$3; q=$8-$4; i=$9-$5; t=u+s+q+i; if (t>0) line[$1]=sprintf("         %-5s %-7s occupé %3.0f %%  user %3.0f  noyau %3.0f  softirq %3.0f", $1, role[$1], 100*(u+s+q)/t, 100*u/t, 100*s/t, 100*q/t)}
         {if (role[$1]=="memtier" && t>0) {mt+=100*(u+s+q)/t; nm++}}
         END{for (k=1; k<=n; k++) if (ord[k] in line) print line[ord[k]]
+            printf "         RSS  chargé %s Mo  après %s Mo  pic %s Mo\n", rl, rn, rp
             if (nm && mt/nm > 85) printf "         ⚠ memtier saturé (%.0f %% en moyenne) : ce débit est celui du client\n", mt/nm}'
     } | tee -a "$SUMMARY"
   done
