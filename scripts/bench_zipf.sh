@@ -23,8 +23,9 @@
 #   de cœurs que le plus grand N de CONFIGS, plus un pour les threads bio de
 #   Valkey. Les jumeaux SMT de ces cœurs restent libres ; memtier prend tous les
 #   CPU des autres cœurs.
-# - memtier : MT_THREADS (4) × MT_CLIENTS (20) connexions, --distinct-client-seed
-#   --randomize.
+# - memtier : un thread par CPU de MT_CPUS (MT_THREADS), MT_CONNS (80)
+#   connexions en tout, --distinct-client-seed --randomize. Si ses CPU passent
+#   85 % d'occupation, le cas est signalé : le débit mesure alors le client.
 # - Charge user / noyau / softirq de chaque CPU lue dans /proc/stat pendant la
 #   mesure : le coût CPU par opération compte autant que le débit (le thread
 #   d'E/S de Valkey tourne en attente active).
@@ -39,8 +40,7 @@ KEYS="${KEYS:-1000000}"
 ZIPF="${ZIPF:-0.99}"
 PIPELINES="${PIPELINES:-1 64}"
 CONFIGS="${CONFIGS:-rx-1c rx-2c vk-1t vk-2t}"
-MT_THREADS="${MT_THREADS:-4}"
-MT_CLIENTS="${MT_CLIENTS:-20}"
+MT_CONNS="${MT_CONNS:-80}"
 RX_BIN="${RX_BIN:-$ROOT/target/release/radixox}"
 VALKEY_BIN="${VALKEY_BIN:-valkey-server}"
 PORT="${PORT:-6440}"
@@ -88,6 +88,10 @@ if [ -z "${SERVER_CPUS:-}" ] || [ -z "${MT_CPUS:-}" ]; then
   MT_CPUS="${MT_CPUS:-$(IFS=,; echo "${mt[*]}")}"
   echo "topologie : $(printf '%s\n' "${CORES[@]}" | awk '{n[$1]++} END{printf "%d cœurs P, %d cœurs E", n["P"], n["E"]}') ; serveur sur $SERVER_CPUS (jumeaux SMT libres), memtier sur $MT_CPUS"
 fi
+
+MT_THREADS="${MT_THREADS:-$(expand "$MT_CPUS" | wc -l)}"
+MT_CLIENTS=$(( (MT_CONNS + MT_THREADS - 1) / MT_THREADS ))
+echo "memtier : $MT_THREADS threads × $MT_CLIENTS clients"
 
 # cpu, user, noyau, irq+softirq, idle+iowait
 snap() { awk '/^cpu[0-9]+ /{print $1, $2+$3, $4, $7+$8, $5+$6}' /proc/stat; }
@@ -147,7 +151,9 @@ for cfg in $CONFIGS; do
       awk -v c="$cfg" -v p="$p" '/^Totals/{printf "%-6s pipeline %-3s %10.0f ops/s   p50 %6s   p99 %6s   p99.9 %6s ms\n", c, p, $2, $(NF-3), $(NF-2), $(NF-1)}' "$OUT/$cfg.p$p.txt"
       join "$OUT/s0" "$OUT/s1" | awk -v show="$SHOW" 'BEGIN{n=split(show, l, "\n"); for (k=1; k<=n; k++) {split(l[k], f, " "); role[f[2]]=f[1]; ord[k]=f[2]}}
         {u=$6-$2; s=$7-$3; q=$8-$4; i=$9-$5; t=u+s+q+i; if (t>0) line[$1]=sprintf("         %-5s %-7s occupé %3.0f %%  user %3.0f  noyau %3.0f  softirq %3.0f", $1, role[$1], 100*(u+s+q)/t, 100*u/t, 100*s/t, 100*q/t)}
-        END{for (k=1; k<=n; k++) if (ord[k] in line) print line[ord[k]]}'
+        {if (role[$1]=="memtier" && t>0) {mt+=100*(u+s+q)/t; nm++}}
+        END{for (k=1; k<=n; k++) if (ord[k] in line) print line[ord[k]]
+            if (nm && mt/nm > 85) printf "         ⚠ memtier saturé (%.0f %% en moyenne) : ce débit est celui du client\n", mt/nm}'
     } | tee -a "$SUMMARY"
   done
   stop
