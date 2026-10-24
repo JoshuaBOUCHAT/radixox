@@ -122,6 +122,10 @@ struct Server {
     no_iowait: bool,
     /// Sends délégués aux workers io-wq (`IOSQE_ASYNC`, RUNTIME_ARCH.md §6.4).
     send_async: bool,
+    /// Recv simples délégués aux workers io-wq au lieu du multishot
+    /// (`RADIXOX_RECV_ASYNC`, RUNTIME_ARCH.md §6.4) : la réception TCP et la copie
+    /// dans nos tampons tournent sur le worker.
+    recv_async: bool,
     /// Écritures du dump sur io-wq, épinglé hors de notre cœur (`RADIXOX_FILE_CPUS`).
     file_async: bool,
     /// Attente groupée (expérimental) : `(want, µs)`, le noyau attend `want`
@@ -253,7 +257,7 @@ impl Server {
                         self.core.complete(Completion::Recv { slot, res: -libc::EBADF, bid: None, buf_more: false, more: false });
                         continue;
                     }
-                    opcode::RecvMulti::new(Fixed(slot), BGID).build().user_data(ud(K_RECV, slot))
+                    self.recv_sqe(slot)
                 }
                 Op::Reject { fd } => {
                     let msg = b"-ERR max number of clients reached\r\n";
@@ -262,7 +266,7 @@ impl Server {
                     close(fd);
                     continue;
                 }
-                Op::RecvMulti { slot } => opcode::RecvMulti::new(Fixed(slot), BGID).build().user_data(ud(K_RECV, slot)),
+                Op::RecvMulti { slot } => self.recv_sqe(slot),
                 Op::Send { slot } => {
                     // Le tampon reste intact jusqu'au CQE (invariant du cœur).
                     let buf = self.core.pending_send(slot);
@@ -391,6 +395,21 @@ impl Server {
     }
 
     /// Place pour `n` SQE consécutives (une chaîne liée) sans soumission entre.
+    /// Recv d'une connexion : multishot (défaut), ou simple sur io-wq. Le recv
+    /// simple rend `more = false` à chaque CQE : le cœur le réarme comme un
+    /// multishot terminé. Les deux choisissent leur tampon dans notre anneau.
+    fn recv_sqe(&self, slot: Slot) -> squeue::Entry {
+        if self.recv_async {
+            opcode::Recv::new(Fixed(slot), std::ptr::null_mut(), 0)
+                .buf_group(BGID)
+                .build()
+                .flags(squeue::Flags::BUFFER_SELECT | squeue::Flags::ASYNC)
+                .user_data(ud(K_RECV, slot))
+        } else {
+            opcode::RecvMulti::new(Fixed(slot), BGID).build().user_data(ud(K_RECV, slot))
+        }
+    }
+
     fn reserve_sqes(&mut self, n: usize) -> io::Result<()> {
         loop {
             let free = {
@@ -712,7 +731,8 @@ fn min_wait(ring: &IoUring) -> Option<(u32, u32)> {
 
 /// Délégation à io-wq (RUNTIME_ARCH.md §6.4), version statique ; rend
 /// `(sends, fichiers)` délégués.
-/// - `RADIXOX_SEND_ASYNC=1` : sends en `IOSQE_ASYNC` ; `RADIXOX_IOWQ_WORKERS`
+/// - `RADIXOX_SEND_ASYNC=1` : sends en `IOSQE_ASYNC` ; `RADIXOX_RECV_ASYNC=1` :
+///   recv simples en `IOSQE_ASYNC` au lieu du multishot ; `RADIXOX_IOWQ_WORKERS`
 ///   fixe le plafond de workers réseau (1 par défaut : sans plafond, le noyau
 ///   peut en créer des dizaines) ; `RADIXOX_IOWQ_CPUS` (« 1,7 ») les épingle.
 /// - `RADIXOX_FILE_CPUS` (« 1 ») : écritures du dump en `IOSQE_ASYNC`, un worker
@@ -721,23 +741,29 @@ fn min_wait(ring: &IoUring) -> Option<(u32, u32)> {
 ///   cœur, §8.2).
 ///
 /// L'affinité vaut pour tous les workers du ring : c'est l'union des deux listes.
-fn setup_iowq(ring: &IoUring) -> io::Result<(bool, bool)> {
-    let send = std::env::var("RADIXOX_SEND_ASYNC")
-        .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+fn setup_iowq(ring: &IoUring) -> io::Result<(bool, bool, bool)> {
+    let send = env_yes("RADIXOX_SEND_ASYNC", false);
+    let recv = env_yes("RADIXOX_RECV_ASYNC", false);
+    let net = send || recv;
     let file_cpus = std::env::var("RADIXOX_FILE_CPUS").ok().filter(|v| !v.trim().is_empty());
-    if !send && file_cpus.is_none() {
-        return Ok((false, false));
+    if !net && file_cpus.is_none() {
+        return Ok((false, false, false));
     }
     let workers: u32 = std::env::var("RADIXOX_IOWQ_WORKERS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
     // [bounded (disque), unbounded (réseau)] ; 0 = inchangé. Une écriture du
     // dump au plus en vol : un worker fichiers suffit.
-    let mut max = [u32::from(file_cpus.is_some()), if send { workers.max(1) } else { 0 }];
+    let mut max = [u32::from(file_cpus.is_some()), if net { workers.max(1) } else { 0 }];
     ring.submitter().register_iowq_max_workers(&mut max)?;
     let mut parts = Vec::new();
-    if send {
-        parts.push(format!("sends délégués à io-wq : {} worker(s) réseau", workers.max(1)));
+    if net {
+        let what = match (send, recv) {
+            (true, true) => "sends et recv",
+            (true, false) => "sends",
+            _ => "recv",
+        };
+        parts.push(format!("{what} délégués à io-wq : {} worker(s) réseau", workers.max(1)));
     }
-    let cpus: Vec<String> = [std::env::var("RADIXOX_IOWQ_CPUS").ok().filter(|_| send), file_cpus.clone()]
+    let cpus: Vec<String> = [std::env::var("RADIXOX_IOWQ_CPUS").ok().filter(|_| net), file_cpus.clone()]
         .into_iter()
         .flatten()
         .collect();
@@ -754,7 +780,7 @@ fn setup_iowq(ring: &IoUring) -> io::Result<(bool, bool)> {
         parts.push(format!("affinité io-wq : CPU {}", cpus.join(",")));
     }
     println!("{}", parts.join(" ; "));
-    Ok((send, file_cpus.is_some()))
+    Ok((send, recv, file_cpus.is_some()))
 }
 
 /// Taille : octets, ou suffixe `kb` / `mb` / `gb` (puissances de 1024, comme Valkey).
@@ -874,7 +900,7 @@ fn main() -> io::Result<()> {
     cfg.max_conn = raise_nofile(cfg.max_conn);
     ring.submitter().register_files_sparse(cfg.max_conn)?;
     let no_iowait = ring.params().is_feature_no_iowait();
-    let (send_async, file_async) = setup_iowq(&ring)?;
+    let (send_async, recv_async, file_async) = setup_iowq(&ring)?;
     let min_wait = min_wait(&ring);
     if let Some(mb) = std::env::var("RADIXOX_AOF_MAX_PENDING_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
         cfg.aof_max_pending = mb.max(1) << 20;
@@ -914,7 +940,7 @@ fn main() -> io::Result<()> {
 
     // Avec l'AOF, le flux suffit à l'arrêt : pas de save par défaut.
     let signals = Signals::install(core.autosave_on() && !aof_on, aof_on)?;
-    let mut server = Server { ring, bufring, core, listener, ops: Vec::new(), no_iowait, send_async, file_async, min_wait,
+    let mut server = Server { ring, bufring, core, listener, ops: Vec::new(), no_iowait, send_async, recv_async, file_async, min_wait,
         signals,
         connects: Default::default(),
         stop: None,

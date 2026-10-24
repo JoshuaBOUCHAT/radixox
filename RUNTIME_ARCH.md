@@ -698,6 +698,30 @@ tampons. Le type de buffer (`READ_FIXED`, enregistré) ne change pas qui copie. 
 réception : la copie socket → tampon de l'anneau et le CQE, au moment où **nous** entrons
 (le softirq TCP tourne ailleurs).
 
+**Prototype mesuré (2026-10-24) : `RADIXOX_RECV_ASYNC=1`, perte nette, désactivé par
+défaut.** Recv simple + `BUFFER_SELECT` sur notre anneau + `IOSQE_ASYNC` ; le cœur n'a pas
+changé (un CQE `more = false` avec données réarme, comme un multishot terminé). Loopback,
+Ryzen 7600X, `scripts/bench_zipf.sh`, Zipf 0,99, sans pipeline, 80 conns, sends délégués :
+
+| | multishot | `RECV_ASYNC` |
+|---|---|---|
+| rx-3c (boucle + 2 workers) | 592 K, boucle 82 %, workers 100 % | 502 K, boucle 69 %, workers 99 % |
+| rx-3c + `MIN_WAIT` 5/8 | 630 K (client saturé) | 445 K |
+| rx-4c (boucle + 3 workers), client saturé | 469 K, boucle 69 %, workers ~53 % ; 2,28 cœurs | 471 K, boucle **86 %**, workers **~98 %** ; **3,79 cœurs** |
+
+- `io_recv` disparaît bien du thread de la boucle (profil : 33 % de son temps avant), mais
+  à débit égal la boucle coûte **plus** : un SQE de plus par commande (`io_submit_sqes`
+  9 → 15 %), le réveil d'un worker par recv (`io_wq_enqueue`), des CQE qui arrivent un par
+  un (sommeil / réveil 13 → 17 %).
+- Sans pipeline, la socket est **toujours vide** quand le recv part (le client attend la
+  réponse) : chaque recv paie la tentative à vide et l'armement d'un poll sur le worker
+  (`io_arm_poll_handler`), puis la relance. Le relais n'est évité que si les données sont
+  déjà là, c'est-à-dire en pipeline, où la boucle n'a pas besoin d'aide.
+- Conclusion : io-wq n'est pas le bon outil pour la réception. Pour décharger le recv, il
+  faut que chaque thread réseau garde un multishot sur **son propre anneau** (piste 4 du
+  §17.6, threads réseau + SPSC). Lire la CQ sans `enter` (anneau sans `DEFER_TASKRUN`,
+  CQE postés par les workers) ne change rien à ce coût et n'a pas été tenté.
+
 **Ordre de mise en place, sans optimisation prématurée :**
 1. `RADIXOX_SEND_ASYNC=off|on`, statique. Mesures à charge faible, moyenne et saturée,
    sur 2 vCPU, en loopback puis en cloud.
@@ -1827,7 +1851,9 @@ CPU) :
 1. **Attente groupée automatique** quand les envois sont délégués et que la boucle fait
    ~1 `enter` par commande (§12.7 : `enter` ÷7). Existe déjà en option
    (`RADIXOX_MIN_WAIT_US` / `RADIXOX_WAIT_NR`).
-2. **Recv simple en `IOSQE_ASYNC`** (§6.4, « À rouvrir ») : jusqu'à ~25 % de la boucle.
+2. ~~**Recv simple en `IOSQE_ASYNC`**~~ : mesuré le 2026-10-24 (§6.4), perte nette
+   (+66 % de CPU serveur et boucle +25 % à débit égal) ; `RADIXOX_RECV_ASYNC` reste en
+   option, désactivé.
 3. **Enregistrer le fd de l'anneau** (`IORING_REGISTER_RING_FDS` +
    `IORING_ENTER_REGISTERED_RING`) : ~1 % à 317 K `enter`/s ; vérifier le support du crate
    `io-uring`.
