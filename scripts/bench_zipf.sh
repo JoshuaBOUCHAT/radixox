@@ -88,7 +88,8 @@ if [ -z "${SERVER_CPUS:-}" ] || [ -z "${MT_CPUS:-}" ]; then
   done
   SERVER_CPUS="${SERVER_CPUS:-$(IFS=,; echo "${srv[*]}")}"
   MT_CPUS="${MT_CPUS:-$(IFS=,; echo "${mt[*]}")}"
-  echo "topologie : $(printf '%s\n' "${CORES[@]}" | awk '{n[$1]++} END{printf "%d cœurs P, %d cœurs E", n["P"], n["E"]}') ; serveur sur $SERVER_CPUS (jumeaux SMT libres), memtier sur $MT_CPUS"
+  echo "topologie : $(printf '%s\n' "${CORES[@]}" | awk '{n[$1]++; l=l" "$3} END{printf "%d cœurs P, %d cœurs E ; CPU par cœur physique :%s\n", n["P"], n["E"], l}')"
+  echo "placement : serveur sur $SERVER_CPUS (jumeaux SMT libres), memtier sur $MT_CPUS"
 fi
 
 MT_THREADS="${MT_THREADS:-$(expand "$MT_CPUS" | wc -l)}"
@@ -140,7 +141,10 @@ stop() {
 trap stop EXIT
 
 # CPU affichés : ceux du serveur, puis ceux de memtier
-SHOW=$( { expand "$SERVER_CPUS" | sed 's/^/serveur cpu/'; expand "$MT_CPUS" | sed 's/^/memtier cpu/'; } )
+# puis tous les autres (« libre » : jumeaux SMT du serveur, CPU inutilisés)
+SHOW=$( { expand "$SERVER_CPUS" | sed 's/^/serveur cpu/'; expand "$MT_CPUS" | sed 's/^/memtier cpu/'
+          ls -d /sys/devices/system/cpu/cpu[0-9]* | sed 's|.*/cpu||' | sort -n | sed 's/^/libre cpu/'; } |
+        awk '!seen[$2]++' )
 
 echo "Zipf $ZIPF, $KEYS clés, ${TEST_TIME} s par cas ; résultats : $OUT" | tee -a "$SUMMARY"
 for cfg in $CONFIGS; do
