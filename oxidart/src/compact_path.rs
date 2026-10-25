@@ -144,10 +144,12 @@ impl CompactPath {
     /// GC (MEMORY_ARCH.md §17) : un objet d'un bloc marqué est recopié au curseur des
     /// survivants. Propriétaire unique : jamais épinglé. Rend les octets recopiés.
     pub(crate) fn gc_relocate(&mut self) -> usize {
-        let Some((base, size)) = self.pool_slot() else { return 0 };
-        if !pool::is_marked(base) {
+        // L'adresse d'abord, sans lire l'en-tête (un défaut de cache par chemin visité) :
+        // une forme longue, hors du pool, n'est jamais marquée.
+        if !self.is_heap() || !pool::is_marked(unsafe { self.0.heap.sub(Self::SHORT_HEADER) } as usize) {
             return 0;
         }
+        let Some((base, size)) = self.pool_slot() else { return 0 };
         let new = pool::alloc_survivor(size);
         if new.is_null() {
             return 0; // plage pleine : l'objet reste

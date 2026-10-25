@@ -141,11 +141,11 @@ impl SharedByte {
     pub fn gc_relocate(&mut self) -> usize {
         #[cfg(not(any(radixox_nopool, radixox_sysalloc)))]
         {
-            if self.is_external() {
-                return 0;
-            }
+            // L'adresse d'abord : la plupart des objets ne sont pas dans un bloc marqué,
+            // et lire l'en-tête serait un défaut de cache par valeur visitée. Une forme
+            // longue (jemalloc) est hors de la plage du pool : jamais marquée.
             let base = self.header_ptr() as *mut u8;
-            if !crate::pool::is_marked(base as usize) {
+            if !crate::pool::is_marked(base as usize) || self.is_external() {
                 return 0;
             }
             if self.rc() != 1 {
