@@ -490,7 +490,15 @@ impl OxidArt {
         Some(unsafe { value_from_raw_ref(tag, val) })
     }
 
-    /// EXISTS à une clé.
+    /// Une clé de MGET : la valeur string par référence (`None` : absente,
+    /// expirée ou pas une string), sans clone.
+    pub fn str_hinted(&mut self, key: &[u8], hint: Hint) -> Option<RangeVal<'_>> {
+        let loc = self.live_hinted(key, hint)?;
+        let (tag, val, exp) = self.loc_value(loc);
+        str_val(tag, val, exp, self.now)
+    }
+
+    /// EXISTS d'une clé.
     pub fn exists_hinted(&mut self, key: &[u8], hint: Hint) -> bool {
         self.live_hinted(key, hint).is_some()
     }

@@ -1622,17 +1622,22 @@ impl Core {
             // avec les indices, fenêtre d'oxidart ouverte. Les autres frames
             // coupent les séries et passent par le chemin normal, fenêtre fermée.
             let amac = cfg.amac > 0 && !cfg!(radixox_gc_debug) && !read_only && refuse_writes.is_none() && !over_cap;
-            let keys: Window<Option<&[u8]>> = frames
+            // Clés de toutes les frames avec indice, à la suite ; `spans[i]` :
+            // celles de la frame i (début, nombre).
+            let mut flat: SmallVec<[&[u8]; oxidart::PREFETCH_BATCH]> = SmallVec::new();
+            let spans: Window<Option<(usize, usize)>> = frames
                 .iter()
                 .map(|(slot, c, _, _)| {
                     let o = &outs[*slot as usize];
-                    if amac && o.client.authed && o.channels.is_empty() { crate::exec::hint_key(c) } else { None }
+                    let start = flat.len();
+                    (amac && o.client.authed && o.channels.is_empty() && crate::exec::hint_keys(c, |k| flat.push(k)))
+                        .then(|| (start, flat.len() - start))
                 })
                 .collect();
-            // dans une série (au moins deux indices de suite)
-            let in_run: Window<bool> = (0..keys.len())
+            // dans une série (au moins deux frames avec indice de suite)
+            let in_run: Window<bool> = (0..spans.len())
                 .map(|i| {
-                    let has = |j: usize| keys.get(j).is_some_and(|k| k.is_some());
+                    let has = |j: usize| spans.get(j).is_some_and(|s| s.is_some());
                     has(i) && (has(i + 1) || (i > 0 && has(i - 1)))
                 })
                 .collect();
@@ -1647,9 +1652,8 @@ impl Core {
                     art.prefetch_keys(&rest);
                 }
             }
-            // la fenêtre est bornée par PREFETCH_BATCH (`width`)
-            let mut hints = [oxidart::Hint::NONE; oxidart::PREFETCH_BATCH];
-            // fin de la série en cours : fenêtre d'oxidart ouverte avant
+            let mut hints: SmallVec<[oxidart::Hint; oxidart::PREFETCH_BATCH]> = smallvec::smallvec![oxidart::Hint::NONE; flat.len()];
+            // fin de la série en cours (en frames) : fenêtre d'oxidart ouverte avant
             let mut run_end = 0;
             for (k, (slot, cmd, raw, end)) in frames.into_iter().enumerate() {
                 if k == run_end && art.in_window() {
@@ -1657,17 +1661,21 @@ impl Core {
                 }
                 if k >= run_end && in_run[k] {
                     run_end = k + in_run[k..].iter().take_while(|r| **r).count();
-                    let run_keys: Window<&[u8]> = keys[k..run_end].iter().map(|k| k.expect("série")).collect();
-                    art.amac_descend(&run_keys, cfg.amac, &mut hints[k..run_end]);
+                    let (from, _) = spans[k].expect("série");
+                    let (last, n) = spans[run_end - 1].expect("série");
+                    let to = last + n;
+                    art.amac_descend(&flat[from..to], cfg.amac, &mut hints[from..to]);
                     art.begin_window();
                 }
                 if k < run_end {
-                    // préchargement en avance sur l'exécution (PF1 : nœud, PF2 : valeur)
-                    if cfg.amac_pf >= 1 && k + 4 < run_end {
-                        art.prefetch_hint_node(hints[k + 4]);
+                    // préchargement en avance sur l'exécution (PF1 : nœud, PF2 :
+                    // valeur), sur la première clé des frames suivantes
+                    let first = |j: usize| spans.get(j).copied().flatten().filter(|&(_, n)| j < run_end && n > 0).map(|(s, _)| hints[s]);
+                    if cfg.amac_pf >= 1 && let Some(h) = first(k + 4) {
+                        art.prefetch_hint_node(h);
                     }
-                    if cfg.amac_pf >= 2 && k + 2 < run_end {
-                        art.prefetch_hint_value(hints[k + 2]);
+                    if cfg.amac_pf >= 2 && let Some(h) = first(k + 2) {
+                        art.prefetch_hint_value(h);
                     }
                     // ni plafond du flux ni réplica : aucun écrivain arrêté
                     debug_assert!(aof_stops.is_empty());
@@ -1676,9 +1684,10 @@ impl Core {
                     if weight > 0 {
                         persist.note_writes(weight);
                     }
-                    let hint = hints[k];
+                    let (s, n) = spans[k].expect("série");
+                    let hints = &hints[s..s + n];
                     let after = journaled(journal.as_mut(), release_upto, held, slot, o, raw, art, cmd, |cmd, art, o| {
-                        extend_encode(&mut o.out, &crate::exec::execute_hinted(cmd, art, hint));
+                        crate::exec::execute_hinted(cmd, art, hints, &mut o.out);
                         After::Continue
                     });
                     afters.push((slot, after));

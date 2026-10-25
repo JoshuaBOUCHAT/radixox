@@ -135,10 +135,11 @@ pub fn execute_into<'a>(
 
 // ── Commandes avec indice (moteur AMAC, RUNTIME_ARCH.md §8bis) ───────────────
 
-/// Clé d'une commande que [`execute_hinted`] sait exécuter : une clé, et un
-/// effet sur l'arbre qui ne passe que par les primitives de la fenêtre AMAC
+/// Clés d'une commande que [`execute_hinted`] sait exécuter, passées à
+/// `push` dans l'ordre (`false`, rien passé : pas une telle commande). Son
+/// effet sur l'arbre ne passe que par les primitives de la fenêtre AMAC
 /// d'oxidart (`prefetch_batch.rs`).
-pub fn hint_key<'a>(cmd: &Cmd<'a>) -> Option<&'a [u8]> {
+pub fn hint_keys<'a>(cmd: &Cmd<'a>, mut push: impl FnMut(&'a [u8])) -> bool {
     match cmd {
         Cmd::Get(k)
         | Cmd::Type(k)
@@ -151,31 +152,79 @@ pub fn hint_key<'a>(cmd: &Cmd<'a>) -> Option<&'a [u8]> {
         | Cmd::SetNx { key: k, .. }
         | Cmd::Expire { key: k, .. }
         | Cmd::IncrBy { key: k, .. }
-        | Cmd::DecrBy { key: k, .. } => Some(k),
-        Cmd::Del(keys) | Cmd::Exists(keys) if keys.len() == 1 => Some(keys[0]),
-        _ => None,
+        | Cmd::DecrBy { key: k, .. } => push(k),
+        Cmd::Del(keys) | Cmd::Exists(keys) => keys.iter().for_each(|k| push(k)),
+        Cmd::MGet(keys) => keys.iter().for_each(|k| push(k)),
+        Cmd::MSet(pairs) => pairs.iter().for_each(|(k, _)| push(k)),
+        _ => return false,
     }
+    true
 }
 
-/// Comme [`execute_sync`], avec l'indice de la descente AMAC de
-/// [`hint_key`]`(cmd)`, dans une fenêtre ouverte (`OxidArt::begin_window`).
-pub fn execute_hinted(cmd: Cmd<'_>, art: &mut OxidArt, hint: oxidart::Hint) -> Frame {
-    match cmd {
-        Cmd::Get(key) => cmd_get_hinted(art, key, hint),
-        Cmd::Set { key, val, opts } => cmd_set_hinted(art, key, val, opts, hint),
-        Cmd::SetNx { key, val } => cmd_setnx_hinted(art, key, val, hint),
-        Cmd::Del(keys) => Frame::Integer(art.del_hinted(keys[0], hint) as i64),
-        Cmd::Exists(keys) => Frame::Integer(art.exists_hinted(keys[0], hint) as i64),
-        Cmd::Type(key) => cmd_type_hinted(art, key, hint),
-        Cmd::Ttl(key) => cmd_ttl_hinted(art, key, false, hint),
-        Cmd::Pttl(key) => cmd_ttl_hinted(art, key, true, hint),
-        Cmd::Expire { key, dur } => Frame::Integer(art.expire_hinted(key, dur, hint) as i64),
-        Cmd::Persist(key) => Frame::Integer(art.persist_hinted(key, hint) as i64),
-        Cmd::Incr(key) => cmd_incrby_hinted(art, key, 1, hint),
-        Cmd::Decr(key) => cmd_incrby_hinted(art, key, -1, hint),
-        Cmd::IncrBy { key, delta } => cmd_incrby_hinted(art, key, delta, hint),
-        Cmd::DecrBy { key, delta } => cmd_incrby_hinted(art, key, delta.wrapping_neg(), hint),
-        _ => unreachable!("execute_hinted : commande sans hint_key"),
+/// Comme [`execute_into`], avec un indice de la descente AMAC par clé de
+/// [`hint_keys`]`(cmd)`, dans une fenêtre ouverte (`OxidArt::begin_window`).
+pub fn execute_hinted(cmd: Cmd<'_>, art: &mut OxidArt, hints: &[oxidart::Hint], out: &mut Vec<u8>) {
+    use radixox_lib::shared_frame::extend_encode;
+    let h = hints[0];
+    let frame = match cmd {
+        Cmd::Get(key) => cmd_get_hinted(art, key, h),
+        Cmd::Set { key, val, opts } => cmd_set_hinted(art, key, val, opts, h),
+        Cmd::SetNx { key, val } => cmd_setnx_hinted(art, key, val, h),
+        Cmd::Type(key) => cmd_type_hinted(art, key, h),
+        Cmd::Ttl(key) => cmd_ttl_hinted(art, key, false, h),
+        Cmd::Pttl(key) => cmd_ttl_hinted(art, key, true, h),
+        Cmd::Expire { key, dur } => Frame::Integer(art.expire_hinted(key, dur, h) as i64),
+        Cmd::Persist(key) => Frame::Integer(art.persist_hinted(key, h) as i64),
+        Cmd::Incr(key) => cmd_incrby_hinted(art, key, 1, h),
+        Cmd::Decr(key) => cmd_incrby_hinted(art, key, -1, h),
+        Cmd::IncrBy { key, delta } => cmd_incrby_hinted(art, key, delta, h),
+        Cmd::DecrBy { key, delta } => cmd_incrby_hinted(art, key, delta.wrapping_neg(), h),
+        Cmd::Del(keys) => {
+            let mut n = 0;
+            for (j, (k, &h)) in keys.iter().zip(hints).enumerate() {
+                prefetch_next(art, hints, j);
+                n += art.del_hinted(k, h) as i64;
+            }
+            Frame::Integer(n)
+        }
+        Cmd::Exists(keys) => {
+            let mut n = 0;
+            for (j, (k, &h)) in keys.iter().zip(hints).enumerate() {
+                prefetch_next(art, hints, j);
+                n += art.exists_hinted(k, h) as i64;
+            }
+            Frame::Integer(n)
+        }
+        Cmd::MSet(pairs) => {
+            for (j, ((k, v), &h)) in pairs.iter().zip(hints).enumerate() {
+                prefetch_next(art, hints, j);
+                art.set_cond_hinted(k, None, oxidart::value::Value::String(v.clone()), None, h);
+            }
+            resp_ok()
+        }
+        Cmd::MGet(keys) => {
+            use oxidart::krange::RangeVal;
+            radixox_lib::shared_frame::encode_array_len(out, keys.len());
+            for (j, (k, &h)) in keys.iter().zip(hints).enumerate() {
+                prefetch_next(art, hints, j);
+                match art.str_hinted(k, h) {
+                    Some(RangeVal::Bytes(b)) => radixox_lib::shared_frame::encode_bulk(out, b.as_slice()),
+                    Some(RangeVal::Int(n)) => encode_int_bulk(out, n),
+                    None => out.extend_from_slice(b"$-1\r\n"),
+                }
+            }
+            return;
+        }
+        _ => unreachable!("execute_hinted : commande sans hint_keys"),
+    };
+    extend_encode(out, &frame);
+}
+
+/// Dans une commande à plusieurs clés : précharge la valeur de la clé j+2.
+#[inline]
+fn prefetch_next(art: &OxidArt, hints: &[oxidart::Hint], j: usize) {
+    if let Some(&h) = hints.get(j + 2) {
+        art.prefetch_hint_value(h);
     }
 }
 

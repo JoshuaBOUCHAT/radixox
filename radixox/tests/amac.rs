@@ -32,7 +32,7 @@ impl Drop for Server {
 fn start(port: u16, dir: &Path, env: &[(&str, &str)]) -> Server {
     let _ = Command::new("fuser").args(["-k", &format!("{port}/tcp")]).stderr(Stdio::null()).status();
     std::thread::sleep(Duration::from_millis(150));
-    let child = Command::new(common::server_bin())
+    let server = Command::new(common::server_bin())
         .envs(env.iter().copied())
         .env("RADIXOX_PORT", port.to_string())
         .env("RADIXOX_DIR", dir)
@@ -41,10 +41,11 @@ fn start(port: u16, dir: &Path, env: &[(&str, &str)]) -> Server {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
+        .map(Server)
         .expect("spawn radixox");
     for _ in 0..1200 {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return Server(child);
+            return server;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -71,7 +72,7 @@ impl Rng {
     fn below(&mut self, n: u64) -> u64 {
         self.next() % n
     }
-    fn pick<'a>(&mut self, s: &'a [u8]) -> u8 {
+    fn pick(&mut self, s: &[u8]) -> u8 {
         s[self.below(s.len() as u64) as usize]
     }
 }
@@ -144,6 +145,17 @@ fn command(rng: &mut Rng, conn: usize) -> (Vec<u8>, bool) {
         87 => resp(&[b"HGET", &k, b"f"]),
         88 => resp(&[b"PING"]),
         89..=91 => resp(&[b"MSET", &k, &v, &k2, &v]),
+        // plusieurs clés, dont des doublons
+        92..=93 => {
+            let ks: Vec<Vec<u8>> = (0..8).map(|_| key(rng, conn)).collect();
+            let mut args: Vec<&[u8]> = vec![b"MGET"];
+            args.extend(ks.iter().map(|k| k.as_slice()));
+            args.push(&k);
+            resp(&args)
+        }
+        94 => resp(&[b"DEL", &k, &k2, &k, &k3, &k2]),
+        95 => resp(&[b"MSET", &k, &v, &k2, b"1", &k, b"2"]),
+        96 => resp(&[b"EXISTS", &k, &k, &k2]),
         _ => resp(&[b"GET", &k]),
     };
     (c, false)

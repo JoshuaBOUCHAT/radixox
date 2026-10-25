@@ -1102,8 +1102,9 @@ autre commande (code : en-tête du moteur dans `oxidart/src/prefetch_batch.rs`) 
   valeur de i+2 (la valeur préchargée en phase 1 a quitté la L1 après ~60 descentes).
 - **Séries** (branche `full-pipeline`) : la fenêtre n'est plus « tout ou rien ». Chaque
   série d'au moins deux frames consécutives que `exec::execute_hinted` sait faire
-  (`exec::hint_key` : GET, SET toutes options, SETNX, DEL et EXISTS à une clé, TYPE,
-  TTL, PTTL, EXPIRE, PERSIST, INCR, DECR, INCRBY, DECRBY) descend puis s'exécute fenêtre
+  (`exec::hint_keys` : GET, SET toutes options, SETNX, TYPE, TTL, PTTL, EXPIRE,
+  PERSIST, INCR, DECR, INCRBY, DECRBY, et à N clés MGET, MSET, DEL, EXISTS : un indice
+  par clé, MGET par référence sans clone) descend puis s'exécute fenêtre
   d'oxidart ouverte ; toute autre frame coupe la série et passe par le chemin normal,
   fenêtre fermée (`end_window` avant elle). Le flux (AOF, réplication) est admis : chaque
   frame, avec ou sans indice, passe par `journaled` (plan → exécution → `finish`). Restent
@@ -1153,9 +1154,8 @@ n'économise presque rien et la synchronisation coûte. Surtout, chaque mutation
 signaler aux descentes en vol (un oubli = réponse fausse) ; en v2, un oubli de `touch`
 coûte au pire une redescente détectée par le debug.
 
-**Suite** : commandes à plusieurs clés (MGET, MSET, DEL, EXISTS : N indices par frame) ;
-Hash/Set (descente valart enchaînée) ; activation par défaut ; SET de clé absente avec
-indice d'insertion.
+**Suite** : Hash/Set (descente valart enchaînée) ; activation par défaut ; SET de clé
+absente avec indice d'insertion.
 
 **Chantiers de layout (prototype + bench avant code définitif) :**
 - **Feuille fusionnée avec sa valeur** : l'entrée d'enfant (u32, bit de tag) désigne
