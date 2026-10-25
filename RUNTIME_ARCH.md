@@ -1206,6 +1206,17 @@ de branchement sur les radix aléatoires), chargement 1,27 M/s contre 2,2 M/s, R
 contre 1 725 Mo. Le GC du pool relit aussi la longueur des valeurs qu'il déplace
 (`gc::visit_val`), en défaut.
 
+**Fenêtre en tableau fixe (3c56fb1) et mauvaises prédictions.** IBS (L2) montrait `frames`
+(SmallVec de 16) débordant sur le tas à chaque fenêtre de 64 ; `Fixed` (longueur +
+emplacements, tranche, `drain` sur place) : UUID 3,49 → 3,66 M (Zipf), 3,22 → 3,37 M
+(uniforme) ; memtier `key:NNN` Zipf rx-2s **5,33 → 6,0 M** (838 cycles/op, IPC 2,96).
+Branchements mal prédits (IBS `-R`, drapeau `OpBrnMisp`, UUID uniforme) : 3,2 % des
+branchements, ~21 par op ; 36 % sur l'aiguillage `match step[s]` d'`amac_descend`, 29 %
+sur « radix dans le nœud ou dans la page » d'un Overflow8 (pile ou face sur des radix
+aléatoires). Essai : tout Overflow8 passe par `PageSearch` (choix sur le nœud, pas sur le
+radix) : perdant, −4 à −8 % sur UUID, −11 % sur `key:NNN` (un tour et un aiguillage de plus
+coûtent plus qu'un raté une fois sur deux) ; retiré.
+
 **Suite** : l'écart du mixte ; ZSet ; indices dans valart (l'exécution sans seconde descente) (le champ d'un HGET / HSET
 aussi en AMAC) ; SET de clé absente avec indice d'insertion.
 
