@@ -1625,29 +1625,24 @@ impl Core {
             // Clés de toutes les frames avec indice, à la suite ; `spans[i]` :
             // celles de la frame i (début, nombre).
             let mut flat: SmallVec<[&[u8]; oxidart::PREFETCH_BATCH]> = SmallVec::new();
-            let spans: Window<Option<(usize, usize)>> = frames
-                .iter()
-                .map(|(slot, c, _, _)| {
+            let mut spans: SmallVec<[Option<(usize, usize)>; oxidart::PREFETCH_BATCH]> = SmallVec::new();
+            if amac {
+                spans.extend(frames.iter().map(|(slot, c, _, _)| {
                     let o = &outs[*slot as usize];
                     let start = flat.len();
-                    (amac && o.client.authed && o.channels.is_empty() && crate::exec::hint_keys(c, |k| flat.push(k)))
+                    (o.client.authed && o.channels.is_empty() && crate::exec::hint_keys(c, |k| flat.push(k)))
                         .then(|| (start, flat.len() - start))
-                })
-                .collect();
-            // dans une série (au moins deux frames avec indice de suite)
-            let in_run: Window<bool> = (0..spans.len())
-                .map(|i| {
-                    let has = |j: usize| spans.get(j).is_some_and(|s| s.is_some());
-                    has(i) && (has(i + 1) || (i > 0 && has(i - 1)))
-                })
-                .collect();
+                }));
+            }
+            // bit i : frame i dans une série (au moins deux frames avec indice de
+            // suite) ; la fenêtre est bornée par PREFETCH_BATCH = 64 (`width`)
+            debug_assert!(frames.len() <= 64);
+            let has = spans.iter().enumerate().fold(0u64, |m, (i, s)| m | (s.is_some() as u64) << i);
+            let in_run = has & (has << 1 | has >> 1);
+            let run = |i: usize| in_run >> i & 1 != 0;
             if frames.len() > 1 {
-                let rest: Window<&[u8]> = frames
-                    .iter()
-                    .zip(&in_run)
-                    .filter(|(_, run)| !**run)
-                    .filter_map(|((_, c, _, _), _)| c.main_key())
-                    .collect();
+                let rest: Window<&[u8]> =
+                    frames.iter().enumerate().filter(|(i, _)| !run(*i)).filter_map(|(_, (_, c, _, _))| c.main_key()).collect();
                 if rest.len() > 1 {
                     art.prefetch_keys(&rest);
                 }
@@ -1659,8 +1654,8 @@ impl Core {
                 if k == run_end && art.in_window() {
                     art.end_window();
                 }
-                if k >= run_end && in_run[k] {
-                    run_end = k + in_run[k..].iter().take_while(|r| **r).count();
+                if k >= run_end && run(k) {
+                    run_end = k + (!(in_run >> k)).trailing_zeros() as usize;
                     let (from, _) = spans[k].expect("série");
                     let (last, n) = spans[run_end - 1].expect("série");
                     let to = last + n;
