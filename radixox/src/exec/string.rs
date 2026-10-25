@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use radixox_lib::shared_frame::SharedFrame as Frame;
-use oxidart::{OxidArt, PREFETCH_BATCH, TtlResult, counter::CounterError, value::Value};
+use oxidart::{Hint, OxidArt, PREFETCH_BATCH, TtlResult, counter::CounterError, value::Value};
 use radixox_lib::cmd::{SetCondition, SetOpts};
 use radixox_lib::shared_byte::SharedByte;
 
@@ -30,6 +30,32 @@ pub fn cmd_set(art: &mut OxidArt, key: &[u8], val: SharedByte, opts: SetOpts) ->
         return Frame::Null;
     }
 
+    Frame::SimpleString("OK")
+}
+
+/// GET avec l'indice du moteur AMAC (prototype, `RADIXOX_AMAC`).
+pub fn cmd_get_hinted(art: &mut OxidArt, key: &[u8], hint: Hint) -> Frame {
+    match art.get_hinted(key, hint) {
+        Some(val) => match val.as_bytes() {
+            Some(b) => Frame::BulkString(b),
+            None => Frame::Error(
+                "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+            ),
+        },
+        None => Frame::Null,
+    }
+}
+
+/// SET avec l'indice du moteur AMAC (prototype, `RADIXOX_AMAC`).
+pub fn cmd_set_hinted(art: &mut OxidArt, key: &[u8], val: SharedByte, opts: SetOpts, hint: Hint) -> Frame {
+    let if_exists = match opts.condition {
+        SetCondition::Always => None,
+        SetCondition::IfExists => Some(true),
+        SetCondition::IfNotExists => Some(false),
+    };
+    if !art.set_cond_hinted(key, opts.ttl, Value::String(val), if_exists, hint) {
+        return Frame::Null;
+    }
     Frame::SimpleString("OK")
 }
 

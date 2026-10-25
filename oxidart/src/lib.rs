@@ -56,7 +56,7 @@ pub mod new_node;
 pub mod hcommand;
 pub mod krange;
 mod prefetch_batch;
-pub use prefetch_batch::PREFETCH_BATCH;
+pub use prefetch_batch::{AmacStats, Hint, PREFETCH_BATCH};
 mod load;
 pub(crate) mod node;
 pub mod save;
@@ -161,6 +161,11 @@ pub struct OxidArt {
     pub(crate) key_count: usize,
     /// FLUSHDB faits ([`detach_all`](Self::detach_all)) : voir `Detached::flushes`.
     flushes: u64,
+    /// Fenêtre AMAC ouverte ([`begin_window`](Self::begin_window)) : aucun
+    /// nœud n'est libéré ni fusionné ; voir `prefetch_batch::WindowState`.
+    pub(crate) window: Option<prefetch_batch::WindowState>,
+    /// Compteurs du moteur AMAC (prototype).
+    pub amac_stats: AmacStats,
     _live: gc::LiveTree,
 }
 
@@ -317,6 +322,8 @@ impl OxidArt {
             save: OxidSave::default(),
             key_count: 0,
             flushes: 0,
+            window: None,
+            amac_stats: AmacStats::default(),
             _live: gc::LiveTree::new(),
         }
     }
@@ -712,21 +719,13 @@ impl OxidArt {
                 if !ok(node.has_val() && !expired(node.exp_and_radix.exp(), now)) {
                     return false;
                 }
-                let before = node.has_any_ttl();
-                let node = self.node_mut(idx);
                 if node.has_val() {
-                    // Après `node_mut` : un nœud intact capturé par la save tient un
-                    // clone (rc == 2), l'écrasement est refusé tout seul.
-                    if overwrite_self(node, &raw, exp) {
-                        self.retag(idx, before);
-                        return true;
-                    }
-                    drop(take_self(node));
-                } else {
-                    self.key_count += 1;
+                    self.write_at(Loc { node: idx, slot: Slot::SelfVal }, raw, exp);
+                    return true;
                 }
-                let node = self.node_mut(idx);
-                put_self(node, raw, exp);
+                let before = node.has_any_ttl();
+                self.key_count += 1;
+                put_self(self.node_mut(idx), raw, exp);
                 self.retag(idx, before);
                 return true;
             }
@@ -769,20 +768,7 @@ impl OxidArt {
                     self.node_mut(idx).insert(r, leaf(raw, exp, sfx_of(rest)));
                     self.retag(idx, before);
                 }
-                Step::SameLeaf { .. } => {
-                    let before = self.node(idx).has_any_ttl();
-                    // Écrasement sur place, après `node_mut` (voir la self-val).
-                    if let Some(src) = raw.as_bytes()
-                        && self.node_mut(idx).overwrite_leaf_bytes(r, src, exp)
-                    {
-                        self.retag(idx, before);
-                        return true;
-                    }
-                    let (tag, val) = raw.into_parts();
-                    let updated = self.node_mut(idx).update_leaf(r, tag, val, exp);
-                    debug_assert!(updated);
-                    self.retag(idx, before);
-                }
+                Step::SameLeaf { .. } => self.write_at(Loc { node: idx, slot: Slot::Leaf(r) }, raw, exp),
                 Step::SplitLeaf => {
                     self.key_count += 1;
                     self.split_leaf(idx, r, rest, raw, exp);
@@ -795,6 +781,34 @@ impl OxidArt {
             }
             return true;
         }
+    }
+
+    /// Écrase la valeur présente à `loc` (expirée ou non) par `raw`, échéance
+    /// `exp`. Ne change pas la forme : `loc` reste l'emplacement de la clé.
+    pub(crate) fn write_at(&mut self, loc: Loc, raw: RawVal, exp: Option<u64>) {
+        let idx = loc.node;
+        let before = self.node(idx).has_any_ttl();
+        match loc.slot {
+            Slot::SelfVal => {
+                // Après `node_mut` : un nœud intact capturé par la save tient un
+                // clone (rc == 2), l'écrasement est refusé tout seul.
+                let node = self.node_mut(idx);
+                if !overwrite_self(node, &raw, exp) {
+                    drop(take_self(node));
+                    put_self(node, raw, exp);
+                }
+            }
+            Slot::Leaf(r) => {
+                // Écrasement sur place, après `node_mut` (voir la self-val).
+                let in_place = raw.as_bytes().is_some_and(|src| self.node_mut(idx).overwrite_leaf_bytes(r, src, exp));
+                if !in_place {
+                    let (tag, val) = raw.into_parts();
+                    let updated = self.node_mut(idx).update_leaf(r, tag, val, exp);
+                    debug_assert!(updated);
+                }
+            }
+        }
+        self.retag(idx, before);
     }
 
     /// Promotion : la feuille `r` de `idx` et la nouvelle clé (reste `rest`)
@@ -810,9 +824,13 @@ impl OxidArt {
         let mut n = Node::new(CompactPath::from_slice(&s[..common]), idx, r);
         place(&mut n, s, common, RawVal::new(tag, val), old_exp);
         place(&mut n, rest, common, raw, exp);
+        let old_slot = if common == s.len() { Slot::SelfVal } else { Slot::Leaf(s[common]) };
         let n_idx = self.insert_node(n);
         self.node_mut(idx).insert(r, Entry::Child(n_idx));
         self.retag(idx, before);
+        if let Some(w) = &mut self.window {
+            w.leaf_moved(Loc { node: idx, slot: Slot::Leaf(r) }, Loc { node: n_idx, slot: old_slot });
+        }
     }
 
     /// Le préfixe `cp` de l'enfant `c` ne prolonge pas la clé : un nœud
@@ -863,7 +881,7 @@ impl OxidArt {
         true
     }
 
-    fn set_loc_exp(&mut self, loc: Loc, exp: Option<u64>) {
+    pub(crate) fn set_loc_exp(&mut self, loc: Loc, exp: Option<u64>) {
         let before = self.node(loc.node).has_any_ttl();
         let node = self.node_mut(loc.node);
         match loc.slot {
@@ -903,6 +921,13 @@ impl OxidArt {
     /// Retire la valeur à `loc` (propriété à l'appelant) puis rétablit
     /// l'invariant de forme.
     pub(crate) fn remove_loc(&mut self, loc: Loc) -> RawVal {
+        let raw = self.take_loc(loc);
+        self.normalize(loc.node);
+        raw
+    }
+
+    /// Retire la valeur à `loc` sans normaliser (l'appelant le fait).
+    pub(crate) fn take_loc(&mut self, loc: Loc) -> RawVal {
         self.key_count -= 1;
         let before = self.node(loc.node).has_any_ttl();
         let raw = match loc.slot {
@@ -916,7 +941,6 @@ impl OxidArt {
             }
         };
         self.retag(loc.node, before);
-        self.normalize(loc.node);
         raw
     }
 

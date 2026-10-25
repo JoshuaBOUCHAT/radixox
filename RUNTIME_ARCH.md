@@ -1081,6 +1081,53 @@ parse par fenêtres de K commandes, précharge `Cmd::main_key`, exécute dans l'
    rentable une fois les miss superposés. **Fait (aa93749)** : SWAR partout (inline, overflow
    léger, groupes `[[u8;8][u32;8]]` du huge), SSE2 inutile ; +8,8 % en pipeline 64.
 
+**Prototype AMAC (2026-10-25, `RADIXOX_AMAC=N`, désactivé par défaut).** Le point 3
+appliqué au lot du pipeline, en deux phases, sans jamais refaire une descente à cause d'une
+autre commande (code : en-tête du moteur dans `oxidart/src/prefetch_batch.rs`) :
+- **Phase 1** `amac_descend` : toutes les descentes de la fenêtre en lecture pure, N voies
+  en vol (AMAC : une voie finie prend la clé suivante, pas de paquet qui attend son plus
+  lent) → un indice (nœud, self-val ou radix) par commande.
+- **Phase 2** entre `begin_window` / `end_window` : exécution dans l'ordre avec l'indice
+  (`get_hinted`, `set_cond_hinted`, `del_hinted`). Aucun nœud libéré ni fusionné, l'arbre
+  reste canonique : une suppression qui garde la forme (racine, ou nœud qui garde ≥ 2
+  choses) est faite tout de suite ; sinon la valeur reçoit `exp = 0` (expirée = absente,
+  DURABILITY_DESIGN DET2) et attend `end_window`, qui retire ce qui est encore expiré, par
+  nœud, ancêtres d'abord (aucune valeur en attente ne bouge ; un `split_leaf` remappe
+  sa feuille déplacée).
+- Un indice ne vaut plus que pour sa propre clé : clé ajoutée ou retirée plus tôt dans la
+  fenêtre (empreintes `touched`), feuille déplacée par `split_leaf` (`moved`) → cette
+  commande seule redescend (236 sur 69 M en charge mixte). Vérifié en debug contre
+  `locate`.
+- `RADIXOX_AMAC_PF=2` (défaut) : en exécutant la commande i, précharge le nœud de i+4 et la
+  valeur de i+2 (la valeur préchargée en phase 1 a quitté la L1 après ~60 descentes).
+- Fenêtres admises : GET, SET (toutes options), DEL à une clé, sans AOF/réplication ni refus
+  d'écriture ; sinon le chemin ci-dessus.
+
+Mesures (pipeline 64, SQPOLL : boucle CPU 0, SQPOLL CPU 1 ; 1 M clés uniformes, 100 o ;
+débit compté par le serveur, `total_commands_processed`, le « ops/s » de memtier variant
+de ±15 % ; 3 passages alternés, médiane) :
+
+| GET/SET 78/22 | ops/s | cycles/op | IPC user |
+|---|---|---|---|
+| fenêtre 64, chemin actuel | 2,95 M | 1 814 | 2,19 |
+| AMAC 8 voies | 3,85 M | 1 375 | 2,17 |
+| + préchargement du nœud seul | 3,89 M | 1 365 | 2,20 |
+| **+ nœud et valeur (PF2)** | **4,10 M** | **1 295** | **2,40** |
+
+Charge mixte (GET 70 / SET 20 dont 40 % avec TTL / DEL 10, un passage, avant PF2) : 2,86 M →
+3,40 M. Une première version entrelaçait l'exécution avec les descentes et faisait repartir
+de la racine les descentes en vol après tout changement de forme (compteur global) :
+36 % de redescentes en charge mixte, abandonnée.
+
+Profil de la v2 + PF2 (GET/SET) : arbre ≈ 60 % du thread (`amac_descend` 33 %), parse +
+dispatch 14 %, boucle et connexions ≈ 8 %, copies 5 %, encodage 4 %. Avec des threads IO
+(NET_THREADS_DESIGN.md), le métier garderait ~75–80 % de ce travail : plafond brut ≈ 5 M
+ops/s, moins les défauts entre cœurs sur les requêtes et les réponses.
+
+**Suite** : exécution dès la fin de chaque descente (v3 : une descente posée sur un nœud
+muté refait seulement son étape courante) ; SET de clé absente avec indice d'insertion ;
+autres commandes (MGET, INCR, HGET/HSET…).
+
 **Chantiers de layout (prototype + bench avant code définitif) :**
 - **Feuille fusionnée avec sa valeur** : l'entrée d'enfant (u32, bit de tag) désigne
   directement un bloc `[exp?|suffixe de clé|rc|len|données]`. Un miss de moins par GET,

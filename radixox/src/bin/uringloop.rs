@@ -930,6 +930,12 @@ fn main() -> io::Result<()> {
     if let Some(w) = std::env::var("RADIXOX_PREFETCH").ok().and_then(|v| v.parse::<usize>().ok()) {
         cfg.prefetch = w.max(1);
     }
+    if let Some(k) = std::env::var("RADIXOX_AMAC").ok().and_then(|v| v.parse::<usize>().ok()) {
+        cfg.amac = k;
+    }
+    if let Some(p) = std::env::var("RADIXOX_AMAC_PF").ok().and_then(|v| v.parse::<u8>().ok()) {
+        cfg.amac_pf = p;
+    }
     // Anneau de réception (RUNTIME_ARCH.md §5.1) : nombre et taille des tampons.
     // Recv simples sur io-wq : chaque recv en vol réserve un tampon entier, il en
     // faut au moins un par connexion active ; plus nombreux et plus petits.

@@ -69,6 +69,13 @@ pub struct Config {
     /// Commandes dont les clés sont préchargées ensemble (`RADIXOX_PREFETCH`,
     /// 1 = pas de préchargement).
     pub prefetch: usize,
+    /// Prototype : descentes en vol du moteur AMAC pour les fenêtres de GET / SET /
+    /// DEL seulement (`RADIXOX_AMAC`, 0 = désactivé) ; la fenêtre reste `prefetch`.
+    pub amac: usize,
+    /// Préchargement en phase 2 du moteur AMAC (`RADIXOX_AMAC_PF`, défaut 2 : nœud
+    /// de la commande i+4 et valeur de la commande i+2 ; 1 = nœud seul, mesuré
+    /// sans gain ; 0 = rien). RUNTIME_ARCH.md §8bis.
+    pub amac_pf: u8,
     /// Connexion sans rien reçu depuis cette durée : fermée (`timeout` de
     /// Redis ; `RADIXOX_TIMEOUT`, désactivé par défaut).
     pub idle_timeout: Option<Duration>,
@@ -123,6 +130,8 @@ impl Default for Config {
             flush_early: 64 << 10,
             out_backpressure: 1 << 20,
             prefetch: 8,
+            amac: 0,
+            amac_pf: 2,
             idle_timeout: None,
             job_budget: KEYS_BUDGET.min(FREE_BUDGET),
             save_rules: Vec::new(),
@@ -389,6 +398,16 @@ impl ConnJob {
 
 /// Après cette commande, plus rien de sa connexion dans la fenêtre : barrière
 /// (§2.1) ou commande qui peut parquer la connexion.
+/// Clé d'une commande que le moteur AMAC sait exécuter (prototype).
+fn amac_key<'a>(cmd: &Cmd<'a>) -> Option<&'a [u8]> {
+    match cmd {
+        Cmd::Get(k) => Some(k),
+        Cmd::Set { key, .. } => Some(key),
+        Cmd::Del(keys) if keys.len() == 1 => Some(keys[0]),
+        _ => None,
+    }
+}
+
 fn stops_window(cmd: &Cmd<'_>) -> bool {
     cmd.is_barrier()
         || matches!(
@@ -427,6 +446,8 @@ pub struct Core {
     /// Jobs des connexions parquées, avec l'époque de leur parquage.
     conn_jobs: std::collections::VecDeque<(Slot, u32, ConnJob)>,
     turn: u64,
+    /// Commandes exécutées depuis le démarrage (`total_commands_processed`).
+    cmds_total: u64,
     /// Horloge monotone du tour (`set_now`) ; le TTL suit l'horloge murale
     /// d'oxidart (`art.tick`).
     now: Instant,
@@ -513,6 +534,7 @@ impl Core {
             jobs: Default::default(),
             conn_jobs: Default::default(),
             turn: 0,
+            cmds_total: 0,
             now,
             timers,
             sweep_pos: 0,
@@ -1388,6 +1410,7 @@ impl Core {
                 }
             }
             let done = self.exec_window(&picked, width.min(budget));
+            self.cmds_total += done as u64;
             if done == 0 {
                 pos += 1;
                 idle_run += 1;
@@ -1603,7 +1626,53 @@ impl Core {
                     plans.push(plan);
                 }
             }
-            if frames.len() > 1 {
+            // Prototype AMAC (`RADIXOX_AMAC`) : une fenêtre de GET / SET / DEL à une clé,
+            // sans flux ni refus d'écriture : toutes les descentes en AMAC (lecture
+            // pure), puis exécution dans l'ordre avec les indices (`oxidart`,
+            // prefetch_batch.rs) ; sinon préchargement puis descente normale.
+            let amac = cfg.amac > 0
+                && !cfg!(radixox_gc_debug)
+                && journal.is_none()
+                && !read_only
+                && refuse_writes.is_none()
+                && !over_cap
+                && frames.iter().all(|(slot, c, _, _)| {
+                    let o = &outs[*slot as usize];
+                    o.client.authed && o.channels.is_empty() && amac_key(c).is_some()
+                });
+            if amac {
+                let keys: Window<&[u8]> = frames.iter().map(|(_, c, _, _)| amac_key(c).expect("GET / SET / DEL")).collect();
+                // la fenêtre est bornée par PREFETCH_BATCH (`width`)
+                let mut hints = [oxidart::Hint::NONE; oxidart::PREFETCH_BATCH];
+                let hints = &mut hints[..keys.len()];
+                art.amac_descend(&keys, cfg.amac, hints);
+                art.begin_window();
+                let hints = &*hints;
+                for (i, ((slot, cmd, _, _), &hint)) in frames.drain(..).zip(hints.iter()).enumerate() {
+                    // Expérience : préchargement en avance sur l'exécution.
+                    if cfg.amac_pf >= 1 && let Some(&h) = hints.get(i + 4) {
+                        art.prefetch_hint_node(h);
+                    }
+                    if cfg.amac_pf >= 2 && let Some(&h) = hints.get(i + 2) {
+                        art.prefetch_hint_value(h);
+                    }
+                    let frame = match cmd {
+                        Cmd::Get(key) => crate::exec::string::cmd_get_hinted(art, key, hint),
+                        Cmd::Set { key, val, opts } => {
+                            persist.note_writes(1);
+                            crate::exec::string::cmd_set_hinted(art, key, val, opts, hint)
+                        }
+                        Cmd::Del(keys) => {
+                            persist.note_writes(1);
+                            Frame::Integer(art.del_hinted(keys[0], hint) as i64)
+                        }
+                        _ => unreachable!("fenêtre AMAC : GET / SET / DEL"),
+                    };
+                    extend_encode(&mut outs[slot as usize].out, &frame);
+                    afters.push((slot, After::Continue));
+                }
+                art.end_window();
+            } else if frames.len() > 1 {
                 let keys: Window<&[u8]> = frames.iter().filter_map(|(_, c, _, _)| c.main_key()).collect();
                 if keys.len() > 1 {
                     art.prefetch_keys(&keys);
@@ -1801,6 +1870,14 @@ impl Core {
                 self.repl_info(&mut info);
                 info.push_str("\r\n");
                 crate::exec::info_stats(&mut info);
+                let st = self.art.amac_stats;
+                let _ = std::fmt::Write::write_fmt(
+                    &mut info,
+                    format_args!(
+                        "total_commands_processed:{}\r\namac_cmds:{}\r\namac_redescents:{}\r\n",
+                        self.cmds_total, st.cmds, st.redescents
+                    ),
+                );
                 info.push_str("\r\n");
                 crate::exec::info_memory(&mut info, self.gc.enabled, self.gc.pass.is_some(), self.gc.max_slice_us);
                 let _ = std::fmt::Write::write_fmt(

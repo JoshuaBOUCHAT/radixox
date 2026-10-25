@@ -679,6 +679,7 @@ Environment variables:
 | `RADIXOX_RING_BUFS` / `RADIXOX_RING_BUF_KB` | `64` / `32` | receive buffer ring shared by all connections |
 | `RADIXOX_SEND_ASYNC` | off | run sends on kernel io-wq workers (`IOSQE_ASYNC`): helps clients without pipelining when a second core is available |
 | `RADIXOX_SQPOLL_CPU` / `RADIXOX_SQPOLL_IDLE_MS` / `RADIXOX_SQPOLL_SPIN_US` | unset / `1000` / `1000` | dedicated machines: a kernel SQPOLL thread pinned on this CPU submits and receives, so the loop makes no syscalls while busy (pair with `RADIXOX_SEND_ASYNC`). Burns that core; +10 % pipelined throughput measured, no gain without pipelining |
+| `RADIXOX_AMAC` / `RADIXOX_AMAC_PF` | `0` / `2` | experimental: in windows made only of GET, SET and single-key DEL, run all key lookups as `N` interleaved state machines (try `8` with `RADIXOX_PREFETCH=64`), then execute in order from the found positions; `AMAC_PF` prefetches ahead of execution (`2` = node and value). +39 % pipelined GET/SET throughput measured |
 | `RADIXOX_RECV_ASYNC` | off | experimental: single-shot receives on io-wq workers instead of multishot on the loop; measured slower on loopback (more CPU per command), kept for testing on real NICs |
 | `RADIXOX_IOWQ_WORKERS` / `RADIXOX_IOWQ_CPUS` | `1` / unset | io-wq network workers at most, and the CPUs they may run on (e.g. `1,7`) |
 | `RADIXOX_FILE_CPUS` | unset | run the dump's writes and fsync on an io-wq worker pinned to these CPUs (e.g. `1`), off the server's core; io-wq has one CPU mask, the union of this and `RADIXOX_IOWQ_CPUS` |

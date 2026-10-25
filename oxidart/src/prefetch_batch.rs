@@ -19,6 +19,7 @@ use radixox_lib::prefetch::prefetch_l1;
 use crate::krange::{OwnedVal, RangeVal, str_val};
 use crate::node::{EntryRef, Probe};
 use crate::save::prefetch_value;
+use crate::value::{RawVal, Value, value_from_raw_ref};
 use crate::{Loc, OxidArt, Slot, eq_fast, expired as is_expired, starts_with_fast};
 
 /// Nombre maximal de clés suivies ensemble.
@@ -198,6 +199,330 @@ impl OxidArt {
                 *found = encode(Loc { node: idx, slot: Slot::Leaf(key[cursor]) });
             }
         }
+    }
+}
+
+// ── Moteur AMAC (prototype, `RADIXOX_AMAC`) ──────────────────────────────────
+//
+// Deux phases par fenêtre, sans jamais refaire une descente à cause d'une autre
+// commande :
+// 1. `amac_descend` : toutes les descentes, en lecture pure (au plus `lanes` en
+//    vol, une voie libérée prend la clé suivante) → un indice par clé ;
+// 2. entre `begin_window` et `end_window`, les commandes s'exécutent dans
+//    l'ordre avec leur indice. Aucun nœud n'est libéré ni fusionné, et l'arbre
+//    reste canonique : une suppression qui garde la forme (racine, ou nœud qui
+//    garde au moins deux choses) est faite tout de suite ; sinon la valeur
+//    reçoit une échéance passée (expirée = absente, DET2) et son emplacement
+//    attend `end_window`, qui ne retire que ce qui est encore expiré. Un indice
+//    ne vaut plus que pour deux raisons, propres à sa clé : la clé a été
+//    ajoutée ou retirée plus tôt dans la fenêtre (`touched`), ou un
+//    `split_leaf` a déplacé sa feuille (`moved`) ; seule cette commande
+//    redescend.
+
+/// Emplacement de la valeur d'une clé (ou son absence) trouvé par
+/// [`OxidArt::amac_descend`], valable dans la fenêtre qui suit.
+#[derive(Clone, Copy, Debug)]
+pub struct Hint {
+    found: u64,
+}
+
+impl Hint {
+    pub const NONE: Hint = Hint { found: NOT_FOUND };
+}
+
+/// Compteurs du moteur : commandes servies par indice, et commandes
+/// redescendues (clé touchée plus tôt dans la fenêtre, feuille déplacée).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AmacStats {
+    pub cmds: u64,
+    pub redescents: u64,
+}
+
+/// État d'une fenêtre ouverte (voir l'en-tête du moteur).
+#[derive(Default)]
+pub(crate) struct WindowState {
+    /// Valeurs mortes (expirées) dont le retrait changerait la forme.
+    dead: Vec<Loc>,
+    /// Empreintes des clés ajoutées ou retirées dans la fenêtre.
+    touched: Vec<u64>,
+    /// Nœuds dont une feuille est partie dans un nouveau nœud (`split_leaf`).
+    moved: Vec<u32>,
+}
+
+impl WindowState {
+    /// `split_leaf` a déplacé la feuille `from` en `to` : seul déplacement de
+    /// valeur possible dans une fenêtre.
+    pub(crate) fn leaf_moved(&mut self, from: Loc, to: Loc) {
+        self.moved.push(from.node);
+        for d in &mut self.dead {
+            if *d == from {
+                *d = to;
+            }
+        }
+    }
+}
+
+/// Empreinte d'une clé : une collision ne coûte qu'une redescente.
+#[inline]
+fn key_tag(key: &[u8]) -> u64 {
+    let mut h = 0x9E37_79B9_7F4A_7C15u64 ^ key.len() as u64;
+    for c in key.chunks(8) {
+        let mut b = [0u8; 8];
+        b[..c.len()].copy_from_slice(c);
+        h = (h ^ u64::from_le_bytes(b)).wrapping_mul(0x0000_0100_0000_01B3).rotate_left(29);
+    }
+    h
+}
+
+impl OxidArt {
+    /// Phase 1 : descentes de `keys` en AMAC, lecture pure. `hints[i]` reçoit
+    /// l'emplacement de la valeur de `keys[i]` (préchargée), expirée ou non.
+    pub fn amac_descend(&self, keys: &[&[u8]], lanes: usize, hints: &mut [Hint]) {
+        let n = keys.len();
+        debug_assert_eq!(hints.len(), n);
+        if n == 0 {
+            return;
+        }
+        let k = lanes.clamp(1, PREFETCH_BATCH).min(n);
+        let root = self.root_idx;
+        let mut idx = [root; PREFETCH_BATCH];
+        let mut cursor = [0usize; PREFETCH_BATCH];
+        let mut step = [Step::Enter; PREFETCH_BATCH];
+        let mut found = [NOT_FOUND; PREFETCH_BATCH];
+        let mut key_of = [0usize; PREFETCH_BATCH];
+        for (s, slot) in key_of[..k].iter_mut().enumerate() {
+            *slot = s;
+        }
+        let (mut issued, mut active) = (k, k);
+        while active > 0 {
+            for s in 0..k {
+                let key = keys[key_of[s]];
+                let next = match step[s] {
+                    Step::Done => continue,
+                    Step::Enter => self.batch_enter(key, &mut idx[s], &mut cursor[s], &mut found[s]),
+                    Step::PageSearch => self.batch_search(key, &mut idx[s], &mut cursor[s], &mut found[s]),
+                    Step::Entry(e) => self.batch_entry(key, &mut idx[s], &mut cursor[s], e as usize, &mut found[s]),
+                    Step::LeafSfx(e) => {
+                        self.batch_leaf(key, idx[s], cursor[s], e as usize, &mut found[s]);
+                        Step::Done
+                    }
+                };
+                if !matches!(next, Step::Done) {
+                    step[s] = next;
+                    continue;
+                }
+                hints[key_of[s]] = Hint { found: found[s] };
+                if issued < n {
+                    key_of[s] = issued;
+                    (idx[s], cursor[s], step[s], found[s]) = (root, 0, Step::Enter, NOT_FOUND);
+                    issued += 1;
+                } else {
+                    step[s] = Step::Done;
+                    active -= 1;
+                }
+            }
+        }
+    }
+
+    /// Phase 2, en avance sur l'exécution : précharge le nœud de l'indice
+    /// (les premiers de la fenêtre ont pu quitter la L1 pendant les autres
+    /// descentes).
+    #[inline]
+    pub fn prefetch_hint_node(&self, hint: Hint) {
+        if hint.found != NOT_FOUND {
+            prefetch_node(self, decode(hint.found).node);
+        }
+    }
+
+    /// Comme [`prefetch_hint_node`](Self::prefetch_hint_node), pour la valeur
+    /// (le nœud doit déjà être en cache : une recherche du radix).
+    #[inline]
+    pub fn prefetch_hint_value(&self, hint: Hint) {
+        if hint.found == NOT_FOUND {
+            return;
+        }
+        let loc = decode(hint.found);
+        let node = self.node(loc.node);
+        match loc.slot {
+            Slot::SelfVal if node.has_val() => prefetch_value(node.tag, &node.val),
+            // une feuille déplacée par un split : rien à précharger
+            Slot::Leaf(r) => {
+                if let Some(EntryRef::Leaf { tag, val, .. }) = node.get(r) {
+                    prefetch_value(tag, val);
+                }
+            }
+            Slot::SelfVal => {}
+        }
+    }
+
+    /// Phase 2 : ouvre la fenêtre (voir l'en-tête du moteur).
+    pub fn begin_window(&mut self) {
+        debug_assert!(self.window.is_none());
+        self.window = Some(WindowState::default());
+    }
+
+    /// Ferme la fenêtre : retire les valeurs mortes encore expirées (une
+    /// valeur recréée entre-temps est vivante : sautée). Par nœud, toutes ses
+    /// valeurs mortes puis une seule normalisation (ce qui remonte n'est pas
+    /// en attente) ; les ancêtres d'abord : une normalisation ne déplace que
+    /// vers le haut, et la fusion avec un enfant garde l'idx de l'enfant, donc
+    /// aucune valeur en attente ne bouge. Le garde-fou `is_occupied` ne devrait
+    /// jamais servir ; on ne retire de toute façon qu'une valeur expirée.
+    pub fn end_window(&mut self) {
+        let Some(mut w) = self.window.take() else { return };
+        if w.dead.is_empty() {
+            return;
+        }
+        let depth = |art: &OxidArt, mut x: u32| {
+            let mut d = 0u32;
+            while x != art.root_idx {
+                x = art.node(x).parent_idx;
+                d += 1;
+            }
+            d
+        };
+        let mut order: Vec<(u32, u32)> = w.dead.iter().map(|l| (depth(self, l.node), l.node)).collect();
+        order.sort_unstable();
+        order.dedup();
+        for (_, x) in order {
+            if !self.map.is_occupied(x) {
+                continue;
+            }
+            let mut took = false;
+            for loc in w.dead.iter_mut().filter(|l| l.node == x) {
+                let node = self.node(x);
+                let exp = match loc.slot {
+                    Slot::SelfVal if node.has_val() => node.exp_and_radix.exp(),
+                    Slot::Leaf(r) => match node.get(r) {
+                        Some(EntryRef::Leaf { ttl, .. }) => ttl,
+                        _ => continue,
+                    },
+                    Slot::SelfVal => continue,
+                };
+                if is_expired(exp, self.now) {
+                    drop(self.take_loc(*loc));
+                    took = true;
+                }
+            }
+            if took {
+                self.normalize(x);
+            }
+        }
+    }
+
+    /// Retire la valeur à `loc` si la forme de l'arbre n'en dépend pas ;
+    /// sinon la laisse (expirée) pour [`end_window`](Self::end_window).
+    fn remove_in_window(&mut self, loc: Loc) {
+        let node = self.node(loc.node);
+        if loc.node == self.root_idx || node.len() + node.has_val() as usize > 2 {
+            // `normalize` n'aura rien à faire
+            drop(self.remove_loc(loc));
+            return;
+        }
+        if !is_expired(self.loc_value(loc).2, self.now) {
+            self.set_loc_exp(loc, Some(0));
+        }
+        self.window.as_mut().expect("fenêtre ouverte").dead.push(loc);
+    }
+
+    /// Note que la présence de `key` a changé (ajout, suppression) ou que son
+    /// indice n'a pas servi.
+    #[inline]
+    fn touch(&mut self, key: &[u8]) {
+        if let Some(w) = &mut self.window {
+            w.touched.push(key_tag(key));
+        }
+    }
+
+    /// [`get`](Self::get) par une descente, dans la fenêtre (suppression d'une
+    /// expirée par `remove_in_window`).
+    fn get_in_window(&mut self, key: &[u8]) -> Option<Value> {
+        let (loc, tag, val, exp) = self.find_value(key)?;
+        if is_expired(exp, self.now) {
+            if !self.is_saving() {
+                self.remove_in_window(loc);
+            }
+            return None;
+        }
+        // SAFETY: tag != None (valeur trouvée).
+        Some(unsafe { value_from_raw_ref(tag, val) })
+    }
+
+    /// `Some(emplacement ou absence)` si l'indice est encore valable.
+    fn resolve(&mut self, key: &[u8], hint: Hint) -> Option<Option<Loc>> {
+        let w = self.window.as_ref().expect("indice AMAC hors fenêtre");
+        let touched = !w.touched.is_empty() && w.touched.contains(&key_tag(key));
+        let loc = (hint.found != NOT_FOUND).then(|| decode(hint.found));
+        let moved = matches!(loc, Some(Loc { node, slot: Slot::Leaf(_) }) if w.moved.contains(&node));
+        if touched || moved {
+            self.amac_stats.redescents += 1;
+            return None;
+        }
+        self.amac_stats.cmds += 1;
+        debug_assert_eq!(loc, self.locate(key), "indice AMAC faux pour {}", key.escape_ascii());
+        Some(loc)
+    }
+
+    /// [`get`](Self::get) avec l'indice de [`amac_descend`](Self::amac_descend).
+    pub fn get_hinted(&mut self, key: &[u8], hint: Hint) -> Option<Value> {
+        let loc = match self.resolve(key, hint) {
+            None => {
+                self.touch(key);
+                return self.get_in_window(key);
+            }
+            Some(None) => return None,
+            Some(Some(loc)) => loc,
+        };
+        let (tag, val, exp) = self.loc_value(loc);
+        if is_expired(exp, self.now) {
+            if !self.is_saving() {
+                self.remove_in_window(loc);
+                self.touch(key);
+            }
+            return None;
+        }
+        // SAFETY: tag != None (valeur trouvée).
+        Some(unsafe { value_from_raw_ref(tag, val) })
+    }
+
+    /// [`del`](Self::del) avec l'indice de [`amac_descend`](Self::amac_descend).
+    pub fn del_hinted(&mut self, key: &[u8], hint: Hint) -> bool {
+        let loc = match self.resolve(key, hint) {
+            None => self.locate(key),
+            Some(loc) => loc,
+        };
+        let Some(loc) = loc else { return false };
+        let live = !is_expired(self.loc_value(loc).2, self.now);
+        self.remove_in_window(loc);
+        let removed = live;
+        self.touch(key);
+        removed
+    }
+
+    /// [`set_cond`](Self::set_cond) avec l'indice de
+    /// [`amac_descend`](Self::amac_descend) : une clé présente est écrasée sur
+    /// place, sans descente.
+    pub fn set_cond_hinted(
+        &mut self,
+        key: &[u8],
+        ttl: Option<std::time::Duration>,
+        val: Value,
+        if_exists: Option<bool>,
+        hint: Hint,
+    ) -> bool {
+        let exp = ttl.map(|d| self.now.saturating_add(d.as_secs()));
+        let raw = RawVal::from_value(val);
+        let Some(Some(loc)) = self.resolve(key, hint) else {
+            // absente (insertion) ou indice inutilisable : descente normale
+            self.touch(key);
+            return self.set_raw(key, raw, exp, if_exists);
+        };
+        let live = !is_expired(self.loc_value(loc).2, self.now);
+        if !if_exists.is_none_or(|want| want == live) {
+            return false;
+        }
+        self.write_at(loc, raw, exp);
+        true
     }
 }
 
@@ -420,6 +745,75 @@ mod tests {
         art.mget_ref(&refs, &mut expired3);
         assert!(expired3.is_empty(), "plus aucune expirée : {expired3:?}");
         assert_eq!(art.mget_owned(&refs).len(), refs.len());
+    }
+
+    /// AMAC contre l'arbre ordinaire : GET / SET (avec ou sans TTL) / SET NX /
+    /// DEL tirés sur des clés à préfixes partagés (splits, nouvelles clés,
+    /// suppressions et expirations en pleine fenêtre), 1 à 64 voies. Les
+    /// indices utilisés sont vérifiés dans `resolve` ; l'arbre est canonique
+    /// après chaque fenêtre.
+    #[test]
+    fn amac_matches_plain_tree() {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        use std::time::Duration;
+        for (seed, lanes) in [(1u64, 1usize), (2, 2), (3, 8), (4, 16), (5, 64)] {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut a = OxidArt::new();
+            let mut b = OxidArt::new();
+            let key = |rng: &mut StdRng| -> Vec<u8> {
+                let len = rng.gen_range(0..6);
+                let mut k = b"user:".to_vec();
+                k.extend((0..len).map(|_| b"abc"[rng.gen_range(0..3)]));
+                k
+            };
+            for round in 0..400u64 {
+                a.set_now(1000 + round);
+                b.set_now(1000 + round);
+                let n = rng.gen_range(1..=64);
+                let ops: Vec<(u8, Vec<u8>)> = (0..n).map(|_| (rng.gen_range(0..11), key(&mut rng))).collect();
+                let keys: Vec<&[u8]> = ops.iter().map(|(_, k)| k.as_slice()).collect();
+                let mut hints = vec![super::Hint::NONE; n];
+                a.amac_descend(&keys, lanes, &mut hints);
+                a.begin_window();
+                let ttl = Some(Duration::from_secs(1));
+                let got: Vec<String> = ops
+                    .iter()
+                    .zip(&hints)
+                    .enumerate()
+                    .map(|(i, ((op, k), &h))| {
+                        let v = val(&format!("{round}:{i}"));
+                        match op {
+                            0..=3 => format!("{:?}", a.get_hinted(k, h)),
+                            4..=5 => format!("{}", a.set_cond_hinted(k, None, v, None, h)),
+                            6 => format!("{}", a.set_cond_hinted(k, ttl, v, None, h)),
+                            7 => format!("{}", a.set_cond_hinted(k, None, v, Some(false), h)),
+                            _ => format!("{}", a.del_hinted(k, h)),
+                        }
+                    })
+                    .collect();
+                a.end_window();
+                let want: Vec<String> = ops
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (op, k))| {
+                        let v = val(&format!("{round}:{i}"));
+                        match op {
+                            0..=3 => format!("{:?}", b.get(k)),
+                            4..=5 => format!("{}", b.set_cond(k, None, v, None)),
+                            6 => format!("{}", b.set_cond(k, ttl, v, None)),
+                            7 => format!("{}", b.set_cond(k, None, v, Some(false))),
+                            _ => format!("{}", b.del(k)),
+                        }
+                    })
+                    .collect();
+                assert_eq!(got, want, "seed {seed} lanes {lanes} round {round}");
+                assert_eq!(a.len(), b.len());
+                a.assert_canonical();
+            }
+            let st = a.amac_stats;
+            // peu de clés : une même clé revient souvent dans la fenêtre
+            assert!(st.cmds > st.redescents && st.redescents > 0, "{st:?}");
+        }
     }
 }
 
