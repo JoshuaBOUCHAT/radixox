@@ -302,6 +302,11 @@ fn amac_answers_like_plain_path() {
     };
     let (mut ca, mut cb) = (open(PORT_AMAC), open(PORT_PLAIN));
     for round in 0..rounds {
+        // save progressive en cours pendant des fenêtres (barrière de save)
+        if round % 400 == 200 {
+            simple(PORT_AMAC, &[b"BGSAVE"]);
+            simple(PORT_PLAIN, &[b"BGSAVE"]);
+        }
         // toutes les connexions envoient, puis on lit : les fenêtres mêlent
         // les connexions
         let mut kinds: Vec<Vec<Reply>> = Vec::new();
@@ -347,4 +352,7 @@ fn amac_answers_like_plain_path() {
     drop(a);
     let _a = start(PORT_AMAC, &dir_a, &amac_env);
     assert_eq!(digest(PORT_AMAC, now), before, "contenu après reprise sur l'AOF");
+    drop((_a, _b));
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
 }
