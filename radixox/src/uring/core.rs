@@ -241,6 +241,96 @@ struct FsJob {
 
 /// Une fenêtre de préchargement, sur la pile (pas d'allocation par fenêtre).
 type Window<T> = SmallVec<[T; 16]>;
+/// Ce qui est borné par la largeur de la fenêtre (`PREFETCH_BATCH`) : jamais sur le tas
+/// (une allocation par fenêtre, dans une mémoire hors du L1, mesuré).
+type Batch<T> = SmallVec<[T; oxidart::PREFETCH_BATCH]>;
+
+/// Tableau de taille fixe (une fenêtre : au plus `PREFETCH_BATCH` éléments) : une
+/// longueur et des emplacements, lus par tranche. Contrairement à `SmallVec`, aucun
+/// accès ne choisit entre inline et tas.
+struct Fixed<T, const N: usize = { oxidart::PREFETCH_BATCH }> {
+    len: usize,
+    buf: [std::mem::MaybeUninit<T>; N],
+}
+
+impl<T, const N: usize> Fixed<T, N> {
+    fn new() -> Self {
+        Self { len: 0, buf: [const { std::mem::MaybeUninit::uninit() }; N] }
+    }
+
+    /// La borne est structurelle (largeur de fenêtre), jamais une donnée client.
+    #[inline]
+    fn push(&mut self, v: T) {
+        assert!(self.len < N, "Fixed : capacité de la fenêtre dépassée");
+        self.buf[self.len].write(v);
+        self.len += 1;
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.drain();
+    }
+
+    /// Consomme les éléments dans l'ordre, sans déplacer le tableau.
+    #[inline]
+    fn drain(&mut self) -> FixedDrain<'_, T, N> {
+        let len = std::mem::replace(&mut self.len, 0);
+        FixedDrain { arr: self, pos: 0, len }
+    }
+}
+
+impl<T, const N: usize> std::ops::Deref for Fixed<T, N> {
+    type Target = [T];
+    #[inline]
+    fn deref(&self) -> &[T] {
+        // SAFETY: `len` premiers emplacements initialisés.
+        unsafe { std::slice::from_raw_parts(self.buf.as_ptr() as *const T, self.len) }
+    }
+}
+
+impl<T, const N: usize> std::ops::DerefMut for Fixed<T, N> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [T] {
+        // SAFETY: idem.
+        unsafe { std::slice::from_raw_parts_mut(self.buf.as_mut_ptr() as *mut T, self.len) }
+    }
+}
+
+impl<T, const N: usize> Drop for Fixed<T, N> {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+/// Voir [`Fixed::drain`] : `len` mis à 0 d'abord, les éléments non lus sont détruits ici.
+struct FixedDrain<'a, T, const N: usize> {
+    arr: &'a mut Fixed<T, N>,
+    pos: usize,
+    len: usize,
+}
+
+impl<T, const N: usize> Iterator for FixedDrain<'_, T, N> {
+    type Item = T;
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        if self.pos == self.len {
+            return None;
+        }
+        // SAFETY: emplacement initialisé, lu une seule fois (pos avance).
+        let v = unsafe { self.arr.buf[self.pos].assume_init_read() };
+        self.pos += 1;
+        Some(v)
+    }
+}
+
+impl<T, const N: usize> Drop for FixedDrain<'_, T, N> {
+    fn drop(&mut self) {
+        for slot in &mut self.arr.buf[self.pos..self.len] {
+            // SAFETY: emplacements initialisés non lus.
+            unsafe { slot.assume_init_drop() };
+        }
+    }
+}
 
 /// Évicteur TTL : une passe d'échantillonnage par seconde, comme l'ancien serveur monoio
 /// (l'évicteur à curseur est un chantier d'oxidart à part).
@@ -1381,7 +1471,7 @@ impl Core {
         let mut pos = 0;
         let width = self.cfg.prefetch.clamp(1, oxidart::PREFETCH_BATCH);
         let mut budget = self.cfg.batch_cmds;
-        let mut picked: Window<Slot> = SmallVec::new();
+        let mut picked: Fixed<Slot> = Fixed::new();
         let mut idle_run = 0;
         while budget > 0 && idle_run < n {
             let first = self.ready[pos % n];
@@ -1531,8 +1621,8 @@ impl Core {
             /// Index de la première frame de cette connexion dans `frames`.
             first: usize,
         }
-        let mut plans: Window<Plan> = SmallVec::new();
-        let mut afters: Window<(Slot, After)> = SmallVec::new();
+        let mut plans: Fixed<Plan> = Fixed::new();
+        let mut afters: Fixed<(Slot, After)> = Fixed::new();
         // Écrivains arrêtés par le plafond du flux : (connexion, début dans le
         // morceau de tête de la frame arrêtée ; `None` : la frame de `rx`).
         let mut aof_stops: Window<(Slot, Option<u32>)> = SmallVec::new();
@@ -1560,7 +1650,7 @@ impl Core {
             };
             // (connexion, commande, octets de sa frame, fin de la frame dans le
             // morceau de tête ; `None` : la frame de `rx`)
-            let mut frames: Window<(Slot, Cmd<'_>, &[u8], Option<u32>)> = SmallVec::new();
+            let mut frames: Fixed<(Slot, Cmd<'_>, &[u8], Option<u32>)> = Fixed::new();
             for (rank, &slot) in picked.iter().enumerate() {
                 if frames.len() >= width {
                     break;
@@ -1671,7 +1761,7 @@ impl Core {
             let in_run = has & (has << 1 | has >> 1);
             let run = |i: usize| in_run >> i & 1 != 0;
             if frames.len() > 1 {
-                let rest: Window<&[u8]> =
+                let rest: Batch<&[u8]> =
                     frames.iter().enumerate().filter(|(i, _)| !run(*i)).filter_map(|(_, (_, c, _, _))| c.main_key()).collect();
                 if rest.len() > 1 {
                     art.prefetch_keys(&rest);
@@ -1680,7 +1770,7 @@ impl Core {
             let mut hints = [oxidart::Hint::NONE; B];
             // fin de la série en cours (en frames) : fenêtre d'oxidart ouverte avant
             let mut run_end = 0;
-            for (k, (slot, cmd, raw, end)) in frames.into_iter().enumerate() {
+            for (k, (slot, cmd, raw, end)) in frames.drain().enumerate() {
                 if k == run_end && art.in_window() {
                     art.end_window();
                 }
@@ -1790,7 +1880,7 @@ impl Core {
             plan.err = None;
         }
         // Avancer dans les morceaux, rendre les tampons vidés.
-        for plan in &plans {
+        for plan in plans.iter() {
             let s = plan.slot as usize;
             let i = &mut self.ins[s];
             if plan.from_rx {
@@ -1821,14 +1911,14 @@ impl Core {
                 self.try_recycle(bid);
             }
         }
-        for (slot, after) in afters {
+        for (slot, after) in afters.drain() {
             self.finish_frame(slot, after);
         }
         for &(slot, _) in &aof_stops {
             self.aof_park(slot);
         }
         // Erreur de protocole : après les réponses des frames d'avant.
-        for plan in &plans {
+        for plan in plans.iter() {
             let s = plan.slot as usize;
             if let Some(msg) = self.ins[s].proto_err.take() {
                 let o = &mut self.outs[s];
