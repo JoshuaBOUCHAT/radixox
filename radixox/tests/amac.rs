@@ -6,7 +6,7 @@
 //! Chaque connexion a ses propres clés (suffixe `#i`) : l'ordre entre
 //! connexions dans une fenêtre ne change aucune réponse. Les clés partagent
 //! leurs préfixes : les mêmes nœuds portent les clés de plusieurs connexions.
-//! `AMAC_ROUNDS=2000` pour une passe longue.
+//! `AMAC_ROUNDS=5000` pour une passe longue, `AMAC_SEED=n` pour une autre suite.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -114,13 +114,28 @@ fn value(rng: &mut Rng) -> Vec<u8> {
     }
 }
 
-/// Une commande ; `true` : réponse de TTL / PTTL (la valeur dépend de l'horloge).
-fn command(rng: &mut Rng, conn: usize) -> (Vec<u8>, bool) {
+/// Comment comparer une réponse.
+#[derive(Clone, Copy, PartialEq)]
+enum Reply {
+    Exact,
+    /// TTL / PTTL : la valeur dépend de l'horloge, seul le signe compte.
+    Ttl,
+    /// SPOP : tirage au hasard, les éléments comptent, pas leur ordre.
+    Unordered,
+}
+
+fn command(rng: &mut Rng, conn: usize) -> (Vec<u8>, Reply) {
     let k = key(rng, conn);
     let v = value(rng);
     let k2 = key(rng, conn);
     let k3 = key(rng, conn);
-    let c = match rng.below(100) {
+    // peu de champs et de membres : des conteneurs qui se vident
+    let f = [b'f', b'0' + rng.below(4) as u8];
+    let f2 = [b'f', b'0' + rng.below(4) as u8];
+    let m = [b'm', b'0' + rng.below(5) as u8];
+    let m2 = [b'm', b'0' + rng.below(5) as u8];
+    let score = rng.below(20).to_string().into_bytes();
+    let c = match rng.below(130) {
         0..=19 => resp(&[b"GET", &k]),
         20..=31 => resp(&[b"SET", &k, &v]),
         32..=35 => resp(&[b"SET", &k, &v, b"EX", b"100"]),
@@ -132,8 +147,8 @@ fn command(rng: &mut Rng, conn: usize) -> (Vec<u8>, bool) {
         57..=60 => resp(&[b"EXISTS", &k]),
         61 => resp(&[b"EXISTS", &k, &k2]),
         62..=64 => resp(&[b"TYPE", &k]),
-        65..=67 => return (resp(&[b"TTL", &k]), true),
-        68 => return (resp(&[b"PTTL", &k]), true),
+        65..=67 => return (resp(&[b"TTL", &k]), Reply::Ttl),
+        68 => return (resp(&[b"PTTL", &k]), Reply::Ttl),
         69..=71 => resp(&[b"EXPIRE", &k, b"100"]),
         72..=73 => resp(&[b"PERSIST", &k]),
         74..=77 => resp(&[b"INCR", &k]),
@@ -156,9 +171,31 @@ fn command(rng: &mut Rng, conn: usize) -> (Vec<u8>, bool) {
         94 => resp(&[b"DEL", &k, &k2, &k, &k3, &k2]),
         95 => resp(&[b"MSET", &k, &v, &k2, b"1", &k, b"2"]),
         96 => resp(&[b"EXISTS", &k, &k, &k2]),
+        // Hash, Set, ZSet (le moteur passe par `with_hint`)
+        97..=99 => resp(&[b"HSET", &k, &f, &v, &f2, b"7"]),
+        100..=101 => resp(&[b"HDEL", &k, &f, &f2]),
+        102 => resp(&[b"HGET", &k, &f]),
+        103 => resp(&[b"HINCRBY", &k, &f, b"3"]),
+        104 => resp(&[b"HLEN", &k]),
+        105 => resp(&[b"HGETALL", &k]),
+        106 => resp(&[b"HMGET", &k, &f, &f2]),
+        107 => resp(&[b"HEXISTS", &k, &f]),
+        108 => resp(&[b"HKEYS", &k]),
+        109..=111 => resp(&[b"SADD", &k, &m, &m2]),
+        112..=113 => resp(&[b"SREM", &k, &m, &m2]),
+        114 => resp(&[b"SISMEMBER", &k, &m]),
+        115 => resp(&[b"SCARD", &k]),
+        116 => resp(&[b"SMEMBERS", &k]),
+        117 => return (resp(&[b"SPOP", &k, b"1000"]), Reply::Unordered),
+        118..=120 => resp(&[b"ZADD", &k, &score, &m]),
+        121..=122 => resp(&[b"ZREM", &k, &m, &m2]),
+        123 => resp(&[b"ZSCORE", &k, &m]),
+        124 => resp(&[b"ZINCRBY", &k, b"2", &m]),
+        125 => resp(&[b"ZRANGE", &k, b"0", b"-1", b"WITHSCORES"]),
+        126 => resp(&[b"ZCARD", &k]),
         _ => resp(&[b"GET", &k]),
     };
-    (c, false)
+    (c, Reply::Exact)
 }
 
 /// Fin de la réponse qui commence à `pos`, si elle est complète.
@@ -188,17 +225,37 @@ fn reply_end(buf: &[u8], pos: usize) -> Option<usize> {
     }
 }
 
-/// Lit `n` réponses ; celles des TTL (`ttl[i]`) positives deviennent `:T`.
-fn read_replies(s: &mut TcpStream, buf: &mut Vec<u8>, ttl: &[bool]) -> Vec<Vec<u8>> {
-    let mut out = Vec::with_capacity(ttl.len());
+/// Réponse sous une forme comparable (voir [`Reply`]).
+fn normalize(r: &[u8], kind: Reply) -> Vec<u8> {
+    match kind {
+        Reply::Ttl if r.starts_with(b":") && !r.starts_with(b":-") => b":T".to_vec(),
+        Reply::Unordered if r.starts_with(b"*") => {
+            let head = r.windows(2).position(|w| w == b"\r\n").unwrap() + 2;
+            let mut items = Vec::new();
+            let mut p = head;
+            while p < r.len() {
+                let e = reply_end(r, p).unwrap();
+                items.push(&r[p..e]);
+                p = e;
+            }
+            items.sort();
+            let mut out = r[..head].to_vec();
+            items.iter().for_each(|i| out.extend_from_slice(i));
+            out
+        }
+        _ => r.to_vec(),
+    }
+}
+
+/// Lit une réponse par élément de `kinds`, normalisée.
+fn read_replies(s: &mut TcpStream, buf: &mut Vec<u8>, kinds: &[Reply]) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(kinds.len());
     let mut pos = 0;
     let mut chunk = [0u8; 64 << 10];
-    while out.len() < ttl.len() {
+    while out.len() < kinds.len() {
         match reply_end(buf, pos) {
             Some(end) => {
-                let r = &buf[pos..end];
-                let ttl_positive = ttl[out.len()] && r.starts_with(b":") && !r.starts_with(b":-");
-                out.push(if ttl_positive { b":T".to_vec() } else { r.to_vec() });
+                out.push(normalize(&buf[pos..end], kinds[out.len()]));
                 pos = end;
             }
             None => {
@@ -216,7 +273,7 @@ fn simple(port: u16, args: &[&[u8]]) -> Vec<u8> {
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.write_all(&resp(args)).unwrap();
     let mut buf = Vec::new();
-    read_replies(&mut s, &mut buf, &[false]).remove(0)
+    read_replies(&mut s, &mut buf, &[Reply::Exact]).remove(0)
 }
 
 fn info_field(port: u16, field: &str) -> u64 {
@@ -238,7 +295,8 @@ fn amac_answers_like_plain_path() {
     let amac_env = [("RADIXOX_AMAC", "8"), ("RADIXOX_AMAC_PF", "2"), ("RADIXOX_APPENDONLY", "yes"), ("RADIXOX_APPENDFSYNC", "always")];
     let a = start(PORT_AMAC, &dir_a, &amac_env);
     let _b = start(PORT_PLAIN, &dir_b, &[("RADIXOX_AMAC", "0")]);
-    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    let seed: u64 = std::env::var("AMAC_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ seed.wrapping_mul(0xD6E8_FEB8_6659_FD93));
     let open = |port| -> Vec<(TcpStream, Vec<u8>)> {
         (0..CONNS).map(|_| (TcpStream::connect(("127.0.0.1", port)).unwrap(), Vec::new())).collect()
     };
@@ -246,15 +304,15 @@ fn amac_answers_like_plain_path() {
     for round in 0..rounds {
         // toutes les connexions envoient, puis on lit : les fenêtres mêlent
         // les connexions
-        let mut kinds: Vec<Vec<bool>> = Vec::new();
+        let mut kinds: Vec<Vec<Reply>> = Vec::new();
         for c in 0..CONNS {
             let n = 1 + rng.below(80) as usize;
             let mut bytes = Vec::new();
             let mut ttl = Vec::with_capacity(n);
             for _ in 0..n {
-                let (cmd, is_ttl) = command(&mut rng, c);
+                let (cmd, kind) = command(&mut rng, c);
                 bytes.extend_from_slice(&cmd);
-                ttl.push(is_ttl);
+                ttl.push(kind);
             }
             ca[c].0.write_all(&bytes).unwrap();
             cb[c].0.write_all(&bytes).unwrap();
@@ -275,14 +333,18 @@ fn amac_answers_like_plain_path() {
         }
     }
     assert_eq!(simple(PORT_AMAC, &[b"DBSIZE"]), simple(PORT_PLAIN, &[b"DBSIZE"]));
-    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs().to_string();
-    let digest = |port| simple(port, &[b"DEBUG", b"DIGEST", at.as_bytes()]);
-    let want = digest(PORT_PLAIN);
-    assert_eq!(digest(PORT_AMAC), want, "contenu");
+    // Le condensé couvre les échéances : un `EX 100` exécuté de part et d'autre
+    // d'un changement de seconde diffère d'un serveur à l'autre. Entre les deux
+    // serveurs, les clés sans TTL (condensé à +1000 s : les autres sont
+    // expirées) ; leurs réponses ont déjà comparé le reste.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let digest = |port, at: u64| simple(port, &[b"DEBUG", b"DIGEST", at.to_string().as_bytes()]);
+    assert_eq!(digest(PORT_AMAC, now + 1000), digest(PORT_PLAIN, now + 1000), "contenu");
     let served = info_field(PORT_AMAC, "amac_cmds");
     assert!(served > (rounds * CONNS) as u64, "le moteur AMAC n'a presque pas servi : {served}");
-    // `always` : tout ce qui a été répondu est sur le disque
+    // `always` : tout ce qui a été répondu est sur le disque ; échéances comprises
+    let before = digest(PORT_AMAC, now);
     drop(a);
     let _a = start(PORT_AMAC, &dir_a, &amac_env);
-    assert_eq!(digest(PORT_AMAC), want, "contenu après reprise sur l'AOF");
+    assert_eq!(digest(PORT_AMAC, now), before, "contenu après reprise sur l'AOF");
 }

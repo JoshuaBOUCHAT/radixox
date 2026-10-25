@@ -582,26 +582,37 @@ impl OxidArt {
 
     /// Emplacement de la valeur vivante de `key`. Une valeur expirée est
     /// supprimée au passage (sauf pendant une save : seulement vue absente).
+    /// Dans [`with_hint`](Self::with_hint), part de l'indice.
     pub(crate) fn live_loc(&mut self, key: &[u8]) -> Option<Loc> {
+        if let Some(hint) = self.scoped_hint(key) {
+            return self.live_hinted(key, hint);
+        }
         let (loc, _, _, exp) = self.find_value(key)?;
         if expired(exp, self.now) {
-            if !self.is_saving() {
-                drop(self.remove_loc(loc));
-            }
+            self.drop_expired(loc, key);
             return None;
         }
         Some(loc)
     }
 
+    /// Retire une valeur expirée croisée en lecture (pas pendant une save) ;
+    /// dans une fenêtre AMAC, sans changer la forme (`remove_in_window`).
+    #[inline]
+    pub(crate) fn drop_expired(&mut self, loc: Loc, key: &[u8]) {
+        if self.is_saving() {
+            return;
+        }
+        if self.window.is_some() {
+            self.remove_in_window(loc);
+            self.touch(key);
+        } else {
+            drop(self.remove_loc(loc));
+        }
+    }
+
     /// Valeur vivante à `key`, par référence (aucune capture de save).
     pub(crate) fn get_ref(&mut self, key: &[u8]) -> Option<NodeValRef<'_>> {
-        let (loc, _, _, exp) = self.find_value(key)?;
-        if expired(exp, self.now) {
-            if !self.is_saving() {
-                drop(self.remove_loc(loc));
-            }
-            return None;
-        }
+        let loc = self.live_loc(key)?;
         let (tag, val, _) = self.loc_value(loc);
         Some(NodeValRef { tag, val })
     }
@@ -656,9 +667,7 @@ impl OxidArt {
     pub fn get(&mut self, key: &[u8]) -> Option<Value> {
         let (loc, tag, val, exp) = self.find_value(key)?;
         if expired(exp, self.now) {
-            if !self.is_saving() {
-                drop(self.remove_loc(loc));
-            }
+            self.drop_expired(loc, key);
             return None;
         }
         // SAFETY: tag != None (valeur trouvée).
@@ -713,7 +722,9 @@ impl OxidArt {
     /// Pose `raw` (échéance `exp`) à `key` en une seule descente. Avec
     /// `cond = Some(want)`, n'écrit que si l'existence de la clé (vivante)
     /// vaut `want` ; sinon `raw` est libérée et la fonction renvoie `false`.
+    /// Dans une fenêtre AMAC, la clé est notée touchée (elle a pu apparaître).
     pub(crate) fn set_raw(&mut self, key: &[u8], raw: RawVal, exp: Option<u64>, cond: Option<bool>) -> bool {
+        self.touch(key);
         let now = self.now;
         let ok = |exists: bool| cond.is_none_or(|want| want == exists);
         let mut idx = self.root_idx;
@@ -911,7 +922,13 @@ impl OxidArt {
             return false;
         };
         let live = !expired(exp, self.now);
-        drop(self.remove_loc(loc));
+        if self.window.is_some() {
+            // fenêtre AMAC : sans changer la forme
+            self.remove_in_window(loc);
+            self.touch(key);
+        } else {
+            drop(self.remove_loc(loc));
+        }
         live
     }
 
@@ -953,6 +970,7 @@ impl OxidArt {
     /// suppression, en remontant par les `parent_idx` si le parent perd une
     /// entrée.
     pub(crate) fn normalize(&mut self, mut x: u32) {
+        debug_assert!(self.window.is_none(), "normalize dans une fenêtre AMAC : la forme ne doit pas changer");
         while x != self.root_idx {
             let node = self.node(x);
             let (len, has_val) = (node.len(), node.has_val());

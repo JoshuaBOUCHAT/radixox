@@ -153,6 +153,30 @@ pub fn hint_keys<'a>(cmd: &Cmd<'a>, mut push: impl FnMut(&'a [u8])) -> bool {
         | Cmd::Expire { key: k, .. }
         | Cmd::IncrBy { key: k, .. }
         | Cmd::DecrBy { key: k, .. } => push(k),
+        // par `OxidArt::with_hint` (le conteneur ; le champ, par sa propre
+        // descente valart)
+        Cmd::HGetAll(k)
+        | Cmd::HLen(k)
+        | Cmd::HKeys(k)
+        | Cmd::HVals(k)
+        | Cmd::SCard(k)
+        | Cmd::SMembers(k)
+        | Cmd::ZCard(k)
+        | Cmd::HSet { key: k, .. }
+        | Cmd::HGet { key: k, .. }
+        | Cmd::HDel { key: k, .. }
+        | Cmd::HExists { key: k, .. }
+        | Cmd::HMGet { key: k, .. }
+        | Cmd::HIncrBy { key: k, .. }
+        | Cmd::SAdd { key: k, .. }
+        | Cmd::SRem { key: k, .. }
+        | Cmd::SIsMember { key: k, .. }
+        | Cmd::SPop { key: k, .. }
+        | Cmd::ZAdd { key: k, .. }
+        | Cmd::ZRange { key: k, .. }
+        | Cmd::ZScore { key: k, .. }
+        | Cmd::ZRem { key: k, .. }
+        | Cmd::ZIncrBy { key: k, .. } => push(k),
         Cmd::Del(keys) | Cmd::Exists(keys) => keys.iter().for_each(|k| push(k)),
         Cmd::MGet(keys) => keys.iter().for_each(|k| push(k)),
         Cmd::MSet(pairs) => pairs.iter().for_each(|(k, _)| push(k)),
@@ -161,9 +185,10 @@ pub fn hint_keys<'a>(cmd: &Cmd<'a>, mut push: impl FnMut(&'a [u8])) -> bool {
     true
 }
 
-/// Comme [`execute_into`], avec un indice de la descente AMAC par clé de
-/// [`hint_keys`]`(cmd)`, dans une fenêtre ouverte (`OxidArt::begin_window`).
-pub fn execute_hinted(cmd: Cmd<'_>, art: &mut OxidArt, hints: &[oxidart::Hint], out: &mut Vec<u8>) {
+/// Comme [`execute_into`], avec `keys` = [`hint_keys`]`(cmd)` et l'indice de
+/// la descente AMAC de chacune, dans une fenêtre ouverte
+/// (`OxidArt::begin_window`).
+pub fn execute_hinted(cmd: Cmd<'_>, art: &mut OxidArt, keys: &[&[u8]], hints: &[oxidart::Hint], out: &mut Vec<u8>) {
     use radixox_lib::shared_frame::extend_encode;
     let h = hints[0];
     let frame = match cmd {
@@ -215,7 +240,8 @@ pub fn execute_hinted(cmd: Cmd<'_>, art: &mut OxidArt, hints: &[oxidart::Hint], 
             }
             return;
         }
-        _ => unreachable!("execute_hinted : commande sans hint_keys"),
+        // Hash, Set, ZSet : la commande normale, sa clé partant de l'indice
+        cmd => art.with_hint(keys[0], h, |art| execute_sync(cmd, art)),
     };
     extend_encode(out, &frame);
 }

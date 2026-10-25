@@ -248,6 +248,8 @@ pub(crate) struct WindowState {
     touched: Vec<u64>,
     /// Nœuds dont une feuille est partie dans un nouveau nœud (`split_leaf`).
     moved: Vec<u32>,
+    /// Clé et indice de [`OxidArt::with_hint`] en cours.
+    scoped: Option<(*const u8, usize, Hint)>,
 }
 
 impl WindowState {
@@ -419,11 +421,11 @@ impl OxidArt {
 
     /// Retire la valeur à `loc` si la forme de l'arbre n'en dépend pas ;
     /// sinon la laisse (expirée) pour [`end_window`](Self::end_window).
-    fn remove_in_window(&mut self, loc: Loc) {
+    pub(crate) fn remove_in_window(&mut self, loc: Loc) {
         let node = self.node(loc.node);
         if loc.node == self.root_idx || node.len() + node.has_val() as usize > 2 {
-            // `normalize` n'aura rien à faire
-            drop(self.remove_loc(loc));
+            // la forme reste canonique : pas de `normalize`
+            drop(self.take_loc(loc));
             return;
         }
         if !is_expired(self.loc_value(loc).2, self.now) {
@@ -435,7 +437,7 @@ impl OxidArt {
     /// Note que la présence de `key` a changé (ajout, suppression) ou que son
     /// indice n'a pas servi.
     #[inline]
-    fn touch(&mut self, key: &[u8]) {
+    pub(crate) fn touch(&mut self, key: &[u8]) {
         if let Some(w) = &mut self.window {
             w.touched.push(key_tag(key));
         }
@@ -467,16 +469,39 @@ impl OxidArt {
 
     /// `live_loc` dans la fenêtre : une valeur expirée est retirée par
     /// `remove_in_window` (sauf pendant une save) et vue absente.
-    fn live_hinted(&mut self, key: &[u8], hint: Hint) -> Option<Loc> {
+    pub(crate) fn live_hinted(&mut self, key: &[u8], hint: Hint) -> Option<Loc> {
         let loc = self.hinted_loc(key, hint)?;
         if is_expired(self.loc_value(loc).2, self.now) {
-            if !self.is_saving() {
-                self.remove_in_window(loc);
-                self.touch(key);
-            }
+            self.drop_expired(loc, key);
             return None;
         }
         Some(loc)
+    }
+
+    /// Exécute `f` avec l'indice de `key` : pendant `f`, toute recherche de
+    /// `key` par `live_loc` (donc `get_ref`, `value_mut`, et les commandes Hash,
+    /// Set, ZSet) part de l'indice. Les autres accès restent sûrs dans la
+    /// fenêtre (`set_raw` note la clé, `del` et les expirées croisées passent
+    /// par `remove_in_window`) ; une suppression qui changerait la forme
+    /// déclenche le `debug_assert` de `normalize`.
+    pub fn with_hint<R>(&mut self, key: &[u8], hint: Hint, f: impl FnOnce(&mut OxidArt) -> R) -> R {
+        let w = self.window.as_mut().expect("with_hint hors fenêtre");
+        debug_assert!(w.scoped.is_none());
+        w.scoped = Some((key.as_ptr(), key.len(), hint));
+        let r = f(self);
+        if let Some(w) = &mut self.window {
+            w.scoped = None;
+        }
+        r
+    }
+
+    /// L'indice de [`with_hint`](Self::with_hint), si `key` est sa clé.
+    #[inline]
+    pub(crate) fn scoped_hint(&self, key: &[u8]) -> Option<Hint> {
+        let (ptr, len, hint) = self.window.as_ref()?.scoped?;
+        // SAFETY: `with_hint` emprunte la clé pendant tout `f`, seul moment où
+        // `scoped` est posé.
+        (len == key.len() && unsafe { std::slice::from_raw_parts(ptr, len) } == key).then_some(hint)
     }
 
     // Les commandes avec l'indice de `amac_descend`, dans une fenêtre ouverte :
@@ -545,7 +570,6 @@ impl OxidArt {
         if let Some(loc) = self.live_hinted(key, hint) {
             return Ok(self.val_mut_at(loc).incr(delta)?);
         }
-        self.touch(key);
         self.set_raw(key, RawVal::from_value(Value::Int(delta)), None, None);
         Ok(delta)
     }
@@ -575,7 +599,6 @@ impl OxidArt {
         let raw = RawVal::from_value(val);
         let Some(Some(loc)) = self.resolve(key, hint) else {
             // absente (insertion) ou indice inutilisable : descente normale
-            self.touch(key);
             return self.set_raw(key, raw, exp, if_exists);
         };
         let live = !is_expired(self.loc_value(loc).2, self.now);

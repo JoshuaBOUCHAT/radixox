@@ -1687,7 +1687,7 @@ impl Core {
                     let (s, n) = spans[k].expect("série");
                     let hints = &hints[s..s + n];
                     let after = journaled(journal.as_mut(), release_upto, held, slot, o, raw, art, cmd, |cmd, art, o| {
-                        crate::exec::execute_hinted(cmd, art, hints, &mut o.out);
+                        crate::exec::execute_hinted(cmd, art, &flat[s..s + n], hints, &mut o.out);
                         After::Continue
                     });
                     afters.push((slot, after));

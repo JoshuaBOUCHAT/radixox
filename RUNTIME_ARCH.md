@@ -1104,7 +1104,8 @@ autre commande (code : en-tête du moteur dans `oxidart/src/prefetch_batch.rs`) 
   série d'au moins deux frames consécutives que `exec::execute_hinted` sait faire
   (`exec::hint_keys` : GET, SET toutes options, SETNX, TYPE, TTL, PTTL, EXPIRE,
   PERSIST, INCR, DECR, INCRBY, DECRBY, et à N clés MGET, MSET, DEL, EXISTS : un indice
-  par clé, MGET par référence sans clone) descend puis s'exécute fenêtre
+  par clé, MGET par référence sans clone ; Hash, Set, ZSet à une clé : la commande
+  normale sous `OxidArt::with_hint`, voir plus bas) descend puis s'exécute fenêtre
   d'oxidart ouverte ; toute autre frame coupe la série et passe par le chemin normal,
   fenêtre fermée (`end_window` avant elle). Le flux (AOF, réplication) est admis : chaque
   frame, avec ou sans indice, passe par `journaled` (plan → exécution → `finish`). Restent
@@ -1114,11 +1115,19 @@ autre commande (code : en-tête du moteur dans `oxidart/src/prefetch_batch.rs`) 
   `remove_in_window` (`live_hinted` pour la suppression à la volée d'une expirée). Ce qui
   ne change pas la forme (écrasement `write_at`, échéance `set_loc_exp`, INCR sur place
   `val_mut_at`) n'a rien à signaler ; une insertion passe par `set_raw` + `touch`.
+- **Entonnoirs sûrs dans une fenêtre** : `set_raw` note la clé (`touch`), `del` et la
+  suppression à la volée d'une expirée (`drop_expired`, depuis `live_loc`, `get_ref`,
+  `get`) passent par `remove_in_window`. Les commandes Hash / Set / ZSet n'atteignent
+  l'arbre que par là (`get_ref`, `value_mut`, `ensure_container`, `set_raw`, `del`) :
+  `with_hint(key, hint, f)` fait partir de l'indice toute recherche de `key` par
+  `live_loc` pendant `f` (le champ, lui, fait sa propre descente valart). Une suppression
+  qui changerait la forme dans une fenêtre déclenche le `debug_assert` de `normalize`.
 - Filet : `debug_assert` de chaque indice contre `locate` ; différentiel oxidart
   (`amac_matches_plain_tree`, 15 opérations contre l'arbre sans indice, avec expirations) ;
   différentiel serveur (`radixox/tests/amac.rs` : mêmes pipelines aléatoires à un serveur
   AMAC + AOF `always` et à un serveur sans, réponses octet pour octet, `DEBUG DIGEST`, puis
-  reprise sur l'AOF). Un `touch` retiré de `del_hinted` y casse en moins d'une seconde.
+  reprise sur l'AOF ; `AMAC_SEED`, `AMAC_ROUNDS`). Un `touch` retiré de `del_hinted`, ou
+  un `remove_loc` remis dans `del`, y casse en moins d'une seconde.
 
 Mesures (pipeline 64, SQPOLL : boucle CPU 0, SQPOLL CPU 1 ; 1 M clés uniformes, 100 o ;
 débit compté par le serveur, `total_commands_processed`, le « ops/s » de memtier variant
@@ -1154,8 +1163,8 @@ n'économise presque rien et la synchronisation coûte. Surtout, chaque mutation
 signaler aux descentes en vol (un oubli = réponse fausse) ; en v2, un oubli de `touch`
 coûte au pire une redescente détectée par le debug.
 
-**Suite** : Hash/Set (descente valart enchaînée) ; activation par défaut ; SET de clé
-absente avec indice d'insertion.
+**Suite** : activation par défaut ; descente valart enchaînée (le champ d'un HGET / HSET
+aussi en AMAC) ; SET de clé absente avec indice d'insertion.
 
 **Chantiers de layout (prototype + bench avant code définitif) :**
 - **Feuille fusionnée avec sa valeur** : l'entrée d'enfant (u32, bit de tag) désigne
