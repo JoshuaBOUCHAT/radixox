@@ -1081,7 +1081,7 @@ parse par fenêtres de K commandes, précharge `Cmd::main_key`, exécute dans l'
    rentable une fois les miss superposés. **Fait (aa93749)** : SWAR partout (inline, overflow
    léger, groupes `[[u8;8][u32;8]]` du huge), SSE2 inutile ; +8,8 % en pipeline 64.
 
-**Moteur AMAC (2026-10-25 ; actif par défaut : `RADIXOX_AMAC=8`, `RADIXOX_AMAC_PF=2`, fenêtre `RADIXOX_PREFETCH=64` ; `RADIXOX_AMAC=0` pour revenir au préchargement seul).** Le point 3
+**Moteur AMAC (2026-10-25 ; actif par défaut : `RADIXOX_AMAC=16`, `RADIXOX_AMAC_PF=2`, fenêtre `RADIXOX_PREFETCH=64` ; `RADIXOX_AMAC=0` pour revenir au préchargement seul).** Le point 3
 appliqué au lot du pipeline, en deux phases, sans jamais refaire une descente à cause d'une
 autre commande (code : en-tête du moteur dans `oxidart/src/prefetch_batch.rs`) :
 - **Phase 1** `amac_descend` : toutes les descentes de la fenêtre en lecture pure, N voies
@@ -1182,6 +1182,17 @@ sans champ. Mesures (2 passages) : Hash d'un million de champs HGET 70 / HSET 30
 2,43–2,44 M (+10 à 18 %) ; Set d'un million de membres SISMEMBER 70 / SADD 30 2,56–2,74 M →
 3,15–3,22 M (+17 à 23 %) ; GET/SET inchangé (+19 instructions/op). Petit bloc (≤ 8 entrées) :
 essayé (bloc, champs, valeur) et retiré, −6 à −12 % sur un Hash d'un champ.
+
+**16 voies plutôt que 8 (même jour).** IBS (`perf record -e ibs_op//`, `perf_event_paranoid`
+≤ 0, CPU de la boucle) sur rx-2s pipeline 64 uniforme : les chargements servis par la DRAM
+qui restent sont presque tous les premières lectures d'un nœud oxidart dans `batch_enter`
+(préfixe, `kind`, `n_in`, pointeur de page) : préchargé un tour plus tôt, il n'est pas encore
+arrivé, un tour de 8 voies étant plus court que la latence DRAM. Les « RAM hit » les plus
+nombreux sont nos `prefetcht0` eux-mêmes (IBS les compte), pas des attentes ; rien en phase 2.
+Mesures (débit compté serveur, 2 passages) : uniforme 8 → 12 → 16 → 24 → 32 voies : 3,95 →
+4,09 → 4,18 → 4,07 → 4,15 M (plateau à 16, 1 315 → 1 240 cycles/op, mêmes instructions) ;
+Zipf 5,20 → 5,33 M ; GET/SET (bench_full) 3,95 → 4,13 M ; Hash d'un million de champs 2,44 →
+2,50 M.
 
 **Suite** : l'écart du mixte ; ZSet ; indices dans valart (l'exécution sans seconde descente) (le champ d'un HGET / HSET
 aussi en AMAC) ; SET de clé absente avec indice d'insertion.

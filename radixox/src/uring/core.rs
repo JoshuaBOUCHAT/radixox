@@ -70,7 +70,8 @@ pub struct Config {
     /// ensemble (`RADIXOX_PREFETCH`, défaut 64 = `PREFETCH_BATCH` ; 1 = une à une).
     pub prefetch: usize,
     /// Descentes en vol du moteur AMAC dans chaque fenêtre (`RADIXOX_AMAC`, défaut
-    /// 8 ; 0 = désactivé : préchargement seul puis descente normale). RUNTIME_ARCH.md §8bis.
+    /// 16 : à 8, un tour des voies est plus court que la latence DRAM, mesuré ;
+    /// 0 = désactivé : préchargement seul puis descente normale). RUNTIME_ARCH.md §8bis.
     pub amac: usize,
     /// Préchargement en phase 2 du moteur AMAC (`RADIXOX_AMAC_PF`, défaut 2 : nœud
     /// de la commande i+4 et valeur de la commande i+2 ; 1 = nœud seul, mesuré
@@ -130,7 +131,7 @@ impl Default for Config {
             flush_early: 64 << 10,
             out_backpressure: 1 << 20,
             prefetch: oxidart::PREFETCH_BATCH,
-            amac: 8,
+            amac: 16,
             amac_pf: 2,
             idle_timeout: None,
             job_budget: KEYS_BUDGET.min(FREE_BUDGET),
