@@ -398,16 +398,6 @@ impl ConnJob {
 
 /// Après cette commande, plus rien de sa connexion dans la fenêtre : barrière
 /// (§2.1) ou commande qui peut parquer la connexion.
-/// Clé d'une commande que le moteur AMAC sait exécuter (prototype).
-fn amac_key<'a>(cmd: &Cmd<'a>) -> Option<&'a [u8]> {
-    match cmd {
-        Cmd::Get(k) => Some(k),
-        Cmd::Set { key, .. } => Some(key),
-        Cmd::Del(keys) if keys.len() == 1 => Some(keys[0]),
-        _ => None,
-    }
-}
-
 fn stops_window(cmd: &Cmd<'_>) -> bool {
     cmd.is_barrier()
         || matches!(
@@ -1626,59 +1616,74 @@ impl Core {
                     plans.push(plan);
                 }
             }
-            // Prototype AMAC (`RADIXOX_AMAC`) : une fenêtre de GET / SET / DEL à une clé,
-            // sans flux ni refus d'écriture : toutes les descentes en AMAC (lecture
-            // pure), puis exécution dans l'ordre avec les indices (`oxidart`,
-            // prefetch_batch.rs) ; sinon préchargement puis descente normale.
-            let amac = cfg.amac > 0
-                && !cfg!(radixox_gc_debug)
-                && journal.is_none()
-                && !read_only
-                && refuse_writes.is_none()
-                && !over_cap
-                && frames.iter().all(|(slot, c, _, _)| {
+            // Moteur AMAC (`RADIXOX_AMAC`, RUNTIME_ARCH.md §8bis) : chaque série
+            // d'au moins deux frames consécutives que `execute_hinted` sait faire
+            // descend d'abord en AMAC (lecture pure), puis s'exécute dans l'ordre
+            // avec les indices, fenêtre d'oxidart ouverte. Les autres frames
+            // coupent les séries et passent par le chemin normal, fenêtre fermée.
+            let amac = cfg.amac > 0 && !cfg!(radixox_gc_debug) && !read_only && refuse_writes.is_none() && !over_cap;
+            let keys: Window<Option<&[u8]>> = frames
+                .iter()
+                .map(|(slot, c, _, _)| {
                     let o = &outs[*slot as usize];
-                    o.client.authed && o.channels.is_empty() && amac_key(c).is_some()
-                });
-            if amac {
-                let keys: Window<&[u8]> = frames.iter().map(|(_, c, _, _)| amac_key(c).expect("GET / SET / DEL")).collect();
-                // la fenêtre est bornée par PREFETCH_BATCH (`width`)
-                let mut hints = [oxidart::Hint::NONE; oxidart::PREFETCH_BATCH];
-                let hints = &mut hints[..keys.len()];
-                art.amac_descend(&keys, cfg.amac, hints);
-                art.begin_window();
-                let hints = &*hints;
-                for (i, ((slot, cmd, _, _), &hint)) in frames.drain(..).zip(hints.iter()).enumerate() {
-                    // Expérience : préchargement en avance sur l'exécution.
-                    if cfg.amac_pf >= 1 && let Some(&h) = hints.get(i + 4) {
-                        art.prefetch_hint_node(h);
-                    }
-                    if cfg.amac_pf >= 2 && let Some(&h) = hints.get(i + 2) {
-                        art.prefetch_hint_value(h);
-                    }
-                    let frame = match cmd {
-                        Cmd::Get(key) => crate::exec::string::cmd_get_hinted(art, key, hint),
-                        Cmd::Set { key, val, opts } => {
-                            persist.note_writes(1);
-                            crate::exec::string::cmd_set_hinted(art, key, val, opts, hint)
-                        }
-                        Cmd::Del(keys) => {
-                            persist.note_writes(1);
-                            Frame::Integer(art.del_hinted(keys[0], hint) as i64)
-                        }
-                        _ => unreachable!("fenêtre AMAC : GET / SET / DEL"),
-                    };
-                    extend_encode(&mut outs[slot as usize].out, &frame);
-                    afters.push((slot, After::Continue));
-                }
-                art.end_window();
-            } else if frames.len() > 1 {
-                let keys: Window<&[u8]> = frames.iter().filter_map(|(_, c, _, _)| c.main_key()).collect();
-                if keys.len() > 1 {
-                    art.prefetch_keys(&keys);
+                    if amac && o.client.authed && o.channels.is_empty() { crate::exec::hint_key(c) } else { None }
+                })
+                .collect();
+            // dans une série (au moins deux indices de suite)
+            let in_run: Window<bool> = (0..keys.len())
+                .map(|i| {
+                    let has = |j: usize| keys.get(j).is_some_and(|k| k.is_some());
+                    has(i) && (has(i + 1) || (i > 0 && has(i - 1)))
+                })
+                .collect();
+            if frames.len() > 1 {
+                let rest: Window<&[u8]> = frames
+                    .iter()
+                    .zip(&in_run)
+                    .filter(|(_, run)| !**run)
+                    .filter_map(|((_, c, _, _), _)| c.main_key())
+                    .collect();
+                if rest.len() > 1 {
+                    art.prefetch_keys(&rest);
                 }
             }
-            for (slot, cmd, raw, end) in frames {
+            // la fenêtre est bornée par PREFETCH_BATCH (`width`)
+            let mut hints = [oxidart::Hint::NONE; oxidart::PREFETCH_BATCH];
+            // fin de la série en cours : fenêtre d'oxidart ouverte avant
+            let mut run_end = 0;
+            for (k, (slot, cmd, raw, end)) in frames.into_iter().enumerate() {
+                if k == run_end && art.in_window() {
+                    art.end_window();
+                }
+                if k >= run_end && in_run[k] {
+                    run_end = k + in_run[k..].iter().take_while(|r| **r).count();
+                    let run_keys: Window<&[u8]> = keys[k..run_end].iter().map(|k| k.expect("série")).collect();
+                    art.amac_descend(&run_keys, cfg.amac, &mut hints[k..run_end]);
+                    art.begin_window();
+                }
+                if k < run_end {
+                    // préchargement en avance sur l'exécution (PF1 : nœud, PF2 : valeur)
+                    if cfg.amac_pf >= 1 && k + 4 < run_end {
+                        art.prefetch_hint_node(hints[k + 4]);
+                    }
+                    if cfg.amac_pf >= 2 && k + 2 < run_end {
+                        art.prefetch_hint_value(hints[k + 2]);
+                    }
+                    // ni plafond du flux ni réplica : aucun écrivain arrêté
+                    debug_assert!(aof_stops.is_empty());
+                    let o = &mut outs[slot as usize];
+                    let weight = cmd.write_weight();
+                    if weight > 0 {
+                        persist.note_writes(weight);
+                    }
+                    let hint = hints[k];
+                    let after = journaled(journal.as_mut(), release_upto, held, slot, o, raw, art, cmd, |cmd, art, o| {
+                        extend_encode(&mut o.out, &crate::exec::execute_hinted(cmd, art, hint));
+                        After::Continue
+                    });
+                    afters.push((slot, after));
+                    continue;
+                }
                 if aof_stops.iter().any(|&(s, _)| s == slot) {
                     continue;
                 }
@@ -1713,30 +1718,13 @@ impl Core {
                 }
                 #[cfg(radixox_gc_debug)]
                 GC_DEBUG_RAW.with(|r| *r.borrow_mut() = raw.to_vec());
-                let Some(stream) = journal.as_mut() else {
-                    afters.push((slot, run_cmd(cmd, art, o, job_budget)));
-                    continue;
-                };
-                // Le flux : la frame reçue, décidée avant (la commande est
-                // consommée), confirmée par la réponse (DURABILITY_DESIGN.md §3).
-                let plan = journal::plan(&cmd);
-                let start = o.out.len();
-                afters.push((slot, run_cmd(cmd, art, o, job_budget)));
-                let mark = stream.end_mark();
-                journal::finish(plan, &o.out[start..], raw, art.now, stream);
-                if stream.end_mark() != mark {
-                    o.write_mark = stream.end_mark();
-                }
-                // Écriture ou lecture : elle a pu voir du non-durable (§7.5).
-                if let Some(durable) = release_upto {
-                    let mark = stream.end_mark();
-                    if mark > durable {
-                        o.holds.push_back((start, mark));
-                        if o.holds.len() == 1 {
-                            held.push(slot);
-                        }
-                    }
-                }
+                let after = journaled(journal.as_mut(), release_upto, held, slot, o, raw, art, cmd, |cmd, art, o| {
+                    run_cmd(cmd, art, o, job_budget)
+                });
+                afters.push((slot, after));
+            }
+            if art.in_window() {
+                art.end_window();
             }
         }
         let done = afters.len();
@@ -2509,6 +2497,45 @@ thread_local! {
 }
 
 /// Exécute une commande d'une connexion.
+/// Exécute une frame par `run` et, avec le flux, l'y passe : la frame reçue,
+/// décidée avant (la commande est consommée), confirmée par la réponse
+/// (DURABILITY_DESIGN.md §3).
+#[allow(clippy::too_many_arguments)]
+fn journaled<'a>(
+    stream: Option<&mut Stream>,
+    release_upto: Option<u64>,
+    held: &mut Vec<Slot>,
+    slot: Slot,
+    o: &mut ConnOut,
+    raw: &[u8],
+    art: &mut OxidArt,
+    cmd: Cmd<'a>,
+    run: impl FnOnce(Cmd<'a>, &mut OxidArt, &mut ConnOut) -> After,
+) -> After {
+    let Some(stream) = stream else {
+        return run(cmd, art, o);
+    };
+    let plan = journal::plan(&cmd);
+    let start = o.out.len();
+    let after = run(cmd, art, o);
+    let mark = stream.end_mark();
+    journal::finish(plan, &o.out[start..], raw, art.now, stream);
+    if stream.end_mark() != mark {
+        o.write_mark = stream.end_mark();
+    }
+    // Écriture ou lecture : elle a pu voir du non-durable (§7.5).
+    if let Some(durable) = release_upto {
+        let mark = stream.end_mark();
+        if mark > durable {
+            o.holds.push_back((start, mark));
+            if o.holds.len() == 1 {
+                held.push(slot);
+            }
+        }
+    }
+    after
+}
+
 fn run_cmd(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) -> After {
     // Mode abonné : seules les commandes Pub/Sub, PING et QUIT passent.
     if !o.channels.is_empty() && o.client.authed {

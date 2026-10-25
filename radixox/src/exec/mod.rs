@@ -31,9 +31,10 @@ use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::shared_frame::SharedFrame as Frame;
 
 use string::{
-    cmd_dbsize, cmd_decr, cmd_decrby, cmd_del, cmd_exists, cmd_expire, cmd_get,
-    cmd_incr, cmd_incrby, cmd_mset, cmd_persist, cmd_pttl, cmd_set, cmd_setnx, cmd_ttl,
-    cmd_type,
+    cmd_dbsize, cmd_decr, cmd_decrby, cmd_del, cmd_exists, cmd_expire, cmd_get, cmd_get_hinted,
+    cmd_incr, cmd_incrby, cmd_incrby_hinted, cmd_mset, cmd_persist, cmd_pttl, cmd_set,
+    cmd_set_hinted, cmd_setnx, cmd_setnx_hinted, cmd_ttl, cmd_ttl_hinted, cmd_type,
+    cmd_type_hinted,
 };
 
 // ── Exécution vers le tampon de sortie ──────────────────────────────────────
@@ -130,6 +131,52 @@ pub fn execute_into<'a>(
     };
     extend_encode(out, &frame);
     Executed::Done
+}
+
+// ── Commandes avec indice (moteur AMAC, RUNTIME_ARCH.md §8bis) ───────────────
+
+/// Clé d'une commande que [`execute_hinted`] sait exécuter : une clé, et un
+/// effet sur l'arbre qui ne passe que par les primitives de la fenêtre AMAC
+/// d'oxidart (`prefetch_batch.rs`).
+pub fn hint_key<'a>(cmd: &Cmd<'a>) -> Option<&'a [u8]> {
+    match cmd {
+        Cmd::Get(k)
+        | Cmd::Type(k)
+        | Cmd::Ttl(k)
+        | Cmd::Pttl(k)
+        | Cmd::Persist(k)
+        | Cmd::Incr(k)
+        | Cmd::Decr(k)
+        | Cmd::Set { key: k, .. }
+        | Cmd::SetNx { key: k, .. }
+        | Cmd::Expire { key: k, .. }
+        | Cmd::IncrBy { key: k, .. }
+        | Cmd::DecrBy { key: k, .. } => Some(k),
+        Cmd::Del(keys) | Cmd::Exists(keys) if keys.len() == 1 => Some(keys[0]),
+        _ => None,
+    }
+}
+
+/// Comme [`execute_sync`], avec l'indice de la descente AMAC de
+/// [`hint_key`]`(cmd)`, dans une fenêtre ouverte (`OxidArt::begin_window`).
+pub fn execute_hinted(cmd: Cmd<'_>, art: &mut OxidArt, hint: oxidart::Hint) -> Frame {
+    match cmd {
+        Cmd::Get(key) => cmd_get_hinted(art, key, hint),
+        Cmd::Set { key, val, opts } => cmd_set_hinted(art, key, val, opts, hint),
+        Cmd::SetNx { key, val } => cmd_setnx_hinted(art, key, val, hint),
+        Cmd::Del(keys) => Frame::Integer(art.del_hinted(keys[0], hint) as i64),
+        Cmd::Exists(keys) => Frame::Integer(art.exists_hinted(keys[0], hint) as i64),
+        Cmd::Type(key) => cmd_type_hinted(art, key, hint),
+        Cmd::Ttl(key) => cmd_ttl_hinted(art, key, false, hint),
+        Cmd::Pttl(key) => cmd_ttl_hinted(art, key, true, hint),
+        Cmd::Expire { key, dur } => Frame::Integer(art.expire_hinted(key, dur, hint) as i64),
+        Cmd::Persist(key) => Frame::Integer(art.persist_hinted(key, hint) as i64),
+        Cmd::Incr(key) => cmd_incrby_hinted(art, key, 1, hint),
+        Cmd::Decr(key) => cmd_incrby_hinted(art, key, -1, hint),
+        Cmd::IncrBy { key, delta } => cmd_incrby_hinted(art, key, delta, hint),
+        Cmd::DecrBy { key, delta } => cmd_incrby_hinted(art, key, delta.wrapping_neg(), hint),
+        _ => unreachable!("execute_hinted : commande sans hint_key"),
+    }
 }
 
 // ── Command execution ─────────────────────────────────────────────────────────

@@ -609,12 +609,17 @@ impl OxidArt {
     /// Accès en écriture à la valeur vivante de `key` (passe par la barrière).
     pub(crate) fn value_mut(&mut self, key: &[u8]) -> Option<NodeValMut<'_>> {
         let loc = self.live_loc(key)?;
+        Some(self.val_mut_at(loc))
+    }
+
+    /// Accès en écriture à la valeur à `loc` (passe par la barrière).
+    pub(crate) fn val_mut_at(&mut self, loc: Loc) -> NodeValMut<'_> {
         let node = self.node_mut(loc.node);
         match loc.slot {
-            Slot::SelfVal => Some(NodeValMut { tag: &mut node.tag, val: &mut node.val }),
+            Slot::SelfVal => NodeValMut { tag: &mut node.tag, val: &mut node.val },
             Slot::Leaf(r) => {
                 let (tag, val) = node.leaf_val_mut(r).expect("feuille");
-                Some(NodeValMut { tag, val })
+                NodeValMut { tag, val }
             }
         }
     }

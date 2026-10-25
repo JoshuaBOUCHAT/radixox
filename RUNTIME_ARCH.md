@@ -1081,7 +1081,7 @@ parse par fenêtres de K commandes, précharge `Cmd::main_key`, exécute dans l'
    rentable une fois les miss superposés. **Fait (aa93749)** : SWAR partout (inline, overflow
    léger, groupes `[[u8;8][u32;8]]` du huge), SSE2 inutile ; +8,8 % en pipeline 64.
 
-**Prototype AMAC (2026-10-25, `RADIXOX_AMAC=N`, désactivé par défaut).** Le point 3
+**Moteur AMAC (2026-10-25, `RADIXOX_AMAC=N`, désactivé par défaut ; branche `full-pipeline`).** Le point 3
 appliqué au lot du pipeline, en deux phases, sans jamais refaire une descente à cause d'une
 autre commande (code : en-tête du moteur dans `oxidart/src/prefetch_batch.rs`) :
 - **Phase 1** `amac_descend` : toutes les descentes de la fenêtre en lecture pure, N voies
@@ -1100,8 +1100,24 @@ autre commande (code : en-tête du moteur dans `oxidart/src/prefetch_batch.rs`) 
   `locate`.
 - `RADIXOX_AMAC_PF=2` (défaut) : en exécutant la commande i, précharge le nœud de i+4 et la
   valeur de i+2 (la valeur préchargée en phase 1 a quitté la L1 après ~60 descentes).
-- Fenêtres admises : GET, SET (toutes options), DEL à une clé, sans AOF/réplication ni refus
-  d'écriture ; sinon le chemin ci-dessus.
+- **Séries** (branche `full-pipeline`) : la fenêtre n'est plus « tout ou rien ». Chaque
+  série d'au moins deux frames consécutives que `exec::execute_hinted` sait faire
+  (`exec::hint_key` : GET, SET toutes options, SETNX, DEL et EXISTS à une clé, TYPE,
+  TTL, PTTL, EXPIRE, PERSIST, INCR, DECR, INCRBY, DECRBY) descend puis s'exécute fenêtre
+  d'oxidart ouverte ; toute autre frame coupe la série et passe par le chemin normal,
+  fenêtre fermée (`end_window` avant elle). Le flux (AOF, réplication) est admis : chaque
+  frame, avec ou sans indice, passe par `journaled` (plan → exécution → `finish`). Restent
+  exclus : réplica, refus d'écriture, flux au plafond, client non authentifié ou abonné.
+- Une commande avec indice = sa version normale où la descente est remplacée par
+  `hinted_loc` (l'indice s'il vaut encore, sinon `locate`) et toute suppression par
+  `remove_in_window` (`live_hinted` pour la suppression à la volée d'une expirée). Ce qui
+  ne change pas la forme (écrasement `write_at`, échéance `set_loc_exp`, INCR sur place
+  `val_mut_at`) n'a rien à signaler ; une insertion passe par `set_raw` + `touch`.
+- Filet : `debug_assert` de chaque indice contre `locate` ; différentiel oxidart
+  (`amac_matches_plain_tree`, 15 opérations contre l'arbre sans indice, avec expirations) ;
+  différentiel serveur (`radixox/tests/amac.rs` : mêmes pipelines aléatoires à un serveur
+  AMAC + AOF `always` et à un serveur sans, réponses octet pour octet, `DEBUG DIGEST`, puis
+  reprise sur l'AOF). Un `touch` retiré de `del_hinted` y casse en moins d'une seconde.
 
 Mesures (pipeline 64, SQPOLL : boucle CPU 0, SQPOLL CPU 1 ; 1 M clés uniformes, 100 o ;
 débit compté par le serveur, `total_commands_processed`, le « ops/s » de memtier variant
@@ -1124,9 +1140,22 @@ dispatch 14 %, boucle et connexions ≈ 8 %, copies 5 %, encodage 4 %. Avec des 
 (NET_THREADS_DESIGN.md), le métier garderait ~75–80 % de ce travail : plafond brut ≈ 5 M
 ops/s, moins les défauts entre cœurs sur les requêtes et les réponses.
 
-**Suite** : exécution dès la fin de chaque descente (v3 : une descente posée sur un nœud
-muté refait seulement son étape courante) ; SET de clé absente avec indice d'insertion ;
-autres commandes (MGET, INCR, HGET/HSET…).
+**v3 abandonnée (branche locale `amac-v3`).** Exécution dès la fin de chaque descente : une
+descente posée sur un nœud muté refaisait seulement son étape courante (`changed` : rangs
+décalés → recherche du radix ; `reprefixed` : préfixe raccourci par `split_child` →
+relecture de l'entrée du parent), retrait dans l'ordre. Première version : une voie
+n'était rendue qu'au retrait (blocage en tête) ; avec un tampon de retrait (voie rendue
+dès la descente finie, valeur préchargée), mesure propre, 3 passages alternés : GET/SET
+3,61 M contre **3,83 M** pour v2 + PF2, mixte 2,97 M contre **3,03 M**, ~200 instructions/op
+de plus (contrôle des listes à chaque étape, exécution dans la boucle des voies). Les
+nœuds d'une fenêtre de 64 (~32 Ko) restent en L1/L2 entre les deux phases : entrelacer
+n'économise presque rien et la synchronisation coûte. Surtout, chaque mutation devait se
+signaler aux descentes en vol (un oubli = réponse fausse) ; en v2, un oubli de `touch`
+coûte au pire une redescente détectée par le debug.
+
+**Suite** : commandes à plusieurs clés (MGET, MSET, DEL, EXISTS : N indices par frame) ;
+Hash/Set (descente valart enchaînée) ; activation par défaut ; SET de clé absente avec
+indice d'insertion.
 
 **Chantiers de layout (prototype + bench avant code définitif) :**
 - **Feuille fusionnée avec sa valeur** : l'entrée d'enfant (u32, bit de tag) désigne

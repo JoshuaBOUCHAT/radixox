@@ -33,7 +33,8 @@ pub fn cmd_set(art: &mut OxidArt, key: &[u8], val: SharedByte, opts: SetOpts) ->
     Frame::SimpleString("OK")
 }
 
-/// GET avec l'indice du moteur AMAC (prototype, `RADIXOX_AMAC`).
+// Avec l'indice du moteur AMAC (`execute_hinted`) : mêmes réponses que sans.
+
 pub fn cmd_get_hinted(art: &mut OxidArt, key: &[u8], hint: Hint) -> Frame {
     match art.get_hinted(key, hint) {
         Some(val) => match val.as_bytes() {
@@ -46,7 +47,6 @@ pub fn cmd_get_hinted(art: &mut OxidArt, key: &[u8], hint: Hint) -> Frame {
     }
 }
 
-/// SET avec l'indice du moteur AMAC (prototype, `RADIXOX_AMAC`).
 pub fn cmd_set_hinted(art: &mut OxidArt, key: &[u8], val: SharedByte, opts: SetOpts, hint: Hint) -> Frame {
     let if_exists = match opts.condition {
         SetCondition::Always => None,
@@ -57,6 +57,33 @@ pub fn cmd_set_hinted(art: &mut OxidArt, key: &[u8], val: SharedByte, opts: SetO
         return Frame::Null;
     }
     Frame::SimpleString("OK")
+}
+
+pub fn cmd_setnx_hinted(art: &mut OxidArt, key: &[u8], val: SharedByte, hint: Hint) -> Frame {
+    Frame::Integer(art.set_cond_hinted(key, None, Value::String(val), Some(false), hint) as i64)
+}
+
+pub fn cmd_incrby_hinted(art: &mut OxidArt, key: &[u8], delta: i64, hint: Hint) -> Frame {
+    match art.incrby_hinted(key, delta, hint) {
+        Ok(val) => Frame::Integer(val),
+        Err(e) => counter_err(e),
+    }
+}
+
+/// TTL (`ms = false`) ou PTTL.
+pub fn cmd_ttl_hinted(art: &mut OxidArt, key: &[u8], ms: bool, hint: Hint) -> Frame {
+    match art.ttl_hinted(key, hint) {
+        TtlResult::KeyNotExist => Frame::Integer(-2),
+        TtlResult::KeyWithoutTtl => Frame::Integer(-1),
+        TtlResult::KeyWithTtl(secs) => Frame::Integer((if ms { secs * 1000 } else { secs }) as i64),
+    }
+}
+
+pub fn cmd_type_hinted(art: &mut OxidArt, key: &[u8], hint: Hint) -> Frame {
+    match art.get_hinted(key, hint) {
+        Some(val) => Frame::SimpleString(val.redis_type().as_str()),
+        None => Frame::SimpleString("none"),
+    }
 }
 
 pub fn cmd_setnx(art: &mut OxidArt, key: &[u8], val: SharedByte) -> Frame {

@@ -20,7 +20,8 @@ use crate::krange::{OwnedVal, RangeVal, str_val};
 use crate::node::{EntryRef, Probe};
 use crate::save::prefetch_value;
 use crate::value::{RawVal, Value, value_from_raw_ref};
-use crate::{Loc, OxidArt, Slot, eq_fast, expired as is_expired, starts_with_fast};
+use crate::counter::CounterError;
+use crate::{Loc, OxidArt, Slot, TtlResult, eq_fast, expired as is_expired, starts_with_fast};
 
 /// Nombre maximal de clés suivies ensemble.
 pub const PREFETCH_BATCH: usize = 64;
@@ -361,6 +362,12 @@ impl OxidArt {
         self.window = Some(WindowState::default());
     }
 
+    /// Une fenêtre est ouverte.
+    #[inline]
+    pub fn in_window(&self) -> bool {
+        self.window.is_some()
+    }
+
     /// Ferme la fenêtre : retire les valeurs mortes encore expirées (une
     /// valeur recréée entre-temps est vivante : sautée). Par nœud, toutes ses
     /// valeurs mortes puis une seule normalisation (ce qui remonte n'est pas
@@ -434,20 +441,6 @@ impl OxidArt {
         }
     }
 
-    /// [`get`](Self::get) par une descente, dans la fenêtre (suppression d'une
-    /// expirée par `remove_in_window`).
-    fn get_in_window(&mut self, key: &[u8]) -> Option<Value> {
-        let (loc, tag, val, exp) = self.find_value(key)?;
-        if is_expired(exp, self.now) {
-            if !self.is_saving() {
-                self.remove_in_window(loc);
-            }
-            return None;
-        }
-        // SAFETY: tag != None (valeur trouvée).
-        Some(unsafe { value_from_raw_ref(tag, val) })
-    }
-
     /// `Some(emplacement ou absence)` si l'indice est encore valable.
     fn resolve(&mut self, key: &[u8], hint: Hint) -> Option<Option<Loc>> {
         let w = self.window.as_ref().expect("indice AMAC hors fenêtre");
@@ -463,45 +456,105 @@ impl OxidArt {
         Some(loc)
     }
 
-    /// [`get`](Self::get) avec l'indice de [`amac_descend`](Self::amac_descend).
-    pub fn get_hinted(&mut self, key: &[u8], hint: Hint) -> Option<Value> {
-        let loc = match self.resolve(key, hint) {
-            None => {
-                self.touch(key);
-                return self.get_in_window(key);
-            }
-            Some(None) => return None,
-            Some(Some(loc)) => loc,
-        };
-        let (tag, val, exp) = self.loc_value(loc);
-        if is_expired(exp, self.now) {
+    /// Emplacement de `key`, expirée ou non : l'indice s'il vaut encore,
+    /// sinon une descente.
+    fn hinted_loc(&mut self, key: &[u8], hint: Hint) -> Option<Loc> {
+        match self.resolve(key, hint) {
+            Some(loc) => loc,
+            None => self.locate(key),
+        }
+    }
+
+    /// `live_loc` dans la fenêtre : une valeur expirée est retirée par
+    /// `remove_in_window` (sauf pendant une save) et vue absente.
+    fn live_hinted(&mut self, key: &[u8], hint: Hint) -> Option<Loc> {
+        let loc = self.hinted_loc(key, hint)?;
+        if is_expired(self.loc_value(loc).2, self.now) {
             if !self.is_saving() {
                 self.remove_in_window(loc);
                 self.touch(key);
             }
             return None;
         }
+        Some(loc)
+    }
+
+    // Les commandes avec l'indice de `amac_descend`, dans une fenêtre ouverte :
+    // mêmes réponses et mêmes effets que leur version sans indice.
+
+    /// [`get`](Self::get).
+    pub fn get_hinted(&mut self, key: &[u8], hint: Hint) -> Option<Value> {
+        let loc = self.live_hinted(key, hint)?;
+        let (tag, val, _) = self.loc_value(loc);
         // SAFETY: tag != None (valeur trouvée).
         Some(unsafe { value_from_raw_ref(tag, val) })
     }
 
-    /// [`del`](Self::del) avec l'indice de [`amac_descend`](Self::amac_descend).
-    pub fn del_hinted(&mut self, key: &[u8], hint: Hint) -> bool {
-        let loc = match self.resolve(key, hint) {
-            None => self.locate(key),
-            Some(loc) => loc,
-        };
-        let Some(loc) = loc else { return false };
-        let live = !is_expired(self.loc_value(loc).2, self.now);
-        self.remove_in_window(loc);
-        let removed = live;
-        self.touch(key);
-        removed
+    /// EXISTS à une clé.
+    pub fn exists_hinted(&mut self, key: &[u8], hint: Hint) -> bool {
+        self.live_hinted(key, hint).is_some()
     }
 
-    /// [`set_cond`](Self::set_cond) avec l'indice de
-    /// [`amac_descend`](Self::amac_descend) : une clé présente est écrasée sur
-    /// place, sans descente.
+    /// [`get_ttl`](Self::get_ttl) (une expirée reste en place, comme sans indice).
+    pub fn ttl_hinted(&mut self, key: &[u8], hint: Hint) -> TtlResult {
+        let Some(loc) = self.hinted_loc(key, hint) else {
+            return TtlResult::KeyNotExist;
+        };
+        match self.loc_value(loc).2 {
+            Some(exp) if exp < self.now => TtlResult::KeyNotExist,
+            Some(exp) => TtlResult::KeyWithTtl(exp - self.now),
+            None => TtlResult::KeyWithoutTtl,
+        }
+    }
+
+    /// [`expire`](Self::expire) : l'échéance change sur place.
+    pub fn expire_hinted(&mut self, key: &[u8], ttl: std::time::Duration, hint: Hint) -> bool {
+        let Some(loc) = self.hinted_loc(key, hint) else {
+            return false;
+        };
+        if is_expired(self.loc_value(loc).2, self.now) {
+            return false;
+        }
+        self.set_loc_exp(loc, Some(self.now.saturating_add(ttl.as_secs())));
+        true
+    }
+
+    /// [`persist`](Self::persist).
+    pub fn persist_hinted(&mut self, key: &[u8], hint: Hint) -> bool {
+        let Some(loc) = self.hinted_loc(key, hint) else {
+            return false;
+        };
+        let exp = self.loc_value(loc).2;
+        if exp.is_none() || is_expired(exp, self.now) {
+            return false;
+        }
+        self.set_loc_exp(loc, None);
+        true
+    }
+
+    /// [`incrby`](Self::incrby) : une clé présente change sur place.
+    pub fn incrby_hinted(&mut self, key: &[u8], delta: i64, hint: Hint) -> Result<i64, CounterError> {
+        if let Some(loc) = self.live_hinted(key, hint) {
+            return Ok(self.val_mut_at(loc).incr(delta)?);
+        }
+        self.touch(key);
+        self.set_raw(key, RawVal::from_value(Value::Int(delta)), None, None);
+        Ok(delta)
+    }
+
+    /// [`del`](Self::del).
+    pub fn del_hinted(&mut self, key: &[u8], hint: Hint) -> bool {
+        let Some(loc) = self.hinted_loc(key, hint) else {
+            return false;
+        };
+        let live = !is_expired(self.loc_value(loc).2, self.now);
+        self.remove_in_window(loc);
+        self.touch(key);
+        live
+    }
+
+    /// [`set_cond`](Self::set_cond) : une clé présente est écrasée sur place,
+    /// sans descente.
     pub fn set_cond_hinted(
         &mut self,
         key: &[u8],
@@ -755,57 +808,77 @@ mod tests {
     #[test]
     fn amac_matches_plain_tree() {
         use rand::{Rng, SeedableRng, rngs::StdRng};
+        use radixox_lib::shared_byte::SharedByte;
         use std::time::Duration;
+        // chaque commande avec indice, et sa version sans indice
+        fn hinted(art: &mut OxidArt, op: u8, k: &[u8], v: Value, h: super::Hint) -> String {
+            let ttl = Some(Duration::from_secs(1));
+            match op {
+                0..=2 => format!("{:?}", art.get_hinted(k, h)),
+                3..=4 => format!("{}", art.set_cond_hinted(k, None, v, None, h)),
+                5 => format!("{}", art.set_cond_hinted(k, ttl, v, None, h)),
+                6 => format!("{}", art.set_cond_hinted(k, None, v, Some(false), h)),
+                7 => format!("{}", art.set_cond_hinted(k, None, v, Some(true), h)),
+                8..=9 => format!("{}", art.del_hinted(k, h)),
+                10 => format!("{}", art.exists_hinted(k, h)),
+                11 => format!("{:?}", art.ttl_hinted(k, h)),
+                12 => format!("{}", art.expire_hinted(k, Duration::from_secs(2), h)),
+                13 => format!("{}", art.persist_hinted(k, h)),
+                _ => format!("{:?}", art.incrby_hinted(k, 3, h)),
+            }
+        }
+        fn plain(art: &mut OxidArt, op: u8, k: &[u8], v: Value) -> String {
+            let ttl = Some(Duration::from_secs(1));
+            let sb = SharedByte::from_slice(k);
+            match op {
+                0..=2 => format!("{:?}", art.get(k)),
+                3..=4 => format!("{}", art.set_cond(k, None, v, None)),
+                5 => format!("{}", art.set_cond(k, ttl, v, None)),
+                6 => format!("{}", art.set_cond(k, None, v, Some(false))),
+                7 => format!("{}", art.set_cond(k, None, v, Some(true))),
+                8..=9 => format!("{}", art.del(k)),
+                10 => format!("{}", art.get(k).is_some()),
+                11 => format!("{:?}", art.get_ttl(sb)),
+                12 => format!("{}", art.expire(sb, Duration::from_secs(2))),
+                13 => format!("{}", art.persist(sb)),
+                _ => format!("{:?}", art.incrby(sb, 3)),
+            }
+        }
         for (seed, lanes) in [(1u64, 1usize), (2, 2), (3, 8), (4, 16), (5, 64)] {
             let mut rng = StdRng::seed_from_u64(seed);
             let mut a = OxidArt::new();
             let mut b = OxidArt::new();
+            // préfixes partagés courts (splits fréquents), et nœuds larges à
+            // profondeurs variées (étapes de page)
             let key = |rng: &mut StdRng| -> Vec<u8> {
-                let len = rng.gen_range(0..6);
-                let mut k = b"user:".to_vec();
-                k.extend((0..len).map(|_| b"abc"[rng.gen_range(0..3)]));
-                k
+                if rng.gen_bool(0.5) {
+                    let len = rng.gen_range(0..6);
+                    let mut k = b"user:".to_vec();
+                    k.extend((0..len).map(|_| b"abc"[rng.gen_range(0..3)]));
+                    k
+                } else {
+                    let len = rng.gen_range(1..9);
+                    let mut k = b"k:".to_vec();
+                    k.extend((0..len).map(|i| b"abcdefghijklmnopqrst"[rng.gen_range(0..if i < 2 { 20 } else { 3 })]));
+                    k
+                }
             };
-            for round in 0..400u64 {
+            for round in 0..1000u64 {
                 a.set_now(1000 + round);
                 b.set_now(1000 + round);
                 let n = rng.gen_range(1..=64);
-                let ops: Vec<(u8, Vec<u8>)> = (0..n).map(|_| (rng.gen_range(0..11), key(&mut rng))).collect();
+                let ops: Vec<(u8, Vec<u8>)> = (0..n).map(|_| (rng.gen_range(0..15), key(&mut rng))).collect();
+                // valeurs : entiers (INCRBY) ou texte
+                let vals: Vec<String> =
+                    (0..n).map(|i| if rng.gen_bool(0.3) { format!("{i}") } else { format!("{round}:{i}") }).collect();
                 let keys: Vec<&[u8]> = ops.iter().map(|(_, k)| k.as_slice()).collect();
                 let mut hints = vec![super::Hint::NONE; n];
                 a.amac_descend(&keys, lanes, &mut hints);
                 a.begin_window();
-                let ttl = Some(Duration::from_secs(1));
-                let got: Vec<String> = ops
-                    .iter()
-                    .zip(&hints)
-                    .enumerate()
-                    .map(|(i, ((op, k), &h))| {
-                        let v = val(&format!("{round}:{i}"));
-                        match op {
-                            0..=3 => format!("{:?}", a.get_hinted(k, h)),
-                            4..=5 => format!("{}", a.set_cond_hinted(k, None, v, None, h)),
-                            6 => format!("{}", a.set_cond_hinted(k, ttl, v, None, h)),
-                            7 => format!("{}", a.set_cond_hinted(k, None, v, Some(false), h)),
-                            _ => format!("{}", a.del_hinted(k, h)),
-                        }
-                    })
-                    .collect();
+                let got: Vec<String> =
+                    ops.iter().zip(&hints).zip(&vals).map(|(((op, k), &h), v)| hinted(&mut a, *op, k, val(v), h)).collect();
                 a.end_window();
-                let want: Vec<String> = ops
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (op, k))| {
-                        let v = val(&format!("{round}:{i}"));
-                        match op {
-                            0..=3 => format!("{:?}", b.get(k)),
-                            4..=5 => format!("{}", b.set_cond(k, None, v, None)),
-                            6 => format!("{}", b.set_cond(k, ttl, v, None)),
-                            7 => format!("{}", b.set_cond(k, None, v, Some(false))),
-                            _ => format!("{}", b.del(k)),
-                        }
-                    })
-                    .collect();
+                let want: Vec<String> = ops.iter().zip(&vals).map(|((op, k), v)| plain(&mut b, *op, k, val(v))).collect();
                 assert_eq!(got, want, "seed {seed} lanes {lanes} round {round}");
                 assert_eq!(a.len(), b.len());
                 a.assert_canonical();
