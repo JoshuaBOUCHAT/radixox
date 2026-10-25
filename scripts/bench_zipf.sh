@@ -18,6 +18,9 @@
 #   SERVER_CPUS=0,1,6 MT_CPUS=2-5 CONFIGS="vk-3t" scripts/bench_zipf.sh   # à la main
 #   VALKEY_BIN=…/valkey-src/src/valkey-server scripts/bench_zipf.sh
 #
+# - RadixOx : `target/release/radixox`, recompilé à chaque lancement (rien à
+#   faire s'il est à jour) ; RX_BIN=… pour un autre binaire, RX_BIN_KEEP=1 pour
+#   ne pas compiler.
 # - Un serveur à la fois, 1M clés préchargées (une fois chacune, pipeline 64).
 # - Placement automatique (topologie lue dans sysfs), sauf SERVER_CPUS / MT_CPUS
 #   donnés : le serveur prend un thread par cœur physique, les cœurs
@@ -52,7 +55,8 @@ VALKEY_BIN="${VALKEY_BIN:-valkey-server}"
 PORT="${PORT:-6440}"
 MEM_MAX="${MEM_MAX:-4G}"
 
-[ -x "$RX_BIN" ] || cargo build -q --release -p radixox --manifest-path "$ROOT/Cargo.toml"
+# toujours recompilé (rien à faire si à jour) : un binaire périmé fausserait la mesure
+[ -n "${RX_BIN_KEEP:-}" ] || cargo build -q --release -p radixox --manifest-path "$ROOT/Cargo.toml"
 command -v memtier_benchmark >/dev/null
 mkdir -p "$OUT"
 SUMMARY="$OUT/summary.txt"
