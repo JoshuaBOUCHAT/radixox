@@ -722,6 +722,20 @@ impl Node {
         prefetch_l1(self.ptr.as_ptr());
     }
 
+    /// Précharge toute la page d'une petite forme (≤ 224 o, au plus 5 lignes),
+    /// sans test : les adresses au-delà du bloc retombent sur son dernier octet
+    /// (cmov). Forme large ou sans page : la première ligne seulement (ou
+    /// `TRASH`), comme [`prefetch_page`](Self::prefetch_page).
+    #[inline(always)]
+    pub(crate) fn prefetch_page_all(&self) {
+        let p = self.ptr.as_ptr() as *const u8;
+        let last = if self.kind.is_small() { self.block().saturating_sub(1) } else { 0 };
+        for i in 0..4 {
+            prefetch_l1(p.wrapping_add((64 * i).min(last)));
+        }
+        prefetch_l1(p.wrapping_add(last));
+    }
+
     /// Préchargement de second étage, une fois le nœud arrivé en cache :
     /// sa page, son préfixe long et les suffixes longs (sur le tas) des
     /// feuilles de ses cellules. Ceux de la page attendent qu'elle arrive.

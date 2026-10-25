@@ -1217,6 +1217,23 @@ aléatoires). Essai : tout Overflow8 passe par `PageSearch` (choix sur le nœud,
 radix) : perdant, −4 à −8 % sur UUID, −11 % sur `key:NNN` (un tour et un aiguillage de plus
 coûtent plus qu'un raté une fois sur deux) ; retiré.
 
+**Page entière préchargée (Overflow8).** Un radix dans la page coûtait 3 tours par étage
+(`Enter` précharge la 1re ligne de page, `PageSearch` cherche et précharge la cellule,
+`Entry` la lit). `prefetch_page_all` précharge dès `Enter` toute la page d'une petite forme
+(≤ 224 o, 5 préchargements à `ptr + min(64·i, taille−1)`, le `min` en cmov ; forme large ou
+sans page : une ligne, ou `TRASH`) et `batch_page` lit l'entrée au tour suivant : 2 tours.
+Mesures (rx-2s p64, 15M clés, débit compté serveur, 2 passages alternés) : UUID Zipf 3,52 /
+3,55 → 3,73 / 3,90 M, uniforme 3,25 / 3,28 → 3,41 / 3,57 M (−60 à −110 instructions/op) ;
+`key:NNN` neutre (cycles/op dans le bruit, uniforme −2 %).
+
+Défauts DRAM restants (IBS avec latence, `-W`, UUID 15M uniforme, machine libre) : ~0,6 par
+requête, presque tous la première lecture d'un nœud dans `batch_enter` (`ptr`, `kind`,
+`pg_block8`), latence médiane 375 cycles (p25 112) : un quart rattrape un préchargement en
+route, le reste est un défaut complet. Découpage temporaire de la boucle (sous charge) :
+la vidange de fin de fenêtre fait 1,6× plus de défauts par unité de travail mais un tiers du
+total ; 16 → 32 voies n'abaisse pas le plancher de la boucle pleine ; TLB écartée (99,4 % en
+pages de 2 Mio, 81 / 85 défauts avec la traduction en TLB L1). Cause du plancher non établie.
+
 **Suite** : l'écart du mixte ; ZSet ; indices dans valart (l'exécution sans seconde descente) (le champ d'un HGET / HSET
 aussi en AMAC) ; SET de clé absente avec indice d'insertion.
 

@@ -64,7 +64,7 @@ enum Step {
     /// Nœud courant préchargé (deux lignes) : comparer son préfixe, chercher
     /// le radix suivant.
     Enter,
-    /// En-tête de la page préchargé : y chercher le radix.
+    /// Page entière préchargée (Overflow8) : y chercher le radix, lire l'entrée.
     PageSearch,
     /// Cellule de l'entrée de ce rang préchargée (dans la page).
     Entry(u16),
@@ -121,7 +121,7 @@ impl OxidArt {
                 let next = match step[i] {
                     Step::Done => continue,
                     Step::Enter => self.batch_enter(keys[i], &mut idx[i], &mut cursor[i], &mut found[i]),
-                    Step::PageSearch => self.batch_search(keys[i], &mut idx[i], &mut cursor[i], &mut found[i]),
+                    Step::PageSearch => self.batch_page(keys[i], &mut idx[i], &mut cursor[i], &mut found[i]),
                     Step::Entry(e) => self.batch_entry(keys[i], &mut idx[i], &mut cursor[i], e as usize, &mut found[i]),
                     Step::LeafSfx(e) => {
                         self.batch_leaf(keys[i], idx[i], cursor[i], e as usize, &mut found[i]);
@@ -140,8 +140,9 @@ impl OxidArt {
     #[inline(always)]
     fn batch_enter(&self, key: &[u8], idx: &mut u32, cursor: &mut usize, found: &mut u64) -> Step {
         let node = self.node(*idx);
-        // sans test : sans page, le pointeur vise une ligne poubelle chaude
-        node.prefetch_page();
+        // sans test : sans page, le pointeur vise une ligne poubelle chaude ;
+        // toute la page d'une petite forme, que `batch_page` lira d'un coup
+        node.prefetch_page_all();
         let p: &[u8] = &node.prefix;
         if !starts_with_fast(&key[*cursor..], p) {
             return Step::Done;
@@ -173,6 +174,19 @@ impl OxidArt {
             }
             Probe::Here(entry) => self.batch_entry_ref(key, idx, cursor, entry, found),
         }
+    }
+
+    /// Overflow8, radix au-delà du nœud : la page entière a été préchargée
+    /// par `batch_enter` au tour précédent, en-tête et cellules ensemble.
+    /// L'entrée se lit donc tout de suite, sans tour `Entry`.
+    #[inline(always)]
+    fn batch_page(&self, key: &[u8], idx: &mut u32, cursor: &mut usize, found: &mut u64) -> Step {
+        let node = self.node(*idx);
+        debug_assert!(node.search_needs_page(key[*cursor]));
+        let Some(e) = node.find(key[*cursor]) else {
+            return Step::Done;
+        };
+        self.batch_entry_ref(key, idx, cursor, node.entry_ref(e), found)
     }
 
     /// Entrée de la page (cellule préchargée au tour précédent).
@@ -332,7 +346,7 @@ impl OxidArt {
                 let next = match step[s] {
                     Step::Done => continue,
                     Step::Enter => self.batch_enter(key, &mut idx[s], &mut cursor[s], &mut found[s]),
-                    Step::PageSearch => self.batch_search(key, &mut idx[s], &mut cursor[s], &mut found[s]),
+                    Step::PageSearch => self.batch_page(key, &mut idx[s], &mut cursor[s], &mut found[s]),
                     Step::Entry(e) => self.batch_entry(key, &mut idx[s], &mut cursor[s], e as usize, &mut found[s]),
                     Step::LeafSfx(e) => {
                         self.batch_leaf(key, idx[s], cursor[s], e as usize, &mut found[s]);
