@@ -1044,7 +1044,7 @@ mêmes 894 instructions).
 (`oxidart/src/prefetch_batch.rs`) : K clés descendent étage par étage, chacune précharge
 son nœud suivant, puis l'overflow, puis la valeur. Rien n'est gardé ni écrit. `handle_buffer`
 parse par fenêtres de K commandes, précharge `Cmd::main_key`, exécute dans l'ordre.
-`RADIXOX_PREFETCH` (défaut **8**, 0 = off). Au-delà de 8–10 clés, ça se dégrade (cause non
+`RADIXOX_PREFETCH` (défaut **8** à l'époque, 64 depuis le moteur AMAC par défaut). Au-delà de 8–10 clés, ça se dégradait (cause non
 établie : THP déjà actif, TLB non confirmée).
 
 **Dans la boucle maison :**
@@ -1081,7 +1081,7 @@ parse par fenêtres de K commandes, précharge `Cmd::main_key`, exécute dans l'
    rentable une fois les miss superposés. **Fait (aa93749)** : SWAR partout (inline, overflow
    léger, groupes `[[u8;8][u32;8]]` du huge), SSE2 inutile ; +8,8 % en pipeline 64.
 
-**Moteur AMAC (2026-10-25, `RADIXOX_AMAC=N`, désactivé par défaut ; branche `full-pipeline`).** Le point 3
+**Moteur AMAC (2026-10-25 ; actif par défaut : `RADIXOX_AMAC=8`, `RADIXOX_AMAC_PF=2`, fenêtre `RADIXOX_PREFETCH=64` ; `RADIXOX_AMAC=0` pour revenir au préchargement seul).** Le point 3
 appliqué au lot du pipeline, en deux phases, sans jamais refaire une descente à cause d'une
 autre commande (code : en-tête du moteur dans `oxidart/src/prefetch_batch.rs`) :
 - **Phase 1** `amac_descend` : toutes les descentes de la fenêtre en lecture pure, N voies
@@ -1164,7 +1164,13 @@ n'économise presque rien et la synchronisation coûte. Surtout, chaque mutation
 signaler aux descentes en vol (un oubli = réponse fausse) ; en v2, un oubli de `touch`
 coûte au pire une redescente détectée par le debug.
 
-**Suite** : activation par défaut ; descente valart enchaînée (le champ d'un HGET / HSET
+Mesures de la version par défaut (pipeline 64, SQPOLL, débit compté serveur, 2 passages) :
+GET/SET 2,7 M sans AMAC → 4,07 M ; Hash (HGET 70 / HSET 30) 2,35 M → 2,70 M ; mixte avec AOF
+everysec 2,32 M → 2,75 M ; sans pipeline, rien (293 K, le réseau limite). Contre le
+prototype (`aa158be`, mêmes réglages) : GET/SET à égalité, mixte 0 à −5 % (+110
+instructions/op dans la boucle de fenêtre, cause non trouvée).
+
+**Suite** : l'écart du mixte ; descente valart enchaînée (le champ d'un HGET / HSET
 aussi en AMAC) ; SET de clé absente avec indice d'insertion.
 
 **Chantiers de layout (prototype + bench avant code définitif) :**

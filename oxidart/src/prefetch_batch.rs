@@ -417,6 +417,20 @@ impl OxidArt {
                 self.normalize(x);
             }
         }
+        #[cfg(debug_assertions)]
+        self.assert_no_dead();
+    }
+
+    /// Debug : aucune valeur marquée morte (`exp = 0`) ne reste dans l'arbre.
+    #[cfg(debug_assertions)]
+    fn assert_no_dead(&self) {
+        if self.len() > 5000 {
+            return;
+        }
+        let mut path = Vec::new();
+        self.walk(self.root_idx, &mut path, |k: &[u8], _, _, exp: Option<u64>| {
+            assert_ne!(exp, Some(0), "valeur morte restée après end_window : {}", k.escape_ascii());
+        });
     }
 
     /// Retire la valeur à `loc` si la forme de l'arbre n'en dépend pas ;
@@ -543,7 +557,7 @@ impl OxidArt {
             return TtlResult::KeyNotExist;
         };
         match self.loc_value(loc).2 {
-            Some(exp) if exp < self.now => TtlResult::KeyNotExist,
+            Some(exp) if is_expired(Some(exp), self.now) => TtlResult::KeyNotExist,
             Some(exp) => TtlResult::KeyWithTtl(exp - self.now),
             None => TtlResult::KeyWithoutTtl,
         }
@@ -904,8 +918,9 @@ mod tests {
                 }
             };
             for round in 0..1000u64 {
-                a.set_now(1000 + round);
-                b.set_now(1000 + round);
+                // horloge à 0 les 100 premiers tours : la marque de mort doit valoir quand même
+                a.set_now(round.saturating_sub(100));
+                b.set_now(round.saturating_sub(100));
                 let n = rng.gen_range(1..=64);
                 let ops: Vec<(u8, Vec<u8>)> = (0..n).map(|_| (rng.gen_range(0..15), key(&mut rng))).collect();
                 // valeurs : entiers (INCRBY) ou texte

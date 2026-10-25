@@ -199,9 +199,11 @@ pub(crate) enum PrefixHit {
     Leaf { node: u32, radix: u8 },
 }
 
+/// Échéance passée. L'échéance 0 l'est toujours, même horloge à 0 : c'est la
+/// marque de mort d'une fenêtre AMAC (`remove_in_window`).
 #[inline]
 pub(crate) fn expired(exp: Option<u64>, now: u64) -> bool {
-    exp.is_some_and(|e| e < now)
+    exp.is_some_and(|e| e < now.max(1))
 }
 
 /// `hay` commence-t-il par `needle` ? Les préfixes et suffixes comparés en
@@ -680,7 +682,7 @@ impl OxidArt {
             return TtlResult::KeyNotExist;
         };
         match exp {
-            Some(exp) if exp < self.now => TtlResult::KeyNotExist,
+            Some(exp) if expired(Some(exp), self.now) => TtlResult::KeyNotExist,
             Some(exp) => TtlResult::KeyWithTtl(exp - self.now),
             None => TtlResult::KeyWithoutTtl,
         }

@@ -64,7 +64,9 @@ erreur, RUNTIME_ARCH §16).
 - l'arbre appartient au cœur (`&mut OxidArt`, plus de `Rc<RefCell<>>`) ;
 - réception multishot dans un anneau partagé de petits tampons ; les morceaux reçus
   attendent tels quels dans la file de leur connexion ;
-- lot par fenêtres de K commandes (parse en place, préchargement, exécution), une
+- lot par fenêtres de 64 commandes (parse en place, puis moteur AMAC : les descentes de
+  chaque série de commandes connues en machines à états entrelacées, lecture pure, puis
+  exécution dans l'ordre sur les emplacements trouvés ; RUNTIME_ARCH §8bis), une
   connexion servie d'un bloc, réponses envoyées entre tranches de 2048 commandes ;
 - KEYS, UNLINK `prefix*`, FLUSHDB, BGSAVE : jobs à curseur synchrones avancés d'une
   tranche par tour ; une commande longue parque seulement sa connexion ;
@@ -212,6 +214,12 @@ Avant de valider du code :
 - [ ] Toute mutation ou libération d'un nœud oxidart / valart passe par son point de
       passage (barrière de save, SAVE_DESIGN §3) ; aucune libération pendant une save hors
       liste différée.
+- [ ] Fenêtre AMAC ouverte (`begin_window` … `end_window`) : aucune mutation ne change
+      la forme de l'arbre (pas de `normalize`, `debug_assert`) ; une suppression passe
+      par `remove_in_window`, une clé ajoutée ou retirée est notée (`touch`, fait par
+      `set_raw`), un déplacement de feuille par `leaf_moved`. Nouvelle commande avec
+      indice : `exec::hint_keys` + `execute_hinted`, et le différentiel
+      `radixox/tests/amac.rs` doit la tirer.
 - [ ] Aucune opération O(n) synchrone sur une grande structure (§5) : sinon tranches.
 - [ ] Pour une valeur partagée : décrément de refcount, jamais de libération aveugle.
 - [ ] Fichiers : temporaire → fsync → `rename` → fsync du dossier.

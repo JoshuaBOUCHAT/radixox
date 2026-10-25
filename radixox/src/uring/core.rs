@@ -66,11 +66,11 @@ pub struct Config {
     /// `out` au-delà duquel une connexion qui a déjà un send en vol n'est plus
     /// tirée (backpressure, §6.2).
     pub out_backpressure: usize,
-    /// Commandes dont les clés sont préchargées ensemble (`RADIXOX_PREFETCH`,
-    /// 1 = pas de préchargement).
+    /// Largeur de la fenêtre d'exécution : commandes dont les clés descendent
+    /// ensemble (`RADIXOX_PREFETCH`, défaut 64 = `PREFETCH_BATCH` ; 1 = une à une).
     pub prefetch: usize,
-    /// Prototype : descentes en vol du moteur AMAC pour les fenêtres de GET / SET /
-    /// DEL seulement (`RADIXOX_AMAC`, 0 = désactivé) ; la fenêtre reste `prefetch`.
+    /// Descentes en vol du moteur AMAC dans chaque fenêtre (`RADIXOX_AMAC`, défaut
+    /// 8 ; 0 = désactivé : préchargement seul puis descente normale). RUNTIME_ARCH.md §8bis.
     pub amac: usize,
     /// Préchargement en phase 2 du moteur AMAC (`RADIXOX_AMAC_PF`, défaut 2 : nœud
     /// de la commande i+4 et valeur de la commande i+2 ; 1 = nœud seul, mesuré
@@ -129,8 +129,8 @@ impl Default for Config {
             batch_cmds: 2048,
             flush_early: 64 << 10,
             out_backpressure: 1 << 20,
-            prefetch: 8,
-            amac: 0,
+            prefetch: oxidart::PREFETCH_BATCH,
+            amac: 8,
             amac_pf: 2,
             idle_timeout: None,
             job_budget: KEYS_BUDGET.min(FREE_BUDGET),
