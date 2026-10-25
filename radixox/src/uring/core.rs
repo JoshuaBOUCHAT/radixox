@@ -1622,22 +1622,41 @@ impl Core {
             // avec les indices, fenêtre d'oxidart ouverte. Les autres frames
             // coupent les séries et passent par le chemin normal, fenêtre fermée.
             let amac = cfg.amac > 0 && !cfg!(radixox_gc_debug) && !read_only && refuse_writes.is_none() && !over_cap;
-            // Clés de toutes les frames avec indice, à la suite ; `spans[i]` :
-            // celles de la frame i (début, nombre).
-            let mut flat: SmallVec<[&[u8]; oxidart::PREFETCH_BATCH]> = SmallVec::new();
-            let mut spans: SmallVec<[Option<(usize, usize)>; oxidart::PREFETCH_BATCH]> = SmallVec::new();
+            // Clés des frames avec indice, à la suite, au plus B par fenêtre (au-delà,
+            // la frame passe par le chemin normal) : frame i = flat[start[i]..start[i + 1]].
+            // La fenêtre est bornée par PREFETCH_BATCH = 64 (`width`) ; bit i de `has` :
+            // la frame i a ses indices.
+            const B: usize = oxidart::PREFETCH_BATCH;
+            debug_assert!(frames.len() <= B);
+            let mut flat: [&[u8]; B] = [&[]; B];
+            let mut start = [0u8; B + 1];
+            let mut has = 0u64;
             if amac {
-                spans.extend(frames.iter().map(|(slot, c, _, _)| {
+                let mut n = 0;
+                for (i, (slot, c, _, _)) in frames.iter().enumerate() {
                     let o = &outs[*slot as usize];
-                    let start = flat.len();
-                    (o.client.authed && o.channels.is_empty() && crate::exec::hint_keys(c, |k| flat.push(k)))
-                        .then(|| (start, flat.len() - start))
-                }));
+                    let from = n;
+                    let mut fits = true;
+                    let hinted = o.client.authed
+                        && o.channels.is_empty()
+                        && crate::exec::hint_keys(c, |k| {
+                            if n < B {
+                                flat[n] = k;
+                                n += 1;
+                            } else {
+                                fits = false;
+                            }
+                        });
+                    if hinted && fits {
+                        has |= 1 << i;
+                    } else {
+                        n = from;
+                    }
+                    start[i + 1] = n as u8;
+                }
             }
-            // bit i : frame i dans une série (au moins deux frames avec indice de
-            // suite) ; la fenêtre est bornée par PREFETCH_BATCH = 64 (`width`)
-            debug_assert!(frames.len() <= 64);
-            let has = spans.iter().enumerate().fold(0u64, |m, (i, s)| m | (s.is_some() as u64) << i);
+            let span = |i: usize| start[i] as usize..start[i + 1] as usize;
+            // bit i : frame i dans une série (au moins deux frames avec indice de suite)
             let in_run = has & (has << 1 | has >> 1);
             let run = |i: usize| in_run >> i & 1 != 0;
             if frames.len() > 1 {
@@ -1647,7 +1666,7 @@ impl Core {
                     art.prefetch_keys(&rest);
                 }
             }
-            let mut hints: SmallVec<[oxidart::Hint; oxidart::PREFETCH_BATCH]> = smallvec::smallvec![oxidart::Hint::NONE; flat.len()];
+            let mut hints = [oxidart::Hint::NONE; B];
             // fin de la série en cours (en frames) : fenêtre d'oxidart ouverte avant
             let mut run_end = 0;
             for (k, (slot, cmd, raw, end)) in frames.into_iter().enumerate() {
@@ -1656,21 +1675,18 @@ impl Core {
                 }
                 if k >= run_end && run(k) {
                     run_end = k + (!(in_run >> k)).trailing_zeros() as usize;
-                    let (from, _) = spans[k].expect("série");
-                    let (last, n) = spans[run_end - 1].expect("série");
-                    let to = last + n;
-                    art.amac_descend(&flat[from..to], cfg.amac, &mut hints[from..to]);
+                    let keys = start[k] as usize..start[run_end] as usize;
+                    art.amac_descend(&flat[keys.clone()], cfg.amac, &mut hints[keys]);
                     art.begin_window();
                 }
                 if k < run_end {
                     // préchargement en avance sur l'exécution (PF1 : nœud, PF2 :
                     // valeur), sur la première clé des frames suivantes
-                    let first = |j: usize| spans.get(j).copied().flatten().filter(|&(_, n)| j < run_end && n > 0).map(|(s, _)| hints[s]);
-                    if cfg.amac_pf >= 1 && let Some(h) = first(k + 4) {
-                        art.prefetch_hint_node(h);
+                    if cfg.amac_pf >= 1 && k + 4 < run_end {
+                        art.prefetch_hint_node(hints[start[k + 4] as usize]);
                     }
-                    if cfg.amac_pf >= 2 && let Some(h) = first(k + 2) {
-                        art.prefetch_hint_value(h);
+                    if cfg.amac_pf >= 2 && k + 2 < run_end {
+                        art.prefetch_hint_value(hints[start[k + 2] as usize]);
                     }
                     // ni plafond du flux ni réplica : aucun écrivain arrêté
                     debug_assert!(aof_stops.is_empty());
@@ -1679,13 +1695,12 @@ impl Core {
                     if weight > 0 {
                         persist.note_writes(weight);
                     }
-                    let (s, n) = spans[k].expect("série");
-                    let hints = &hints[s..s + n];
-                    let after = journaled(journal.as_mut(), release_upto, held, slot, o, raw, art, cmd, |cmd, art, o| {
-                        crate::exec::execute_hinted(cmd, art, &flat[s..s + n], hints, &mut o.out);
-                        After::Continue
-                    });
-                    afters.push((slot, after));
+                    let plan = journal.is_some().then(|| (journal::plan(&cmd), o.out.len()));
+                    crate::exec::execute_hinted(cmd, art, &flat[span(k)], &hints[span(k)], &mut o.out);
+                    if let (Some(stream), Some((plan, start))) = (journal.as_mut(), plan) {
+                        journal_finish(stream, plan, start, release_upto, held, slot, o, raw, art.now);
+                    }
+                    afters.push((slot, After::Continue));
                     continue;
                 }
                 if aof_stops.iter().any(|&(s, _)| s == slot) {
@@ -1722,10 +1737,11 @@ impl Core {
                 }
                 #[cfg(radixox_gc_debug)]
                 GC_DEBUG_RAW.with(|r| *r.borrow_mut() = raw.to_vec());
-                let after = journaled(journal.as_mut(), release_upto, held, slot, o, raw, art, cmd, |cmd, art, o| {
-                    run_cmd(cmd, art, o, job_budget)
-                });
-                afters.push((slot, after));
+                let plan = journal.is_some().then(|| (journal::plan(&cmd), o.out.len()));
+                afters.push((slot, run_cmd(cmd, art, o, job_budget)));
+                if let (Some(stream), Some((plan, start))) = (journal.as_mut(), plan) {
+                    journal_finish(stream, plan, start, release_upto, held, slot, o, raw, art.now);
+                }
             }
             if art.in_window() {
                 art.end_window();
@@ -2500,30 +2516,23 @@ thread_local! {
     static GC_DEBUG_RAW: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Exécute une commande d'une connexion.
-/// Exécute une frame par `run` et, avec le flux, l'y passe : la frame reçue,
-/// décidée avant (la commande est consommée), confirmée par la réponse
-/// (DURABILITY_DESIGN.md §3).
+/// Avec le flux, après l'exécution d'une frame : la frame reçue, décidée avant
+/// (`journal::plan`, la commande est consommée), confirmée par la réponse, qui
+/// commence à `start` dans `o.out` (DURABILITY_DESIGN.md §3).
 #[allow(clippy::too_many_arguments)]
-fn journaled<'a>(
-    stream: Option<&mut Stream>,
+fn journal_finish(
+    stream: &mut Stream,
+    plan: journal::Journal<'_>,
+    start: usize,
     release_upto: Option<u64>,
     held: &mut Vec<Slot>,
     slot: Slot,
     o: &mut ConnOut,
     raw: &[u8],
-    art: &mut OxidArt,
-    cmd: Cmd<'a>,
-    run: impl FnOnce(Cmd<'a>, &mut OxidArt, &mut ConnOut) -> After,
-) -> After {
-    let Some(stream) = stream else {
-        return run(cmd, art, o);
-    };
-    let plan = journal::plan(&cmd);
-    let start = o.out.len();
-    let after = run(cmd, art, o);
+    now: u64,
+) {
     let mark = stream.end_mark();
-    journal::finish(plan, &o.out[start..], raw, art.now, stream);
+    journal::finish(plan, &o.out[start..], raw, now, stream);
     if stream.end_mark() != mark {
         o.write_mark = stream.end_mark();
     }
@@ -2537,9 +2546,9 @@ fn journaled<'a>(
             }
         }
     }
-    after
 }
 
+/// Exécute une commande d'une connexion.
 fn run_cmd(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) -> After {
     // Mode abonné : seules les commandes Pub/Sub, PING et QUIT passent.
     if !o.channels.is_empty() && o.client.authed {

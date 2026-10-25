@@ -509,8 +509,13 @@ impl OxidArt {
 
     /// [`get`](Self::get).
     pub fn get_hinted(&mut self, key: &[u8], hint: Hint) -> Option<Value> {
-        let loc = self.live_hinted(key, hint)?;
-        let (tag, val, _) = self.loc_value(loc);
+        // `live_hinted` en ligne : une seule lecture de la valeur
+        let loc = self.hinted_loc(key, hint)?;
+        let (tag, val, exp) = self.loc_value(loc);
+        if is_expired(exp, self.now) {
+            self.drop_expired(loc, key);
+            return None;
+        }
         // SAFETY: tag != None (valeur trouvée).
         Some(unsafe { value_from_raw_ref(tag, val) })
     }
@@ -518,7 +523,11 @@ impl OxidArt {
     /// Une clé de MGET : la valeur string par référence (`None` : absente,
     /// expirée ou pas une string), sans clone.
     pub fn str_hinted(&mut self, key: &[u8], hint: Hint) -> Option<RangeVal<'_>> {
-        let loc = self.live_hinted(key, hint)?;
+        let loc = self.hinted_loc(key, hint)?;
+        if is_expired(self.loc_value(loc).2, self.now) {
+            self.drop_expired(loc, key);
+            return None;
+        }
         let (tag, val, exp) = self.loc_value(loc);
         str_val(tag, val, exp, self.now)
     }

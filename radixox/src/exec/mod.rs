@@ -188,6 +188,7 @@ pub fn hint_keys<'a>(cmd: &Cmd<'a>, mut push: impl FnMut(&'a [u8])) -> bool {
 /// Comme [`execute_into`], avec `keys` = [`hint_keys`]`(cmd)` et l'indice de
 /// la descente AMAC de chacune, dans une fenêtre ouverte
 /// (`OxidArt::begin_window`).
+#[inline(always)]
 pub fn execute_hinted(cmd: Cmd<'_>, art: &mut OxidArt, keys: &[&[u8]], hints: &[oxidart::Hint], out: &mut Vec<u8>) {
     use radixox_lib::shared_frame::extend_encode;
     let h = hints[0];
@@ -240,10 +241,16 @@ pub fn execute_hinted(cmd: Cmd<'_>, art: &mut OxidArt, keys: &[&[u8]], hints: &[
             }
             return;
         }
-        // Hash, Set, ZSet : la commande normale, sa clé partant de l'indice
-        cmd => art.with_hint(keys[0], h, |art| execute_sync(cmd, art)),
+        cmd => execute_with_hint(cmd, art, keys[0], h),
     };
     extend_encode(out, &frame);
+}
+
+/// Hash, Set, ZSet : la commande normale, sa clé partant de l'indice (hors du
+/// chemin des commandes string, qui n'a pas à porter le cadre d'`execute_sync`).
+#[inline(never)]
+fn execute_with_hint(cmd: Cmd<'_>, art: &mut OxidArt, key: &[u8], hint: oxidart::Hint) -> Frame {
+    art.with_hint(key, hint, |art| execute_sync(cmd, art))
 }
 
 /// Dans une commande à plusieurs clés : précharge la valeur de la clé j+2.

@@ -1108,8 +1108,9 @@ autre commande (code : en-tête du moteur dans `oxidart/src/prefetch_batch.rs`) 
   normale sous `OxidArt::with_hint`, voir plus bas) descend puis s'exécute fenêtre
   d'oxidart ouverte ; toute autre frame coupe la série et passe par le chemin normal,
   fenêtre fermée (`end_window` avant elle). Le flux (AOF, réplication) est admis : chaque
-  frame, avec ou sans indice, passe par `journaled` (plan → exécution → `finish`). Restent
-  exclus : réplica, refus d'écriture, flux au plafond, client non authentifié ou abonné.
+  frame, avec ou sans indice, passe par `journal::plan` avant l'exécution et
+  `journal_finish` après : la commande s'exécute sur place (passée par valeur à une
+  fermeture, la `Cmd` était recopiée : −120 instructions/op mesurées). Restent exclus : réplica, refus d'écriture, flux au plafond, client non authentifié ou abonné.
 - Une commande avec indice = sa version normale où la descente est remplacée par
   `hinted_loc` (l'indice s'il vaut encore, sinon `locate`) et toute suppression par
   `remove_in_window` (`live_hinted` pour la suppression à la volée d'une expirée). Ce qui
