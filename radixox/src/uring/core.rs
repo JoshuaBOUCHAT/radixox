@@ -1629,6 +1629,12 @@ impl Core {
             const B: usize = oxidart::PREFETCH_BATCH;
             debug_assert!(frames.len() <= B);
             let mut flat: [&[u8]; B] = [&[]; B];
+            // champ de la première clé de chaque frame (`exec::hint_field`), en
+            // pointeur : il appartient à la `Cmd`, consommée par la boucle plus
+            // bas, mais seulement après la descente de sa série
+            let mut field: [Option<(*const u8, usize)>; B] = [None; B];
+            // bit i : la frame i porte un champ
+            let mut fields_in = 0u64;
             let mut start = [0u8; B + 1];
             let mut has = 0u64;
             if amac {
@@ -1649,6 +1655,8 @@ impl Core {
                         });
                     if hinted && fits {
                         has |= 1 << i;
+                        field[from] = crate::exec::hint_field(c).map(|f| (f.as_ptr(), f.len()));
+                        fields_in |= (field[from].is_some() as u64) << i;
                     } else {
                         n = from;
                     }
@@ -1656,6 +1664,8 @@ impl Core {
                 }
             }
             let span = |i: usize| start[i] as usize..start[i + 1] as usize;
+            // bits k..end
+            let in_run_mask = |k: usize, end: usize| (u64::MAX >> (64 - (end - k))) << k;
             // bit i : frame i dans une série (au moins deux frames avec indice de suite)
             let in_run = has & (has << 1 | has >> 1);
             let run = |i: usize| in_run >> i & 1 != 0;
@@ -1676,7 +1686,24 @@ impl Core {
                 if k >= run_end && run(k) {
                     run_end = k + (!(in_run >> k)).trailing_zeros() as usize;
                     let keys = start[k] as usize..start[run_end] as usize;
-                    art.amac_descend(&flat[keys.clone()], cfg.amac, &mut hints[keys]);
+                    art.amac_descend(&flat[keys.clone()], cfg.amac, &mut hints[keys.clone()]);
+                    if fields_in & in_run_mask(k, run_end) != 0 {
+                        // phase 1 bis : les champs de Hash / membres de Set de la série,
+                        // dans un trie valart
+                        let mut items: [(oxidart::Hint, &[u8]); B] = [(oxidart::Hint::NONE, &[]); B];
+                        let mut m = 0;
+                        for j in k..run_end {
+                            if let Some((p, n)) = field[start[j] as usize]
+                                && hints[start[j] as usize].has_tree()
+                            {
+                                // SAFETY: les frames de la série (k..run_end) ne sont pas
+                                // encore consommées ; leurs champs vivent dans leur `Cmd`.
+                                items[m] = (hints[start[j] as usize], unsafe { std::slice::from_raw_parts(p, n) });
+                                m += 1;
+                            }
+                        }
+                        art.amac_fields(&items[..m], cfg.amac);
+                    }
                     art.begin_window();
                 }
                 if k < run_end {

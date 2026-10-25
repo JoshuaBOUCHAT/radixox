@@ -557,6 +557,12 @@ pub struct HashOverflow {
     ptr: NonNull<u8>,
 }
 
+impl PreFetch for SetOverflow {
+    fn prefetch(&self) {
+        self.ptr.ptr_prefetch();
+    }
+}
+
 impl PreFetch for HashOverflow {
     fn prefetch(&self) {
         self.ptr.ptr_prefetch();

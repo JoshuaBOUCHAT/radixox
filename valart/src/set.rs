@@ -502,6 +502,33 @@ impl ValTrees {
         self.set_node(root).parent_or_card
     }
 
+    /// Un pas de [`ValTrees::probe_step`] dans un Set.
+    pub(crate) fn set_probe_step(&self, h: u64, idx: &mut u32, depth: &mut u8, ovf: &mut bool) -> bool {
+        let h = crate::common::MemberHash(h);
+        let node = self.set_node(*idx);
+        if let Some(ov) = &node.overflow
+            && !*ovf
+        {
+            ov.prefetch();
+            *ovf = true;
+            return false;
+        }
+        *ovf = false;
+        let Some(slot) = node.find(h.radix(*depth as usize)) else { return true };
+        if node.ctrl_of(slot) == h.ctrl() {
+            node.key(slot).prefetch();
+            return true;
+        }
+        let child = node.child(slot);
+        if child == NO_CHILD || *depth as usize + 1 >= DISPATCH_LEVELS {
+            return true;
+        }
+        prefetch_slot(&self.nodes, child);
+        *idx = child;
+        *depth += 1;
+        false
+    }
+
     /// SISMEMBER.
     pub fn set_contains(&self, root: u32, member: &[u8]) -> bool {
         let h = self.member_hash(member);

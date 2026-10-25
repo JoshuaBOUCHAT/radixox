@@ -19,7 +19,7 @@ use radixox_lib::prefetch::prefetch_l1;
 use crate::krange::{OwnedVal, RangeVal, str_val};
 use crate::node::{EntryRef, Probe};
 use crate::save::prefetch_value;
-use crate::value::{RawVal, Value, value_from_raw_ref};
+use crate::value::{RawVal, Tag, Value, valart, value_from_raw_ref};
 use crate::counter::CounterError;
 use crate::{Loc, OxidArt, Slot, TtlResult, eq_fast, expired as is_expired, starts_with_fast};
 
@@ -38,6 +38,15 @@ fn encode(loc: Loc) -> u64 {
             Slot::SelfVal => 0,
             Slot::Leaf(r) => 0x100 | r as u64,
         }
+}
+
+/// Bit de l'emplacement trouvé : la valeur est un trie valart (Hash ou Set
+/// au-delà du petit bloc). Hors du nœud (bits 9..40) : `decode` l'ignore.
+const TREE: u64 = 1 << 62;
+
+#[inline(always)]
+fn tree_bit(tag: Tag) -> u64 {
+    if matches!(tag, Tag::Hash | Tag::Set) { TREE } else { 0 }
 }
 
 #[inline]
@@ -61,6 +70,16 @@ enum Step {
     Entry(u16),
     /// Suffixe sur le tas préchargé : comparer la feuille de ce rang.
     LeafSfx(u16),
+    Done,
+}
+
+/// Étape de la descente préchargée d'un champ ([`OxidArt::amac_fields`]).
+#[derive(Clone, Copy)]
+enum FieldStep {
+    /// Nœud oxidart de l'indice préchargé : lire le conteneur.
+    Start,
+    /// Trie valart (`ValTrees::probe_step`), nœud courant préchargé.
+    Tree { set: bool, depth: u8, ovf: bool },
     Done,
 }
 
@@ -131,7 +150,7 @@ impl OxidArt {
         let Some(&radix) = key.get(*cursor) else {
             if node.has_val() {
                 prefetch_value(node.tag, &node.val);
-                *found = encode(Loc { node: *idx, slot: Slot::SelfVal });
+                *found = encode(Loc { node: *idx, slot: Slot::SelfVal }) | tree_bit(node.tag);
             }
             return Step::Done;
         };
@@ -183,7 +202,7 @@ impl OxidArt {
                 let s: &[u8] = sfx.map_or(&[], |p| p);
                 if eq_fast(s, &key[*cursor + 1..]) {
                     prefetch_value(tag, val);
-                    *found = encode(Loc { node: *idx, slot: Slot::Leaf(key[*cursor]) });
+                    *found = encode(Loc { node: *idx, slot: Slot::Leaf(key[*cursor]) }) | tree_bit(tag);
                 }
                 Step::Done
             }
@@ -197,7 +216,7 @@ impl OxidArt {
             let s: &[u8] = sfx.map_or(&[], |p| p);
             if eq_fast(s, &key[cursor + 1..]) {
                 prefetch_value(tag, val);
-                *found = encode(Loc { node: idx, slot: Slot::Leaf(key[cursor]) });
+                *found = encode(Loc { node: idx, slot: Slot::Leaf(key[cursor]) }) | tree_bit(tag);
             }
         }
     }
@@ -229,6 +248,14 @@ pub struct Hint {
 
 impl Hint {
     pub const NONE: Hint = Hint { found: NOT_FOUND };
+
+    /// La valeur trouvée est un trie valart (Hash ou Set au-delà du petit
+    /// bloc) : la descente de son champ vaut d'être préchargée
+    /// ([`OxidArt::amac_fields`]).
+    #[inline]
+    pub fn has_tree(self) -> bool {
+        self.found != NOT_FOUND && self.found & TREE != 0
+    }
 }
 
 /// Compteurs du moteur : commandes servies par indice, et commandes
@@ -325,6 +352,78 @@ impl OxidArt {
                 }
             }
         }
+    }
+
+    /// Phase 1 bis, après [`amac_descend`](Self::amac_descend) et seulement si
+    /// des commandes portent un champ dans un trie valart ([`Hint::has_tree`]) :
+    /// descentes préchargées des champs de Hash et membres de Set `(indice de la
+    /// clé, champ)`, en AMAC, lecture pure. Rien n'est gardé : l'exécution refait
+    /// sa descente dans le conteneur, cache chaud. À part de `amac_descend`, dont
+    /// la boucle ne paie rien pour les commandes sans champ. Petit bloc : rien
+    /// (mesuré perdant, l'exécution superpose déjà ses défauts).
+    pub fn amac_fields(&self, items: &[(Hint, &[u8])], lanes: usize) {
+        let n = items.len();
+        if n == 0 {
+            return;
+        }
+        let k = lanes.clamp(1, PREFETCH_BATCH).min(n);
+        let mut step = [FieldStep::Done; PREFETCH_BATCH];
+        let mut idx = [0u32; PREFETCH_BATCH];
+        // hash du champ (trie) ou adresse du petit bloc
+        let mut fh = [0u64; PREFETCH_BATCH];
+        let mut item_of = [0usize; PREFETCH_BATCH];
+        let (mut issued, mut active) = (0, 0);
+        // une voie libre prend l'élément suivant (indice trouvé seulement)
+        let issue = |s: usize, issued: &mut usize, item_of: &mut [usize], step: &mut [FieldStep]| -> bool {
+            while *issued < n {
+                let i = *issued;
+                *issued += 1;
+                if items[i].0.has_tree() {
+                    self.prefetch_hint_node(items[i].0);
+                    item_of[s] = i;
+                    step[s] = FieldStep::Start;
+                    return true;
+                }
+            }
+            false
+        };
+        for s in 0..k {
+            active += issue(s, &mut issued, &mut item_of, &mut step) as usize;
+        }
+        while active > 0 {
+            for s in 0..k {
+                let (hint, field) = items[item_of[s]];
+                step[s] = match step[s] {
+                    FieldStep::Done => continue,
+                    FieldStep::Start => self.field_start(hint.found, field, &mut idx[s], &mut fh[s]),
+                    FieldStep::Tree { set, mut depth, mut ovf } => {
+                        if valart().probe_step(set, fh[s], &mut idx[s], &mut depth, &mut ovf) {
+                            FieldStep::Done
+                        } else {
+                            FieldStep::Tree { set, depth, ovf }
+                        }
+                    }
+                };
+                if matches!(step[s], FieldStep::Done) && !issue(s, &mut issued, &mut item_of, &mut step) {
+                    active -= 1;
+                }
+            }
+        }
+    }
+
+    /// Trie de l'indice (nœud oxidart en cache) : précharge sa racine.
+    #[inline]
+    fn field_start(&self, found: u64, field: &[u8], idx: &mut u32, fh: &mut u64) -> FieldStep {
+        let (tag, val, _) = self.loc_value(decode(found));
+        if !matches!(tag, Tag::Hash | Tag::Set) {
+            return FieldStep::Done;
+        }
+        // SAFETY: Hash / Set ⇒ champ idx actif.
+        let root = unsafe { val.idx };
+        valart().prefetch_root(root);
+        *idx = root;
+        *fh = valart().probe_hash(field);
+        FieldStep::Tree { set: tag == Tag::Set, depth: 0, ovf: false }
     }
 
     /// Phase 2, en avance sur l'exécution : précharge le nœud de l'indice
@@ -865,9 +964,16 @@ mod tests {
         use radixox_lib::shared_byte::SharedByte;
         use std::time::Duration;
         // chaque commande avec indice, et sa version sans indice
-        fn hinted(art: &mut OxidArt, op: u8, k: &[u8], v: Value, h: super::Hint) -> String {
+        // 15..=18 : Hash / Set sous `with_hint`, champ préchargé par la phase 1
+        fn hinted(art: &mut OxidArt, op: u8, k: &[u8], f: &str, v: &str, h: super::Hint) -> String {
             let ttl = Some(Duration::from_secs(1));
+            let (fb, vb) = (SharedByte::from_str(f), SharedByte::from_str(v));
+            let v = val(v);
             match op {
+                15 => art.with_hint(k, h, |art| format!("{:?}", art.cmd_hset(k, &[(fb, vb)], None))),
+                16 => art.with_hint(k, h, |art| format!("{:?}", art.cmd_hget(k, f.as_bytes()))),
+                17 => art.with_hint(k, h, |art| format!("{:?}", art.cmd_sadd(k, &[fb], None))),
+                18 => art.with_hint(k, h, |art| format!("{:?}", art.cmd_sismember(k, fb))),
                 0..=2 => format!("{:?}", art.get_hinted(k, h)),
                 3..=4 => format!("{}", art.set_cond_hinted(k, None, v, None, h)),
                 5 => format!("{}", art.set_cond_hinted(k, ttl, v, None, h)),
@@ -881,10 +987,16 @@ mod tests {
                 _ => format!("{:?}", art.incrby_hinted(k, 3, h)),
             }
         }
-        fn plain(art: &mut OxidArt, op: u8, k: &[u8], v: Value) -> String {
+        fn plain(art: &mut OxidArt, op: u8, k: &[u8], f: &str, v: &str) -> String {
             let ttl = Some(Duration::from_secs(1));
             let sb = SharedByte::from_slice(k);
+            let (fb, vb) = (SharedByte::from_str(f), SharedByte::from_str(v));
+            let v = val(v);
             match op {
+                15 => format!("{:?}", art.cmd_hset(k, &[(fb, vb)], None)),
+                16 => format!("{:?}", art.cmd_hget(k, f.as_bytes())),
+                17 => format!("{:?}", art.cmd_sadd(k, &[fb], None)),
+                18 => format!("{:?}", art.cmd_sismember(k, fb)),
                 0..=2 => format!("{:?}", art.get(k)),
                 3..=4 => format!("{}", art.set_cond(k, None, v, None)),
                 5 => format!("{}", art.set_cond(k, ttl, v, None)),
@@ -922,18 +1034,22 @@ mod tests {
                 a.set_now(round.saturating_sub(100));
                 b.set_now(round.saturating_sub(100));
                 let n = rng.gen_range(1..=64);
-                let ops: Vec<(u8, Vec<u8>)> = (0..n).map(|_| (rng.gen_range(0..15), key(&mut rng))).collect();
+                let ops: Vec<(u8, Vec<u8>)> = (0..n).map(|_| (rng.gen_range(0..19), key(&mut rng))).collect();
+                // 20 champs : au-delà de 8 le petit bloc passe en trie valart
+                let fields: Vec<String> = (0..n).map(|_| format!("f{}", rng.gen_range(0..20))).collect();
                 // valeurs : entiers (INCRBY) ou texte
                 let vals: Vec<String> =
                     (0..n).map(|i| if rng.gen_bool(0.3) { format!("{i}") } else { format!("{round}:{i}") }).collect();
                 let keys: Vec<&[u8]> = ops.iter().map(|(_, k)| k.as_slice()).collect();
                 let mut hints = vec![super::Hint::NONE; n];
                 a.amac_descend(&keys, lanes, &mut hints);
+                let probe: Vec<(super::Hint, &[u8])> =
+                    (0..n).filter(|&i| ops[i].0 >= 15).map(|i| (hints[i], fields[i].as_bytes())).collect();
+                a.amac_fields(&probe, lanes);
                 a.begin_window();
-                let got: Vec<String> =
-                    ops.iter().zip(&hints).zip(&vals).map(|(((op, k), &h), v)| hinted(&mut a, *op, k, val(v), h)).collect();
+                let got: Vec<String> = (0..n).map(|i| hinted(&mut a, ops[i].0, &ops[i].1, &fields[i], &vals[i], hints[i])).collect();
                 a.end_window();
-                let want: Vec<String> = ops.iter().zip(&vals).map(|((op, k), v)| plain(&mut b, *op, k, val(v))).collect();
+                let want: Vec<String> = (0..n).map(|i| plain(&mut b, ops[i].0, &ops[i].1, &fields[i], &vals[i])).collect();
                 assert_eq!(got, want, "seed {seed} lanes {lanes} round {round}");
                 assert_eq!(a.len(), b.len());
                 a.assert_canonical();

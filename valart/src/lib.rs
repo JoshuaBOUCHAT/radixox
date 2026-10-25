@@ -332,6 +332,24 @@ impl ValTrees {
         }
     }
 
+    /// Descente préchargée d'un champ de Hash ou d'un membre de Set (moteur
+    /// AMAC d'oxidart) : lecture pure, rien n'est gardé, l'exécution refait sa
+    /// descente dans un cache chaud. `probe_hash`, puis `probe_step` un pas par
+    /// tour jusqu'à `true` : chaque pas lit le nœud `idx` préchargé au pas
+    /// d'avant (la racine : par [`prefetch_root`](Self::prefetch_root)) et
+    /// précharge le suivant, puis le champ et sa valeur. `depth` et `ovf` partent
+    /// de 0 / `false`.
+    #[inline]
+    pub fn probe_hash(&self, member: &[u8]) -> u64 {
+        self.member_hash(member).0
+    }
+
+    /// Voir [`probe_hash`](Self::probe_hash) ; `set` : un Set, sinon un Hash.
+    #[inline]
+    pub fn probe_step(&self, set: bool, h: u64, idx: &mut u32, depth: &mut u8, ovf: &mut bool) -> bool {
+        if set { self.set_probe_step(h, idx, depth, ovf) } else { self.hash_probe_step(h, idx, depth, ovf) }
+    }
+
     pub fn is_saving(&self) -> bool {
         self.save.is_active()
     }

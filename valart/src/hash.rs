@@ -562,6 +562,35 @@ impl ValTrees {
             .map(|i| Loc::Bucket(idx, i))
     }
 
+    /// Un pas de [`ValTrees::probe_step`] dans un Hash.
+    pub(crate) fn hash_probe_step(&self, h: u64, idx: &mut u32, depth: &mut u8, ovf: &mut bool) -> bool {
+        let h = crate::common::MemberHash(h);
+        let node = self.hash_node(*idx);
+        if let Some(ov) = &node.overflow
+            && !*ovf
+        {
+            ov.prefetch();
+            *ovf = true;
+            return false;
+        }
+        *ovf = false;
+        let Some(slot) = node.find(h.radix(*depth as usize)) else { return true };
+        if node.ctrl_of(slot) == h.ctrl() {
+            // 1 faux positif sur 256 : on s'arrête quand même (préchargement seul)
+            node.key(slot).prefetch();
+            node.val(slot).prefetch();
+            return true;
+        }
+        let child = node.child(slot);
+        if child == NO_CHILD || *depth as usize + 1 >= DISPATCH_LEVELS {
+            return true;
+        }
+        prefetch_slot(&self.nodes, child);
+        *idx = child;
+        *depth += 1;
+        false
+    }
+
     /// HGET.
     pub fn hash_get(&self, root: u32, field: &[u8]) -> Option<&SharedByte> {
         match self.hash_locate(root, field)? {

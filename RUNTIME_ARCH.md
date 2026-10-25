@@ -1170,7 +1170,20 @@ everysec 2,32 M → 2,75 M ; sans pipeline, rien (293 K, le réseau limite). Con
 prototype (`aa158be`, mêmes réglages) : GET/SET à égalité, mixte 0 à −5 % (+110
 instructions/op dans la boucle de fenêtre, cause non trouvée).
 
-**Suite** : l'écart du mixte ; descente valart enchaînée (le champ d'un HGET / HSET
+**Phase 1 bis : les champs dans les tries valart (`OxidArt::amac_fields`).** Quand la valeur
+trouvée par la phase 1 est un trie valart (Hash ou Set au-delà du petit bloc : bit `TREE` de
+l'indice, posé là où le tag est déjà lu), la commande porte un champ (`exec::hint_field` :
+HGET, HSET, HDEL, HEXISTS, HINCRBY, HMGET, SISMEMBER, SADD, SREM ; le premier champ) : une
+passe AMAC à part descend ces champs, préchargement seul (`ValTrees::probe_step` : nœud par
+niveau, bloc de débordement, puis octets du champ et de la valeur). Rien n'est gardé dans
+valart : l'exécution refait sa descente, cache chaud, donc rien à invalider. À part de
+`amac_descend` : enchaînée dans sa boucle, elle coûtait +120 instructions/op aux commandes
+sans champ. Mesures (2 passages) : Hash d'un million de champs HGET 70 / HSET 30 2,07–2,20 M →
+2,43–2,44 M (+10 à 18 %) ; Set d'un million de membres SISMEMBER 70 / SADD 30 2,56–2,74 M →
+3,15–3,22 M (+17 à 23 %) ; GET/SET inchangé (+19 instructions/op). Petit bloc (≤ 8 entrées) :
+essayé (bloc, champs, valeur) et retiré, −6 à −12 % sur un Hash d'un champ.
+
+**Suite** : l'écart du mixte ; ZSet ; indices dans valart (l'exécution sans seconde descente) (le champ d'un HGET / HSET
 aussi en AMAC) ; SET de clé absente avec indice d'insertion.
 
 **Chantiers de layout (prototype + bench avant code définitif) :**

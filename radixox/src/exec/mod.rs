@@ -185,6 +185,20 @@ pub fn hint_keys<'a>(cmd: &Cmd<'a>, mut push: impl FnMut(&'a [u8])) -> bool {
     true
 }
 
+/// Champ (Hash) ou membre (Set) d'une commande de [`hint_keys`] : la descente
+/// AMAC de sa clé enchaîne sur sa descente dans le conteneur (préchargement
+/// seul). Le premier quand il y en a plusieurs.
+pub fn hint_field<'c>(cmd: &'c Cmd<'_>) -> Option<&'c [u8]> {
+    match cmd {
+        Cmd::HGet { field, .. } | Cmd::HExists { field, .. } => Some(field),
+        Cmd::HIncrBy { field, .. } | Cmd::SIsMember { member: field, .. } => Some(field),
+        Cmd::HSet { fields, .. } => fields.first().map(|(f, _)| f.as_slice()),
+        Cmd::HDel { fields, .. } | Cmd::HMGet { fields, .. } => fields.first().map(|f| f.as_slice()),
+        Cmd::SAdd { members, .. } | Cmd::SRem { members, .. } => members.first().map(|m| m.as_slice()),
+        _ => None,
+    }
+}
+
 /// Comme [`execute_into`], avec `keys` = [`hint_keys`]`(cmd)` et l'indice de
 /// la descente AMAC de chacune, dans une fenêtre ouverte
 /// (`OxidArt::begin_window`).
