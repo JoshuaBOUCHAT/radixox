@@ -1234,6 +1234,21 @@ la vidange de fin de fenêtre fait 1,6× plus de défauts par unité de travail 
 total ; 16 → 32 voies n'abaisse pas le plancher de la boucle pleine ; TLB écartée (99,4 % en
 pages de 2 Mio, 81 / 85 défauts avec la traduction en TLB L1). Cause du plancher non établie.
 
+**Machine libre, même jour (548ca28, 15M clés, rx-2s p64, 2 passages).** UUID : Zipf 4,05 /
+4,01 M, uniforme 3,72 / 3,64 M. `prefetchnta` pour les valeurs (point 4 ci-dessus, essai
+`--cfg radixox_value_nta`) : neutre (3,99 / 4,07 M et 3,67 / 3,75 M), retiré. Attention :
+`RUSTFLAGS` remplace le `target-cpu=native` de `.cargo/config.toml` (premier essai à
++450 instructions/op, faux). `key:NNN` : Zipf 6,12 / 6,14 M, uniforme 4,61 / 4,65 M ; avec le
+rang Zipf mélangé (`uuidload --scramble`, bijection rang → clé : les clés chaudes ne sont plus
+`key:1…`, courtes et voisines) Zipf 5,33 / 5,37 M (+500 instructions/op) : ~13 % du chiffre
+Zipf de memtier vient de ce biais (Valkey en profite aussi).
+
+Compteurs (UUID 15M, par requête) : 94 instructions de préchargement, dont ~21 sur une ligne
+déjà en L1 ; lignes remplies depuis la DRAM par préchargement 10,5 (uniforme) contre 6,8
+(Zipf), défauts DRAM à la demande 0,73 contre 0,40 : l'écart Zipf / uniforme est le nombre de
+lignes froides par requête. ~17 lectures à la demande par requête servies par la L2, surtout
+hors de l'arbre (fenêtre, connexions, encodage) ; MAB occupés en moyenne 4 à 5.
+
 **Suite** : l'écart du mixte ; ZSet ; indices dans valart (l'exécution sans seconde descente) (le champ d'un HGET / HSET
 aussi en AMAC) ; SET de clé absente avec indice d'insertion.
 
