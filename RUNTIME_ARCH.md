@@ -1194,6 +1194,18 @@ Mesures (débit compté serveur, 2 passages) : uniforme 8 → 12 → 16 → 24 �
 Zipf 5,20 → 5,33 M ; GET/SET (bench_full) 3,95 → 4,13 M ; Hash d'un million de champs 2,44 →
 2,50 M.
 
+**UUID → UUID, 15M paires (~1 Gio utile), même jour.** Clés hexadécimales aléatoires de 36 o :
+nœuds à 16 enfants, suffixes de feuille d'environ 30 o, donc sur le tas. IBS : le premier
+défaut DRAM réel était `sfx.len() > 7` dans `batch_entry_ref`, qui lit la longueur sur le
+tas pour décider de précharger le suffixe, et attend donc le défaut qu'il voulait éviter →
+`is_heap()` (un bit de la forme inline). rx-2s pipeline 64, débit compté serveur, client
+maison (`uuidload`, scratchpad) : Zipf 2,91 → 3,24 M (correction) → 3,49 M (+ 16 voies),
+uniforme 2,61 → 2,91 → 3,20 M ; Valkey 2 threads 3,42 / 3,08 M. Restent contre Valkey :
+IPC 2,44 contre 2,75 (34 % des cycles bloqués sur la mémoire, 13 % en mauvaises prédictions
+de branchement sur les radix aléatoires), chargement 1,27 M/s contre 2,2 M/s, RSS 2 034 Mo
+contre 1 725 Mo. Le GC du pool relit aussi la longueur des valeurs qu'il déplace
+(`gc::visit_val`), en défaut.
+
 **Suite** : l'écart du mixte ; ZSet ; indices dans valart (l'exécution sans seconde descente) (le champ d'un HGET / HSET
 aussi en AMAC) ; SET de clé absente avec indice d'insertion.
 

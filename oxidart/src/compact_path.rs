@@ -33,8 +33,10 @@ impl CompactPath {
         })
     }
 
+    /// Sur le tas (plus de 7 octets) : se lit sans déréférencer, avant que les
+    /// données soient en cache.
     #[inline]
-    fn is_heap(&self) -> bool {
+    pub(crate) fn is_heap(&self) -> bool {
         unsafe { self.0.inline[0] & 1 == 0 }
     }
 

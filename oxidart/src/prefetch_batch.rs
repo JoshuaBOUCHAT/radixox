@@ -193,7 +193,9 @@ impl OxidArt {
                 *cursor += 1;
                 Step::Enter
             }
-            EntryRef::Leaf { sfx: Some(sfx), .. } if sfx.len() > 7 => {
+            // `is_heap` et pas `len() > 7` : la longueur est sur le tas, la lire
+            // ferait attendre le défaut que l'on veut précharger
+            EntryRef::Leaf { sfx: Some(sfx), .. } if sfx.is_heap() => {
                 sfx.prefetch();
                 let e = self.node(*idx).find(key[*cursor]).expect("feuille trouvée");
                 Step::LeafSfx(e as u16)
