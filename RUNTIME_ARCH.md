@@ -1257,6 +1257,11 @@ l'ancienne feuille (~30 o, une fois par insertion ou presque), (2) `page_resize`
 page d'un nœud à chaque classe franchie en grandissant. (1) corrigé : `CompactPath::drop_front`
 décale sur place et rend la fin (`short_shrink`), aussi pour le préfixe de `split_child` :
 1,82 → 2,08 M/s, 16 → 6 passes, RSS 2 031 → 1 935 Mo. Reste (2) : objets évacués de ~62 o.
+`split_leaf` faisait aussi `remove` (page réduite, forme redescendue) puis `insert` (page
+regrossie) : `Node::leaf_to_child` change la feuille en enfant au même rang, une seule
+normalisation à la fin : 2,05 → 2,11 M/s, 6 → 4 passes. Reste : pages agrandies classe par
+classe en grandissant, `set_raw` qui refait sa descente (~13 % du chargement), `touch` qui
+hache la clé octet par octet (~3 %).
 
 **Suite** : l'écart du mixte ; ZSet ; indices dans valart (l'exécution sans seconde descente) (le champ d'un HGET / HSET
 aussi en AMAC) ; SET de clé absente avec indice d'insertion.

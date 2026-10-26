@@ -1662,6 +1662,24 @@ impl Node {
         Some(unsafe { raw.into_entry() })
     }
 
+    /// La feuille `radix` devient l'enfant `child` au même rang (`split_leaf`), sans réduire
+    /// la page ni changer de forme entre les deux : `remove` puis `insert` pouvaient
+    /// réallouer la page deux fois (réduite puis regrossie), deux trous pour le GC. Rend
+    /// la feuille.
+    pub(crate) fn leaf_to_child(&mut self, radix: u8, child: u32) -> Leaf {
+        let e = self.find(radix).expect("leaf_to_child : radix absent");
+        let mut raw = self.remove_raw(e);
+        raw.radix = radix;
+        let Entry::Leaf(old) = (unsafe { raw.into_entry() }) else {
+            unreachable!("leaf_to_child sur une entrée qui n'est pas une feuille");
+        };
+        self.insert_raw(e, &Raw::from_entry(radix, Entry::Child(child)));
+        self.page_trim();
+        // l'entrée a rétréci : un Wide32 qui tient en petite forme redescend (forme canonique)
+        self.maybe_shrink_kind();
+        old
+    }
+
     /// Pose ou retire le TTL d'une feuille (le record change de taille).
     /// `false` si le radix n'est pas une feuille.
     pub(crate) fn set_ttl(&mut self, radix: u8, ttl: Option<u64>) -> bool {

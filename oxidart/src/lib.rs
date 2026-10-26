@@ -833,9 +833,9 @@ impl OxidArt {
     /// divergent → un nœud de préfixe commun les porte.
     fn split_leaf(&mut self, idx: u32, r: u8, rest: &[u8], raw: RawVal, exp: Option<u64>) {
         let before = self.node(idx).has_any_ttl();
-        let Some(Entry::Leaf(old)) = self.node_mut(idx).remove(r) else {
-            unreachable!("split_leaf sur une entrée qui n'est pas une feuille");
-        };
+        // L'entrée devient tout de suite un enfant (index provisoire, remplacé une fois
+        // le nouveau nœud posé) : la page n'est ni réduite ni regrossie.
+        let old = self.node_mut(idx).leaf_to_child(r, u32::MAX);
         let (tag, val, old_exp, old_sfx) = old.into_parts();
         let s: &[u8] = old_sfx.as_deref().unwrap_or(&[]);
         let common = lcp(s, rest);
@@ -859,7 +859,8 @@ impl OxidArt {
         }
         place(&mut n, rest, common, raw, exp);
         let n_idx = self.insert_node(n);
-        self.node_mut(idx).insert(r, Entry::Child(n_idx));
+        let done = self.node_mut(idx).set_child_idx(r, n_idx);
+        debug_assert!(done);
         self.retag(idx, before);
         if let Some(w) = &mut self.window {
             w.leaf_moved(Loc { node: idx, slot: Slot::Leaf(r) }, Loc { node: n_idx, slot: old_slot });
