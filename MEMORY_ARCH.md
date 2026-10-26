@@ -1524,3 +1524,87 @@ un second allocateur. Deux nuances :
   `idx → chunk`) ; à trancher avec le compactage. D'ici là, une réserve globale (pool +
   slab) éviterait au moins de rendre d'un côté ce que l'autre reprend.
 
+
+## 18. Sans jemalloc : grands objets et objets épinglés (2026-10-26)
+
+**Décision (utilisateur, 2026-10-26)** : tout ce qui est alloué passe par l'allocateur de
+RadixOx ; jemalloc est retiré. Ordre de la suite : allocateur complet → nouveau ZSet (né
+dans l'allocateur) → `maxmemory` avec éviction.
+
+### 18.1 Mesure de départ
+
+`--cfg radixox_heapcount` (`INFO` : `mem_heap_bytes`, allocateur par défaut compté),
+serveur rx-2s, chargements successifs :
+
+| phase | RSS | pool + slabs | hors de l'allocateur |
+|---|---|---|---|
+| vide | 14 Mo | — | glibc 4,8 Mo (anneaux, tampons) |
+| 1M UUID | 145 Mo | pool 81 + slab des nœuds 45 | +0 |
+| + 1000 ZSet × 1000 | +94 Mo | 0 | glibc +59 Mo (`BTreeSet`, `HashMap`), jemalloc +20 Mo (membres) |
+| + 2000 strings de 64 Kio (125 Mio) | +166 Mo | 0 | jemalloc 164 Mo de RSS |
+
+Une valeur de 64 Kio + en-tête tombe dans la classe de 80 Kio de jemalloc : +25 %.
+
+### 18.2 Ce qui passe par `external` aujourd'hui
+
+- **grands** (> 16 Kio) : `SharedByte` forme longue, `CompactPath` long, objets de
+  structure au-delà de 16 Kio ou plage du pool pleine (`struct_alloc`) ;
+- **petits épinglés** (§16.9, le GC ne les voit pas) : membres de ZSet (jusqu'au nouveau
+  ZSet), clés Pub/Sub, noms de client.
+
+L'API `raw_alloc::external::{malloc, free(ptr, size)}` reste ; seule l'implémentation
+change. `free` reçoit la taille : pas d'en-tête d'allocateur.
+
+### 18.3 Plage et granule
+
+Plage à elle (`RADIXOX_LARGE_VIRT_GB`, défaut 64), `MAP_NORESERVE`, **`MADV_NOHUGEPAGE`** :
+granule G = 4 Kio, unité d'allocation et de rendu. Sans huge pages, un trou de 4 Kio se
+rend sans casser de page de 2 Mio ; les grands objets se lisent en séquence, la TLB y
+compte peu. Mono-thread, état en `static mut` comme le pool.
+
+### 18.4 Tas de granules (≥ 16 Kio) : TLSF
+
+- Un objet = une suite de `n = ⌈taille / G⌉` granules (64 Kio + 6 o → 17 granules,
+  68 Kio : +6 % au lieu de +25 %).
+- Suites libres indexées en TLSF (deux niveaux : `log2 n`, puis 16 sous-classes ; deux
+  masques de bits) : allocation et libération en O(1), meilleur ajustement à une
+  sous-classe près.
+- Étiquettes de bord dans un tableau parallèle (un `u32` par granule, `MAP_NORESERVE`) :
+  longueur, libre, sale ; au premier et au dernier granule d'une suite libre, au premier
+  d'une suite allouée. La libération fusionne avec les voisines **de même état**.
+- Pas de suite assez grande : le sommet de la plage avance.
+
+### 18.5 Rendu au système, sans thread de fond
+
+- Une suite libérée est **sale** (pages tenues). File FIFO `(début, longueur, instant)`.
+- `release_step` (déjà appelé par la boucle pour le pool) rend les suites sales plus
+  vieilles que `RADIXOX_MEMORY_DECAY` par `MADV_DONTNEED`, avec un budget d'octets par
+  appel ; la suite devient **propre** et fusionne avec ses voisines propres. Une entrée de
+  FIFO périmée (suite réallouée ou fusionnée entre-temps) est sautée : vérifiée sur
+  l'étiquette à son début.
+- Réallouer une suite sale ne coûte aucun défaut de page ; une propre en coûte un par
+  granule touché. Suite à mesurer : `MADV_DONTNEED` par l'anneau (`IORING_OP_MADVISE`).
+
+### 18.6 Petits épinglés (< 16 Kio) : slabs par classe
+
+- Classes : multiples de 16 jusqu'à 256, puis ×1,25 environ jusqu'à 16 Kio.
+- Slab = suite de 16 granules (64 Kio) prise au tas, liste libre intrusive, compteur.
+  Granule → slab par le tableau d'étiquettes. Slab vide : rendue au tas (sale, puis
+  rendue au système par le §18.5).
+- Après le nouveau ZSet, il n'en restera que les clés Pub/Sub et les noms de client.
+
+### 18.7 Comptes (`INFO`)
+
+`mem_external_bytes` / `mem_external_objects` (demandés, inchangés) ; nouveaux :
+`mem_large_held_bytes` (granules alloués), `mem_large_dirty_bytes`,
+`mem_large_released_bytes`, `mem_slab_held_bytes`, `mem_slab_live_bytes` ;
+`mem_external_bg_thread` disparaît.
+
+### 18.8 Ordre
+
+1. Tas de granules + tests (modèle aléatoire, invariants de fusion) ;
+2. slabs + tests ;
+3. `external` branché dessus, `tikv-jemalloc-sys` retiré ;
+4. rendu par `release_step` ; mesure du scénario du §13.2 (512 Mo, −50 %, −90 %) et des
+   valeurs de 64 Kio ;
+5. `INFO`, docs.
