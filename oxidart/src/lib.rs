@@ -65,6 +65,7 @@ pub(crate) mod small;
 pub mod value;
 pub mod zcommand;
 pub mod zset_inner;
+pub mod zset;
 
 
 pub mod counter;
