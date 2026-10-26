@@ -23,7 +23,7 @@
 | [`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md) | AOF et réplication par un seul flux : commandes journalisées par blocs de tour (avec `now`), exceptions non déterministes, point de linéarisation des commandes longues, snapshot exact, commit groupé `always` | AOF fait (étapes 1–6 : `everysec` / `no` / `always`, réécriture) ; réplication de base faite (étape 7 : poussée, backlog, synchronisation complète, promotion) ; reste l'étape 8 (zéro copie, `WAIT`) |
 | [`MEMORY_ARCH.md`](MEMORY_ARCH.md) | mémoire v2 : allocateur maison par pools (bump + compteur par bloc de 64 Kio, pages de 2 Mio), GC par évacuation à deux niveaux, compactage HiSlab, `maxmemory` (CLOCK) | conception, rien d'implémenté ; spécification de la v1 en §16 |
 | [`TX_DESIGN.md`](TX_DESIGN.md) | transactions atomiques à conditions (`MULTI ATOMIC`, `DELPREFIX`, `EXEC DURABLE`) | conception, rien d'implémenté ; dépend de la boucle maison |
-| [`ANALYSE_ART_UNIFIE.md`](ANALYSE_ART_UNIFIE.md) | journal de décisions « tout dans l'ART » : TTL par champ (abandonné), valart (§11–12), design ZSet retenu (§13) | journal ; §13 = référence du futur ZSet, relancé en §13.8 (la save v1 bloque ~340 ms par million de membres) |
+| [`ANALYSE_ART_UNIFIE.md`](ANALYSE_ART_UNIFIE.md) | journal de décisions « tout dans l'ART » : TTL par champ (abandonné), valart (§11–12), architecture ZSet retenue (§13, refaite le 2026-10-26 : petite forme en colonnes, grande = index valart + B+tree compté + objets à poignée) | §13 = référence du futur ZSet ; objets à poignée : MEMORY_ARCH §19 |
 | [`protocol-spec.md`](protocol-spec.md) | spécification RESP de Redis (copie de référence) | référence externe |
 
 Ordre de lecture conseillé : ce fichier → le document du sujet touché. Avant de toucher
@@ -131,7 +131,7 @@ l'atomicité (RUNTIME_ARCH §8.1).
 | String | `SharedByte` : buffer à refcount mono-thread de 8 o (pas d'atomique), mimalloc |
 | Entier | `i64` (seuls INCR / INCRBY en créent ; `SET n 42` stocke une chaîne), formaté à la lecture |
 | Hash, Set | ≤ 8 entrées : bloc compact de `SharedByte` ; au-delà : **valart** (`valart/`), un radix compact par conteneur, slab unique partagé (nœuds de 128 o) |
-| ZSet | `BTreeSet<(score, membre)>` + `HashMap` membre → score ; design cible (B+tree à compteurs) : ANALYSE_ART_UNIFIE §13 |
+| ZSet | `BTreeSet<(score, membre)>` + `HashMap` membre → score ; architecture cible : ANALYSE_ART_UNIFIE §13 (2026-10-26), objets à poignée MEMORY_ARCH §19 |
 | List | pas de commandes (LPUSH… à faire) |
 
 Pourquoi valart plutôt que `HashMap` : pas de rehash O(n) en plein chemin chaud, ordre

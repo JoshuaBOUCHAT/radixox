@@ -1684,3 +1684,68 @@ split, suppression, `drop_front`, GC, compactage).
 
 `KEYS *` sur 1M UUID (réponse ~44 Mo) : pic glibc 91,9 → 5,9 Mo (inchangé par le KEYS) ;
 pic de RSS = 145 + 43 Mo, retour à 147 Mo dès l'envoi fini.
+
+## 19. Objets à poignée (2026-10-26, spécification, pas implémenté)
+
+**But.** Un objet référencé par **plusieurs** structures (membre de ZSet : index + B+tree,
+ANALYSE_ART_UNIFIE.md §13.4) reste déplaçable par le GC, sans parcourir ces structures et
+sans `rc` partagé (`rc > 1` = épinglé). Les structures gardent une **poignée** `u32` ; une
+table dense donne l'adresse ; l'objet connaît sa poignée (pointeur de retour). Ce n'est pas
+un GC traçant : la propriété reste explicite (ZREM libère) ; c'est un relocateur.
+
+### 19.1 Table
+
+- Plage `mmap` à elle, `MAP_NORESERVE`, `u64` par poignée (adresse de l'objet) ;
+  `RADIXOX_HANDLES_MAX` (défaut 2^28 poignées, 2 Gio virtuels).
+- Case libre : `(poignée suivante << 1) | 1` (liste libre intrusive ; une adresse d'objet
+  est paire, donc le bit 0 distingue les cases libres). Allocation : tête de liste, sinon
+  sommet. Libération : en tête de liste.
+- Seuls l'allocation, la libération et le GC écrivent la table ; lire un objet = une
+  lecture de case puis l'objet.
+
+### 19.2 Objets
+
+- Curseurs dédiés du pool (`HANDLED`, `HANDLED_SURVIVOR`) : leurs blocs ne contiennent que
+  des objets à poignée, donc se parcourent.
+- En-tête de 6 o : `[longueur u16 : bit 15 = mort][poignée u32]`, puis les octets ; granule
+  de 2 o comme le reste du pool.
+- **Bump seul, objets ≤ 2 Kio** (`MEDIUM`) : la fenêtre Best-Fit des objets moyens place
+  depuis le haut du bloc, ce qui casserait le parcours. Un objet à poignée plus grand va
+  dans l'allocateur des grands objets (§18 ; en-tête `[longueur u32][poignée u32]`), que le
+  GC ne déplace pas.
+- Libérer : bit « mort » dans l'en-tête (la longueur reste, pour sauter l'objet), compte
+  du bloc décrémenté comme pour tout objet du pool (recul du sommet si c'était le
+  dernier) ; la poignée retourne à la liste libre.
+- Fin de remplissage de chaque bloc à poignée : un `u16` par bloc (en granules), tenu à la
+  fermeture du curseur, borne du parcours.
+
+### 19.3 Évacuation
+
+Pour un bloc marqué de la classe à poignée (la passe du GC décide quels blocs, §16.6) : on
+parcourt le bloc de son début à sa fin de remplissage ; pour chaque objet vivant : copie
+au curseur `HANDLED_SURVIVOR`, `table[poignée] = nouvelle adresse`, ancien rendu. Aucune
+structure n'est visitée : le coût est celui du bloc, pas de la base. Tranches bornées en
+octets copiés, comme le reste du GC.
+
+### 19.4 Save
+
+- Les images de save gardent des poignées, pas des adresses ; l'écriture lit l'objet par
+  sa poignée au moment où elle l'écrit. Le GC peut donc déplacer pendant une save.
+- Un objet libéré pendant une save attend la fin de la save (liste différée de poignées),
+  pour que la poignée d'une image reste valide.
+
+### 19.5 Coût et comptes
+
+- Par objet : 4 o (poignée dans l'en-tête) + 8 o (case) ; chaque structure qui le
+  référence garde 4 o au lieu d'un pointeur de 8 (net à peu près nul dès deux références).
+- Lecture des octets : une lecture dépendante de plus (case), à précharger dans les
+  chaînes AMAC (ANALYSE_ART_UNIFIE.md §13.6).
+- `INFO` : `mem_handles_live`, `mem_handles_table_bytes`, plus les octets du pool déjà
+  comptés.
+
+### 19.6 Tests (avant tout usage)
+
+Modèle aléatoire : allouer, libérer, évacuer des blocs marqués ; après chaque étape, chaque
+case vivante pointe vers un objet dont l'en-tête porte cette poignée, chaque objet vivant
+d'un bloc à poignée est pointé par sa case, les octets sont intacts, les comptes du pool
+justes.

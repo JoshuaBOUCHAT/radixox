@@ -627,158 +627,233 @@ inventer.
   des re-scores de membres existants ; à trancher selon l'usage visé, pas un
   défaut universel.
 
-## 13. ZSet — design retenu après investigation (2026-10-07, pas implémenté)
+## 13. ZSet — architecture retenue (2026-10-26, pas implémenté)
 
-Remplace la « direction pressentie » du §12.4. Le ZSet actuel (`InnerZCommand` :
-`SmallVec` trié ≤ 16, puis `BTreeSet<(score, membre)>` + `HashMap`) reste
-branché tel quel ; Hash et Set sont passés sur valart.
+Remplace le design du 2026-10-07 (texte précédent : `git show 18218a1:ANALYSE_ART_UNIFIE.md`,
+§13). Décidée avec l'utilisateur le 2026-10-26, après l'allocateur sans jemalloc
+(MEMORY_ARCH.md §18). Repose sur les objets à poignée (MEMORY_ARCH.md §19).
 
-### 13.1 Le point bloquant du §12.4 : les rangs
+### 13.0 Pourquoi refaire
 
-Un trie (oxidart) ou un `BTreeMap` std ne connaît pas la taille de ses
-sous-arbres. Toutes les commandes par **position** restent alors en O(n) :
-ZRANGE par index (la forme par défaut), ZRANK/ZREVRANK, ZCOUNT, ZLEXCOUNT,
-ZREMRANGEBYRANK, ZRANDMEMBER. Constat sur l'existant : `cmd_zrange` fait
-`iter().skip(start)` (`oxidart/src/zcommand.rs`), donc `ZRANGE k -10 -1` sur 1M
-membres parcourt les 1M. Redis fait O(log n) grâce aux `span` de sa skiplist.
-Ajouter des compteurs à oxidart les ferait payer à tous les nœuds du keyspace.
+Le ZSet actuel (`InnerZCommand` : `SmallVec` trié ≤ 16, puis `BTreeSet<(score, membre)>` +
+`HashMap`) :
+- **membres épinglés** : partagés par les deux structures (`rc = 2`), donc convertis en
+  externe (§16.9 de MEMORY_ARCH) ; le GC ne peut pas les déplacer ;
+- **hors de l'allocateur** : `BTreeSet` et `HashMap` dans glibc (~59 o/membre, invisibles
+  dans `INFO`) ;
+- **la save bloque** : hors barrière, écrit d'un bloc au `begin` (340 ms par million de
+  membres) ;
+- **ZRANGE par rang en O(n)** (`iter().skip(start)`), comme ZRANK, ZCOUNT, ZREMRANGEBYRANK.
 
-### 13.2 Trois représentations selon la taille
+Mesuré (2026-10-26, membres de 15 o, scores entiers, RSS par membre, clé comprise) :
 
-1. **≤ 7 membres** : un seul nœud 128 B du slab valart, 7 × (score u64 + ptr
-   membre) triés + 1 octet de contrôle par entrée. Zéro allocation, rang =
-   index, lookup membre = SWAR sur les ctrl.
-2. **8 à ~128 membres** : un bloc trié unique en colonnes
-   `[scores u64][membres][ctrl]`, façon listpack. ~17 B/membre, aucun index
-   séparé ; insert/remove = memmove ≤ ~2 Ko.
-3. **> 128 membres** : deux structures.
-   - **B+tree à compteurs** (order-statistic), clé = `(score u64 ordonné, ptr
-     membre)`, **aucune valeur**. Nœuds ~512 B ; feuilles en colonnes
-     (`scores [u64; 31]`, `membres [ptr; 31]`), chaînées prev/next ; nœuds
-     internes : séparateurs + enfants u32 + **compteur par sous-arbre**. Hauteur
-     ~5 pour 1M. Comparaison : `u64` d'abord, octets du membre seulement en cas
-     d'égalité de score (ordre lexicographique exigé par ZRANGE/ZRANGEBYLEX).
-   - **Index membre → score** : variante de `HashNode` valart, score `u64`
-     inline à la place de la valeur `SharedByte` (même 16 B/entrée). Le membre
-     est le même `SharedByte` que dans le B+tree (rc = 2, pas de copie).
-   - Estimation ~40 B/membre hors octets des membres (actuel ~70 B, Redis
-     skiplist + dict ~90-100 B). À vérifier au bench.
+| | grands (1000 × 1000) | petits (100 000 × 10) |
+|---|---|---|
+| Valkey 9.1.2 (skiplist + table ; listpack) | 93 o | 27 o |
+| RadixOx actuel | 99 o | 62 o |
+| **objectif** | **≤ 70 o** | **≤ 27 o** |
 
-### 13.3 Mécanique
+### 13.1 Quelle structure sert quelle commande
 
-- **Rang** : en descendant, somme des compteurs des sous-arbres à gauche du
-  chemin. **Sélection par rang** : on descend en soustrayant. **ZCOUNT** =
-  rang(max) − rang(min). Insert/remove : ±1 sur les compteurs du chemin (déjà
-  en cache).
-- **Équilibrage** : B+tree équilibré par construction (feuilles à la même
-  profondeur, split qui remonte, emprunt/fusion sous la moitié), aucune
-  rotation, quel que soit l'ordre d'insertion.
-- **Min/max** : `first_leaf` / `last_leaf` dans l'en-tête → O(1). Après un pop,
-  le suivant est l'entrée voisine ou la feuille `next`. Compteurs du chemin du
-  min = enfant 0 à chaque niveau, redescente sans comparaison : **pas besoin de
-  pointeur parent pour ZPOPMIN/MAX**.
-- **ZINCRBY / ZADD update sur place** : si le nouveau score reste entre les
-  voisins dans la feuille, on déplace l'entrée dans la feuille ; aucun compteur
-  ne change (même optimisation que `zslUpdateScore` de Redis).
-- **Pas de référencement croisé par index** (`membre → score_idx`,
-  `score → membre_idx`) : les entrées d'un B+tree bougent à chaque insert
-  (décalage), split, fusion → il faudrait corriger jusqu'à ~30 pointeurs dans
-  l'index par insertion, en accès aléatoires. Le sens score → membre est
-  inutile (l'entrée contient déjà le ptr du membre). Redis lui-même relit le
-  score dans le dict puis **redescend** la skiplist (`zslDelete(score, ele)`),
-  il n'utilise pas son pointeur pour aller au nœud. Nous copions le score dans
-  l'index (8 B, comme leur pointeur) au lieu de pointer dessus.
-- **Score en f64 obligatoire** : f32 = entiers exacts seulement ≤ 2^24 → casse
-  les timestamps ms (files à délai, rate limiting, le cas d'usage n°1), les
-  classements > 16M points, les IDs. Gain f32 seulement ~18 % (~40 → ~33 B).
-  Si besoin un jour : encodage étroit par ZSet façon `intset` (4 B tant que
-  tous les scores y tiennent exactement, réécriture unique en 8 B sinon).
-  Normaliser −0.0 en 0.0 à l'insertion (Redis les considère égaux).
+Comme Redis (`struct zset { dict *dict; zskiplist *zsl; }`), l'index membre → score n'a
+**pas besoin d'ordre** : tout ce qui est ordonné passe par l'arbre.
 
-### 13.4 Égalités de score massives (ex. file à priorité, tout à 0)
+| commandes | structure |
+|---|---|
+| ZSCORE, ZMSCORE, existence dans ZADD, ancien score dans ZREM / ZINCRBY, ZINTER / ZUNION / ZDIFF (appartenance) | index (valart, haché) |
+| ZRANGE (rang, BYSCORE, BYLEX), ZRANK, ZCOUNT, ZLEXCOUNT, ZPOPMIN/MAX, ZREMRANGEBY* | B+tree compté |
+| ZRANDMEMBER | B+tree : rang tiré au hasard puis sélection en O(log n) (uniforme) |
+| ZSCAN | index (ordre valart stable sous mutation, même garantie qu'un curseur de table) |
+| ZCARD | compteur de l'en-tête |
 
-Retrouver `(15, TRUC)` parmi des milliers d'ex-aequo = O(log n) comparaisons
-qui déréférencent chacune un membre (~25 cache misses, ~2 µs). Redis paie la
-même chose (`sdscmp`). Atténuations, à n'activer qu'après mesure :
-- **Indice de feuille** dans l'index (u32, entrée 16 → 20 B) : on cherche dans
-  la feuille indiquée le **pointeur membre identique** (même `SharedByte`,
-  comparaison SIMD de 31 u64, zéro déréférencement). Indice périmé (split /
-  fusion, ~1 insert sur 15) → redescente puis correction. Un indice faux ne
-  corrompt jamais rien. Demande des **pointeurs parents** dans le B+tree
-  (remonter pour les compteurs et pour ZRANK depuis une feuille), maintenus aux
-  splits — classique et contrôlable par le vérificateur.
-- **Préfixe de 8 octets du membre** à côté du score (+8 B/entrée) pour trancher
-  les comparaisons d'insertion sans déréférencement (inutile si les membres
-  partagent un long préfixe, ex. `job:000…`).
+### 13.2 Deux formes
 
-### 13.5 Descente entrelacée (AMAC) pour ZADD d'un nouveau membre
+- **Petite** (§13.3) : au plus **128 membres** et chaque membre d'au plus **64 o** (seuils
+  de Redis, `zset-max-listpack-entries` / `-value`). Un seul bloc, membres en ligne.
+- **Grande** (§13.4) : au-delà. Index + B+tree compté + poignées.
+- Passage petite → grande quand un seuil est dépassé ; **pas de retour** (Redis non plus).
+- Seuils à re-mesurer (§13.9) : coût d'un ZSCORE / ZADD dans la petite forme à 32, 64 et
+  128 membres contre la descente de la grande.
 
-Les descentes index (hash du membre) et B+tree (score, membre) sont
-indépendantes : on les avance niveau par niveau en prefetchant le prochain nœud
-de chacune → coût ≈ max des deux au lieu de la somme. Si l'index révèle un
-membre existant avec un autre score, il faut en plus retrouver l'ancienne
-entrée (indice de feuille ou redescente).
+### 13.3 Petite forme : bloc en colonnes
 
-### 13.6 Options écartées
+```text
+[n u8][largeur u8][cap u8][pad][scores : largeur × cap][longueurs : u8 × cap][octets des membres]
+```
 
-- **Trie radix sur `score_be ++ membre` (oxidart)** : ex-aequo gratuits (octets
-  du membre dans le chemin, pas de déréférencement) mais rangs O(n) et ~64 B
-  par nœud.
-- **`BTreeMap<f64, membre | valart de membres>`** (deux niveaux) : pas de
-  compteurs (rangs O(n)), et un valart trierait les ex-aequo par hash au lieu de
-  l'ordre lexicographique exigé par Redis.
+- **Scores à largeur fixe par bloc**, triés croissants : entiers signés sur 2 ou 4 o si
+  tous les scores du bloc sont entiers et y tiennent, sinon 8 o (`f64` en `u64` ordonné,
+  §13.4). La largeur ne fait que grandir (réécriture du bloc, une fois) ; jamais de
+  rétrécissement en v1. Permet la **recherche dichotomique par score** (ZRANGEBYSCORE,
+  position d'insertion), que le listpack (longueurs variables) ne permet pas.
+- **Longueurs dans leur colonne** : ZSCORE / ZADD balaient les longueurs (SIMD), puis ne
+  comparent les octets que des candidats de la bonne longueur. Décalage d'un membre = somme
+  des longueurs avant lui.
+- Ordre : `(score, membre)` ; à score égal, ordre lexicographique des octets.
+- Insertion / suppression : `memmove` des trois colonnes (≤ ~3 Ko à 128 × 15 o).
+- **Un seul propriétaire** (la valeur du nœud oxidart, `Tag::ZSetSmall`, `ValUnion::ptr`) :
+  même chemin que `HashSmall` / `SetSmall` (`oxidart/src/small.rs`) — le GC déplace le bloc
+  d'un coup (`gc::visit_val`, `v.page`), l'image de save en garde une copie profonde, la
+  modification passe par `value_mut` (barrière). Aucune poignée, aucun `SharedByte`
+  intérieur. Bloc alloué dans le pool (objet de structure aligné sur 8).
+- Estimation : 10 membres de 15 o, scores sur 4 o : (4 + 1 + 15) = 20 o/membre + en-tête.
 
-### 13.7 Contraintes et plan
+### 13.4 Grande forme
 
-- **Tous les nœuds en HiSlab** (B+tree compris, dans son propre slab), pour le
-  mécanisme de COW de la sauvegarde. Les blocs « moyen » (représentation 2) et
-  les overflows valart sont aujourd'hui hors slab : même point ouvert que pour
-  Hash/Set.
-- **v1** : B+tree à compteurs + feuilles chaînées + first/last, index membre →
-  score, redescente systématique (ni parents ni indice), représentations 1 et 2.
-  Couvre toutes les commandes avec les bonnes complexités ; seul point faible
-  les updates/suppressions sur de grands groupes d'ex-aequo.
-- **v2 si le bench des ex-aequo le justifie** : indice de feuille + parents,
-  descente entrelacée, préfixe de membre.
-- Développement comme Set/Hash : vérificateur d'invariants (compteurs, ordre,
-  remplissage, chaînage), tests contre un modèle de référence, bench 1M contre
-  `BTreeSet` + `HashMap`.
+```text
+index (valart)        entrée = {ctrl, poignée u32, score u64}      ← ZSCORE lit le score ici
+B+tree compté (HiSlab) feuille = scores [u64], poignées [u32]       ← ordre, rangs, plages
+table des poignées     poignée → adresse (8 o)                      ← GC, lecture des octets
+membre (pool)          {longueur, poignée, octets}
+```
 
-### 13.8 Relance (2026-10-21) : le ZSet bloque la save
+**Score.** `f64` → `u64` ordonné (bijection exacte sur les bits, ordre de `total_cmp`) ;
+`-0.0` normalisé en `0.0` avant (Valkey : même score, départagés par le nom) ; NaN refusé
+avant la structure (`ERR value is not a valid float`). Le score vit à deux endroits,
+l'entrée d'index et l'entrée de feuille ; une mise à jour touche les deux, qui sont lues de
+toute façon pour la faire. La table ne contient que des adresses : ni ZSCORE ni une mise à
+jour ne l'écrivent. Écarté : `vals[]` / `scores[]` séparés dans la table (ZSCORE vérifie le
+membre, donc lit l'adresse **et** le score : deux défauts au lieu d'un ; et le GC ne balaie
+pas la table, §19 de MEMORY_ARCH, l'argument « table moins polluée » ne tient plus).
 
-**Fait déclencheur.** Le ZSet actuel (`BTreeSet` + `HashMap` std) est hors slab, donc hors
-barrière : la save v1 l'écrit en entier au `begin` (SAVE_DESIGN.md §D). Mesuré : 340 ms par
-million de membres, sur la boucle ; ~1,5 s avec le ZSet `_indices` de YCSB à 5 M clés. Copier
-le ZSet à sa première écriture pendant la save ne suffit pas (YCSB fait un `ZADD _indices` par
-insertion : même arrêt). Patcher l'ancienne structure (copie à l'écriture membre par membre)
-serait du code jeté : on passe au §13.2 sur HiSlab, qui hérite de la barrière par nœud.
+**Membres.** Objets à poignée (MEMORY_ARCH.md §19) : une seule copie des octets, deux
+structures qui ne gardent que la poignée (4 o au lieu d'un pointeur de 8), déplacement par
+le GC = une case de la table réécrite. Un membre de plus de 16 Kio va dans l'allocateur des
+grands objets (§18), que le GC ne déplace pas.
 
-**Variante discutée à comparer au §13.2-3.** Clé de l'arbre = **score seul** (u64 ordonné,
-unique dans l'arbre) ; les ex-aequo sortent de l'arbre :
-- valeur d'une entrée de feuille = un `SharedByte` (un seul membre à ce score), ou, bit 0 du
-  pointeur à 1 (`SharedByte` = `NonNull` aligné ≥ 8 par `mi_malloc`), un pointeur fin vers un
-  **bucket** d'ex-aequo ;
-- petit bucket : `Vec` trié de `SharedByte` avec en-tête `{len, cap}` (rang = indice par
-  dichotomie) ; gros bucket (tout à score 0, `ZRANGEBYLEX`, autocomplétion) : le **même**
-  B+tree à compteurs, générique sur la clé (`CountedTree<u64>` pour les scores,
-  `CountedTree<SharedByte>` pour les octets du membre). Une seule structure difficile à
-  écrire et à tester, utilisée deux fois ;
-- compteurs des nœuds internes = nombre de **membres** (une entrée pèse 1 ou `bucket.len`) ;
-- recherche en feuille = comparaisons de `u64` seules (SIMD), jamais de déréférencement de
-  membre hors des buckets.
+**Index membre → score.** Variante du `HashNode` de valart, entrée `{poignée u32, score
+u64}` + octet de contrôle (empreinte du hash). Recherche : hash du membre → candidats dont
+l'empreinte correspond → case de la table → octets comparés. Pas d'ordre.
 
-Cela lève les deux objections du §13.6 contre le « deux niveaux » : rang en O(log n) grâce aux
-compteurs, ordre lexicographique grâce au bucket compté (et non valart, qui trie par hash).
-Coût : un niveau d'indirection pour les ex-aequo. À trancher par un bench sur les deux profils
-(scores distincts ; tout à 0).
+**B+tree compté.** Nœuds dans une `HiSlab` à lui (idx u32), pour la barrière de save.
+- Feuille (~512 o) : `n`, `prev` / `next` (feuilles chaînées), `scores [u64; L]`,
+  `poignées [u32; L]`, en colonnes (comparaisons SIMD sur les scores) ; L ≈ 41.
+- Interne (~512 o) : séparateurs `(score u64, poignée u32)` (clé complète, pour les
+  ex-aequo), `enfants [u32]`, `comptes [u32]` (nombre de membres de chaque sous-arbre) ;
+  ~25 enfants.
+- En-tête du ZSet (objet de structure du pool, seul propriétaire : la valeur oxidart,
+  `Tag::ZSet`) : racine, première et dernière feuille, hauteur, nombre de membres, nœud
+  racine de l'index.
+- Clé `(score, membre)` : `u64` d'abord, octets du membre (via la poignée) seulement à
+  score égal.
+- Hauteur ~5 pour 1M membres.
 
-**Points à ne pas perdre.**
-- f64 → u64 ordonné (`total_cmp`) : bijection exacte sur les bits, aucune perte ; normaliser
-  `-0.0` en `0.0` avant (vérifié sur Valkey : `ZADD z -0 a 0 b` → même score, affiché `0`,
-  départagés par le nom) ; NaN refusé avant l'arbre (`ERR value is not a valid float`).
-- Index membre → score : valart (`membre → {score}`), ZREM = score puis redescente (v1 sans
-  pointeur de retour, §13.3).
-- GC (MEMORY_ARCH.md) : les feuilles deviennent propriétaires de `SharedByte` ; le GC qui les
-  déplace doit réécrire le pointeur en gardant le bit de marquage, et le pool des
-  `SharedByte` garder un alignement ≥ 2.
-- List : même problème de save (hors barrière) ; à traiter avec le même principe.
+**Algorithmes (v1).**
+- **Insertion** d'un membre nouveau (absent de l'index, donc réussite certaine) : descente
+  depuis la racine avec `comptes[enfant] += 1` à chaque niveau (nœuds déjà en cache),
+  insertion dans la feuille. Feuille pleine : split ; le séparateur et le compte du
+  nouveau frère (= sa longueur) remontent par la **pile de la descente** (pas de pointeur
+  parent). **Split 90/10 quand on insère tout à droite de l'arbre** (scores croissants :
+  files à délai, horodatages, `_indices` de YCSB), 50/50 sinon : sans ça, chaque feuille
+  reste à moitié vide sur une insertion séquentielle.
+- **Suppression** (présence connue par l'index) : descente avec `−1`. Pas de
+  rééquilibrage classique (emprunt / fusion) : une feuille vide est rendue, deux voisines
+  sous ¼ chacune sont fusionnées ; racine à un seul enfant : hauteur −1. Un arbre parfois
+  sous-rempli reste correct.
+- **Mise à jour de score** (ZADD d'un membre existant, ZINCRBY) : sur place si le nouveau
+  score reste entre ses voisins de feuille (aucun compte ne change) ; sinon suppression +
+  insertion.
+- **Rang** : en descendant, somme des comptes à gauche du chemin. **Sélection par rang** :
+  on descend en soustrayant. ZCOUNT = rang(max) − rang(min).
+- **Plages** (ZRANGE & co) : une descente (rang ou score), puis les feuilles chaînées.
+
+Estimation (membre de 15 o) : membre 22 o (15 + en-tête 6, arrondi) + case 8 + entrée
+d'index ~19 (13 o ÷ remplissage valart, à mesurer) + entrée de feuille ~17 (12 o ÷ 69 %)
++ internes ~1 = **~67 o/membre** (~81 au pire, remplissage 50 %).
+
+### 13.5 GC
+
+- Petite forme : le bloc, d'un coup (§13.3).
+- Grande forme : les membres s'évacuent **en parcourant le bloc** (en-tête → poignée → case
+  réécrite, MEMORY_ARCH.md §19), sans parcourir ni le B+tree ni l'index : une passe ne
+  dépend pas de la taille des ZSet. En-tête : objet de structure, déplacé par la visite de
+  la valeur oxidart. Nœuds du B+tree (HiSlab) et de l'index (slab valart) : compactage de
+  slab (MEMORY_ARCH.md §17.6), plus tard.
+
+### 13.6 AMAC
+
+- **v1 : préchargement seul**, sur le modèle de `amac_fields` (phase 1 bis) : rien n'est
+  gardé, l'exécution refait ses descentes, cache chaud. Correct par construction ; **pas de
+  pierre tombale** au niveau du ZSet (une suppression, un split, un passage petite →
+  grande plus tôt dans la fenêtre sont vus par la redescente). La clé du ZSet elle-même
+  reste couverte par oxidart (`DEL z` puis `ZADD z` dans la même fenêtre, TTL).
+- Chaînes de la phase de préchargement :
+
+| commande | chaîne |
+|---|---|
+| ZSCORE, ZMSCORE | clé (oxidart) → index → candidat → case → octets |
+| ZADD membre nouveau | clé → index (absence) **et** descente du B+tree vers `(score, membre)`, en parallèle dans la même voie |
+| ZADD mise à jour, ZINCRBY, ZREM, ZRANK | clé → index → ancien score → descente du B+tree vers l'ancienne entrée (enchaînées) |
+| petite forme | clé → lignes du bloc |
+
+- **Plages** : pas d'AMAC entre commandes mais un pipeline dans la commande : pendant
+  l'émission de la feuille `i`, préchargement de la feuille `i+1`, puis des cases de ses
+  poignées, puis des octets.
+- **v2** (après mesure) : garder les indices des lectures ; pour les écritures, règle « ZSet
+  modifié plus tôt dans la fenêtre → redescente » (le ZSet vient d'être écrit, il est en
+  cache). Toujours pas de pierre tombale (une entrée morte dans une feuille casserait les
+  rangs).
+
+### 13.7 Save
+
+- Nœuds du B+tree derrière la barrière (images, comme valart) ; index : valart, déjà
+  derrière ; en-tête et petite forme : modifiés via `value_mut` (image = copie profonde).
+- Membres : lus par leur poignée au moment de l'écriture ; un membre libéré pendant une
+  save attend la fin de la save (liste différée de poignées, comme la liste différée de
+  valart, SAVE_DESIGN.md §2.B), pour que les images gardent des poignées valides.
+- Format : par ZSet, cardinalité T0 puis `(score, membre)` dans l'ordre de l'arbre ; le
+  rechargement construit les feuilles pleines de gauche à droite (pas d'insertion une à
+  une).
+
+### 13.8 Ordre de travail
+
+Chaque couche seule, avec ses tests, avant la suivante :
+1. **Objets à poignée** (MEMORY_ARCH.md §19) : table, curseur dédié du pool, évacuation par
+   parcours de bloc ; tests contre un modèle (allouer, libérer, évacuer, chaque case pointe
+   vers son objet, chaque en-tête vers sa case).
+2. **B+tree compté**, générique sur la clé, seul : vérificateur d'invariants (comptes,
+   ordre, remplissage, chaînage, hauteur) ; tests contre un `BTreeSet` + rangs calculés.
+3. **Petite forme** seule : tests contre un modèle trié.
+4. **ZSet assemblé** (petite + grande, passage) : test différentiel contre le ZSet actuel,
+   gardé comme oracle (comme `oxidart-legacy` pour l'arbre).
+5. Branchement des commandes ; ZRANGE par rang en O(log n) vérifié.
+6. AMAC (préchargement seul).
+7. Save (barrière, liste différée, format, rechargement).
+8. Mesures : mémoire contre Valkey (objectifs du §13.0), ZADD / ZSCORE / ZRANGE, ex-aequo
+   massifs (tout à 0), seuils de la petite forme.
+
+### 13.9 Mesures prévues
+
+- Mémoire par membre, grands et petits, scores entiers et flottants, contre Valkey.
+- ZADD séquentiel (scores croissants) : remplissage des feuilles (split 90/10).
+- ZSCORE / ZADD dans la petite forme à 32, 64, 128 membres contre la grande.
+- Ex-aequo massifs : coût des comparaisons d'octets dans la descente.
+- Remplissage réel de l'index valart (le nombre le moins sûr de l'estimation).
+
+### 13.10 Options écartées (ne pas reproposer)
+
+| option | raison |
+|---|---|
+| trie radix (oxidart) pour l'ordre | pas de rangs (O(n)), nœuds de 64 o et plus |
+| `BTreeMap` std / à deux niveaux | pas de comptes, rangs en O(n) |
+| valart pour ordonner les ex-aequo | ordre par hash ; Redis exige l'ordre lexicographique |
+| scores `f32` | entiers exacts seulement jusqu'à 2^24 : casse les horodatages en ms |
+| membre partagé `rc = 2` entre les deux structures | épinglé, le GC ne le déplace pas |
+| deux copies du membre (une par structure) | remplacé par la poignée : une copie, déplacement en une écriture |
+| `vals[]` / `scores[]` séparés dans la table | deux défauts par ZSCORE (§13.4) |
+| petite forme à pointeurs | en-tête et arrondi par membre ; en ligne, un seul propriétaire, rien à suivre |
+| pierres tombales dans le ZSet pour AMAC | v1 sans indice gardé ; en v2, « ZSet modifié → redescente » |
+| rééquilibrage complet à la suppression | partie la plus délicate d'un B+tree, inutile à la correction |
+| retour grande → petite forme | Redis ne le fait pas ; complexité sans cas d'usage |
+
+### 13.11 Pour plus tard (après mesure)
+
+- **Préfixe de 8 o du membre** à côté du score dans les feuilles et séparateurs : départage
+  les ex-aequo par comparaison d'entiers, sans déréférencement (+~12 o/membre ; inutile si
+  les membres partagent un long début, `job:000…`).
+- Indices AMAC gardés (§13.6, v2).
+- Indice de feuille dans l'entrée d'index (ZREM / mise à jour sans redescente).
+- Variante « clé = score seul + seaux d'ex-aequo comptés » (§13.8 de l'ancien texte), si les
+  ex-aequo massifs le demandent.
+- List : même problème de save (hors barrière) et même principe (structure en slab, objets
+  à poignée si plusieurs références).
