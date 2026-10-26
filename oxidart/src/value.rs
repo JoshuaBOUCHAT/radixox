@@ -201,6 +201,12 @@ pub(crate) fn for_each_zset(f: impl FnMut(u32, &ZSet)) {
     zset_slab().for_each_occupied(f);
 }
 
+/// Précharge la case de l'en-tête du ZSet `idx` (chaînes AMAC).
+#[inline]
+pub(crate) fn prefetch_zset(idx: u32) {
+    radixox_lib::prefetch::prefetch_l1(zset_slab().slot_ptr(idx) as *const u8);
+}
+
 /// Slab des ZSet (GC : blocs des petites formes).
 #[inline]
 pub(crate) fn zset_slab_mut() -> &'static mut HiSlab<ZSet> {

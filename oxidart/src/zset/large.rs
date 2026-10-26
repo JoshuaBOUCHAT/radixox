@@ -32,6 +32,69 @@ fn rehash(h: u32) -> u64 {
     member_hash(member(h))
 }
 
+/// Membres lus d'avance dans une feuille (leur case est déjà préchargée).
+const AHEAD: u16 = 4;
+
+/// Parcours d'une plage avec pipeline dans la commande (ANALYSE_ART_UNIFIE.md §13.6) : en
+/// entrant dans une feuille, la suivante est préchargée, puis les cases de toutes ses
+/// poignées ; chaque entrée précharge les octets du membre [`AHEAD`] rangs plus loin.
+pub struct Range {
+    c: Option<Cursor>,
+    back: bool,
+    /// Feuille dont les cases ont été préchargées.
+    warmed: u32,
+}
+
+impl Range {
+    fn new(c: Option<Cursor>, back: bool) -> Self {
+        Self { c, back, warmed: u32::MAX }
+    }
+
+    #[inline]
+    fn warm(&mut self, c: Cursor) {
+        if self.warmed == c.leaf {
+            return;
+        }
+        self.warmed = c.leaf;
+        let (prev, next) = BTree::leaf_links(c.leaf);
+        let other = if self.back { prev } else { next };
+        if other != u32::MAX {
+            super::btree::prefetch(other);
+        }
+        let hs = BTree::leaf_handles(c.leaf);
+        for &h in hs {
+            radixox_lib::prefetch::prefetch_l1(handle::slot_ptr(h) as *const u8);
+        }
+        // les premiers membres tout de suite (ceux d'avant n'auront pas d'avance)
+        for k in 0..AHEAD {
+            if let Some(&h) = self.ahead(hs, c.pos, k) {
+                radixox_lib::prefetch::prefetch_l1(handle::addr(h) as *const u8);
+            }
+        }
+    }
+
+    #[inline]
+    fn ahead<'a>(&self, hs: &'a [u32], pos: u16, k: u16) -> Option<&'a u32> {
+        if self.back { pos.checked_sub(k).and_then(|p| hs.get(p as usize)) } else { hs.get((pos + k) as usize) }
+    }
+}
+
+impl Iterator for Range {
+    type Item = (u64, &'static [u8]);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let c = self.c?;
+        self.warm(c);
+        if let Some(&h) = self.ahead(BTree::leaf_handles(c.leaf), c.pos, AHEAD) {
+            radixox_lib::prefetch::prefetch_l1(handle::addr(h) as *const u8);
+        }
+        let (s, h) = BTree::entry(c);
+        self.c = if self.back { BTree::prev(c) } else { BTree::next(c) };
+        Some((s, member(h)))
+    }
+}
+
 /// Résultat d'un ajout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Added {
@@ -131,13 +194,13 @@ impl ZLarge {
     }
 
     /// `(score, membre)` à partir du rang `r`, croissants.
-    pub fn iter_from(&self, r: u32) -> impl Iterator<Item = (u64, &'static [u8])> {
-        BTree::iter_from(self.tree.select(r)).map(|(s, h)| (s, member(h)))
+    pub fn iter_from(&self, r: u32) -> Range {
+        Range::new(self.tree.select(r), false)
     }
 
     /// `(score, membre)` à partir du rang `r`, décroissants.
-    pub fn iter_back_from(&self, r: u32) -> impl Iterator<Item = (u64, &'static [u8])> {
-        BTree::iter_back_from(self.tree.select(r)).map(|(s, h)| (s, member(h)))
+    pub fn iter_back_from(&self, r: u32) -> Range {
+        Range::new(self.tree.select(r), true)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (u64, &'static [u8])> {

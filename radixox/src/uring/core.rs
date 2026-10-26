@@ -1749,7 +1749,7 @@ impl Core {
             // champ de la première clé de chaque frame (`exec::hint_field`), en
             // pointeur : il appartient à la `Cmd`, consommée par la boucle plus
             // bas, mais seulement après la descente de sa série
-            let mut field: [Option<(*const u8, usize)>; B] = [None; B];
+            let mut field: [Option<(*const u8, usize, oxidart::ZProbe)>; B] = [None; B];
             // bit i : la frame i porte un champ
             let mut fields_in = 0u64;
             let mut start = [0u8; B + 1];
@@ -1772,7 +1772,7 @@ impl Core {
                         });
                     if hinted && fits {
                         has |= 1 << i;
-                        field[from] = crate::exec::hint_field(c).map(|f| (f.as_ptr(), f.len()));
+                        field[from] = crate::exec::hint_field(c).map(|(f, z)| (f.as_ptr(), f.len(), z));
                         fields_in |= (field[from].is_some() as u64) << i;
                     } else {
                         n = from;
@@ -1807,15 +1807,16 @@ impl Core {
                     if fields_in & in_run_mask(k, run_end) != 0 {
                         // phase 1 bis : les champs de Hash / membres de Set de la série,
                         // dans un trie valart
-                        let mut items: [(oxidart::Hint, &[u8]); B] = [(oxidart::Hint::NONE, &[]); B];
+                        let mut items: [(oxidart::Hint, &[u8], oxidart::ZProbe); B] =
+                            [(oxidart::Hint::NONE, &[], oxidart::ZProbe::Index); B];
                         let mut m = 0;
                         for j in k..run_end {
-                            if let Some((p, n)) = field[start[j] as usize]
+                            if let Some((p, n, z)) = field[start[j] as usize]
                                 && hints[start[j] as usize].has_tree()
                             {
                                 // SAFETY: les frames de la série (k..run_end) ne sont pas
                                 // encore consommées ; leurs champs vivent dans leur `Cmd`.
-                                items[m] = (hints[start[j] as usize], unsafe { std::slice::from_raw_parts(p, n) });
+                                items[m] = (hints[start[j] as usize], unsafe { std::slice::from_raw_parts(p, n) }, z);
                                 m += 1;
                             }
                         }

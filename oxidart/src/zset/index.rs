@@ -188,6 +188,20 @@ impl Index {
         is_dir(i).then(|| dir(i).child[nibble(h, level)])
     }
 
+    /// Empreinte rangée dans le seau pour le hash `h`.
+    #[inline]
+    pub fn fingerprint(h: u64) -> u8 {
+        fp(h)
+    }
+
+    /// Chaînes AMAC, au seau : premier candidat d'empreinte `f` à partir du rang `from`
+    /// (maillon `b` seulement) : `(rang, poignée, score)`.
+    #[inline]
+    pub fn candidate(b: u32, f: u8, from: usize) -> Option<(usize, u32, u64)> {
+        let bk = bucket(b);
+        (from..bk.n as usize).find(|&i| bk.ctrl[i] == f).map(|i| (i, bk.handles[i], bk.scores[i]))
+    }
+
     /// Entrée du membre de hash `h` (`eq` : la poignée désigne-t-elle ce membre ?).
     #[inline]
     pub fn find(&self, h: u64, eq: impl Fn(u32) -> bool) -> Option<Loc> {

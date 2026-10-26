@@ -185,16 +185,22 @@ pub fn hint_keys<'a>(cmd: &Cmd<'a>, mut push: impl FnMut(&'a [u8])) -> bool {
     true
 }
 
-/// Champ (Hash) ou membre (Set) d'une commande de [`hint_keys`] : la descente
+/// Champ (Hash), membre (Set, ZSet) d'une commande de [`hint_keys`] : la descente
 /// AMAC de sa clé enchaîne sur sa descente dans le conteneur (préchargement
-/// seul). Le premier quand il y en a plusieurs.
-pub fn hint_field<'c>(cmd: &'c Cmd<'_>) -> Option<&'c [u8]> {
+/// seul). Le premier quand il y en a plusieurs. ZSet : ce qui suit l'index
+/// ([`oxidart::ZProbe`]).
+pub fn hint_field<'c>(cmd: &'c Cmd<'_>) -> Option<(&'c [u8], oxidart::ZProbe)> {
+    use oxidart::ZProbe::{Add, Index, Tree};
     match cmd {
-        Cmd::HGet { field, .. } | Cmd::HExists { field, .. } => Some(field),
-        Cmd::HIncrBy { field, .. } | Cmd::SIsMember { member: field, .. } => Some(field),
-        Cmd::HSet { fields, .. } => fields.first().map(|(f, _)| f.as_slice()),
-        Cmd::HDel { fields, .. } | Cmd::HMGet { fields, .. } => fields.first().map(|f| f.as_slice()),
-        Cmd::SAdd { members, .. } | Cmd::SRem { members, .. } => members.first().map(|m| m.as_slice()),
+        Cmd::HGet { field, .. } | Cmd::HExists { field, .. } => Some((field, Index)),
+        Cmd::HIncrBy { field, .. } | Cmd::SIsMember { member: field, .. } => Some((field, Index)),
+        Cmd::HSet { fields, .. } => fields.first().map(|(f, _)| (f.as_slice(), Index)),
+        Cmd::HDel { fields, .. } | Cmd::HMGet { fields, .. } => fields.first().map(|f| (f.as_slice(), Index)),
+        Cmd::SAdd { members, .. } | Cmd::SRem { members, .. } => members.first().map(|m| (m.as_slice(), Index)),
+        Cmd::ZScore { member, .. } => Some((member, Index)),
+        Cmd::ZIncrBy { member, .. } => Some((member, Tree)),
+        Cmd::ZRem { members, .. } => members.first().map(|m| (m.as_slice(), Tree)),
+        Cmd::ZAdd { members, .. } => members.first().map(|(s, m)| (m.as_slice(), Add(*s))),
         _ => None,
     }
 }

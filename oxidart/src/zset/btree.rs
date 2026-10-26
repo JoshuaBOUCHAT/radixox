@@ -519,6 +519,31 @@ impl BTree {
         (rank, c)
     }
 
+    /// Chaînes AMAC : enfant du nœud interne `i` vers lequel descend la sonde
+    /// (`probe(s, h)` = sonde comparée à l'entrée), préchargé.
+    #[inline]
+    pub fn child_toward(i: u32, mut probe: impl FnMut(u64, u32) -> Ordering) -> u32 {
+        let node = internal(i);
+        let ci = partition(node.n as usize - 1, |k| probe(node.sep_s[k], node.sep_h[k]) != Ordering::Less);
+        let c = node.child[ci];
+        prefetch(c);
+        c
+    }
+
+    /// Feuilles voisines de `l` : `(prev, next)`, `u32::MAX` aux bouts.
+    #[inline]
+    pub fn leaf_links(l: u32) -> (u32, u32) {
+        let lf = leaf(l);
+        (lf.prev, lf.next)
+    }
+
+    /// Poignées de la feuille `l` (préchargement des cases d'une plage).
+    #[inline]
+    pub fn leaf_handles(l: u32) -> &'static [u32] {
+        let lf = leaf(l);
+        &lf.handles[..lf.n as usize]
+    }
+
     /// Rang de `(s, h)` (présente).
     pub fn rank(&self, s: u64, h: u32, tie: &impl Tie) -> u32 {
         self.lower_bound(|es, eh| kcmp(tie, (s, h), (es, eh))).0

@@ -1,6 +1,7 @@
 //! ZSet (ANALYSE_ART_UNIFIE.md §13) : petite forme en colonnes, grande forme = index
 //! valart + B+tree compté + membres à poignée (MEMORY_ARCH.md §19).
 
+pub(crate) mod amac;
 pub mod btree;
 pub mod index;
 pub mod large;
@@ -13,7 +14,6 @@ pub use small::ZSmall;
 
 /// Un ZSet : petite forme tant qu'elle suffit, puis grande, sans retour (§13.2). Possède
 /// sa mémoire (bloc, membres, nœuds) : `Drop` la rend.
-#[derive(Debug)]
 pub enum ZSet {
     Small(ZSmall),
     Large(ZLarge),
@@ -106,7 +106,7 @@ impl ZSet {
     pub fn iter_from(&self, r: usize) -> ZIter<'_> {
         match self {
             Self::Small(z) => ZIter::Small(z.iter_from(r)),
-            Self::Large(z) => ZIter::Large(btree::BTree::iter_from(z.select(r as u32))),
+            Self::Large(z) => ZIter::Large(z.iter_from(r as u32)),
         }
     }
 
@@ -114,7 +114,7 @@ impl ZSet {
     pub fn iter_back_from(&self, r: usize) -> ZIterBack<'_> {
         match self {
             Self::Small(z) => ZIterBack::Small(z.iter_from(0).take(r + 1).rev()),
-            Self::Large(z) => ZIterBack::Large(btree::BTree::iter_back_from(z.select(r as u32))),
+            Self::Large(z) => ZIterBack::Large(z.iter_back_from(r as u32)),
         }
     }
 
@@ -145,6 +145,13 @@ impl ZSet {
             Self::Small(_) => Ok(()),
             Self::Large(z) => z.verify(),
         }
+    }
+}
+
+/// Le contenu, `(score, membre)` dans l'ordre (pas les adresses).
+impl std::fmt::Debug for ZSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter().map(|(s, m)| (decode_score(s), String::from_utf8_lossy(m)))).finish()
     }
 }
 
@@ -179,7 +186,7 @@ impl PartialEq for ZSet {
 /// Parcours croissant.
 pub enum ZIter<'a> {
     Small(small::Iter<'a>),
-    Large(btree::Entries),
+    Large(large::Range),
 }
 
 impl<'a> Iterator for ZIter<'a> {
@@ -189,7 +196,7 @@ impl<'a> Iterator for ZIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::Small(i) => i.next(),
-            Self::Large(i) => i.next().map(|(s, h)| (s, large::member(h))),
+            Self::Large(i) => i.next(),
         }
     }
 }
@@ -197,7 +204,7 @@ impl<'a> Iterator for ZIter<'a> {
 /// Parcours décroissant.
 pub enum ZIterBack<'a> {
     Small(std::iter::Rev<std::iter::Take<small::Iter<'a>>>),
-    Large(btree::Entries),
+    Large(large::Range),
 }
 
 impl<'a> Iterator for ZIterBack<'a> {
@@ -207,7 +214,7 @@ impl<'a> Iterator for ZIterBack<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::Small(i) => i.next(),
-            Self::Large(i) => i.next().map(|(s, h)| (s, large::member(h))),
+            Self::Large(i) => i.next(),
         }
     }
 }

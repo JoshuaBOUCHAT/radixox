@@ -58,12 +58,25 @@ fn encode(loc: Loc) -> u64 {
 }
 
 /// Bit de l'emplacement trouvé : la valeur est un trie valart (Hash ou Set
-/// au-delà du petit bloc). Hors du nœud (bits 9..40) : `decode` l'ignore.
+/// au-delà du petit bloc) ou un ZSet. Hors du nœud (bits 9..40) : `decode` l'ignore.
 const TREE: u64 = 1 << 62;
 
 #[inline(always)]
 fn tree_bit(tag: Tag) -> u64 {
-    if matches!(tag, Tag::Hash | Tag::Set) { TREE } else { 0 }
+    if matches!(tag, Tag::Hash | Tag::Set | Tag::ZSet) { TREE } else { 0 }
+}
+
+/// Ce que la phase 1 bis précharge dans un ZSet après l'index (ANALYSE_ART_UNIFIE.md
+/// §13.6). Sans effet pour un Hash ou un Set.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ZProbe {
+    /// L'index seul (ZSCORE, ZMSCORE).
+    Index,
+    /// Puis la descente du B+tree vers l'entrée actuelle du membre (ZREM, ZINCRBY,
+    /// ZRANK).
+    Tree,
+    /// ZADD : vers l'entrée actuelle si le membre est là, sinon vers `(score, membre)`.
+    Add(f64),
 }
 
 #[inline]
@@ -92,11 +105,21 @@ enum Step {
 
 /// Étape de la descente préchargée d'un champ ([`OxidArt::amac_fields`]).
 #[derive(Clone, Copy)]
-enum FieldStep {
+pub(crate) enum FieldStep {
     /// Nœud oxidart de l'indice préchargé : lire le conteneur.
     Start,
     /// Trie valart (`ValTrees::probe_step`), nœud courant préchargé.
     Tree { set: bool, depth: u8, ovf: bool },
+    /// ZSet : case de la slab des ZSet préchargée (`idx` = son idx).
+    ZHead,
+    /// Index du ZSet, nœud `idx` du niveau `level` préchargé.
+    ZIdx { level: u8 },
+    /// Seau `idx`, candidat de rang `i` : case de sa poignée préchargée.
+    ZSlot { i: u8 },
+    /// Seau `idx`, candidat de rang `i` : octets du membre préchargés.
+    ZObj { i: u8 },
+    /// B+tree, nœud `idx` à `left` niveaux des feuilles préchargé.
+    ZTree { left: u8 },
     Done,
 }
 
@@ -417,7 +440,7 @@ impl OxidArt {
     /// sa descente dans le conteneur, cache chaud. À part de `amac_descend`, dont
     /// la boucle ne paie rien pour les commandes sans champ. Petit bloc : rien
     /// (mesuré perdant, l'exécution superpose déjà ses défauts).
-    pub fn amac_fields(&self, items: &[(Hint, &[u8])], lanes: usize) {
+    pub fn amac_fields(&self, items: &[(Hint, &[u8], ZProbe)], lanes: usize) {
         let n = items.len();
         if n == 0 {
             return;
@@ -425,8 +448,11 @@ impl OxidArt {
         let k = lanes.clamp(1, PREFETCH_BATCH).min(n);
         let mut step = [FieldStep::Done; PREFETCH_BATCH];
         let mut idx = [0u32; PREFETCH_BATCH];
-        // hash du champ (trie) ou adresse du petit bloc
+        // hash du champ (trie, index du ZSet)
         let mut fh = [0u64; PREFETCH_BATCH];
+        // ZSet : idx de son en-tête, score de la descente du B+tree
+        let mut zidx = [0u32; PREFETCH_BATCH];
+        let mut zscore = [0u64; PREFETCH_BATCH];
         let mut item_of = [0usize; PREFETCH_BATCH];
         let (mut issued, mut active) = (0, 0);
         // une voie libre prend l'élément suivant (indice trouvé seulement)
@@ -448,7 +474,7 @@ impl OxidArt {
         }
         while active > 0 {
             for s in 0..k {
-                let (hint, field) = items[item_of[s]];
+                let (hint, field, zp) = items[item_of[s]];
                 step[s] = match step[s] {
                     FieldStep::Done => continue,
                     FieldStep::Start => self.field_start(hint.found, field, &mut idx[s], &mut fh[s]),
@@ -459,6 +485,7 @@ impl OxidArt {
                             FieldStep::Tree { set, depth, ovf }
                         }
                     }
+                    z => crate::zset::amac::step(z, field, zp, &mut idx[s], &mut fh[s], &mut zidx[s], &mut zscore[s]),
                 };
                 if matches!(step[s], FieldStep::Done) && !issue(s, &mut issued, &mut item_of, &mut step) {
                     active -= 1;
@@ -471,6 +498,12 @@ impl OxidArt {
     #[inline]
     fn field_start(&self, found: u64, field: &[u8], idx: &mut u32, fh: &mut u64) -> FieldStep {
         let (tag, val, _) = self.loc_value(decode(found));
+        if tag == Tag::ZSet {
+            // SAFETY: ZSet ⇒ champ idx actif.
+            *idx = unsafe { val.idx };
+            crate::value::prefetch_zset(*idx);
+            return FieldStep::ZHead;
+        }
         if !matches!(tag, Tag::Hash | Tag::Set) {
             return FieldStep::Done;
         }
@@ -1041,6 +1074,13 @@ mod tests {
         use std::time::Duration;
         // chaque commande avec indice, et sa version sans indice
         // 15..=18 : Hash / Set sous `with_hint`, champ préchargé par la phase 1
+        // 19..=22 : ZSet (ZADD, ZSCORE, ZREM, ZINCRBY), chaînes de `zset::amac`
+        fn zs(v: &crate::value::Value) -> f64 {
+            match v {
+                crate::value::Value::String(b) => b.len() as f64 % 7.0,
+                _ => 3.0,
+            }
+        }
         fn hinted(art: &mut OxidArt, op: u8, k: &[u8], f: &str, v: &str, h: super::Hint) -> String {
             let ttl = Some(Duration::from_secs(1));
             let (fb, vb) = (SharedByte::from_str(f), SharedByte::from_str(v));
@@ -1050,6 +1090,10 @@ mod tests {
                 16 => art.with_hint(k, h, |art| format!("{:?}", art.cmd_hget(k, f.as_bytes()))),
                 17 => art.with_hint(k, h, |art| format!("{:?}", art.cmd_sadd(k, &[fb], None))),
                 18 => art.with_hint(k, h, |art| format!("{:?}", art.cmd_sismember(k, fb))),
+                19 => art.with_hint(k, h, |art| format!("{:?}", art.cmd_zadd(SharedByte::from_slice(k), &[(zs(&v), fb)], None))),
+                20 => art.with_hint(k, h, |art| format!("{:?}", art.cmd_zscore(k, fb))),
+                21 => art.with_hint(k, h, |art| format!("{:?}", art.cmd_zrem(k, &[fb]))),
+                22 => art.with_hint(k, h, |art| format!("{:?}", art.cmd_zincrby(SharedByte::from_slice(k), 1.5, fb))),
                 0..=2 => format!("{:?}", art.get_hinted(k, h)),
                 3..=4 => format!("{}", art.set_cond_hinted(k, None, v, None, h)),
                 5 => format!("{}", art.set_cond_hinted(k, ttl, v, None, h)),
@@ -1073,6 +1117,10 @@ mod tests {
                 16 => format!("{:?}", art.cmd_hget(k, f.as_bytes())),
                 17 => format!("{:?}", art.cmd_sadd(k, &[fb], None)),
                 18 => format!("{:?}", art.cmd_sismember(k, fb)),
+                19 => format!("{:?}", art.cmd_zadd(SharedByte::from_slice(k), &[(zs(&v), fb)], None)),
+                20 => format!("{:?}", art.cmd_zscore(k, fb)),
+                21 => format!("{:?}", art.cmd_zrem(k, &[fb])),
+                22 => format!("{:?}", art.cmd_zincrby(SharedByte::from_slice(k), 1.5, fb)),
                 0..=2 => format!("{:?}", art.get(k)),
                 3..=4 => format!("{}", art.set_cond(k, None, v, None)),
                 5 => format!("{}", art.set_cond(k, ttl, v, None)),
@@ -1110,17 +1158,33 @@ mod tests {
                 a.set_now(round.saturating_sub(100));
                 b.set_now(round.saturating_sub(100));
                 let n = rng.gen_range(1..=64);
-                let ops: Vec<(u8, Vec<u8>)> = (0..n).map(|_| (rng.gen_range(0..19), key(&mut rng))).collect();
-                // 20 champs : au-delà de 8 le petit bloc passe en trie valart
-                let fields: Vec<String> = (0..n).map(|_| format!("f{}", rng.gen_range(0..20))).collect();
+                // ZSet sur 4 clés à eux (assez de membres pour la grande forme), parfois
+                // écrasées ou supprimées par les autres commandes
+                let ops: Vec<(u8, Vec<u8>)> = (0..n)
+                    .map(|_| {
+                        let op = rng.gen_range(0..27).min(22);
+                        let k = if op >= 19 || rng.gen_ratio(1, 200) { format!("z{}", rng.gen_range(0..4)).into_bytes() } else { key(&mut rng) };
+                        (op, k)
+                    })
+                    .collect();
+                // 20 champs : au-delà de 8 le petit bloc passe en trie valart ; 400 membres
+                // de ZSet : au-delà de 128 la petite forme passe en grande
+                let fields: Vec<String> = (0..n)
+                    .map(|i| if ops[i].0 >= 19 { format!("m{}", rng.gen_range(0..400)) } else { format!("f{}", rng.gen_range(0..20)) })
+                    .collect();
                 // valeurs : entiers (INCRBY) ou texte
                 let vals: Vec<String> =
                     (0..n).map(|i| if rng.gen_bool(0.3) { format!("{i}") } else { format!("{round}:{i}") }).collect();
                 let keys: Vec<&[u8]> = ops.iter().map(|(_, k)| k.as_slice()).collect();
                 let mut hints = vec![super::Hint::NONE; n];
                 a.amac_descend(&keys, lanes, &mut hints);
-                let probe: Vec<(super::Hint, &[u8])> =
-                    (0..n).filter(|&i| ops[i].0 >= 15).map(|i| (hints[i], fields[i].as_bytes())).collect();
+                let zp = |op: u8| match op {
+                    19 => super::ZProbe::Add(2.0),
+                    21 | 22 => super::ZProbe::Tree,
+                    _ => super::ZProbe::Index,
+                };
+                let probe: Vec<(super::Hint, &[u8], super::ZProbe)> =
+                    (0..n).filter(|&i| ops[i].0 >= 15).map(|i| (hints[i], fields[i].as_bytes(), zp(ops[i].0))).collect();
                 a.amac_fields(&probe, lanes);
                 a.begin_window();
                 let got: Vec<String> = (0..n).map(|i| hinted(&mut a, ops[i].0, &ops[i].1, &fields[i], &vals[i], hints[i])).collect();
@@ -1130,6 +1194,9 @@ mod tests {
                 assert_eq!(a.len(), b.len());
                 a.assert_canonical();
             }
+            let mut large = 0;
+            crate::value::for_each_zset(|_, z| large += matches!(z, crate::zset::ZSet::Large(_)) as u32);
+            eprintln!("seed {seed} : {large} ZSet en grande forme");
             let st = a.amac_stats;
             // peu de clés : une même clé revient souvent dans la fenêtre
             assert!(st.cmds > st.redescents && st.redescents > 0, "{st:?}");

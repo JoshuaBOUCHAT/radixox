@@ -193,6 +193,20 @@ fn command(rng: &mut Rng, conn: usize) -> (Vec<u8>, Reply) {
         124 => resp(&[b"ZINCRBY", &k, b"2", &m]),
         125 => resp(&[b"ZRANGE", &k, b"0", b"-1", b"WITHSCORES"]),
         126 => resp(&[b"ZCARD", &k]),
+        // un ZSet par connexion qui dépasse 128 membres : grande forme (index, B+tree)
+        127..=129 => {
+            let zk = format!("bigz#{conn}").into_bytes();
+            let bm = format!("member:{}", rng.below(300)).into_bytes();
+            match rng.below(6) {
+                0..=2 => resp(&[b"ZADD", &zk, &score, &bm]),
+                3 => resp(&[b"ZREM", &zk, &bm]),
+                4 => resp(&[b"ZSCORE", &zk, &bm]),
+                _ => {
+                    let r = rng.below(200).to_string().into_bytes();
+                    resp(&[b"ZRANGE", &zk, &r, b"-1", b"WITHSCORES"])
+                }
+            }
+        }
         _ => resp(&[b"GET", &k]),
     };
     (c, Reply::Exact)
