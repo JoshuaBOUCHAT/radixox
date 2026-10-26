@@ -7,10 +7,7 @@ pub fn cmd_zadd(art: &mut OxidArt, key: &[u8], score_members: &[(f64, SharedByte
     // cmd_zadd peut créer le nœud zset : oxidart exige une clé possédée ici.
     match art.cmd_zadd(SharedByte::from_slice(key), score_members, None) {
         Ok(added) => Frame::Integer(added as i64),
-        Err(TypeError::ValueNotSet) => {
-            Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
-        }
-        Err(_) => Frame::Error("ERR internal error".into()),
+        Err(e) => type_error(e),
     }
 }
 
@@ -67,9 +64,18 @@ pub fn cmd_zincrby(art: &mut OxidArt, key: &[u8], delta: f64, member: SharedByte
         Ok(new_score) => {
             Frame::BulkString(SharedByte::from_slice(new_score.to_string().as_bytes()))
         }
-        Err(TypeError::ValueNotSet) => {
+        Err(TypeError::NotAFloat) => Frame::Error("ERR resulting score is not a number (NaN)".into()),
+        Err(e) => type_error(e),
+    }
+}
+
+fn type_error(e: TypeError) -> Frame {
+    match e {
+        TypeError::ValueNotSet => {
             Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
         }
-        Err(_) => Frame::Error("ERR internal error".into()),
+        TypeError::NotAFloat => Frame::Error("ERR value is not a valid float".into()),
+        TypeError::OutOfMemory => Frame::Error("OOM handle table full (RADIXOX_HANDLES_MAX)".into()),
+        TypeError::NotAInt => Frame::Error("ERR internal error".into()),
     }
 }

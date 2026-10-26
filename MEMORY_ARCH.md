@@ -1685,7 +1685,7 @@ split, suppression, `drop_front`, GC, compactage).
 `KEYS *` sur 1M UUID (réponse ~44 Mo) : pic glibc 91,9 → 5,9 Mo (inchangé par le KEYS) ;
 pic de RSS = 145 + 43 Mo, retour à 147 Mo dès l'envoi fini.
 
-## 19. Objets à poignée (2026-10-26, spécification, pas implémenté)
+## 19. Objets à poignée (2026-10-26 ; implémenté le 2026-10-27, `radixox-lib/src/handle.rs`)
 
 **But.** Un objet référencé par **plusieurs** structures (membre de ZSet : index + B+tree,
 ANALYSE_ART_UNIFIE.md §13.4) reste déplaçable par le GC, sans parcourir ces structures et
@@ -1749,3 +1749,19 @@ Modèle aléatoire : allouer, libérer, évacuer des blocs marqués ; après cha
 case vivante pointe vers un objet dont l'en-tête porte cette poignée, chaque objet vivant
 d'un bloc à poignée est pointé par sa case, les octets sont intacts, les comptes du pool
 justes.
+
+### 19.7 Implémentation (2026-10-27)
+
+- Pool : curseurs `HANDLED` / `HANDLED_SURVIVOR`, bitmap « bloc à poignée » et fin de
+  remplissage (`u16` par bloc, écrite à la fermeture du curseur) ; le bitmap s'efface quand
+  le bloc est rendu. `Pool::evacuate_handled` parcourt les blocs marqués de la liste du
+  pool, un bloc à la fois, et marque « mort » l'ancien en-tête avant de le rendre (un bloc
+  évacué à moitié, plage pleine, reste parcourable).
+- GC : phase `Handled` en dernier dans `GcPass` (`at` = rang dans la liste des blocs
+  marqués), après la phase `ZSets` (blocs des petites formes).
+- Forme lue à l'adresse : dans la plage du pool, en-tête `[u16][u32]` ; sinon (membre de
+  plus de 2 042 o, pool plein ou désactivé) externe `[u32 longueur][u32 poignée]`.
+- Table pleine : `None` jusqu'à la commande, qui répond `OOM`.
+- `INFO` : `mem_handles_live`, `mem_handles_table_bytes`.
+- La liste différée pendant une save (§19.4) n'est pas encore faite : la save écrit encore
+  les ZSet d'un bloc au `begin` (ANALYSE_ART_UNIFIE §13.12).

@@ -54,7 +54,7 @@ use crate::digest::{Digest, value_terms};
 use crate::save::{DumpError, JournalPos, format};
 use crate::small::{self, SMALL_MAX};
 use crate::value::{RawVal, Tag, ValUnion, alloc_list, alloc_zset, valart};
-use crate::zcommand::InnerZCommand;
+use crate::zset::{ZSet, encode_score};
 use crate::{OxidArt, Value};
 
 const TRUNC: DumpError = DumpError("dump tronqué");
@@ -136,7 +136,7 @@ pub(crate) struct DumpReader<R> {
     pub(crate) jpos: JournalPos,
     /// Condensé du pied (v2, mode `Footer::Crc`), lu après `T_END`.
     pub(crate) footer_digest: Option<u32>,
-    zsets: HashMap<u32, InnerZCommand>,
+    zsets: HashMap<u32, ZSet>,
     lists: HashMap<u32, VecDeque<SharedByte>>,
     key: Vec<u8>,
 }
@@ -181,10 +181,14 @@ impl<R: Read> DumpReader<R> {
 
         for _ in 0..rd.varint()? {
             let idx = rd.varint()? as u32;
-            let mut z = InnerZCommand::new();
+            let mut z = ZSet::new();
             for _ in 0..rd.varint()? {
                 let score = f64::from_bits(rd.u64_le()?);
-                z.insert(score, rd.bytes()?);
+                if score.is_nan() {
+                    return Err(DumpError("score NaN").into());
+                }
+                let m = rd.bytes()?;
+                z.add(encode_score(score), &m).ok_or(DumpError("table des poignées pleine"))?;
             }
             rd.zsets.insert(idx, z);
         }
@@ -349,7 +353,7 @@ impl<R: Read> DumpReader<R> {
         &self.key
     }
 
-    fn zset(&mut self) -> Result<InnerZCommand, LoadError> {
+    fn zset(&mut self) -> Result<ZSet, LoadError> {
         let idx = self.varint()? as u32;
         Ok(self.zsets.remove(&idx).ok_or(DumpError("ZSet absent de la section"))?)
     }

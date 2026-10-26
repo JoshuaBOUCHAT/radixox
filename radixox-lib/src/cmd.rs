@@ -561,8 +561,10 @@ fn arg_i64(s: &[u8]) -> Option<i64> {
     Some(if neg { n.checked_neg()? } else { n })
 }
 
+/// NaN refusé, comme Redis (`ERR value is not a valid float`) : un score NaN casserait
+/// l'ordre des ZSet.
 fn arg_f64(s: &[u8]) -> Option<f64> {
-    std::str::from_utf8(s).ok()?.parse().ok()
+    std::str::from_utf8(s).ok()?.parse().ok().filter(|f: &f64| !f.is_nan())
 }
 
 fn int(s: &[u8]) -> Result<i64, CmdError> {

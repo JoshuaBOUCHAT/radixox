@@ -857,3 +857,35 @@ Chaque couche seule, avec ses tests, avant la suivante :
   ex-aequo massifs le demandent.
 - List : même problème de save (hors barrière) et même principe (structure en slab, objets
   à poignée si plusieurs références).
+
+### 13.12 Implémentation (2026-10-27) : étapes 1 à 5 faites
+
+Code : `radixox-lib/src/handle.rs` (poignées), `oxidart/src/zset/` (`btree.rs`, `index.rs`,
+`small.rs`, `large.rs`, `mod.rs`), commandes dans `oxidart/src/zcommand.rs`. L'ancien ZSet
+(`InnerZCommand`, `zset_inner.rs`) n'est plus compilé qu'en test, comme oracle.
+
+Écarts avec le texte ci-dessus, et pourquoi :
+- **Index : trie haché à seaux, pas une variante du `HashNode` de valart.** Le `HashNode`
+  est lié aux `SharedByte` partout (drop, GC, débordement, save) ; la variante aurait
+  dupliqué ~2 500 lignes. `index.rs` : 4 bits du hash par niveau, seau de 128 o = 9 entrées
+  `{poignée, score}` + empreinte, répertoire de 16 cases où un seau couvre une plage
+  alignée (hachage extensible dans le répertoire). Coupe locale d'un seau plein, jamais de
+  redimensionnement d'ensemble (pas de rehash O(n)) ; fusion de jumeaux peu remplis ;
+  chaînes au-delà des 64 bits. Mesuré : remplissage 69 %, **23,4 o/entrée** (dont 2,9 o de
+  répertoires), contre ~19 estimés. Piste si besoin : répertoires de 64 o.
+- **En-tête dans la slab des ZSet** (`HiSlab<ZSet>`, `Tag::ZSet` + idx), pas un objet de
+  structure du pool : même nombre d'accès (une case de slab au lieu d'un pointeur),
+  aucune nouvelle `Tag`. La petite forme est aussi derrière cet idx (`ZSet::Small`, bloc
+  dans le pool, visité par la phase `ZSets` du GC).
+- **Séparateur = plus petite clé de son sous-arbre droit** (invariant vérifié). Un
+  séparateur périmé gardait la poignée d'un membre retiré ; la poignée, réutilisée,
+  faussait l'ordre des ex-aequo (trouvé par le différentiel). Retirer la clé d'un
+  séparateur le remplace par la suivante ; la mise à jour sur place ne touche jamais la
+  première entrée d'une feuille.
+- NaN refusé au parseur (`arg_f64`) et en résultat de ZINCRBY (`ERR resulting score is
+  not a number (NaN)`), comme Redis.
+
+Reste : AMAC (étape 6), save par barrière (étape 7 : aujourd'hui la save écrit encore les
+ZSet d'un bloc au `begin`), rechargement par `from_sorted`, mesures (étape 8), commandes
+manquantes (ZRANGEBYSCORE, ZRANK, ZCOUNT…, dont les briques existent : `lower_bound`,
+`rank`, `select`). La libération d'un grand ZSet (DEL) est encore synchrone.

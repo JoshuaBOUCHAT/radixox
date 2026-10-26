@@ -253,8 +253,7 @@ impl ZSmall {
             ptr::copy_nonoverlapping(m.as_ptr(), nb.add(off), m.len());
             ptr::copy_nonoverlapping(ob.add(off), nb.add(off + m.len()), used - off);
         }
-        let old = std::mem::replace(self, new);
-        old.free();
+        std::mem::replace(self, new).free();
         true
     }
 
@@ -300,10 +299,16 @@ impl ZSmall {
         Self(p)
     }
 
-    /// Rend le bloc.
-    pub fn free(self) {
+    /// Rend le bloc ; `self` ne doit plus servir.
+    pub fn release(&mut self) {
         let size = self.block_bytes();
         unsafe { pool::struct_free(self.0, size) };
+        self.0 = ptr::null_mut();
+    }
+
+    /// Rend le bloc.
+    pub fn free(mut self) {
+        self.release();
     }
 }
 

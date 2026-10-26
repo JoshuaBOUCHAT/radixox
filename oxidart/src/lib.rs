@@ -64,7 +64,8 @@ pub mod scommand;
 pub(crate) mod small;
 pub mod value;
 pub mod zcommand;
-pub mod zset_inner;
+#[cfg(test)]
+pub(crate) mod zset_inner;
 pub mod zset;
 
 

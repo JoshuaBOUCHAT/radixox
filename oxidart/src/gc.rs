@@ -1,9 +1,10 @@
 //! Énumérateurs du GC (MEMORY_ARCH.md §16.6, §17) : chaque `SharedByte`, chemin sur le tas
 //! et page de nœud que tient l'arbre,
 //! par un parcours linéaire des slabs qui ne connaît que le layout (pas de pointeur
-//! arrière, pas de logique métier). Trois slabs : les nœuds d'oxidart (self-val, feuilles,
-//! petits conteneurs), les nœuds de valart (champs et membres), les listes. Les ZSet ne
-//! sont pas visités : leurs membres sont externes (§16.9).
+//! arrière, pas de logique métier). Quatre slabs : les nœuds d'oxidart (self-val, feuilles,
+//! petits conteneurs), les nœuds de valart (champs et membres), les listes, les ZSet (bloc
+//! de la petite forme). Les membres des grands ZSet sont des objets à poignée : évacués en
+//! parcourant leurs blocs (phase `Handled`), sans visiter les ZSet (MEMORY_ARCH.md §19).
 //!
 //! Le visiteur reçoit `&mut SharedByte` et ne doit le réécrire que vers les mêmes octets
 //! (évacuation) : c'est pourquoi l'accès contourne la barrière de save (§8.5).
@@ -13,7 +14,7 @@ use radixox_lib::shared_byte::SharedByte;
 use crate::OxidArt;
 use crate::compact_path::CompactPath;
 use crate::small;
-use crate::value::{Tag, ValUnion, list_slab, valart};
+use crate::value::{Tag, ValUnion, list_slab, valart, zset_slab_mut};
 
 /// Ce que les énumérateurs donnent à voir : les `SharedByte` de l'arbre et ses chemins sur le
 /// tas (`CompactPath`, MEMORY_ARCH.md §17). Une closure sur `&mut SharedByte` est un visiteur
@@ -64,6 +65,7 @@ enum Phase {
     Oxidart,
     Valart,
     Lists,
+    ZSets,
     /// Blocs à poignée marqués (membres des ZSet, MEMORY_ARCH.md §19.3) : parcourus
     /// eux-mêmes, aucune structure visitée ; `at` = rang dans la liste des blocs marqués.
     Handled,
@@ -99,6 +101,7 @@ impl GcPass {
                 Phase::Valart if valart().is_saving() => None,
                 Phase::Valart => art.gc_visit_valart(self.at, n, &mut v),
                 Phase::Lists => art.gc_visit_lists(self.at, n, &mut |sb| v.bytes(sb)),
+                Phase::ZSets => art.gc_visit_zsets(self.at, n, &mut v),
                 Phase::Handled => radixox_lib::handle::gc_step(self.at, max_bytes, &mut v.moved),
             };
             if let Some(at) = next {
@@ -109,7 +112,8 @@ impl GcPass {
             self.phase = match self.phase {
                 Phase::Oxidart => Phase::Valart,
                 Phase::Valart => Phase::Lists,
-                Phase::Lists => Phase::Handled,
+                Phase::Lists => Phase::ZSets,
+                Phase::ZSets => Phase::Handled,
                 Phase::Handled => return true,
             };
         }
@@ -212,9 +216,27 @@ impl OxidArt {
         Some(at)
     }
 
-    /// Slots couverts par les trois slabs : `N` du budget sous charge (§16.6).
+    /// Même contrat que [`Self::gc_visit`], sur les ZSet : le bloc d'une petite forme est un
+    /// objet de structure à un seul propriétaire.
+    pub fn gc_visit_zsets(&mut self, from: u32, budget: u32, v: &mut impl GcVisitor) -> Option<u32> {
+        let zsets = zset_slab_mut();
+        let mut at = from;
+        for _ in 0..budget {
+            let i = zsets.next_occupied(at)?;
+            if let Some((ptr, size)) = unsafe { zsets.get_unchecked_mut(i) }.small_block() {
+                v.page(ptr, size);
+            }
+            at = i + 1;
+        }
+        Some(at)
+    }
+
+    /// Slots couverts par les slabs : `N` du budget sous charge (§16.6).
     pub fn gc_slot_span(&self) -> u64 {
-        self.map.slot_span() as u64 + valart().slot_span() as u64 + list_slab().slot_span() as u64
+        self.map.slot_span() as u64
+            + valart().slot_span() as u64
+            + list_slab().slot_span() as u64
+            + zset_slab_mut().slot_span() as u64
     }
 
     /// Tous les `SharedByte` de l'arbre, d'un coup (tests, vérificateur). Valart sauté
@@ -233,6 +255,10 @@ impl OxidArt {
         let mut at = Some(0);
         while let Some(from) = at {
             at = self.gc_visit_lists(from, u32::MAX, &mut |sb| v.bytes(sb));
+        }
+        let mut at = Some(0);
+        while let Some(from) = at {
+            at = self.gc_visit_zsets(from, u32::MAX, v);
         }
     }
 

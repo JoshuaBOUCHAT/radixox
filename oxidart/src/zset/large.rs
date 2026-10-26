@@ -149,8 +149,8 @@ impl ZLarge {
         self.tree.lower_bound(|s, h| probe(s, member(h))).0
     }
 
-    /// Rend tout : membres, nœuds de l'arbre et de l'index.
-    pub fn free(mut self) {
+    /// Rend tout : membres, nœuds de l'arbre et de l'index ; reste vide.
+    pub fn release(&mut self) {
         for (_, h) in self.tree.iter() {
             unsafe { handle::free(h) };
         }

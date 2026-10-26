@@ -71,5 +71,6 @@ pub fn cmd_spop(art: &mut OxidArt, key: &[u8], count: Option<u64>) -> Frame {
         Err(TypeError::NotAInt) => {
             Frame::Error("ERR value is not an integer or out of range".into())
         }
+        Err(TypeError::NotAFloat | TypeError::OutOfMemory) => Frame::Error("ERR internal error".into()),
     }
 }

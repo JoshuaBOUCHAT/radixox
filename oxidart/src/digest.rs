@@ -143,7 +143,7 @@ pub(crate) fn value_terms(d: &mut Digest, key: &[u8], exp: Option<u64>, v: &Valu
             d.add(head_term(key, format::T_SET, exp, members.len() as u64));
         }
         Value::ZSet(z) => {
-            let inner = zset_inner(z.iter().map(|(s, m)| (s.into_inner(), m.as_slice())));
+            let inner = zset_inner(z.iter().map(|(s, m)| (crate::zset::decode_score(s), m)));
             d.add(seq_term(key, format::T_ZSET, exp, inner));
         }
         Value::List(l) => {

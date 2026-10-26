@@ -11,7 +11,8 @@ use std::cmp::Ordering;
 pub use large::{Added, ZLarge};
 pub use small::ZSmall;
 
-/// Un ZSet : petite forme tant qu'elle suffit, puis grande, sans retour (§13.2).
+/// Un ZSet : petite forme tant qu'elle suffit, puis grande, sans retour (§13.2). Possède
+/// sa mémoire (bloc, membres, nœuds) : `Drop` la rend.
 #[derive(Debug)]
 pub enum ZSet {
     Small(ZSmall),
@@ -70,11 +71,10 @@ impl ZSet {
         let mut large = ZLarge::from_sorted(small.iter())?;
         let r = large.add(s, m);
         if r.is_none() {
-            large.free();
+            large.release();
             return None;
         }
-        let Self::Small(old) = std::mem::replace(self, Self::Large(large)) else { unreachable!() };
-        old.free();
+        drop(std::mem::replace(self, Self::Large(large)));
         r
     }
 
@@ -122,11 +122,20 @@ impl ZSet {
         self.iter_from(0)
     }
 
-    /// Rend tout.
+    /// Rend tout (comme `drop`).
     pub fn free(self) {
+        drop(self)
+    }
+
+    /// Octets tenus (bloc de la petite forme ; en-tête, nœuds et membres de la grande ne
+    /// sont pas comptés ici).
+    pub fn small_block(&mut self) -> Option<(&mut *mut u8, usize)> {
         match self {
-            Self::Small(z) => z.free(),
-            Self::Large(z) => z.free(),
+            Self::Small(z) => {
+                let size = z.block_bytes();
+                Some((&mut z.0, size))
+            }
+            Self::Large(_) => None,
         }
     }
 
@@ -136,6 +145,34 @@ impl ZSet {
             Self::Small(_) => Ok(()),
             Self::Large(z) => z.verify(),
         }
+    }
+}
+
+impl Drop for ZSet {
+    fn drop(&mut self) {
+        match self {
+            Self::Small(z) => z.release(),
+            Self::Large(z) => z.release(),
+        }
+    }
+}
+
+/// Copie profonde (`Value` possédée, image de save).
+impl Clone for ZSet {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Small(z) => Self::Small(z.deep_clone()),
+            Self::Large(z) => {
+                let it = z.iter().collect::<Vec<_>>();
+                Self::Large(ZLarge::from_sorted(it.into_iter()).expect("table des poignées pleine"))
+            }
+        }
+    }
+}
+
+impl PartialEq for ZSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
     }
 }
 

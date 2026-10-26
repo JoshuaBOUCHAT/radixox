@@ -101,5 +101,6 @@ pub fn cmd_hincrby(art: &mut OxidArt, key: &[u8], field: SharedByte, delta: i64)
         Err(TypeError::ValueNotSet) => {
             Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
         }
+        Err(TypeError::NotAFloat | TypeError::OutOfMemory) => Frame::Error("ERR internal error".into()),
     }
 }

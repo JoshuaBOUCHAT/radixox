@@ -200,7 +200,7 @@ pub(crate) mod reference {
                 }
                 Value::ZSet(z) => Self::ZSet(
                     z.iter()
-                        .map(|(s, m)| (s.into_inner().to_bits(), m.to_vec()))
+                        .map(|(s, m)| (crate::zset::decode_score(s).to_bits(), m.to_vec()))
                         .collect(),
                 ),
                 Value::List(l) => Self::List(l.iter().map(|i| i.to_vec()).collect()),
@@ -545,10 +545,10 @@ impl OxidArt {
             put_varint(out, idx as u64);
             put_varint(out, z.len() as u64);
             for (score, member) in z.iter() {
-                out.extend_from_slice(&score.into_inner().to_le_bytes());
+                out.extend_from_slice(&crate::zset::decode_score(score).to_le_bytes());
                 put_bytes(out, member);
             }
-            zset_sums.insert(idx, digest::zset_inner(z.iter().map(|(s, m)| (s.into_inner(), m.as_slice()))));
+            zset_sums.insert(idx, digest::zset_inner(z.iter().map(|(s, m)| (crate::zset::decode_score(s), m))));
         });
         let mut list_sums = HashMap::new();
         let mut n = 0u64;

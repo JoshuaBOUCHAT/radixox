@@ -131,7 +131,7 @@ l'atomicité (RUNTIME_ARCH §8.1).
 | String | `SharedByte` : buffer à refcount mono-thread de 8 o (pas d'atomique), mimalloc |
 | Entier | `i64` (seuls INCR / INCRBY en créent ; `SET n 42` stocke une chaîne), formaté à la lecture |
 | Hash, Set | ≤ 8 entrées : bloc compact de `SharedByte` ; au-delà : **valart** (`valart/`), un radix compact par conteneur, slab unique partagé (nœuds de 128 o) |
-| ZSet | `BTreeSet<(score, membre)>` + `HashMap` membre → score ; architecture cible : ANALYSE_ART_UNIFIE §13 (2026-10-26), objets à poignée MEMORY_ARCH §19 |
+| ZSet | ≤ 128 membres de ≤ 64 o : un bloc en colonnes (scores 2/4/8 o) ; au-delà : index haché à seaux (membre → score) + B+tree compté (ordre, rangs), membres = objets à poignée (MEMORY_ARCH §19) ; ANALYSE_ART_UNIFIE §13, état en §13.12 |
 | List | pas de commandes (LPUSH… à faire) |
 
 Pourquoi valart plutôt que `HashMap` : pas de rehash O(n) en plein chemin chaud, ordre

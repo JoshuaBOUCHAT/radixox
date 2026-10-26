@@ -8,7 +8,7 @@ use radixox_lib::shared_byte::SharedByte;
 use valart::ValTrees;
 
 use crate::small;
-use crate::zcommand::InnerZCommand;
+use crate::zset::ZSet;
 
 // ─── Tag ─────────────────────────────────────────────────────────────────────
 
@@ -58,7 +58,7 @@ pub(crate) union ValUnion {
 /// Hash et Set : arbres valart. Le nœud oxidart stocke l'idx de la racine
 /// dans `ValUnion::idx`.
 static mut VALART: MaybeUninit<ValTrees> = MaybeUninit::uninit();
-static mut ZSET_SLAB: MaybeUninit<HiSlab<InnerZCommand>> = MaybeUninit::uninit();
+static mut ZSET_SLAB: MaybeUninit<HiSlab<ZSet>> = MaybeUninit::uninit();
 static mut LIST_SLAB: MaybeUninit<HiSlab<VecDeque<SharedByte>>> = MaybeUninit::uninit();
 
 static SLAB_INIT: std::sync::Once = std::sync::Once::new();
@@ -85,7 +85,7 @@ pub(crate) fn valart() -> &'static mut ValTrees {
     }
 }
 #[inline]
-fn zset_slab() -> &'static mut HiSlab<InnerZCommand> {
+fn zset_slab() -> &'static mut HiSlab<ZSet> {
     #[allow(static_mut_refs)]
     unsafe {
         ZSET_SLAB.assume_init_mut()
@@ -183,22 +183,28 @@ fn set_to_members(root: u32) -> Vec<SharedByte> {
     members
 }
 
-pub(crate) fn alloc_zset(val: InnerZCommand) -> u32 {
+pub(crate) fn alloc_zset(val: ZSet) -> u32 {
     zset_slab().insert(val)
 }
 pub(crate) fn free_zset(idx: u32) {
     zset_slab().remove(idx);
 }
-pub(crate) fn zset_ref(idx: u32) -> &'static InnerZCommand {
+pub(crate) fn zset_ref(idx: u32) -> &'static ZSet {
     zset_slab().get(idx).unwrap()
 }
-pub(crate) fn zset_mut(idx: u32) -> &'static mut InnerZCommand {
+pub(crate) fn zset_mut(idx: u32) -> &'static mut ZSet {
     zset_slab().get_mut(idx).unwrap()
 }
 
 /// Parcourt tous les ZSet du slab (section ZSet de la save).
-pub(crate) fn for_each_zset(f: impl FnMut(u32, &InnerZCommand)) {
+pub(crate) fn for_each_zset(f: impl FnMut(u32, &ZSet)) {
     zset_slab().for_each_occupied(f);
+}
+
+/// Slab des ZSet (GC : blocs des petites formes).
+#[inline]
+pub(crate) fn zset_slab_mut() -> &'static mut HiSlab<ZSet> {
+    zset_slab()
 }
 
 /// Parcourt toutes les List du slab (section List de la save).
@@ -426,7 +432,7 @@ impl<'a> NodeValRef<'a> {
         }
     }
 
-    pub fn as_zset(self) -> Result<&'static InnerZCommand, RedisType> {
+    pub fn as_zset(self) -> Result<&'static ZSet, RedisType> {
         self.zset_idx().map(zset_ref)
     }
 }
@@ -443,7 +449,7 @@ pub enum Value {
     Hash(Vec<(SharedByte, SharedByte)>),
     List(VecDeque<SharedByte>),
     Set(Vec<SharedByte>),
-    ZSet(InnerZCommand),
+    ZSet(ZSet),
 }
 
 impl Value {
@@ -490,14 +496,14 @@ impl Value {
         }
     }
 
-    pub fn as_zset(&self) -> Result<&InnerZCommand, RedisType> {
+    pub fn as_zset(&self) -> Result<&ZSet, RedisType> {
         match self {
             Value::ZSet(z) => Ok(z),
             other => Err(other.redis_type()),
         }
     }
 
-    pub fn as_zset_mut(&mut self) -> Result<&mut InnerZCommand, RedisType> {
+    pub fn as_zset_mut(&mut self) -> Result<&mut ZSet, RedisType> {
         match self {
             Value::ZSet(z) => Ok(z),
             other => Err(other.redis_type()),

@@ -394,6 +394,9 @@ pub fn info_memory(out: &mut String, gc_enabled: bool, gc_running: bool, gc_max_
         external::objects(),
         radixox_lib::big_buf::bytes(),
     );
+    // Objets à poignée (membres des grands ZSet, MEMORY_ARCH.md §19.5).
+    let (handles, table) = radixox_lib::handle::stats();
+    let _ = write!(out, "mem_handles_live:{handles}\r\nmem_handles_table_bytes:{table}\r\n");
     // Grands objets et épinglés (MEMORY_ARCH.md §18.7) : absent tant que rien n'y est alloué.
     if let Some(l) = radixox_lib::large::stats() {
         let _ = write!(
