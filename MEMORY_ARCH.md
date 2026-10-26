@@ -1665,3 +1665,22 @@ allocation d'au moins 64 Kio (agrégée par `scripts/heap_sites.py`).
 
 Pistes : KEYS écrit directement dans le tampon de sortie ; nouveau ZSet ; à décider, un
 `#[global_allocator]` sur l'allocateur de RadixOx (repli glibc hors du thread métier).
+
+### 18.11 Grosses réponses : `BigBuf` (KEYS, 2026-10-26)
+
+`radixox-lib/src/big_buf.rs` : tampon sur un mapping à lui (`MAP_NORESERVE`,
+`MADV_HUGEPAGE`), grandi par `mremap` (le noyau déplace les entrées de table de pages,
+aucune copie des données), rendu par `munmap` à la destruction ; `INFO` :
+`mem_bigbuf_bytes`. Le KEYS écrit sa réponse dedans en une passe (en-tête `*N\r\n` dans la
+place réservée en tête, comme avant). À `unpark`, si `out` est vide et que rien n'est
+retenu par l'AOF, la connexion envoie directement depuis ce tampon (`ConnOut::big`, avant
+tout ce qui arrive ensuite dans `out`, envois partiels compris) ; sinon, copie dans `out`
+comme avant.
+
+Pourquoi pas un mode « réponse en blocs chaînés » : en RESP2 l'en-tête `*N` précède la
+première clé, donc la réponse est tenue en entier jusqu'à la fin du parcours de toute
+façon ; et des références aux clés (8–16 o) ne survivent pas aux tranches (règle d'or :
+split, suppression, `drop_front`, GC, compactage).
+
+`KEYS *` sur 1M UUID (réponse ~44 Mo) : pic glibc 91,9 → 5,9 Mo (inchangé par le KEYS) ;
+pic de RSS = 145 + 43 Mo, retour à 147 Mo dès l'envoi fini.

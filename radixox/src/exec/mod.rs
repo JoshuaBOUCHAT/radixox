@@ -389,9 +389,10 @@ pub fn info_memory(out: &mut String, gc_enabled: bool, gc_running: bool, gc_max_
     use std::fmt::Write as _;
     let _ = write!(
         out,
-        "# Memory\r\nmem_external_bytes:{}\r\nmem_external_objects:{}\r\n",
+        "# Memory\r\nmem_external_bytes:{}\r\nmem_external_objects:{}\r\nmem_bigbuf_bytes:{}\r\n",
         external::bytes(),
         external::objects(),
+        radixox_lib::big_buf::bytes(),
     );
     // Grands objets et épinglés (MEMORY_ARCH.md §18.7) : absent tant que rien n'y est alloué.
     if let Some(l) = radixox_lib::large::stats() {

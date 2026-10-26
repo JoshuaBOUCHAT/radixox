@@ -74,6 +74,12 @@ pub struct ConnOut {
     /// Octets de `sending` déjà envoyés (filet de sécurité si un envoi rend
     /// moins que demandé malgré `MSG_WAITALL`).
     pub sent: usize,
+    /// Grosse réponse d'un job (KEYS), envoyée depuis son tampon sans copie
+    /// dans `out`, avant tout ce que `out` contient (MEMORY_ARCH.md §18.11) :
+    /// tampon, début de la réponse dedans.
+    pub big: Option<(radixox_lib::big_buf::BigBuf, usize)>,
+    /// Le send en vol est celui de `big` (`sent` compte alors dans `big`).
+    pub big_sending: bool,
     pub send_cancelled: bool,
     pub client: Client,
     /// Dans la liste des connexions sales du tour.
@@ -122,6 +128,8 @@ impl ConnOut {
             recv_cancelled: false,
             out: Vec::new(),
             sending: Vec::new(),
+            big: None,
+            big_sending: false,
             sent: 0,
             send_cancelled: false,
             // Remplacé à l'accept (`Client::new` consomme un CLIENT ID).
@@ -149,7 +157,12 @@ impl ConnOut {
     }
 
     pub fn send_in_flight(&self) -> bool {
-        !self.sending.is_empty()
+        !self.sending.is_empty() || self.big_sending
+    }
+
+    /// Rien à envoyer : ni `out`, ni grosse réponse en attente.
+    pub fn nothing_to_send(&self) -> bool {
+        self.out.is_empty() && self.big.is_none()
     }
 
     /// Octets de `out` qui peuvent partir : les réponses retenues dont la

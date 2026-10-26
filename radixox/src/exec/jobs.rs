@@ -13,8 +13,9 @@
 
 use oxidart::regex::{GlobKind, glob_kind, glob_literal_prefix, glob_match};
 use oxidart::{Detached, OxidArt};
+use radixox_lib::big_buf::BigBuf;
 use radixox_lib::shared_byte::SharedByte;
-use radixox_lib::shared_frame::{encode_array_len, encode_bulk};
+use radixox_lib::shared_frame::encode_array_len;
 
 /// Clés examinées par tranche de KEYS (~quelques dizaines de µs).
 pub const KEYS_BUDGET: usize = 256;
@@ -45,15 +46,18 @@ pub struct KeysJob {
     pattern: SharedByte,
     /// Reprendre strictement après cette clé ; `None` au départ.
     from: Option<Vec<u8>>,
-    /// Réponse : `HEADER_ROOM` octets réservés, puis les clés en bulk strings.
-    out: Vec<u8>,
+    /// Réponse : `HEADER_ROOM` octets réservés, puis les clés en bulk strings ;
+    /// mapping à lui, grandi sans copie (MEMORY_ARCH.md §18.11).
+    out: BigBuf,
     count: usize,
     done: bool,
 }
 
 impl KeysJob {
     pub fn new(pattern: SharedByte) -> Self {
-        Self { pattern, from: None, out: vec![0; HEADER_ROOM], count: 0, done: false }
+        let mut out = BigBuf::new();
+        out.extend_from_slice(&[0; HEADER_ROOM]);
+        Self { pattern, from: None, out, count: 0, done: false }
     }
 
     pub fn step(&mut self, art: &mut OxidArt, budget: usize) -> Step {
@@ -66,7 +70,7 @@ impl KeysJob {
             GlobKind::Exact(key) => {
                 let mut expired = Vec::new();
                 if art.exists_count(&[key], &mut expired) == 1 {
-                    encode_bulk(&mut self.out, key);
+                    self.out.push_bulk(key);
                     self.count += 1;
                 }
                 if !expired.is_empty() {
@@ -81,7 +85,7 @@ impl KeysJob {
         let from = self.from.as_deref().unwrap_or(b"");
         let page = art.scan_keys(prefix, from, budget, budget, |key, _| exact || glob_match(pat, key));
         for key in page.iter() {
-            encode_bulk(&mut self.out, key);
+            self.out.push_bulk(key);
         }
         self.count += page.len();
         self.from = page.next;
@@ -91,8 +95,15 @@ impl KeysJob {
 
     /// Réponse complète (tableau RESP), à appeler une fois le job terminé.
     pub fn response(&mut self) -> &[u8] {
-        let start = write_header(&mut self.out, self.count);
-        &self.out[start..]
+        let start = write_header(self.out.as_mut_slice(), self.count);
+        &self.out.as_slice()[start..]
+    }
+
+    /// Réponse complète, sans copie : le tampon et le début de la réponse dedans
+    /// (après la place non utilisée de l'en-tête).
+    pub fn into_response(mut self) -> (BigBuf, usize) {
+        let start = write_header(self.out.as_mut_slice(), self.count);
+        (self.out, start)
     }
 }
 

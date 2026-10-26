@@ -574,6 +574,51 @@ fn long_keys_parks_without_blocking_others() {
     assert!(got.ends_with("$5\r\nk2999\r\n$5\r\nafter\r\n"));
 }
 
+/// Grosse réponse de KEYS envoyée depuis son tampon (sans copie dans `out`),
+/// en envois partiels : contenu intact, puis les réponses suivantes.
+#[test]
+fn big_keys_response_partial_sends() {
+    let mut f = Fake::new(Config { max_conn: 8, ..Config::default() });
+    let a = f.connect();
+    let sets: String = (0..3000).map(|i| format!("SET k{i:04} v\r\n")).collect();
+    f.send(a, sets.as_bytes());
+    f.settle();
+    f.take(a);
+    f.sends = Sends::Half;
+    f.send(a, b"KEYS k*\r\nPING after\r\n");
+    f.settle();
+    let want: String = (0..3000).map(|i| format!("$5\r\nk{i:04}\r\n")).collect();
+    assert_eq!(f.take(a), format!("*3000\r\n{want}$5\r\nafter\r\n"));
+    assert_eq!(radixox_lib::big_buf::bytes(), 0, "tampon rendu après l'envoi");
+}
+
+/// KEYS fini pendant qu'une réponse précédente est encore en vol : l'ordre
+/// reste réponse précédente → KEYS → suivantes.
+#[test]
+fn big_keys_waits_for_send_in_flight() {
+    let mut f = Fake::new(Config { max_conn: 8, ..Config::default() });
+    let a = f.connect();
+    let sets: String = (0..3000).map(|i| format!("SET k{i:04} v\r\n")).collect();
+    f.send(a, sets.as_bytes());
+    f.settle();
+    f.take(a);
+    f.peers.get_mut(&a).unwrap().stalled = true;
+    f.send(a, b"PING first\r\nKEYS k*\r\nPING after\r\n");
+    f.settle();
+    // le client relit : le send retenu part, puis le reste
+    let p = f.peers.get_mut(&a).unwrap();
+    p.stalled = false;
+    if std::mem::take(&mut p.send_pending) {
+        let bytes = f.core.pending_send(a).to_vec();
+        f.peers.get_mut(&a).unwrap().received.extend_from_slice(&bytes);
+        f.completions.push(Completion::Send { slot: a, res: bytes.len() as i32 });
+    }
+    f.settle();
+    let got = f.take(a);
+    assert!(got.starts_with("$5\r\nfirst\r\n*3000\r\n$5\r\nk0000\r\n"), "{}", &got[..60]);
+    assert!(got.ends_with("$5\r\nk2999\r\n$5\r\nafter\r\n"));
+}
+
 /// Au repos, le travail de fond avance sans attendre les tours : le KEYS
 /// répond au tour suivant. La passe s'arrête dès qu'un client a quelque chose
 /// à recevoir : la réponse part avant que le second KEYS ne reprenne.

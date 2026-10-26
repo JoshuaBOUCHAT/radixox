@@ -1003,7 +1003,10 @@ impl Core {
     /// Octets à envoyer pour `Op::Send { slot }` (le reste, après un envoi partiel).
     pub fn pending_send(&self, slot: Slot) -> &[u8] {
         let o = &self.outs[slot as usize];
-        &o.sending[o.sent..]
+        match &o.big {
+            Some((b, start)) if o.big_sending => &b.as_slice()[start + o.sent..],
+            _ => &o.sending[o.sent..],
+        }
     }
 
     /// Plus rien à faire sans nouvel événement : la boucle peut attendre.
@@ -1295,6 +1298,8 @@ impl Core {
         o.out.clear();
         o.holds.clear();
         o.sending.clear();
+        o.big = None;
+        o.big_sending = false;
         o.sent = 0;
         o.client = Client::new();
         o.last_active = self.now;
@@ -1413,6 +1418,8 @@ impl Core {
         o.refs -= 1;
         if res < 0 {
             o.sending.clear();
+            o.big = None;
+            o.big_sending = false;
             o.sent = 0;
             if o.mode != Mode::Draining {
                 self.drain(slot);
@@ -1421,6 +1428,24 @@ impl Core {
             return;
         }
         o.sent += res as usize;
+        if o.big_sending {
+            let left = o.big.as_ref().map_or(0, |(b, start)| b.len() - start - o.sent);
+            if left > 0 && o.mode != Mode::Draining {
+                o.refs += 1;
+                self.ops.push(Op::Send { slot });
+                return;
+            }
+            // envoyée : le mapping est rendu au système tout de suite
+            o.big = None;
+            o.big_sending = false;
+            o.sent = 0;
+            if !o.out.is_empty() && !o.dirty {
+                o.dirty = true;
+                self.dirty.push(slot);
+            }
+            self.maybe_close(slot);
+            return;
+        }
         if o.sent < o.sending.len() && o.mode != Mode::Draining {
             // Envoi partiel (ne devrait pas arriver avec MSG_WAITALL) : le reste.
             o.refs += 1;
@@ -1435,7 +1460,7 @@ impl Core {
         if o.out.is_empty() {
             std::mem::swap(&mut o.out, &mut o.sending);
         }
-        if !o.out.is_empty() && !o.dirty {
+        if !o.nothing_to_send() && !o.dirty {
             o.dirty = true;
             self.dirty.push(slot);
         }
@@ -2362,7 +2387,7 @@ impl Core {
     /// Le job a fini : sa réponse part, la connexion reprend (ce qu'elle a reçu
     /// entre-temps est exécuté aux tours suivants). Époque différente : la
     /// connexion n'est plus celle qui attendait, la réponse est jetée.
-    fn unpark(&mut self, slot: Slot, epoch: u32, mut job: ConnJob) {
+    fn unpark(&mut self, slot: Slot, epoch: u32, job: ConnJob) {
         let s = slot as usize;
         let o = &mut self.outs[s];
         if o.epoch != epoch || !o.job_pending || !matches!(o.mode, Mode::Normal | Mode::Closing) {
@@ -2370,14 +2395,22 @@ impl Core {
         }
         o.job_pending = false;
         let start = o.out.len();
-        job.respond(&mut o.out);
-        if let (Some(durable), Some(j)) = (self.aof.as_ref().and_then(|w| w.release_upto()), &self.journal) {
-            let mark = j.end_mark();
-            if mark > durable {
-                o.holds.push_back((start, mark));
-                if o.holds.len() == 1 {
-                    self.held.push(slot);
-                }
+        let hold = match (self.aof.as_ref().and_then(|w| w.release_upto()), &self.journal) {
+            (Some(durable), Some(j)) => Some(j.end_mark()).filter(|&mark| mark > durable),
+            _ => None,
+        };
+        match job {
+            // Grosse réponse partie de son tampon, sans copie dans `out` : seulement
+            // si rien ne la précède ni ne la retient (sinon l'ordre passe par `out`).
+            ConnJob::Keys(keys) if hold.is_none() && o.nothing_to_send() && o.holds.is_empty() => {
+                o.big = Some(keys.into_response());
+            }
+            mut job => job.respond(&mut o.out),
+        }
+        if let Some(mark) = hold {
+            o.holds.push_back((start, mark));
+            if o.holds.len() == 1 {
+                self.held.push(slot);
             }
         }
         if !o.dirty {
@@ -2402,7 +2435,7 @@ impl Core {
         for slot in std::mem::take(&mut self.dirty) {
             let s = slot as usize;
             let o = &mut self.outs[s];
-            if !matches!(o.mode, Mode::Normal | Mode::Closing) || o.out.is_empty() {
+            if !matches!(o.mode, Mode::Normal | Mode::Closing) || o.nothing_to_send() {
                 o.dirty = false;
                 continue;
             }
@@ -2421,7 +2454,7 @@ impl Core {
             if o.mode != Mode::Closing {
                 continue;
             }
-            if !i.has_work() && !o.job_pending && !o.repl_wait && o.out.is_empty() && !o.send_in_flight() {
+            if !i.has_work() && !o.job_pending && !o.repl_wait && o.nothing_to_send() && !o.send_in_flight() {
                 self.drain(slot);
             } else {
                 self.closing.push(slot);
@@ -2435,6 +2468,15 @@ impl Core {
         let upto = self.aof.as_ref().and_then(|w| w.release_upto());
         let o = &mut self.outs[slot as usize];
         debug_assert!(!o.send_in_flight());
+        if o.big.is_some() {
+            // la grosse réponse d'abord : `out` ne contient que ce qui la suit
+            o.big_sending = true;
+            o.sent = 0;
+            o.send_cancelled = false;
+            o.refs += 1;
+            self.ops.push(Op::Send { slot });
+            return;
+        }
         let n = o.sendable(upto);
         if n == 0 {
             return;
@@ -2528,6 +2570,8 @@ impl Core {
         o.out = Vec::new();
         o.holds.clear();
         o.sending = Vec::new();
+        o.big = None;
+        o.big_sending = false;
         o.link = false;
         o.connecting = false;
         self.ins[s] = ConnIn::default();
@@ -2581,7 +2625,11 @@ impl Core {
             if i.has_work() && !o.parked() && matches!(o.mode, Mode::Normal | Mode::Closing) {
                 assert!(o.ready && self.ready.contains(&(s as Slot)), "slot {s} a des frames hors de la liste prête");
             }
-            assert!(o.sent <= o.sending.len());
+            match &o.big {
+                Some((b, start)) if o.big_sending => assert!(start + o.sent <= b.len()),
+                _ => assert!(o.sent <= o.sending.len()),
+            }
+            assert!(!o.big_sending || o.big.is_some(), "slot {s} : send de big sans big");
             if o.link {
                 assert!(!i.has_work() && !o.ready, "lien {s} : rien n'est exécuté");
                 assert!(
