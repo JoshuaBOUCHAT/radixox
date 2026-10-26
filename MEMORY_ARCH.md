@@ -1628,3 +1628,18 @@ Serveur, mêmes chargements que le §18.1 :
 Reste hors de l'allocateur : glibc pour les ZSet (`BTreeSet` + `HashMap`, ~59 Mo par
 million de membres : disparaît avec le nouveau ZSet), les listes (`VecDeque`), et les
 structures du serveur (~5 Mo fixes : anneaux, connexions, tampons).
+
+Grandes valeurs seules (scénario du §13.2), 3000 strings de taille normale N(160 Kio,
+32 Kio) bornée à [64, 256] Kio, 469 Mo vivants, même serveur, `RADIXOX_MEMORY_DECAY` = 10 s :
+
+| phase | vivants | jemalloc (`background_thread`) | allocateur RadixOx |
+|---|---|---|---|
+| plein | 469 | 549 | **489** |
+| −50 %, t+0 | 233 | 548 | 493 (decay : rien rendu) |
+| −50 %, t+12 s | 233 | 440 | **255** |
+| −90 % du reste, t+12 s | 23 | 51 | **42** |
+| rechargé | 469 | 522 | **497** |
+
+Plein : +4 % sur les vivants (arrondi ≤ 4 Kio par objet) contre +17 %. Après decay, tout
+le libéré est rendu (vivants + 22 Mo) ; jemalloc rend progressivement (courbe de decay) et
+tient encore 207 Mo de plus à t+12 s.
