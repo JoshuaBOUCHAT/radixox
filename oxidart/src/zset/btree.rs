@@ -8,9 +8,11 @@
 //! - interne : séparateurs `(score, poignée)` (clé complète), `enfants [u32]`, `comptes
 //!   [u32]` (taille de chaque sous-arbre).
 //!
-//! Convention : le séparateur `i` borne par en dessous l'enfant `i + 1` (toutes ses clés
-//! ≥ séparateur, toutes celles de l'enfant `i` <). Un séparateur peut survivre à la clé
-//! dont il vient : il reste une borne.
+//! Convention : le séparateur `i` est **la plus petite clé de l'enfant `i + 1`** (donc une
+//! clé vivante, et sa poignée aussi : un séparateur périmé garderait une poignée libérée,
+//! puis réutilisée, et fausserait l'ordre des ex-aequo). Supprimer cette clé remplace le
+//! séparateur par la suivante ; la mise à jour sur place ne touche jamais la première
+//! entrée d'une feuille.
 //!
 //! Comptes mis à jour en descendant, pas de pointeur parent : un split remonte par la pile
 //! de la descente. Split 90/10 sur le bord droit (insertions croissantes), 50/50 sinon. À
@@ -149,6 +151,9 @@ pub struct Cursor {
     pub leaf: u32,
     pub pos: u16,
 }
+
+/// Parcours des entrées à partir d'un curseur, dans un sens.
+pub type Entries = std::iter::Map<std::iter::Successors<Cursor, fn(&Cursor) -> Option<Cursor>>, fn(Cursor) -> (u64, u32)>;
 
 /// En-tête de l'arbre (dans l'en-tête du ZSet). `root == NONE` : vide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,8 +326,9 @@ impl BTree {
         self.height += 1;
     }
 
-    /// Descente exacte vers `(s, h)` sans rien modifier : la pile et la position.
-    fn locate(&self, s: u64, h: u32, tie: &impl Tie, path: &mut [(u32, usize); MAX_H]) -> Option<Cursor> {
+    /// Descente exacte vers `(s, h)` sans rien modifier : la pile, la position, et le
+    /// séparateur égal à la clé s'il y en a un (nœud, rang).
+    fn locate(&self, s: u64, h: u32, tie: &impl Tie, path: &mut [(u32, usize); MAX_H], sep: &mut Option<(u32, usize)>) -> Option<Cursor> {
         if self.root == NONE {
             return None;
         }
@@ -331,6 +337,9 @@ impl BTree {
         for slot in path.iter_mut().take(self.height as usize) {
             let node = internal(idx);
             let ci = partition(node.n as usize - 1, |i| kcmp(tie, (node.sep_s[i], node.sep_h[i]), key) != Ordering::Greater);
+            if ci > 0 && node.sep_s[ci - 1] == s && node.sep_h[ci - 1] == h {
+                *sep = Some((idx, ci - 1));
+            }
             *slot = (idx, ci);
             idx = node.child[ci];
         }
@@ -341,13 +350,14 @@ impl BTree {
 
     /// Position de `(s, h)`.
     pub fn find(&self, s: u64, h: u32, tie: &impl Tie) -> Option<Cursor> {
-        self.locate(s, h, tie, &mut [(NONE, 0); MAX_H])
+        self.locate(s, h, tie, &mut [(NONE, 0); MAX_H], &mut None)
     }
 
     /// Retire `(s, h)` ; faux si absente.
     pub fn remove(&mut self, s: u64, h: u32, tie: &impl Tie) -> bool {
         let mut path = [(NONE, 0usize); MAX_H];
-        let Some(c) = self.locate(s, h, tie, &mut path) else { return false };
+        let mut sep = None;
+        let Some(c) = self.locate(s, h, tie, &mut path, &mut sep) else { return false };
         let height = self.height as usize;
         for &(p, ci) in &path[..height] {
             internal(p).count[ci] -= 1;
@@ -359,6 +369,23 @@ impl BTree {
         lf.handles.copy_within(pos + 1..n, pos);
         lf.n -= 1;
         let n = n - 1;
+        // La clé était un séparateur : la suivante prend sa place (si le sous-arbre se vide,
+        // le séparateur part avec lui plus bas).
+        if let Some((p, si)) = sep {
+            let succ = if pos < n {
+                Some((lf.scores[pos], lf.handles[pos]))
+            } else if lf.next != NONE {
+                let nl = leaf(lf.next);
+                Some((nl.scores[0], nl.handles[0]))
+            } else {
+                None
+            };
+            if let Some((ss, sh)) = succ {
+                let node = internal(p);
+                node.sep_s[si] = ss;
+                node.sep_h[si] = sh;
+            }
+        }
         if n == 0 {
             self.unlink_leaf(c.leaf);
             free_node(c.leaf);
@@ -451,9 +478,10 @@ impl BTree {
         let lf = leaf(c.leaf);
         let (pos, n) = (c.pos as usize, lf.n as usize);
         let key = (new, h);
+        // jamais la première entrée d'une feuille : elle peut être un séparateur
         let fits = match new.cmp(&old) {
             Ordering::Equal => true,
-            Ordering::Greater => pos + 1 < n && kcmp(tie, key, (lf.scores[pos + 1], lf.handles[pos + 1])) == Ordering::Less,
+            Ordering::Greater => pos > 0 && pos + 1 < n && kcmp(tie, key, (lf.scores[pos + 1], lf.handles[pos + 1])) == Ordering::Less,
             Ordering::Less => pos > 0 && kcmp(tie, key, (lf.scores[pos - 1], lf.handles[pos - 1])) == Ordering::Greater,
         };
         if fits {
@@ -556,13 +584,15 @@ impl BTree {
     }
 
     /// Entrées dans l'ordre, à partir de `c`.
-    pub fn iter_from(c: Option<Cursor>) -> impl Iterator<Item = (u64, u32)> {
-        std::iter::successors(c, |&c| Self::next(c)).map(Self::entry)
+    pub fn iter_from(c: Option<Cursor>) -> Entries {
+        let next: fn(&Cursor) -> Option<Cursor> = |&c| Self::next(c);
+        std::iter::successors(c, next).map(Self::entry as fn(Cursor) -> (u64, u32))
     }
 
     /// Entrées dans l'ordre inverse, à partir de `c`.
-    pub fn iter_back_from(c: Option<Cursor>) -> impl Iterator<Item = (u64, u32)> {
-        std::iter::successors(c, |&c| Self::prev(c)).map(Self::entry)
+    pub fn iter_back_from(c: Option<Cursor>) -> Entries {
+        let prev: fn(&Cursor) -> Option<Cursor> = |&c| Self::prev(c);
+        std::iter::successors(c, prev).map(Self::entry as fn(Cursor) -> (u64, u32))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (u64, u32)> {
@@ -671,7 +701,7 @@ impl BTree {
             };
         }
         let mut leaves = Vec::new();
-        let n = Self::verify_rec(self.root, self.height, None, None, tie, &mut leaves)?;
+        let (n, _) = Self::verify_rec(self.root, self.height, None, None, tie, &mut leaves)?;
         if n != self.len {
             return Err(format!("len {} mais {n} entrées", self.len));
         }
@@ -698,7 +728,8 @@ impl BTree {
         Ok(())
     }
 
-    fn verify_rec(i: u32, h: u8, lo: Option<(u64, u32)>, hi: Option<(u64, u32)>, tie: &impl Tie, leaves: &mut Vec<u32>) -> Result<u32, String> {
+    /// Rend le nombre d'entrées et la plus petite clé du sous-arbre.
+    fn verify_rec(i: u32, h: u8, lo: Option<(u64, u32)>, hi: Option<(u64, u32)>, tie: &impl Tie, leaves: &mut Vec<u32>) -> Result<(u32, (u64, u32)), String> {
         let in_bounds = |k: (u64, u32)| {
             lo.is_none_or(|lo| kcmp(tie, k, lo) != Ordering::Less) && hi.is_none_or(|hi| kcmp(tie, k, hi) == Ordering::Less)
         };
@@ -713,7 +744,7 @@ impl BTree {
                     }
                 }
                 leaves.push(i);
-                Ok(lf.n as u32)
+                Ok((lf.n as u32, (lf.scores[0], lf.handles[0])))
             }
             (h, BNode::Internal(node)) if h > 0 => {
                 let n = node.n as usize;
@@ -721,16 +752,22 @@ impl BTree {
                     return Err(format!("interne {i} sans enfant"));
                 }
                 let mut total = 0;
+                let mut min = (0, 0);
                 for c in 0..n {
                     let clo = if c == 0 { lo } else { Some((node.sep_s[c - 1], node.sep_h[c - 1])) };
                     let chi = if c + 1 == n { hi } else { Some((node.sep_s[c], node.sep_h[c])) };
-                    let got = Self::verify_rec(node.child[c], h - 1, clo, chi, tie, leaves)?;
+                    let (got, cmin) = Self::verify_rec(node.child[c], h - 1, clo, chi, tie, leaves)?;
                     if got != node.count[c] {
                         return Err(format!("interne {i} : compte de l'enfant {c} = {} au lieu de {got}", node.count[c]));
                     }
+                    if c == 0 {
+                        min = cmin;
+                    } else if clo != Some(cmin) {
+                        return Err(format!("interne {i} : séparateur {} = {clo:?}, plus petite clé de l'enfant {cmin:?}", c - 1));
+                    }
                     total += got;
                 }
-                Ok(total)
+                Ok((total, min))
             }
             _ => Err(format!("nœud {i} : mauvaise sorte à la hauteur {h}")),
         }
@@ -742,10 +779,18 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    thread_local! {
+        /// Poignées retirées : le départage ne doit jamais en voir une (séparateur périmé).
+        static DEAD: std::cell::RefCell<std::collections::HashSet<u32>> = Default::default();
+    }
+
     /// Ex-aequo départagés par la poignée elle-même, à l'envers (pour ne pas confondre
     /// avec l'ordre de comparaison par défaut).
     fn tie() -> impl Tie {
-        |a: u32, b: u32| b.cmp(&a)
+        |a: u32, b: u32| {
+            DEAD.with(|d| assert!(!d.borrow().contains(&a) && !d.borrow().contains(&b), "poignée retirée comparée"));
+            b.cmp(&a)
+        }
     }
 
     fn model_key((s, h): (u64, u32)) -> (u64, std::cmp::Reverse<u32>) {
@@ -785,6 +830,7 @@ mod tests {
             // poignée → score courant
             let mut live: Vec<(u32, u64)> = Vec::new();
             let mut next_h = 0u32;
+            DEAD.with(|d| d.borrow_mut().clear());
             for step in 0..30_000 {
                 let op = rng.below(10);
                 if live.is_empty() || op < 5 {
@@ -799,7 +845,7 @@ mod tests {
                     let (h, s) = live.swap_remove(i);
                     assert!(t.remove(s, h, &tie));
                     assert!(model.remove(&model_key((s, h))));
-                    assert!(!t.remove(s, h, &tie), "déjà retirée");
+                    DEAD.with(|d| d.borrow_mut().insert(h));
                 } else {
                     let i = rng.below(live.len() as u64) as usize;
                     let (h, s) = live[i];
