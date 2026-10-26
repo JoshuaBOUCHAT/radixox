@@ -1259,12 +1259,24 @@ décale sur place et rend la fin (`short_shrink`), aussi pour le préfixe de `sp
 1,82 → 2,08 M/s, 16 → 6 passes, RSS 2 031 → 1 935 Mo. Reste (2) : objets évacués de ~62 o.
 `split_leaf` faisait aussi `remove` (page réduite, forme redescendue) puis `insert` (page
 regrossie) : `Node::leaf_to_child` change la feuille en enfant au même rang, une seule
-normalisation à la fin : 2,05 → 2,11 M/s, 6 → 4 passes. Reste : pages agrandies classe par
-classe en grandissant, `set_raw` qui refait sa descente (~13 % du chargement), `touch` qui
-hache la clé octet par octet (~3 %).
+normalisation à la fin : 2,05 → 2,11 M/s, 6 → 4 passes.
+
+**Indice d'insertion.** Une clé absente gardait `NOT_FOUND` : le SET refaisait toute sa
+descente dans `set_raw`. La phase 1 rend désormais le point où elle s'arrête (bit `MISS`,
+nœud sur 32 bits, octets consommés sur 16 ; `NOT_FOUND` a tous les bits, donc trouvée ⇔
+`x & MISS == 0`) ; sur un préfixe différent, le parent (`parent_idx`, nœud en cache) à
+l'octet d'avant, d'où `set_raw` fera le `split_child`. `set_cond_hinted` insère par
+`set_raw_from(idx, cur)`. Seule invalidation nouvelle : le préfixe du nœud coupé par un
+`split_child` plus tôt dans la fenêtre (`reprefixed`) ; les autres changements de ce nœud
+(entrée ajoutée, page agrandie, feuille devenue enfant) sont relus par `set_raw`, et aucun
+nœud n'est libéré dans une fenêtre. PF1 précharge aussi le nœud du point d'insertion.
+Filet : `on_path` (debug) vérifie le point contre la descente depuis la racine.
+Chargement UUID 3M, 4 passages alternés : 2,01–2,08 → **2,39–2,51 M/s (+19 %)** ; mélange
+1M (Zipf, uniforme) inchangé au bruit près. Reste : pages agrandies classe par classe en
+grandissant, `touch` qui hache la clé octet par octet (~3 %).
 
 **Suite** : l'écart du mixte ; ZSet ; indices dans valart (l'exécution sans seconde descente) (le champ d'un HGET / HSET
-aussi en AMAC) ; SET de clé absente avec indice d'insertion.
+aussi en AMAC) ; INCR de clé absente avec indice d'insertion (SET fait).
 
 **Chantiers de layout (prototype + bench avant code définitif) :**
 - **Feuille fusionnée avec sa valeur** : l'entrée d'enfant (u32, bit de tag) désigne

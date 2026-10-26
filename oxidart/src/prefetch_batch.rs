@@ -31,6 +31,23 @@ pub const PREFETCH_BATCH: usize = 64;
 /// une self-val.
 const NOT_FOUND: u64 = u64::MAX;
 
+/// Bit d'une clé absente (tous les bits de [`NOT_FOUND`] l'ont aussi) : trouvée
+/// si et seulement si `x & MISS == 0`. Sans les autres bits de `NOT_FOUND`,
+/// c'est un point d'insertion : la descente s'est arrêtée au nœud `x >> 16`
+/// (u32), `x & 0xFFFF` octets de la clé consommés, préfixe du nœud compris ;
+/// `set_raw` peut reprendre là.
+const MISS: u64 = 1 << 61;
+
+#[inline(always)]
+fn miss_at(idx: u32, cursor: usize) -> u64 {
+    if cursor > u16::MAX as usize { NOT_FOUND } else { MISS | (idx as u64) << 16 | cursor as u64 }
+}
+
+#[inline(always)]
+fn is_hit(x: u64) -> bool {
+    x & MISS == 0
+}
+
 #[inline]
 fn encode(loc: Loc) -> u64 {
     (loc.node as u64) << 9
@@ -145,14 +162,21 @@ impl OxidArt {
         node.prefetch_page_all();
         let p: &[u8] = &node.prefix;
         if !starts_with_fast(&key[*cursor..], p) {
+            // l'insertion coupera ce préfixe depuis le parent (`split_child`),
+            // qui y voit l'entrée de ce nœud au radix d'avant
+            if *idx != self.root_idx {
+                *found = miss_at(node.parent_idx, *cursor - 1);
+            }
             return Step::Done;
         }
         *cursor += p.len();
         let Some(&radix) = key.get(*cursor) else {
-            if node.has_val() {
+            *found = if node.has_val() {
                 prefetch_value(node.tag, &node.val);
-                *found = encode(Loc { node: *idx, slot: Slot::SelfVal }) | tree_bit(node.tag);
-            }
+                encode(Loc { node: *idx, slot: Slot::SelfVal }) | tree_bit(node.tag)
+            } else {
+                miss_at(*idx, *cursor)
+            };
             return Step::Done;
         };
         if node.search_needs_page(radix) {
@@ -167,7 +191,10 @@ impl OxidArt {
     #[inline(always)]
     fn batch_search(&self, key: &[u8], idx: &mut u32, cursor: &mut usize, found: &mut u64) -> Step {
         match self.node(*idx).probe(key[*cursor]) {
-            Probe::Miss => Step::Done,
+            Probe::Miss => {
+                *found = miss_at(*idx, *cursor);
+                Step::Done
+            }
             Probe::Page(e, addr) => {
                 prefetch_l1(addr);
                 Step::Entry(e as u16)
@@ -184,6 +211,7 @@ impl OxidArt {
         let node = self.node(*idx);
         debug_assert!(node.search_needs_page(key[*cursor]));
         let Some(e) = node.find(key[*cursor]) else {
+            *found = miss_at(*idx, *cursor);
             return Step::Done;
         };
         self.batch_entry_ref(key, idx, cursor, node.entry_ref(e), found)
@@ -216,10 +244,12 @@ impl OxidArt {
             }
             EntryRef::Leaf { tag, val, sfx, .. } => {
                 let s: &[u8] = sfx.map_or(&[], |p| p);
-                if eq_fast(s, &key[*cursor + 1..]) {
+                *found = if eq_fast(s, &key[*cursor + 1..]) {
                     prefetch_value(tag, val);
-                    *found = encode(Loc { node: *idx, slot: Slot::Leaf(key[*cursor]) }) | tree_bit(tag);
-                }
+                    encode(Loc { node: *idx, slot: Slot::Leaf(key[*cursor]) }) | tree_bit(tag)
+                } else {
+                    miss_at(*idx, *cursor)
+                };
                 Step::Done
             }
         }
@@ -230,10 +260,12 @@ impl OxidArt {
     fn batch_leaf(&self, key: &[u8], idx: u32, cursor: usize, e: usize, found: &mut u64) {
         if let EntryRef::Leaf { tag, val, sfx, .. } = self.node(idx).entry_ref(e) {
             let s: &[u8] = sfx.map_or(&[], |p| p);
-            if eq_fast(s, &key[cursor + 1..]) {
+            *found = if eq_fast(s, &key[cursor + 1..]) {
                 prefetch_value(tag, val);
-                *found = encode(Loc { node: idx, slot: Slot::Leaf(key[cursor]) }) | tree_bit(tag);
-            }
+                encode(Loc { node: idx, slot: Slot::Leaf(key[cursor]) }) | tree_bit(tag)
+            } else {
+                miss_at(idx, cursor)
+            };
         }
     }
 }
@@ -270,7 +302,7 @@ impl Hint {
     /// ([`OxidArt::amac_fields`]).
     #[inline]
     pub fn has_tree(self) -> bool {
-        self.found != NOT_FOUND && self.found & TREE != 0
+        is_hit(self.found) && self.found & TREE != 0
     }
 }
 
@@ -291,11 +323,19 @@ pub(crate) struct WindowState {
     touched: Vec<u64>,
     /// Nœuds dont une feuille est partie dans un nouveau nœud (`split_leaf`).
     moved: Vec<u32>,
+    /// Nœuds dont le préfixe a été coupé (`split_child`) : un point
+    /// d'insertion sur eux ne vaut plus (la clé n'y passe plus à ce rang).
+    reprefixed: Vec<u32>,
     /// Clé et indice de [`OxidArt::with_hint`] en cours.
     scoped: Option<(*const u8, usize, Hint)>,
 }
 
 impl WindowState {
+    /// `split_child` a raccourci le préfixe de `idx`.
+    pub(crate) fn prefix_cut(&mut self, idx: u32) {
+        self.reprefixed.push(idx);
+    }
+
     /// `split_leaf` a déplacé la feuille `from` en `to` : seul déplacement de
     /// valeur possible dans une fenêtre.
     pub(crate) fn leaf_moved(&mut self, from: Loc, to: Loc) {
@@ -447,8 +487,10 @@ impl OxidArt {
     /// descentes).
     #[inline]
     pub fn prefetch_hint_node(&self, hint: Hint) {
-        if hint.found != NOT_FOUND {
+        if is_hit(hint.found) {
             prefetch_node(self, decode(hint.found).node);
+        } else if hint.found != NOT_FOUND {
+            prefetch_node(self, (hint.found >> 16) as u32);
         }
     }
 
@@ -456,7 +498,7 @@ impl OxidArt {
     /// (le nœud doit déjà être en cache : une recherche du radix).
     #[inline]
     pub fn prefetch_hint_value(&self, hint: Hint) {
-        if hint.found == NOT_FOUND {
+        if !is_hit(hint.found) {
             return;
         }
         let loc = decode(hint.found);
@@ -576,7 +618,7 @@ impl OxidArt {
     fn resolve(&mut self, key: &[u8], hint: Hint) -> Option<Option<Loc>> {
         let w = self.window.as_ref().expect("indice AMAC hors fenêtre");
         let touched = !w.touched.is_empty() && w.touched.contains(&key_tag(key));
-        let loc = (hint.found != NOT_FOUND).then(|| decode(hint.found));
+        let loc = is_hit(hint.found).then(|| decode(hint.found));
         let moved = matches!(loc, Some(Loc { node, slot: Slot::Leaf(_) }) if w.moved.contains(&node));
         if touched || moved {
             self.amac_stats.redescents += 1;
@@ -585,6 +627,18 @@ impl OxidArt {
         self.amac_stats.cmds += 1;
         debug_assert_eq!(loc, self.locate(key), "indice AMAC faux pour {}", key.escape_ascii());
         Some(loc)
+    }
+
+    /// Point d'insertion d'une clé absente que [`resolve`](Self::resolve) a
+    /// validée (`Some(None)`) : `(nœud, octets consommés)` d'où `set_raw` peut
+    /// reprendre, sauf si le préfixe de ce nœud a été coupé dans la fenêtre.
+    fn insert_point(&self, hint: Hint) -> Option<(u32, usize)> {
+        if is_hit(hint.found) || hint.found == NOT_FOUND {
+            return None;
+        }
+        let idx = (hint.found >> 16) as u32;
+        let w = self.window.as_ref().expect("indice AMAC hors fenêtre");
+        (!w.reprefixed.contains(&idx)).then_some((idx, (hint.found & 0xFFFF) as usize))
     }
 
     /// Emplacement de `key`, expirée ou non : l'indice s'il vaut encore,
@@ -724,7 +778,8 @@ impl OxidArt {
     }
 
     /// [`set_cond`](Self::set_cond) : une clé présente est écrasée sur place,
-    /// sans descente.
+    /// sans descente ; une clé absente est insérée depuis le point où la phase 1
+    /// s'est arrêtée.
     pub fn set_cond_hinted(
         &mut self,
         key: &[u8],
@@ -735,9 +790,14 @@ impl OxidArt {
     ) -> bool {
         let exp = ttl.map(|d| self.now.saturating_add(d.as_secs()));
         let raw = RawVal::from_value(val);
-        let Some(Some(loc)) = self.resolve(key, hint) else {
-            // absente (insertion) ou indice inutilisable : descente normale
-            return self.set_raw(key, raw, exp, if_exists);
+        let loc = match self.resolve(key, hint) {
+            Some(Some(loc)) => loc,
+            Some(None) => {
+                let (idx, cur) = self.insert_point(hint).unwrap_or((self.root_idx, 0));
+                return self.set_raw_from(key, idx, cur, raw, exp, if_exists);
+            }
+            // indice inutilisable : descente normale
+            None => return self.set_raw(key, raw, exp, if_exists),
         };
         let live = !is_expired(self.loc_value(loc).2, self.now);
         if !if_exists.is_none_or(|want| want == live) {
@@ -772,7 +832,7 @@ impl OxidArt {
             let found = &mut found[..chunk.len()];
             self.descend_batch(chunk, found);
             for (i, &x) in found.iter().enumerate() {
-                if x == NOT_FOUND {
+                if !is_hit(x) {
                     out.push(None);
                     continue;
                 }
@@ -840,7 +900,7 @@ impl OxidArt {
             let found = &mut found[..chunk.len()];
             self.descend_batch(chunk, found);
             for (i, &x) in found.iter().enumerate() {
-                if x == NOT_FOUND {
+                if !is_hit(x) {
                     continue;
                 }
                 if is_expired(self.loc_value(decode(x)).2, self.now) {

@@ -501,6 +501,32 @@ impl OxidArt {
 
     /// Emplacement de la valeur de `key`, expirée ou non.
     #[inline]
+    /// `(idx, cur)` est sur le chemin de `key` : la descente depuis la racine
+    /// passe par `idx` avec `cur` octets consommés.
+    #[cfg(debug_assertions)]
+    fn on_path(&self, key: &[u8], idx: u32, cur: usize) -> bool {
+        let (mut x, mut c) = (self.root_idx, 0);
+        loop {
+            if (x, c) == (idx, cur) {
+                return true;
+            }
+            if c >= cur || c == key.len() {
+                return false;
+            }
+            match self.node(x).get(key[c]) {
+                Some(EntryRef::Child(ch)) => {
+                    let cp: &[u8] = &self.node(ch).prefix;
+                    if !starts_with_fast(&key[c + 1..], cp) {
+                        return false;
+                    }
+                    c += 1 + cp.len();
+                    x = ch;
+                }
+                _ => return false,
+            }
+        }
+    }
+
     pub(crate) fn locate(&self, key: &[u8]) -> Option<Loc> {
         let mut idx = self.root_idx;
         let mut cur = 0;
@@ -726,11 +752,26 @@ impl OxidArt {
     /// vaut `want` ; sinon `raw` est libérée et la fonction renvoie `false`.
     /// Dans une fenêtre AMAC, la clé est notée touchée (elle a pu apparaître).
     pub(crate) fn set_raw(&mut self, key: &[u8], raw: RawVal, exp: Option<u64>, cond: Option<bool>) -> bool {
+        self.set_raw_from(key, self.root_idx, 0, raw, exp, cond)
+    }
+
+    /// [`set_raw`](Self::set_raw) à partir du nœud `idx`, `cur` octets de `key`
+    /// consommés (préfixe de `idx` compris) : un point du chemin de `key`, tel
+    /// que la descente de la phase 1 d'AMAC le laisse sur une clé absente.
+    pub(crate) fn set_raw_from(
+        &mut self,
+        key: &[u8],
+        mut idx: u32,
+        mut cur: usize,
+        raw: RawVal,
+        exp: Option<u64>,
+        cond: Option<bool>,
+    ) -> bool {
+        #[cfg(debug_assertions)]
+        assert!(self.on_path(key, idx, cur), "point d'insertion faux pour {}", key.escape_ascii());
         self.touch(key);
         let now = self.now;
         let ok = |exists: bool| cond.is_none_or(|want| want == exists);
-        let mut idx = self.root_idx;
-        let mut cur = 0;
         loop {
             if cur == key.len() {
                 let node = self.node(idx);
@@ -878,6 +919,9 @@ impl OxidArt {
         place(&mut n, rest, common, raw, exp);
         let n_idx = self.insert_node(n);
         self.node_mut(c).prefix.drop_front(common + 1);
+        if let Some(w) = &mut self.window {
+            w.prefix_cut(c);
+        }
         self.set_parent(c, n_idx, cp[common]);
         let done = self.node_mut(idx).set_child_idx(r, n_idx);
         debug_assert!(done);
