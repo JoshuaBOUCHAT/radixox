@@ -2,4 +2,4 @@
 dump*
 callgrind.out*
 vgcore*
-IR:
+IR:scripts/uuidload/target

@@ -1,0 +1,12 @@
+[package]
+name = "uuidload"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# hors du workspace : outil de bench, sans dépendance
+[workspace]
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
