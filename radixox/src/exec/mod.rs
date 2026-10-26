@@ -394,6 +394,10 @@ pub fn info_memory(out: &mut String, gc_enabled: bool, gc_running: bool, gc_max_
         external::objects(),
         external::background_thread() as u8
     );
+    if cfg!(radixox_heapcount) {
+        use radixox_lib::raw_alloc::heap;
+        let _ = write!(out, "mem_heap_bytes:{}\r\nmem_heap_peak_bytes:{}\r\n", heap::bytes(), heap::peak());
+    }
     // Pool (MEMORY_ARCH.md §16.8) : absent tant qu'il n'a rien alloué, ou sous `--cfg radixox_nopool`.
     if let Some((st, reserve)) = radixox_lib::pool::stats() {
         let held = st.held_blocks * radixox_lib::pool::BLOCK as u64;

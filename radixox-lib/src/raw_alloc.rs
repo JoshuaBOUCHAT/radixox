@@ -175,3 +175,53 @@ pub mod external {
         }
     }
 }
+
+/// Allocateur par défaut du processus (glibc) compté, sous `--cfg radixox_heapcount` :
+/// mesure de ce qui échappe encore au pool, aux slabs et à `external` (MEMORY_ARCH.md
+/// §17.6). Le binaire le déclare `#[global_allocator]` ; sans le cfg, rien n'est compté.
+/// Atomiques : tous les threads du processus passent par là.
+pub mod heap {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    static BYTES: AtomicU64 = AtomicU64::new(0);
+    static PEAK: AtomicU64 = AtomicU64::new(0);
+
+    pub struct Counting;
+
+    unsafe impl GlobalAlloc for Counting {
+        #[inline]
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            let p = unsafe { System.alloc(l) };
+            if !p.is_null() {
+                let now = BYTES.fetch_add(l.size() as u64, Relaxed) + l.size() as u64;
+                PEAK.fetch_max(now, Relaxed);
+            }
+            p
+        }
+        #[inline]
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            BYTES.fetch_sub(l.size() as u64, Relaxed);
+            unsafe { System.dealloc(p, l) }
+        }
+        #[inline]
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+            let q = unsafe { System.realloc(p, l, new) };
+            if !q.is_null() {
+                BYTES.fetch_sub(l.size() as u64, Relaxed);
+                let now = BYTES.fetch_add(new as u64, Relaxed) + new as u64;
+                PEAK.fetch_max(now, Relaxed);
+            }
+            q
+        }
+    }
+
+    /// Octets demandés vivants (sans l'en-tête ni l'arrondi de glibc).
+    pub fn bytes() -> u64 {
+        BYTES.load(Relaxed)
+    }
+
+    pub fn peak() -> u64 {
+        PEAK.load(Relaxed)
+    }
+}
