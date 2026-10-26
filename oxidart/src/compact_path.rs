@@ -120,6 +120,33 @@ impl CompactPath {
         *self = new;
     }
 
+    /// Retire les `k` premiers octets. La forme courte qui reste sur le tas garde son objet
+    /// du pool : données décalées, fin rendue par `short_shrink` (un trou de 0 à `k` octets,
+    /// pas un objet entier pour le GC : un `split_leaf` par insertion au chargement). Sinon
+    /// (≤ 7 octets restants, forme longue) : recopie.
+    pub fn drop_front(&mut self, k: usize) {
+        if k == 0 {
+            return;
+        }
+        let len = self.len();
+        debug_assert!(k <= len);
+        let new_len = len - k;
+        if !self.is_heap() || new_len <= Self::INLINE_CAP || self.len_lo() & Self::LONG != 0 {
+            let new = Self::from_slice(&self[k..]);
+            *self = new;
+            return;
+        }
+        unsafe {
+            let p = self.0.heap;
+            std::ptr::copy(p.add(k), p, new_len);
+            (p as *mut u16).sub(1).write(new_len as u16);
+            let (old, new) = (Self::slot(len), Self::slot(new_len));
+            if new < old {
+                pool::short_shrink(p.sub(Self::SHORT_HEADER), old, new);
+            }
+        }
+    }
+
     pub fn from_slice(data: &[u8]) -> Self {
         if data.len() <= Self::INLINE_CAP {
             let mut inner = [0u8; 8];
@@ -218,6 +245,19 @@ impl Drop for CompactPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drop_front_keeps_bytes_in_every_form() {
+        // tas → tas (sur place), tas → inline, forme longue, inline
+        for (len, k) in [(30, 1), (30, 9), (30, 23), (30, 30), (12, 5), (5, 2), (70_000, 3), (70_000, 69_995)] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            let mut p = CompactPath::from_slice(&data);
+            p.drop_front(k);
+            assert_eq!(&*p, &data[k..], "len {len}, k {k}");
+            p.drop_front(0);
+            assert_eq!(&*p, &data[k..]);
+        }
+    }
 
     #[test]
     fn compact_path_lengths_and_forms() {

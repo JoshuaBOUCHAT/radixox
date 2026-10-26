@@ -1249,6 +1249,15 @@ déjà en L1 ; lignes remplies depuis la DRAM par préchargement 10,5 (uniforme)
 lignes froides par requête. ~17 lectures à la demande par requête servies par la L2, surtout
 hors de l'arbre (fenêtre, connexions, encodage) ; MAB occupés en moyenne 4 à 5.
 
+**Chargement : le GC tournait sous charge.** Chargement de 15M UUID 1,82 M/s contre 2,32 M/s
+pour Valkey ; profil : `gc_slice` 10 %, 16 passes « sous charge » (`Blocks(0.75)`), chacune
+parcourant tout l'arbre (48 → 254 ms) ; `RADIXOX_GC=0` : 2,25 M/s, RSS +262 Mo. Sources des
+trous alors que rien n'est supprimé : (1) `split_leaf` réallouait le suffixe raccourci de
+l'ancienne feuille (~30 o, une fois par insertion ou presque), (2) `page_resize` réalloue la
+page d'un nœud à chaque classe franchie en grandissant. (1) corrigé : `CompactPath::drop_front`
+décale sur place et rend la fin (`short_shrink`), aussi pour le préfixe de `split_child` :
+1,82 → 2,08 M/s, 16 → 6 passes, RSS 2 031 → 1 935 Mo. Reste (2) : objets évacués de ~62 o.
+
 **Suite** : l'écart du mixte ; ZSet ; indices dans valart (l'exécution sans seconde descente) (le champ d'un HGET / HSET
 aussi en AMAC) ; SET de clé absente avec indice d'insertion.
 

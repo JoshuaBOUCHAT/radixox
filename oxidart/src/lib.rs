@@ -840,9 +840,24 @@ impl OxidArt {
         let s: &[u8] = old_sfx.as_deref().unwrap_or(&[]);
         let common = lcp(s, rest);
         let mut n = Node::new(CompactPath::from_slice(&s[..common]), idx, r);
-        place(&mut n, s, common, RawVal::new(tag, val), old_exp);
-        place(&mut n, rest, common, raw, exp);
         let old_slot = if common == s.len() { Slot::SelfVal } else { Slot::Leaf(s[common]) };
+        // L'ancienne feuille garde son suffixe, raccourci sur place : pas d'objet neuf, et
+        // pas d'ancien objet entier laissé en trou pour le GC (une fois par insertion au
+        // chargement d'UUID).
+        match old_slot {
+            Slot::SelfVal => put_self(&mut n, RawVal::new(tag, val), old_exp),
+            Slot::Leaf(radix) => {
+                let mut sfx = old_sfx.expect("suffixe plus long que le préfixe commun");
+                let sfx = if common + 1 == sfx.len() {
+                    None
+                } else {
+                    sfx.drop_front(common + 1);
+                    Some(sfx)
+                };
+                n.insert(radix, leaf(RawVal::new(tag, val), old_exp, sfx));
+            }
+        }
+        place(&mut n, rest, common, raw, exp);
         let n_idx = self.insert_node(n);
         self.node_mut(idx).insert(r, Entry::Child(n_idx));
         self.retag(idx, before);
@@ -861,7 +876,7 @@ impl OxidArt {
         n.insert(cp[common], Entry::Child(c));
         place(&mut n, rest, common, raw, exp);
         let n_idx = self.insert_node(n);
-        self.node_mut(c).prefix = CompactPath::from_slice(&cp[common + 1..]);
+        self.node_mut(c).prefix.drop_front(common + 1);
         self.set_parent(c, n_idx, cp[common]);
         let done = self.node_mut(idx).set_child_idx(r, n_idx);
         debug_assert!(done);
