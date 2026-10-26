@@ -1643,3 +1643,25 @@ Grandes valeurs seules (scénario du §13.2), 3000 strings de taille normale N(1
 Plein : +4 % sur les vivants (arrondi ≤ 4 Kio par objet) contre +17 %. Après decay, tout
 le libéré est rendu (vivants + 22 Mo) ; jemalloc rend progressivement (courbe de decay) et
 tient encore 207 Mo de plus à t+12 s.
+
+### 18.10 Ce qui reste dans glibc (2026-10-26)
+
+Build de mesure : `RUSTFLAGS="-C target-cpu=native --cfg radixox_heapcount"
+CARGO_PROFILE_RELEASE_STRIP=none CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
+CARGO_TARGET_DIR=target/heapcount cargo build --release -p radixox` ; `INFO` donne
+`mem_heap_bytes` / `mem_heap_peak_bytes`, `RADIXOX_HEAP_TRACE=65536` la pile de chaque
+allocation d'au moins 64 Kio (agrégée par `scripts/heap_sites.py`).
+
+- **Fixe, 4,8 Mo** : tables `outs` (1,9 Mo, `uring/core.rs:606`) et `ins` (0,84 Mo, :605),
+  un emplacement par connexion possible ; le reste en petits objets. Une connexion en usage :
+  ~50 o de plus.
+- **`KEYS *` sur 1M clés : pic de 87 Mo** — réponse construite dans le `Vec` du job par
+  doublements (`exec/jobs.rs:84`, 11,5 Mo au dernier) puis recopiée dans le tampon de
+  sortie (`uring/core.rs:484`, 8,2 Mo) ; la réponse elle-même fait ~44 Mo.
+- **AOF** : tampon d'écriture de la base, 10 Mo (`exec/persist.rs:109`) ; tranches du
+  journal de ~70 Ko (`exec/journal.rs:344`).
+- Tampons de sortie des connexions : +0,6 Mo au pic d'un chargement pipeliné.
+- Données : ZSet 59 o/membre (nouveau ZSet), Pub/Sub ~240 o/abonné, List (`VecDeque`).
+
+Pistes : KEYS écrit directement dans le tampon de sortie ; nouveau ZSet ; à décider, un
+`#[global_allocator]` sur l'allocateur de RadixOx (repli glibc hors du thread métier).

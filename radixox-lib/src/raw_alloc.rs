@@ -153,6 +153,30 @@ pub mod heap {
 
     pub struct Counting;
 
+    /// `RADIXOX_HEAP_TRACE=octets` : pile d'appel de chaque allocation d'au moins cette
+    /// taille sur stderr (binaire avec symboles : `CARGO_PROFILE_RELEASE_STRIP=none`,
+    /// `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`). Lu une fois, sous la garde.
+    fn trace(size: usize) {
+        use std::cell::Cell;
+        use std::sync::atomic::AtomicUsize;
+        thread_local! { static IN: Cell<bool> = const { Cell::new(false) }; }
+        // usize::MAX : pas encore lu ; 0 : éteint
+        static MIN: AtomicUsize = AtomicUsize::new(usize::MAX);
+        if IN.with(Cell::get) {
+            return;
+        }
+        IN.with(|g| g.set(true));
+        let mut min = MIN.load(Relaxed);
+        if min == usize::MAX {
+            min = std::env::var("RADIXOX_HEAP_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            MIN.store(min, Relaxed);
+        }
+        if min != 0 && size >= min {
+            eprintln!("[heap] {size} o\n{}", std::backtrace::Backtrace::force_capture());
+        }
+        IN.with(|g| g.set(false));
+    }
+
     unsafe impl GlobalAlloc for Counting {
         #[inline]
         unsafe fn alloc(&self, l: Layout) -> *mut u8 {
@@ -160,6 +184,9 @@ pub mod heap {
             if !p.is_null() {
                 let now = BYTES.fetch_add(l.size() as u64, Relaxed) + l.size() as u64;
                 PEAK.fetch_max(now, Relaxed);
+                if l.size() >= 4096 {
+                    trace(l.size());
+                }
             }
             p
         }
@@ -175,6 +202,9 @@ pub mod heap {
                 BYTES.fetch_sub(l.size() as u64, Relaxed);
                 let now = BYTES.fetch_add(new as u64, Relaxed) + new as u64;
                 PEAK.fetch_max(now, Relaxed);
+                if new >= 4096 {
+                    trace(new);
+                }
             }
             q
         }
