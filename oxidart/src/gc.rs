@@ -64,6 +64,9 @@ enum Phase {
     Oxidart,
     Valart,
     Lists,
+    /// Blocs à poignée marqués (membres des ZSet, MEMORY_ARCH.md §19.3) : parcourus
+    /// eux-mêmes, aucune structure visitée ; `at` = rang dans la liste des blocs marqués.
+    Handled,
 }
 
 impl Default for GcPass {
@@ -96,6 +99,7 @@ impl GcPass {
                 Phase::Valart if valart().is_saving() => None,
                 Phase::Valart => art.gc_visit_valart(self.at, n, &mut v),
                 Phase::Lists => art.gc_visit_lists(self.at, n, &mut |sb| v.bytes(sb)),
+                Phase::Handled => radixox_lib::handle::gc_step(self.at, max_bytes, &mut v.moved),
             };
             if let Some(at) = next {
                 self.at = at;
@@ -105,7 +109,8 @@ impl GcPass {
             self.phase = match self.phase {
                 Phase::Oxidart => Phase::Valart,
                 Phase::Valart => Phase::Lists,
-                Phase::Lists => return true,
+                Phase::Lists => Phase::Handled,
+                Phase::Handled => return true,
             };
         }
         false

@@ -38,7 +38,10 @@ const MAIN: usize = 0;
 const SURVIVOR: usize = 1;
 const STRUCT: usize = 2;
 const STRUCT_SURVIVOR: usize = 3;
-const CURSORS: usize = 4;
+/// Objets à poignée (§19) : bump seul, leurs blocs ne contiennent qu'eux et se parcourent.
+const HANDLED: usize = 4;
+const HANDLED_SURVIVOR: usize = 5;
+const CURSORS: usize = 6;
 /// Une passe qui rend moins que ça suspend le déclenchement (§16.6).
 const WEAK_PASS: u64 = 2 << 20;
 const WEAK_PAUSE: Duration = Duration::from_secs(10);
@@ -148,7 +151,11 @@ pub struct Pool {
     open: *mut u64,
     /// Bloc à évacuer par la passe en cours (ou la suivante).
     marked: *mut u64,
-    maps: [(*mut u8, usize); 4],
+    /// Bloc d'un curseur à poignée (§19) : ne contient que des objets à poignée.
+    handled: *mut u64,
+    /// Fin de remplissage d'un bloc à poignée, en granules, tenue à la fermeture du curseur.
+    fill: *mut u16,
+    maps: [(*mut u8, usize); 6],
     pages: Vec<PageState>,
     next_page: u32,
     /// Pages actives trouées (1 à 31 blocs libres), une liste chaînée par nombre de blocs
@@ -211,8 +218,8 @@ impl Pool {
         let virt = nb_pages as usize * PAGE;
         let nb_blocks = nb_pages as usize * BLOCKS_PER_PAGE as usize;
         let bits_len = nb_blocks.div_ceil(64) * 8;
-        let lens = [virt + PAGE, nb_blocks * 2, bits_len, bits_len];
-        let mut maps = [(null_mut(), 0); 4];
+        let lens = [virt + PAGE, nb_blocks * 2, bits_len, bits_len, bits_len, nb_blocks * 2];
+        let mut maps = [(null_mut(), 0); 6];
         for (i, &len) in lens.iter().enumerate() {
             let Some(p) = map(len) else {
                 for &(p, len) in &maps[..i] {
@@ -230,6 +237,8 @@ impl Pool {
             live: maps[1].0 as *mut u16,
             open: maps[2].0 as *mut u64,
             marked: maps[3].0 as *mut u64,
+            handled: maps[4].0 as *mut u64,
+            fill: maps[5].0 as *mut u16,
             maps,
             pages: Vec::new(),
             next_page: 0,
@@ -329,6 +338,90 @@ impl Pool {
         self.alloc_in(STRUCT_SURVIVOR, size)
     }
 
+    /// Objet à poignée (§19, `size` pair, ≤ [`MEDIUM`]) : bump seul.
+    #[inline]
+    pub fn alloc_handled(&mut self, size: usize) -> *mut u8 {
+        debug_assert!(size <= MEDIUM);
+        self.alloc_in(HANDLED, size)
+    }
+
+    /// Évacuation des blocs à poignée marqués (§19.3), à partir du rang `from` de la liste
+    /// des blocs marqués : chaque objet vivant est recopié au curseur des survivants à
+    /// poignée et sa case réécrite ; aucune structure n'est visitée. Un bloc à la fois,
+    /// jusqu'à `max_bytes` recopiés (ajoutés à `moved`). Rend le rang où reprendre, `None`
+    /// à la fin de la liste ; plage pleine : fin aussi (le reste attend la passe suivante).
+    pub fn evacuate_handled(&mut self, table: &mut crate::handle::Handles, from: u32, max_bytes: usize, moved: &mut usize) -> Option<u32> {
+        use crate::handle::{DEAD, obj_size};
+        let mut i = from as usize;
+        while i < self.marked_list.len() {
+            if *moved >= max_bytes {
+                return Some(i as u32);
+            }
+            let b = self.marked_list[i].0;
+            i += 1;
+            if !bit(self.marked, b) || !bit(self.handled, b) {
+                continue;
+            }
+            let start = self.block_addr(b);
+            let end = start + unsafe { *self.fill.add(b as usize) } as usize * 2;
+            let mut a = start;
+            while a < end {
+                let head = unsafe { (a as *const u16).read() };
+                let size = obj_size((head & !DEAD) as usize);
+                if head & DEAD == 0 {
+                    let h = unsafe { ((a + 2) as *const u32).read_unaligned() };
+                    let new = self.alloc_in(HANDLED_SURVIVOR, size);
+                    if new.is_null() {
+                        return None;
+                    }
+                    let last = *self.live(b) as usize * 2 == size;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(a as *const u8, new, size);
+                        (a as *mut u16).write(head | DEAD);
+                        self.free(a as *mut u8, size);
+                    }
+                    table.set(h, new as usize);
+                    self.note_evacuated(size);
+                    *moved += size;
+                    if last {
+                        break; // bloc libéré (et rempli de 0xDB en débogage)
+                    }
+                }
+                a += size;
+            }
+        }
+        None
+    }
+
+    /// Les objets vivants d'un bloc à poignée, `(adresse, poignée, taille)` (vérificateur).
+    pub fn handled_objects(&self, mut f: impl FnMut(usize, u32, usize)) {
+        use crate::handle::{DEAD, obj_size};
+        for b in 0..self.next_page * BLOCKS_PER_PAGE {
+            if !bit(self.handled, b) {
+                continue;
+            }
+            let start = self.block_addr(b);
+            let end = match self.cursors.iter().find(|c| c.block == b) {
+                Some(c) => c.top,
+                None => start + unsafe { *self.fill.add(b as usize) } as usize * 2,
+            };
+            let mut a = start;
+            while a < end {
+                let head = unsafe { (a as *const u16).read() };
+                let size = obj_size((head & !DEAD) as usize);
+                if head & DEAD == 0 {
+                    f(a, unsafe { ((a + 2) as *const u32).read_unaligned() }, size);
+                }
+                a += size;
+            }
+        }
+    }
+
+    /// Granules vivants du bloc de `a` (vérificateur).
+    pub fn live_of_addr(&self, a: usize) -> Option<u64> {
+        self.block_of_addr(a).map(|b| unsafe { *self.live.add(b as usize) } as u64)
+    }
+
     /// `a` est dans la plage du pool.
     #[inline]
     pub fn owns(&self, a: usize) -> bool {
@@ -355,14 +448,28 @@ impl Pool {
 
     #[cold]
     fn alloc_bump_slow(&mut self, k: usize, size: usize) -> *mut u8 {
-        if self.cursors[k].block != NONE {
-            self.close_block(self.cursors[k].block);
-            self.cursors[k] = NO_CURSOR;
-        }
+        self.close_cursor(k);
         let Some(b) = self.take_block() else { return null_mut() };
         let a = self.block_addr(b);
         self.cursors[k] = Cursor { block: b, top: a, end: a + BLOCK };
+        if k >= HANDLED {
+            set_bit(self.handled, b, true);
+        }
         self.alloc_in(k, size)
+    }
+
+    /// Le curseur `k` lâche son bloc ; celui d'un curseur à poignée garde sa fin de
+    /// remplissage, borne de son parcours.
+    fn close_cursor(&mut self, k: usize) {
+        let c = self.cursors[k];
+        if c.block == NONE {
+            return;
+        }
+        if k >= HANDLED {
+            unsafe { *self.fill.add(c.block as usize) = ((c.top - self.block_addr(c.block)) / 2) as u16 };
+        }
+        self.cursors[k] = NO_CURSOR;
+        self.close_block(c.block);
     }
 
     #[inline(never)]
@@ -414,10 +521,7 @@ impl Pool {
     /// Ferme tous les curseurs et fenêtres (passe forcée des tests).
     fn close_cursors(&mut self) {
         for k in 0..CURSORS {
-            if self.cursors[k].block != NONE {
-                self.close_block(self.cursors[k].block);
-                self.cursors[k] = NO_CURSOR;
-            }
+            self.close_cursor(k);
             for i in 0..WINDOW {
                 if self.windows[k].rest[i] != 0 {
                     self.close_case(k, i);
@@ -594,6 +698,7 @@ impl Pool {
             set_bit(self.marked, b, false);
             self.freed_in_pass += 1;
         }
+        set_bit(self.handled, b, false);
         self.held_blocks -= 1;
         let p = b / BLOCKS_PER_PAGE;
         let n = self.free_count(p);
@@ -827,7 +932,7 @@ fn env<T: std::str::FromStr>(name: &str, default: T) -> T {
 }
 
 #[cold]
-fn init() -> Option<&'static mut Pool> {
+pub(crate) fn init() -> Option<&'static mut Pool> {
     unsafe {
         if DISABLED {
             return None;
@@ -845,7 +950,7 @@ fn init() -> Option<&'static mut Pool> {
 
 /// Le pool global, s'il a déjà servi.
 #[inline]
-fn global() -> Option<&'static mut Pool> {
+pub(crate) fn global() -> Option<&'static mut Pool> {
     unsafe { (*&raw mut POOL).as_mut() }
 }
 

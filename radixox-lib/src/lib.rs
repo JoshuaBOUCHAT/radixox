@@ -2,6 +2,7 @@ pub mod array_vec;
 pub mod big_buf;
 pub mod cmd;
 pub mod gen_arena;
+pub mod handle;
 pub mod inline_childs;
 pub mod large;
 pub mod pool;
