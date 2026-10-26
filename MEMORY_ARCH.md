@@ -1587,7 +1587,8 @@ compte peu. Mono-thread, état en `static mut` comme le pool.
 
 ### 18.6 Petits épinglés (< 16 Kio) : slabs par classe
 
-- Classes : multiples de 16 jusqu'à 256, puis ×1,25 environ jusqu'à 16 Kio.
+- Classes : multiples de 8 jusqu'à 128, de 16 jusqu'à 256, puis ×1,25 environ jusqu'à
+  16 Kio (43 classes ; alignement 8).
 - Slab = suite de 16 granules (64 Kio) prise au tas, liste libre intrusive, compteur.
   Granule → slab par le tableau d'étiquettes. Slab vide : rendue au tas (sale, puis
   rendue au système par le §18.5).
@@ -1608,3 +1609,22 @@ compte peu. Mono-thread, état en `static mut` comme le pool.
 4. rendu par `release_step` ; mesure du scénario du §13.2 (512 Mo, −50 %, −90 %) et des
    valeurs de 64 Kio ;
 5. `INFO`, docs.
+
+### 18.9 Fait (2026-10-26) et mesures
+
+`radixox-lib/src/large.rs` (tas TLSF + slabs, tests contre un modèle aléatoire avec
+vérification des invariants), branché sous `raw_alloc::external` ; `tikv-jemalloc-sys`
+retiré ; rendu appelé par le minuteur `MemRelease` de la boucle avec celui du pool.
+`mem_large_held_bytes` compte aussi les granules des slabs.
+
+Serveur, mêmes chargements que le §18.1 :
+
+| phase | jemalloc | allocateur RadixOx |
+|---|---|---|
+| 1M UUID + 1000 ZSet × 1000 | 239 Mo | 239–244 Mo (slabs des membres : 24 Mo pour 21 demandés) |
+| + 2000 strings de 64 Kio | 405 Mo | **377 Mo** (68 Kio par objet au lieu de 80) |
+| DEL d'une sur deux, t+12 s | — | **314 Mo** : 66,4 Mo rendus, 0 sale restant |
+
+Reste hors de l'allocateur : glibc pour les ZSet (`BTreeSet` + `HashMap`, ~59 Mo par
+million de membres : disparaît avec le nouveau ZSet), les listes (`VecDeque`), et les
+structures du serveur (~5 Mo fixes : anneaux, connexions, tampons).

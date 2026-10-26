@@ -14,7 +14,7 @@ use crate::prefetch::PreFetch;
 /// forme longue : [len_hi u16][len_lo u16][rc u16][données…]  bit 15 de len_lo = EXTERNE
 /// ```
 ///
-/// La forme longue est allouée par jemalloc ([`external`]) ; la courte par le pool
+/// La forme longue est allouée par `external` (allocateur des grands objets, MEMORY_ARCH §18) ; la courte par le pool
 /// ([`crate::pool`]) par défaut, par mimalloc sous `--cfg radixox_nopool` ou
 /// `--cfg radixox_sysalloc` (ASan ne voit pas les objets du pool).
 #[repr(transparent)]
@@ -143,7 +143,7 @@ impl SharedByte {
         {
             // L'adresse d'abord : la plupart des objets ne sont pas dans un bloc marqué,
             // et lire l'en-tête serait un défaut de cache par valeur visitée. Une forme
-            // longue (jemalloc) est hors de la plage du pool : jamais marquée.
+            // longue (`external`) est hors de la plage du pool : jamais marquée.
             let base = self.header_ptr() as *mut u8;
             if !crate::pool::is_marked(base as usize) || self.is_external() {
                 return 0;

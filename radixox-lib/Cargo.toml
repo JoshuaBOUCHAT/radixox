@@ -12,7 +12,6 @@ categories = ["network-programming", "parser-implementations"]
 [dependencies]
 mimalloc = { workspace = true }
 libmimalloc-sys = { workspace = true }
-tikv-jemalloc-sys = { workspace = true }
 libc = "0.2"
 
 [lints.rust]

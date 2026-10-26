@@ -74,11 +74,11 @@ pub unsafe fn free(ptr: *mut u8) {
     unsafe { imp::free(ptr) }
 }
 
-/// Objets externes des `SharedByte` (MEMORY_ARCH.md §16.7) : valeurs de plus de
-/// 16 Kio, et celles qui vivent hors de l'arbre (§16.9). jemalloc **préfixé** : il ne
-/// remplace pas le `malloc` du processus et ne sert qu'à ces objets. Son thread de fond
-/// rend la mémoire au système sans toucher à aucune donnée de RadixOx. Sous
-/// `--cfg radixox_sysalloc`, malloc/free de la libc comme le reste.
+/// Objets externes (MEMORY_ARCH.md §18) : valeurs de plus de 16 Kio, et objets qui vivent
+/// hors de l'arbre (§16.9, épinglés : le GC ne les voit pas). Allocateur de RadixOx
+/// (`crate::large` : tas de granules de 4 Kio, slabs par classe), rendu au système par
+/// `release_step` sans thread de fond. Sous `--cfg radixox_sysalloc`, malloc/free de la
+/// libc comme le reste.
 pub mod external {
     // Mono-thread (ARCHITECTURE.md §1) : comptes sans atomique.
     static mut BYTES: u64 = 0;
@@ -115,48 +115,15 @@ pub mod external {
         unsafe { OBJECTS }
     }
 
-    /// Le thread de fond de jemalloc tourne (relu par `mallctl`, pas supposé).
-    pub fn background_thread() -> bool {
-        imp::background_thread()
-    }
-
     #[cfg(not(radixox_sysalloc))]
     mod imp {
-        use std::ffi::{c_char, c_void};
-        use tikv_jemalloc_sys as je;
-
-        #[repr(transparent)]
-        struct Conf(*const c_char);
-        unsafe impl Sync for Conf {}
-
-        /// Lu par jemalloc à son initialisation (avant la première allocation externe).
-        /// Nom préfixé : `_rjem_malloc_conf` dans tikv-jemalloc-sys 0.6.1.
-        #[used]
-        #[unsafe(export_name = "_rjem_malloc_conf")]
-        static MALLOC_CONF: Conf =
-            Conf(c"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0".as_ptr());
-
         #[inline]
         pub unsafe fn malloc(size: usize) -> *mut u8 {
-            unsafe { je::malloc(size) as *mut u8 }
+            unsafe { crate::large::malloc(size) }
         }
         #[inline]
         pub unsafe fn free(ptr: *mut u8, size: usize) {
-            unsafe { je::sdallocx(ptr as *mut c_void, size, 0) }
-        }
-        pub fn background_thread() -> bool {
-            let mut on = false;
-            let mut len = size_of::<bool>();
-            let r = unsafe {
-                je::mallctl(
-                    c"background_thread".as_ptr(),
-                    &mut on as *mut bool as *mut c_void,
-                    &mut len,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            };
-            r == 0 && on
+            unsafe { crate::large::free(ptr, size) }
         }
     }
 
@@ -169,9 +136,6 @@ pub mod external {
         #[inline]
         pub unsafe fn free(ptr: *mut u8, _size: usize) {
             unsafe { super::super::imp::free(ptr) }
-        }
-        pub fn background_thread() -> bool {
-            false
         }
     }
 }

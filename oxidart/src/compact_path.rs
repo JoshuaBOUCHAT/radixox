@@ -10,7 +10,7 @@ use std::ops::Deref;
 // Tas    : inner = ptr vers les données, en-tête lu à reculons en u16 alignés (adresse
 //          paire → bit 0 = 0, ce qui distingue le tas de l'inline) :
 //            forme courte (pool, ≤ 16 Kio) : [len u16][données]          bit 15 de len à 0
-//            forme longue (jemalloc)       : [len_hi u16][len_lo u16][données]  bit 15 à 1
+//            forme longue (`external`)     : [len_hi u16][len_lo u16][données]  bit 15 à 1
 union Inner {
     heap: *mut u8,
     inline: [u8; 8],

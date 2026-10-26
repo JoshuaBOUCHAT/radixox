@@ -383,17 +383,25 @@ pub fn info_stats(out: &mut String) {
     let _ = write!(out, "# Stats\r\nscan_cursors:{}\r\n", scan::active_cursors());
 }
 
-/// Section `# Memory` d'`INFO` (MEMORY_ARCH.md §16.8) : objets externes (jemalloc), pool.
+/// Section `# Memory` d'`INFO` (MEMORY_ARCH.md §16.8) : objets externes, grands objets (§18), pool.
 pub fn info_memory(out: &mut String, gc_enabled: bool, gc_running: bool, gc_max_slice_us: u64) {
     use radixox_lib::raw_alloc::external;
     use std::fmt::Write as _;
     let _ = write!(
         out,
-        "# Memory\r\nmem_external_bytes:{}\r\nmem_external_objects:{}\r\nmem_external_bg_thread:{}\r\n",
+        "# Memory\r\nmem_external_bytes:{}\r\nmem_external_objects:{}\r\n",
         external::bytes(),
         external::objects(),
-        external::background_thread() as u8
     );
+    // Grands objets et épinglés (MEMORY_ARCH.md §18.7) : absent tant que rien n'y est alloué.
+    if let Some(l) = radixox_lib::large::stats() {
+        let _ = write!(
+            out,
+            "mem_large_held_bytes:{}\r\nmem_large_dirty_bytes:{}\r\nmem_large_released_bytes:{}\r\n\
+             mem_large_top_bytes:{}\r\nmem_slab_held_bytes:{}\r\nmem_slab_live_bytes:{}\r\n",
+            l.held_bytes, l.dirty_bytes, l.released_bytes, l.top_bytes, l.slab_held_bytes, l.slab_live_bytes,
+        );
+    }
     if cfg!(radixox_heapcount) {
         use radixox_lib::raw_alloc::heap;
         let _ = write!(out, "mem_heap_bytes:{}\r\nmem_heap_peak_bytes:{}\r\n", heap::bytes(), heap::peak());

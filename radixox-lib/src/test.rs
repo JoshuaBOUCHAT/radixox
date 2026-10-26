@@ -75,14 +75,6 @@ fn shared_byte_forced_external() {
     }
 }
 
-/// `_rjem_malloc_conf` est bien vu par jemalloc (symbole exporté depuis une rlib).
-#[cfg(not(radixox_sysalloc))]
-#[test]
-fn jemalloc_background_thread_on() {
-    drop(SharedByte::from_slice_external(b"init"));
-    assert!(crate::raw_alloc::external::background_thread());
-}
-
 #[test]
 fn shared_byte_to_uppercase() {
     for external in [false, true] {

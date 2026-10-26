@@ -886,7 +886,7 @@ pub unsafe fn shrink(ptr: *mut u8, old: usize, new: usize) {
 
 /// Emplacement d'un objet en forme courte (≤ 16 Kio de données) : le pool, ou mimalloc sous
 /// `radixox_nopool` / `radixox_sysalloc` (ASan ne voit pas les objets du pool). Nul : le
-/// pool est plein, l'appelant passe en forme longue (jemalloc).
+/// pool est plein, l'appelant passe en forme longue (`external`).
 ///
 /// # Safety
 /// Mono-thread ; `size` pair et ≤ [`BLOCK`] ; libérer par [`short_free`] avec la même taille.
@@ -928,7 +928,7 @@ pub unsafe fn short_free(base: *mut u8, _size: usize) {
 pub unsafe fn short_shrink(_base: *mut u8, _old: usize, _new: usize) {}
 
 /// Objet de structure aligné sur 8 (pages des nœuds, §17) : le pool jusqu'à 16 Kio, sinon
-/// (ou plage pleine) jemalloc ; mimalloc sans pool. `size` multiple de 8.
+/// (ou plage pleine) `external` ; mimalloc sans pool. `size` multiple de 8.
 ///
 /// # Safety
 /// Mono-thread ; libérer par [`struct_free`] avec la même taille.

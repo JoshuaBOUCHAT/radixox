@@ -925,7 +925,8 @@ impl Core {
                     self.timers.push(Reverse((self.now + SWEEP_EVERY, Timer::Sweep)));
                 }
                 Timer::MemRelease => {
-                    let more = radixox_lib::pool::release_step(self.now);
+                    // pas de court-circuit : les deux rendent leur part
+                    let more = radixox_lib::pool::release_step(self.now) | radixox_lib::large::release_step(self.now);
                     let next = if more { MEM_RELEASE_AGAIN } else { MEM_RELEASE_EVERY };
                     self.timers.push(Reverse((self.now + next, Timer::MemRelease)));
                 }
