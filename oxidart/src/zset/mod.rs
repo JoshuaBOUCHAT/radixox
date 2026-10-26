@@ -2,6 +2,7 @@
 //! valart + B+tree compté + membres à poignée (MEMORY_ARCH.md §19).
 
 pub mod btree;
+pub mod small;
 
 /// `f64` → `u64` dont l'ordre est celui de `total_cmp` (bijection exacte sur les bits) ;
 /// `-0.0` devient `0.0` (Valkey : même score). NaN refusé avant d'arriver ici.
