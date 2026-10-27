@@ -1051,8 +1051,10 @@ Sur les connexions parquées (RUNTIME_ARCH.md §7), prévues pour ça :
 
 ### 14.4 Save, GC, AMAC
 
-- **Save progressive derrière la barrière**, comme les feuilles du B+tree (SAVE_DESIGN.md
-  §D) : en-têtes en `SaveBarrier` (image : `first`, `len`), blocs en `SaveBarrier<Block>`,
+- **Save en CoW, sans aucun arrêt**, comme les feuilles du B+tree (SAVE_DESIGN.md §D) : au
+  `begin`, seulement la copie des bitmaps d'occupation (un `memcpy`) ; un bloc est copié à
+  sa première modification pendant la save (au plus une fois). En-têtes en `SaveBarrier`
+  (image : `first`, `len`), blocs en `SaveBarrier<Block>`,
   points de passage `block_mut` / `free_block` ; la save suit le chaînage T0 des blocs et
   écrit `len` puis les éléments vivants, en flux (budget 1 par bloc + 1 par élément).
   Valeurs retirées pendant la save → liste différée. Format de l'enregistrement : celui de
@@ -1080,6 +1082,10 @@ Sur les connexions parquées (RUNTIME_ARCH.md §7), prévues pour ça :
    mémoire par élément, petites listes).
 
 ### 14.6 Points ouverts
+
+- **Aucune commande sans borne** : `LTRIM`, `LREM` ou `DEL` d'une très grosse liste ne
+  doivent pas tenir la boucle ; au-delà d'un seuil, en job par tranches (comme KEYS,
+  UNLINK, le DEL des grands ZSet). Même règle à appliquer à `ZREMRANGEBY*` (§13.12).
 
 - **Petites listes** : une liste d'un élément coûte un bloc de 256 o, contre quelques
   dizaines d'octets chez Valkey (listpack). Si les mesures le montrent : premier bloc plus
