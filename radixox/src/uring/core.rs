@@ -361,6 +361,9 @@ const GC_IDLE_AFTER: Duration = Duration::from_millis(10);
 /// régler sur `gc_max_slice_us`.
 const GC_SLICE_SLOTS: u32 = 10_000;
 const GC_SLICE_BYTES: usize = 2 * radixox_lib::pool::BLOCK;
+/// Plafond de temps d'une tranche, celui qui compte à froid (slots ≠ coût) : 50 µs, comme
+/// le compactage, ~10 % d'un p99 de ~500 µs.
+const GC_SLICE_TIME: Duration = Duration::from_micros(50);
 
 /// Compactage de la slab des nœuds (MEMORY_ARCH.md §17.2) : unités par tranche (4 par
 /// copie, 2 par parent, 1 par enfant ≈ lignes de cache touchées). Pipeline de 8 sur une
@@ -2614,7 +2617,7 @@ impl Core {
         use radixox_lib::pool;
         let Some(pass) = self.gc.pass.as_mut() else { return false };
         let t0 = Instant::now();
-        let done = pass.step(&mut self.art, GC_SLICE_SLOTS, GC_SLICE_BYTES);
+        let done = pass.step(&mut self.art, GC_SLICE_SLOTS, GC_SLICE_BYTES, GC_SLICE_TIME);
         self.gc.max_slice_us = self.gc.max_slice_us.max(t0.elapsed().as_micros() as u64);
         if !done {
             return true;

@@ -82,15 +82,19 @@ impl GcPass {
         Self { phase: Phase::Oxidart, at: 0 }
     }
 
-    /// Une tranche : s'arrête au premier plafond atteint, `max_slots` slots visités ou
-    /// `max_bytes` octets recopiés (travail borné, donc coût par tour prévisible). Vrai
-    /// quand la passe est finie.
-    pub fn step(&mut self, art: &mut OxidArt, max_slots: u32, max_bytes: usize) -> bool {
-        /// Slots par appel aux énumérateurs : le plafond d'octets est vérifié entre deux.
-        const CHUNK: u32 = 256;
+    /// Une tranche : s'arrête au premier plafond atteint, `max_slots` slots visités,
+    /// `max_bytes` octets recopiés ou `max_time` écoulé. Le temps borne vraiment la tranche :
+    /// un slot coûte ~10–20 ns cache chaud mais un défaut de cache ou plus à froid (le petit
+    /// bloc d'un Hash en plus) ; 10 000 slots froids ont pris 1,8 ms (YCSB 1M). Vrai quand
+    /// la passe est finie.
+    pub fn step(&mut self, art: &mut OxidArt, max_slots: u32, max_bytes: usize, max_time: std::time::Duration) -> bool {
+        /// Slots par appel aux énumérateurs : octets et temps vérifiés entre deux (64 slots
+        /// froids ≈ 10 µs).
+        const CHUNK: u32 = 64;
+        let t0 = std::time::Instant::now();
         let mut v = Relocate { moved: 0 };
         let mut slots = 0;
-        while slots < max_slots && v.moved < max_bytes {
+        while slots < max_slots && v.moved < max_bytes && (slots == 0 || t0.elapsed() < max_time) {
             let n = CHUNK.min(max_slots - slots);
             slots += n;
             let next = match self.phase {
@@ -323,7 +327,7 @@ impl OxidArt {
             return;
         }
         let mut pass = GcPass::new();
-        while !pass.step(self, u32::MAX, usize::MAX) {}
+        while !pass.step(self, u32::MAX, usize::MAX, std::time::Duration::MAX) {}
         pool::gc_unmark_all();
     }
 }

@@ -1283,6 +1283,13 @@ Chaque étape : tests verts, commit, push (règle du dépôt) ; mesure courte qu
      bloc, et le GC travaillait trop par tour sous charge. `INFO` : `gc_max_slice_us`, pour
      régler les plafonds sur mesure (ordre de grandeur attendu : 100–200 µs pour 10 000
      slots). Le compteur `allocated` du chemin chaud est retiré.
+   - **Plafond de temps en plus (2026-10-27)** : l'ordre de grandeur ne tenait pas à froid.
+     YCSB A 1M (Hash d'un champ) : `gc_max_slice_us` = **1 800–2 080 µs** (un défaut de
+     cache par slot, plus le petit bloc du Hash), et le READ p99.9 à 1 941 µs contre 689
+     GC coupé. Une tranche s'arrête désormais aussi à **50 µs** (`GC_SLICE_TIME`, horloge
+     lue tous les 64 slots) : tranche max 146 µs, p99.9 617 µs (= GC coupé), débit inchangé
+     (254 K), passes plus longues en durée (85 → 350 ms) mais étalées. Les plafonds de slots
+     et d'octets restent (garde-fous à chaud).
    - **bench_compare.sh (YCSB A, 500 K enregistrements, 2026-10-23, avant les tranches
      fixes)** : 1 cœur, pool = mimalloc (231 K contre 227 K ops/s, p99 838 contre 863 µs,
      RSS 191 contre 183 Mo) ; 3 cœurs, pool −8 % une fois ramené au Valkey de chaque run
