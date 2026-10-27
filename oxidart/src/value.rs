@@ -7,6 +7,7 @@ use hislab::HiSlab;
 use radixox_lib::shared_byte::SharedByte;
 use valart::ValTrees;
 
+use crate::list::List;
 use crate::small;
 use crate::zset::ZSet;
 
@@ -59,7 +60,7 @@ pub(crate) union ValUnion {
 /// dans `ValUnion::idx`.
 static mut VALART: MaybeUninit<ValTrees> = MaybeUninit::uninit();
 static mut ZSET_SLAB: MaybeUninit<HiSlab<ZSet>> = MaybeUninit::uninit();
-static mut LIST_SLAB: MaybeUninit<HiSlab<VecDeque<SharedByte>>> = MaybeUninit::uninit();
+static mut LIST_SLAB: MaybeUninit<HiSlab<List>> = MaybeUninit::uninit();
 
 static SLAB_INIT: std::sync::Once = std::sync::Once::new();
 
@@ -92,7 +93,7 @@ fn zset_slab() -> &'static mut HiSlab<ZSet> {
     }
 }
 #[inline]
-pub(crate) fn list_slab() -> &'static mut HiSlab<VecDeque<SharedByte>> {
+fn list_slab() -> &'static mut HiSlab<List> {
     #[allow(static_mut_refs)]
     unsafe {
         LIST_SLAB.assume_init_mut()
@@ -231,18 +232,35 @@ pub(crate) fn zset_slab_mut() -> &'static mut HiSlab<ZSet> {
 }
 
 /// Parcourt toutes les List du slab (section List de la save).
-pub(crate) fn for_each_list(f: impl FnMut(u32, &VecDeque<SharedByte>)) {
+pub(crate) fn for_each_list(f: impl FnMut(u32, &List)) {
     list_slab().for_each_occupied(f);
 }
 
 pub(crate) fn alloc_list(val: VecDeque<SharedByte>) -> u32 {
-    list_slab().insert(val)
+    list_slab().insert(List::from_values(val))
 }
+pub(crate) fn alloc_list_raw(l: List) -> u32 {
+    list_slab().insert(l)
+}
+/// Libère la List `idx` : tout de suite si elle est petite, sinon par tranches
+/// (`list::lazy`).
 pub(crate) fn free_list(idx: u32) {
-    list_slab().remove(idx);
+    if let Some(l) = list_slab().remove(idx) {
+        crate::list::lazy::release(l);
+    }
 }
-pub(crate) fn list_ref(idx: u32) -> &'static VecDeque<SharedByte> {
+pub(crate) fn list_ref(idx: u32) -> &'static List {
     list_slab().get(idx).unwrap()
+}
+/// Point de passage de toute modification d'un en-tête de List.
+pub(crate) fn list_mut(idx: u32) -> &'static mut List {
+    list_slab().get_mut(idx).unwrap()
+}
+
+/// Précharge la case de l'en-tête de la List `idx` (chaînes AMAC).
+#[inline]
+pub(crate) fn prefetch_list(idx: u32) {
+    radixox_lib::prefetch::prefetch_l1(list_slab().slot_ptr(idx) as *const u8);
 }
 
 // ─── Tag+ValUnion ↔ Value conversions ────────────────────────────────────────
@@ -285,7 +303,7 @@ pub(crate) unsafe fn value_from_raw_ref(tag: Tag, val: &ValUnion) -> Value {
             ),
             Tag::SetSmall => Value::Set(small::entries::<1>(val.ptr).iter().map(|[m]| m.clone()).collect()),
             Tag::ZSet => Value::ZSet(zset_ref(val.idx).clone()),
-            Tag::List => Value::List(list_ref(val.idx).clone()),
+            Tag::List => Value::List(list_ref(val.idx).iter().cloned().collect()),
         }
     }
 }
@@ -318,7 +336,14 @@ pub(crate) unsafe fn value_take_raw(tag: Tag, val: ValUnion) -> Value {
                 free_zset(val.idx);
                 Value::ZSet(z)
             }
-            Tag::List => Value::List(list_slab().remove(val.idx).expect("list slot")),
+            Tag::List => {
+                let mut l = list_slab().remove(val.idx).expect("list slot");
+                let mut out = VecDeque::with_capacity(l.len() as usize);
+                while let Some(v) = l.pop_front() {
+                    out.push_back(v);
+                }
+                Value::List(out)
+            }
         }
     }
 }

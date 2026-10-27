@@ -14,7 +14,7 @@ use radixox_lib::shared_byte::SharedByte;
 use crate::OxidArt;
 use crate::compact_path::CompactPath;
 use crate::small;
-use crate::value::{Tag, ValUnion, list_slab, valart, zset_slab_mut};
+use crate::value::{Tag, ValUnion, valart, zset_slab_mut};
 
 /// Ce que les énumérateurs donnent à voir : les `SharedByte` de l'arbre et ses chemins sur le
 /// tas (`CompactPath`, MEMORY_ARCH.md §17). Une closure sur `&mut SharedByte` est un visiteur
@@ -204,16 +204,9 @@ impl OxidArt {
         valart().gc_visit(from, budget, &mut Bridge(v))
     }
 
-    /// Même contrat que [`Self::gc_visit`], sur les listes.
+    /// Même contrat que [`Self::gc_visit`], sur les blocs des listes.
     pub fn gc_visit_lists(&mut self, from: u32, budget: u32, f: &mut impl FnMut(&mut SharedByte)) -> Option<u32> {
-        let lists = list_slab();
-        let mut at = from;
-        for _ in 0..budget {
-            let i = lists.next_occupied(at)?;
-            unsafe { lists.get_unchecked_mut(i) }.iter_mut().for_each(&mut *f);
-            at = i + 1;
-        }
-        Some(at)
+        crate::list::gc_visit(from, budget, f)
     }
 
     /// Même contrat que [`Self::gc_visit`], sur les ZSet : le bloc d'une petite forme est un
@@ -235,7 +228,7 @@ impl OxidArt {
     pub fn gc_slot_span(&self) -> u64 {
         self.map.slot_span() as u64
             + valart().slot_span() as u64
-            + list_slab().slot_span() as u64
+            + crate::list::slot_span() as u64
             + zset_slab_mut().slot_span() as u64
     }
 

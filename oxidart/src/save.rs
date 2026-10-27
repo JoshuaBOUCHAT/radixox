@@ -553,7 +553,7 @@ impl OxidArt {
         for_each_list(|idx, l| {
             put_varint(out, idx as u64);
             put_varint(out, l.len() as u64);
-            for item in l {
+            for item in l.iter() {
                 put_bytes(out, item);
             }
             list_sums.insert(idx, digest::list_inner(l.iter().map(|b| b.as_slice())));

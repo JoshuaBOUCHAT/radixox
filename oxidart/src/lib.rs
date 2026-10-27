@@ -415,16 +415,18 @@ impl OxidArt {
         valart().drain_deferred(rest)
     }
 
-    /// Une tranche de la libération des grands ZSet supprimés (`zset::lazy`), au plus
-    /// `budget` nœuds et membres ; rien pendant une save. Vrai s'il en reste.
+    /// Une tranche de la libération des grands ZSet et des grandes List supprimés
+    /// (`zset::lazy`, `list::lazy`), au plus `budget` unités (nœuds, membres, blocs) ; rien
+    /// pendant une save. Vrai s'il en reste.
     pub fn zset_free_step(&mut self, budget: u32) -> bool {
-        zset::lazy::step(budget)
+        let z = zset::lazy::step(budget);
+        list::lazy::step(budget / 16) || z
     }
 
-    /// Des grands ZSet attendent d'être libérés, et ça peut avancer maintenant (pas de
-    /// save en cours).
+    /// Des grands ZSet ou de grandes List attendent d'être libérés, et ça peut avancer
+    /// maintenant (pas de save en cours).
     pub fn zset_free_pending(&self) -> bool {
-        zset::lazy::pending() > 0 && !self.is_saving()
+        (zset::lazy::pending() > 0 || list::lazy::pending() > 0) && !self.is_saving()
     }
 
     /// Nombre de nœuds qui ont une page de débordement.

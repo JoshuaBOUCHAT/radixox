@@ -17,6 +17,7 @@ use std::mem::MaybeUninit;
 use hislab::HiSlab;
 use radixox_lib::shared_byte::SharedByte;
 
+pub mod lazy;
 pub mod save;
 
 /// Cases par bloc.
