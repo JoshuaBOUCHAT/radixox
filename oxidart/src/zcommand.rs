@@ -3,12 +3,13 @@
 //! `InnerZCommand` (l'ancien ZSet : `SmallVec` trié puis `BTreeSet` + `HashMap`) ne sert
 //! plus que d'oracle aux tests différentiels.
 
+use radixox_lib::cmd::{ZAddFlags, ZRangeBy};
 use radixox_lib::shared_byte::SharedByte;
 
 use crate::{
     OxidArt,
     error::TypeError,
-    value::{RedisType, Tag, alloc_zset, zset_mut},
+    value::{RedisType, Tag, alloc_zset, zset_mut, zset_ref},
     zset::{Added, ZSet, decode_score, encode_score},
 };
 
@@ -174,6 +175,13 @@ mod oracle {
 
 }
 
+/// Réponse de ZADD : un compte, ou le score (INCR ; `None` si rien n'a été fait).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ZAddReply {
+    Count(u32),
+    Score(Option<f64>),
+}
+
 impl OxidArt {
     /// ZSet de `key`, créé s'il n'existe pas.
     fn get_zset_mut(&mut self, ttl: Option<u64>, key: SharedByte) -> Result<&'static mut ZSet, TypeError> {
@@ -200,6 +208,248 @@ impl OxidArt {
             }
         }
         Ok(added)
+    }
+
+    /// ZADD avec options (NX, XX, GT, LT, CH, INCR ; combinaisons validées par le
+    /// parseur), comme `zsetAdd` de Redis : NX n'ajoute que les nouveaux, XX ne met à jour
+    /// que les présents, GT / LT ne mettent à jour que si le score monte / descend (les
+    /// nouveaux sont ajoutés), CH compte aussi les mises à jour. XX sur une clé absente ne
+    /// la crée pas.
+    pub fn cmd_zadd_opts(
+        &mut self,
+        key: SharedByte,
+        flags: ZAddFlags,
+        score_members: &[(f64, SharedByte)],
+        ttl: Option<u64>,
+    ) -> Result<ZAddReply, TypeError> {
+        if score_members.iter().any(|(s, _)| s.is_nan()) {
+            return Err(TypeError::NotAFloat);
+        }
+        let zset = if flags.xx {
+            let Some(val) = self.get_ref(&key) else {
+                return Ok(if flags.incr { ZAddReply::Score(None) } else { ZAddReply::Count(0) });
+            };
+            zset_mut(val.zset_idx().map_err(|_| TypeError::ValueNotSet)?)
+        } else {
+            self.get_zset_mut(ttl, key)?
+        };
+        let (mut added, mut updated) = (0u32, 0u32);
+        let mut last = None;
+        for (score, member) in score_members {
+            last = None;
+            match zset.score(member).map(decode_score) {
+                Some(old) => {
+                    if flags.nx {
+                        continue;
+                    }
+                    let new = if flags.incr { old + score } else { *score };
+                    if new.is_nan() {
+                        return Err(TypeError::NotAFloat);
+                    }
+                    if (flags.gt && new <= old) || (flags.lt && new >= old) {
+                        continue;
+                    }
+                    if new != old {
+                        zset.add(encode_score(new), member).ok_or(TypeError::OutOfMemory)?;
+                        updated += 1;
+                    }
+                    last = Some(new);
+                }
+                None => {
+                    if flags.xx {
+                        continue;
+                    }
+                    zset.add(encode_score(*score), member).ok_or(TypeError::OutOfMemory)?;
+                    added += 1;
+                    last = Some(*score);
+                }
+            }
+        }
+        Ok(if flags.incr {
+            ZAddReply::Score(last)
+        } else {
+            ZAddReply::Count(if flags.ch { added + updated } else { added })
+        })
+    }
+
+    /// ZRANGE et ses variantes : la plage en rangs `[lo, hi)`, puis `LIMIT offset count`
+    /// dans le sens du parcours (REV : du plus grand au plus petit). Rang + REV : les
+    /// indices comptent depuis la fin.
+    pub fn cmd_zrange_by(
+        &mut self,
+        key: &[u8],
+        range: ZRangeBy<'_>,
+        rev: bool,
+        limit: Option<(i64, i64)>,
+        with_scores: bool,
+    ) -> Result<Vec<SharedByte>, RedisType> {
+        let Some(val) = self.get_ref(key) else {
+            return Ok(Vec::new());
+        };
+        let zset = val.as_zset()?;
+        let len = zset.len();
+        let (mut lo, mut hi) = match range {
+            // rangs comptés dans l'ordre inverse : ramenés à l'ordre croissant
+            ZRangeBy::Rank(a, b) if rev => {
+                let (l, h) = zset.rank_range(a, b);
+                (len - h, len - l)
+            }
+            r => zset.resolve(r),
+        };
+        if let Some((offset, count)) = limit {
+            // Offset négatif : non documenté ; Valkey y rend vide ou le dernier élément
+            // selon l'encodage du ZSet (listpack ou skiplist). Ici : toujours vide.
+            if offset < 0 {
+                return Ok(Vec::new());
+            }
+            let n = hi - lo;
+            let off = (offset as usize).min(n);
+            let take = if count < 0 { n - off } else { (count as usize).min(n - off) };
+            if rev {
+                hi -= off;
+                lo = hi - take;
+            } else {
+                lo += off;
+                hi = lo + take;
+            }
+        }
+        Ok(self.zrange_out(key, lo, hi, rev, with_scores))
+    }
+
+    /// Entrées des rangs `[lo, hi)` de la ZSet `key` (présente), dans le sens demandé.
+    fn zrange_out(&mut self, key: &[u8], lo: usize, hi: usize, rev: bool, with_scores: bool) -> Vec<SharedByte> {
+        let Some(val) = self.get_ref(key) else { return Vec::new() };
+        let Ok(zset) = val.as_zset() else { return Vec::new() };
+        let n = hi.saturating_sub(lo);
+        let mut out = Vec::with_capacity(if with_scores { 2 * n } else { n });
+        let mut push = |(s, m): (u64, &[u8])| {
+            out.push(SharedByte::from_slice(m));
+            if with_scores {
+                out.push(SharedByte::from_slice(decode_score(s).to_string()));
+            }
+        };
+        if n > 0 {
+            if rev {
+                zset.iter_back_from(hi - 1).take(n).for_each(&mut push);
+            } else {
+                zset.iter_from(lo).take(n).for_each(&mut push);
+            }
+        }
+        out
+    }
+
+    /// ZRANK / ZREVRANK : `(rang, score)`.
+    pub fn cmd_zrank(&mut self, key: &[u8], member: &[u8], rev: bool) -> Result<Option<(u64, f64)>, RedisType> {
+        let Some(val) = self.get_ref(key) else {
+            return Ok(None);
+        };
+        let zset = val.as_zset()?;
+        let Some(r) = zset.rank(member) else { return Ok(None) };
+        let score = decode_score(zset.score(member).expect("membre classé"));
+        Ok(Some((if rev { zset.len() - 1 - r } else { r } as u64, score)))
+    }
+
+    /// ZCOUNT / ZLEXCOUNT : deux rangs, O(log n).
+    pub fn cmd_zcount(&mut self, key: &[u8], range: ZRangeBy<'_>) -> Result<u64, RedisType> {
+        let Some(val) = self.get_ref(key) else {
+            return Ok(0);
+        };
+        let (lo, hi) = val.as_zset()?.resolve(range);
+        Ok((hi - lo) as u64)
+    }
+
+    /// ZPOPMIN / ZPOPMAX : `(membre, score)` retirés, du plus petit (ou plus grand) ; un
+    /// ZSet vidé disparaît.
+    pub fn cmd_zpop(&mut self, key: &[u8], max: bool, count: u64) -> Result<Vec<(SharedByte, f64)>, RedisType> {
+        let (popped, empty) = {
+            let Some(val) = self.get_ref(key) else {
+                return Ok(Vec::new());
+            };
+            let zset = zset_mut(val.zset_idx()?);
+            let n = (count as usize).min(zset.len());
+            let picked: Vec<(SharedByte, f64)> = if max {
+                zset.iter_back_from(zset.len().wrapping_sub(1)).take(n).map(|(s, m)| (SharedByte::from_slice(m), decode_score(s))).collect()
+            } else {
+                zset.iter().take(n).map(|(s, m)| (SharedByte::from_slice(m), decode_score(s))).collect()
+            };
+            for (m, _) in &picked {
+                zset.remove(m);
+            }
+            (picked, zset.is_empty())
+        };
+        if empty {
+            self.del(key);
+        }
+        Ok(popped)
+    }
+
+    /// ZREMRANGEBYRANK / BYSCORE / BYLEX : nombre de membres retirés.
+    pub fn cmd_zremrange(&mut self, key: &[u8], range: ZRangeBy<'_>) -> Result<u64, RedisType> {
+        let (removed, empty) = {
+            let Some(val) = self.get_ref(key) else {
+                return Ok(0);
+            };
+            let idx = val.zset_idx()?;
+            let (lo, hi) = zset_ref(idx).resolve(range);
+            if lo >= hi {
+                return Ok(0);
+            }
+            let members = zset_ref(idx).members_in(lo, hi);
+            let zset = zset_mut(idx);
+            for m in &members {
+                zset.remove(m);
+            }
+            (members.len() as u64, zset.is_empty())
+        };
+        if empty {
+            self.del(key);
+        }
+        Ok(removed)
+    }
+
+    /// ZMSCORE.
+    pub fn cmd_zmscore(&mut self, key: &[u8], members: &[&[u8]]) -> Result<Vec<Option<f64>>, RedisType> {
+        let Some(val) = self.get_ref(key) else {
+            return Ok(vec![None; members.len()]);
+        };
+        let zset = val.as_zset()?;
+        Ok(members.iter().map(|m| zset.score(m).map(decode_score)).collect())
+    }
+
+    /// ZRANDMEMBER : `count > 0` = membres distincts (au plus tous), `count < 0` =
+    /// `|count|` tirages avec répétition ; sans count, un seul. Tirage uniforme par rang
+    /// (sélection O(log n)).
+    pub fn cmd_zrandmember(&mut self, key: &[u8], count: Option<i64>) -> Result<Vec<(SharedByte, f64)>, RedisType> {
+        use rand::Rng;
+        let Some(val) = self.get_ref(key) else {
+            return Ok(Vec::new());
+        };
+        let zset = val.as_zset()?;
+        let len = zset.len();
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let at = |r: usize| {
+            let (s, m) = zset.iter_from(r).next().expect("rang dans le ZSet");
+            (SharedByte::from_slice(m), decode_score(s))
+        };
+        let mut rng = rand::thread_rng();
+        Ok(match count {
+            None => vec![at(rng.gen_range(0..len))],
+            Some(c) if c < 0 => (0..c.unsigned_abs()).map(|_| at(rng.gen_range(0..len))).collect(),
+            Some(c) if c as usize >= len => zset.iter().map(|(s, m)| (SharedByte::from_slice(m), decode_score(s))).collect(),
+            Some(c) => {
+                // rangs distincts (Floyd) : c tirages, sans rejet
+                let mut picked = std::collections::BTreeSet::new();
+                for j in len - c as usize..len {
+                    let r = rng.gen_range(0..=j);
+                    if !picked.insert(r) {
+                        picked.insert(j);
+                    }
+                }
+                picked.into_iter().map(at).collect()
+            }
+        })
     }
 
     /// ZCARD.

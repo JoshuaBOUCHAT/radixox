@@ -535,7 +535,7 @@ fn cmd_sadd() {
 fn cmd_zadd() {
     let r = resp(&[b"ZADD", b"z", b"1.5", b"m1", b"2.0", b"m2"]);
     match Cmd::from_slice(&r) {
-        Some(Cmd::ZAdd { key, members }) => {
+        Some(Cmd::ZAdd { key, members, .. }) => {
             assert_eq!(&*key, b"z");
             assert_eq!(members.len(), 2);
             assert_eq!(members[0].0, 1.5f64);
@@ -549,9 +549,9 @@ fn cmd_zadd() {
 fn cmd_zrange_with_scores() {
     let r = resp(&[b"ZRANGE", b"z", b"0", b"-1", b"WITHSCORES"]);
     match Cmd::from_slice(&r) {
-        Some(Cmd::ZRange { start, stop, with_scores, .. }) => {
-            assert_eq!(start, 0);
-            assert_eq!(stop, -1);
+        Some(Cmd::ZRange { range, rev, with_scores, .. }) => {
+            assert_eq!(range, crate::cmd::ZRangeBy::Rank(0, -1));
+            assert!(!rev);
             assert!(with_scores);
         }
         _ => panic!("expected ZRange"),

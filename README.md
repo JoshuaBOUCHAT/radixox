@@ -529,7 +529,7 @@ own synchronization.
 | Expiration | `EXPIRE` `PEXPIRE` `PERSIST` `TTL` `PTTL` |
 | Hash | `HSET` `HMSET` `HGET` `HMGET` `HGETALL` `HDEL` `HEXISTS` `HLEN` `HKEYS` `HVALS` `HINCRBY` |
 | Set | `SADD` `SREM` `SISMEMBER` `SCARD` `SMEMBERS` `SPOP` |
-| Sorted set | `ZADD` `ZREM` `ZSCORE` `ZCARD` `ZRANGE` (`WITHSCORES`) `ZINCRBY` |
+| Sorted set | `ZADD` (`NX` `XX` `GT` `LT` `CH` `INCR`) `ZREM` `ZSCORE` `ZMSCORE` `ZCARD` `ZINCRBY` `ZRANGE` (`BYSCORE` `BYLEX` `REV` `LIMIT` `WITHSCORES`) `ZREVRANGE` `ZRANGEBYSCORE` `ZREVRANGEBYSCORE` `ZRANGEBYLEX` `ZREVRANGEBYLEX` `ZRANK` `ZREVRANK` (`WITHSCORE`) `ZCOUNT` `ZLEXCOUNT` `ZPOPMIN` `ZPOPMAX` `ZREMRANGEBYRANK` `ZREMRANGEBYSCORE` `ZREMRANGEBYLEX` `ZRANDMEMBER` |
 | Pub/Sub | `SUBSCRIBE` `UNSUBSCRIBE` `PUBLISH` |
 | Replication | `REPLICATE` (`host port [AUTH pass]`, `STOP host port`) `REPLICAOF NO ONE` `WAIT` `DEBUG DIGEST` (internal: `RXHELLO` `RXLOAD` `RXBLOCK` `RXTICK`) |
 
@@ -799,7 +799,7 @@ a simulated kernel.
   stored as `i64` and formatted on read.
 - Hash and Set: up to 8 entries, one compact block of `SharedByte` pointers; beyond that,
   **valart**, a compact radix tree per container.
-- Sorted set: `BTreeSet<(score, member)>` + hash map for O(1) `ZSCORE`.
+- Sorted set: up to 128 members of ≤ 64 bytes, one columnar block (2/4/8-byte scores); beyond, a hashed bucket trie (member → score, never rehashed) + a counted B+tree (order, ranks in O(log n)), members stored once behind relocatable handles. Saved progressively behind the copy-on-write barrier; deleting a large one is done in slices in the background.
 
 **Single-threaded on purpose**: no locks, no contention, predictable tail latency. Scaling
 across cores is meant to come from sharding by namespace, not from shared-state threads.

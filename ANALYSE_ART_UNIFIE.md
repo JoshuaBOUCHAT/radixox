@@ -899,4 +899,14 @@ Code : `radixox-lib/src/handle.rs` (poignées), `oxidart/src/zset/` (`btree.rs`,
   rendus par tranches en fond (~4 K unités par tranche), gelée pendant une save. Mesuré :
   DEL d'1 M membres 0,03 ms, tout rendu en moins de 2 s, PING max 0,21 ms.
 
-Reste : mesures (étape 8), commandes manquantes.
+**Commandes (2026-10-27).** ZADD (NX XX GT LT CH INCR), ZRANGE (BYSCORE BYLEX REV
+LIMIT WITHSCORES), ZREVRANGE, ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX,
+ZREVRANGEBYLEX, ZRANK / ZREVRANK (WITHSCORE), ZCOUNT, ZLEXCOUNT, ZPOPMIN / ZPOPMAX,
+ZREMRANGEBYRANK / BYSCORE / BYLEX, ZMSCORE, ZRANDMEMBER. Plages résolues en deux rangs
+(`lower_bound`, O(log n)) puis parcours des feuilles. Différentiel contre Valkey 9.1.2
+(`scripts/zset_vs_valkey.py`) : 0 écart sur 8 × ~29 000 commandes, grande forme comprise.
+Écart voulu : `LIMIT` à offset négatif rend toujours vide (Valkey : vide ou dernier élément
+selon l'encodage du ZSet, non documenté). ZREMRANGEBY* et ZPOP retirent membre par membre
+(O(k log n), synchrone).
+
+Reste : mesures (étape 8) ; ZSCAN, ZUNION / ZINTER / ZDIFF (STORE), BZPOP*.

@@ -197,10 +197,22 @@ fn command(rng: &mut Rng, conn: usize) -> (Vec<u8>, Reply) {
         127..=129 => {
             let zk = format!("bigz#{conn}").into_bytes();
             let bm = format!("member:{}", rng.below(300)).into_bytes();
-            match rng.below(6) {
+            let lo = (rng.below(20) as i64 - 10).to_string().into_bytes();
+            let hi = format!("({}", rng.below(20) as i64 - 5).into_bytes();
+            match rng.below(16) {
                 0..=2 => resp(&[b"ZADD", &zk, &score, &bm]),
                 3 => resp(&[b"ZREM", &zk, &bm]),
                 4 => resp(&[b"ZSCORE", &zk, &bm]),
+                5 => resp(&[b"ZADD", &zk, b"GT", b"CH", &score, &bm]),
+                6 => resp(&[b"ZADD", &zk, b"XX", b"INCR", &score, &bm]),
+                7 => resp(&[b"ZRANK", &zk, &bm, b"WITHSCORE"]),
+                8 => resp(&[b"ZREVRANK", &zk, &bm]),
+                9 => resp(&[b"ZCOUNT", &zk, &lo, &hi]),
+                10 => resp(&[b"ZRANGEBYSCORE", &zk, &lo, &hi, b"WITHSCORES", b"LIMIT", b"1", b"5"]),
+                11 => resp(&[b"ZRANGE", &zk, &hi, &lo, b"BYSCORE", b"REV"]),
+                12 => resp(&[b"ZMSCORE", &zk, &bm, &m]),
+                13 => resp(&[if rng.below(2) == 0 { b"ZPOPMIN" } else { b"ZPOPMAX" }, &zk, b"2"]),
+                14 => resp(&[b"ZREMRANGEBYSCORE", &zk, &lo, &hi]),
                 _ => {
                     let r = rng.below(200).to_string().into_bytes();
                     resp(&[b"ZRANGE", &zk, &r, b"-1", b"WITHSCORES"])

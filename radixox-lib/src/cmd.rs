@@ -8,6 +8,43 @@ use crate::shared_byte::SharedByte;
 // SET options
 // ---------------------------------------------------------------------------
 
+/// Options de ZADD (NX, XX, GT, LT, CH, INCR), combinaisons déjà validées.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ZAddFlags {
+    pub nx: bool,
+    pub xx: bool,
+    pub gt: bool,
+    pub lt: bool,
+    pub ch: bool,
+    pub incr: bool,
+}
+
+/// Borne de score : `1.5`, `(1.5` (exclue), `-inf`, `+inf`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScoreBound {
+    pub value: f64,
+    pub excl: bool,
+}
+
+/// Borne lexicographique : `-`, `+`, `[a` (incluse), `(a` (exclue).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LexBound<'a> {
+    Min,
+    Max,
+    Incl(&'a [u8]),
+    Excl(&'a [u8]),
+}
+
+/// Ce que désigne une plage de ZSet ; bornes toujours dans l'ordre (min, max), même
+/// pour les variantes REV (le parseur les remet dans l'ordre).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ZRangeBy<'a> {
+    /// Rangs (négatifs depuis la fin), dans le sens du parcours.
+    Rank(i64, i64),
+    Score(ScoreBound, ScoreBound),
+    Lex(LexBound<'a>, LexBound<'a>),
+}
+
 #[derive(Debug)]
 pub enum SetCondition {
     Always,
@@ -278,22 +315,49 @@ pub enum Cmd<'a> {
     SPop { key: &'a [u8], count: Option<u64> },
 
     // --- ZSet --------------------------------------------------------
-    /// ZADD key score member [score member ...]
+    /// ZADD key [NX|XX] [GT|LT] [CH] [INCR] score member [score member ...]
     ZAdd {
         key: &'a [u8],
+        flags: ZAddFlags,
         members: SmallVec<2, (f64, SharedByte)>,
     },
 
     /// ZCARD key
     ZCard(&'a [u8]),
 
-    /// ZRANGE key start stop [WITHSCORES]
+    /// ZRANGE key a b [BYSCORE|BYLEX] [REV] [LIMIT offset count] [WITHSCORES], et
+    /// ZREVRANGE, ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZREVRANGEBYLEX.
+    /// `limit` : `(offset, count)`, `count < 0` = tout.
     ZRange {
         key: &'a [u8],
-        start: i64,
-        stop: i64,
+        range: ZRangeBy<'a>,
+        rev: bool,
+        limit: Option<(i64, i64)>,
         with_scores: bool,
     },
+
+    /// ZRANK / ZREVRANK key member [WITHSCORE]
+    ZRank {
+        key: &'a [u8],
+        member: &'a [u8],
+        rev: bool,
+        with_score: bool,
+    },
+
+    /// ZCOUNT key min max (score) ; ZLEXCOUNT key min max (`range` = `Lex`)
+    ZCount { key: &'a [u8], range: ZRangeBy<'a> },
+
+    /// ZPOPMIN / ZPOPMAX key [count]
+    ZPop { key: &'a [u8], max: bool, count: Option<u64> },
+
+    /// ZREMRANGEBYRANK / ZREMRANGEBYSCORE / ZREMRANGEBYLEX key a b
+    ZRemRange { key: &'a [u8], range: ZRangeBy<'a> },
+
+    /// ZMSCORE key member [member ...]
+    ZMScore { key: &'a [u8], members: SmallVec<4, &'a [u8]> },
+
+    /// ZRANDMEMBER key [count [WITHSCORES]]
+    ZRandMember { key: &'a [u8], count: Option<i64>, with_scores: bool },
 
     /// ZSCORE key member
     ZScore { key: &'a [u8], member: SharedByte },
@@ -579,6 +643,27 @@ fn float(s: &[u8]) -> Result<f64, CmdError> {
     arg_f64(s).ok_or(CmdError::NotFloat)
 }
 
+/// Borne de score de ZRANGEBYSCORE & co : `(` = exclue.
+fn score_bound(s: &[u8]) -> Result<ScoreBound, CmdError> {
+    let (excl, v) = match s.split_first() {
+        Some((b'(', rest)) => (true, rest),
+        _ => (false, s),
+    };
+    let value = arg_f64(v).ok_or(CmdError::Msg("ERR min or max is not a float"))?;
+    Ok(ScoreBound { value, excl })
+}
+
+/// Borne lexicographique : `-`, `+`, `[x`, `(x`.
+fn lex_bound(s: &[u8]) -> Result<LexBound<'_>, CmdError> {
+    match s {
+        b"-" => Ok(LexBound::Min),
+        b"+" => Ok(LexBound::Max),
+        [b'[', rest @ ..] => Ok(LexBound::Incl(rest)),
+        [b'(', rest @ ..] => Ok(LexBound::Excl(rest)),
+        _ => Err(CmdError::Msg("ERR min or max not valid string range item")),
+    }
+}
+
 /// Construit une valeur possédée — réservé aux champs qui doivent survivre
 /// à la commande (valeur stockée, ou donnée traversant une commande async).
 fn port_num(s: &[u8]) -> Result<u16, CmdError> {
@@ -807,24 +892,166 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
 
         // ── ZSet ─────────────────────────────────────────────────────────
         b"zadd" => {
-            if n < 3 || n % 2 == 0 {
-                return Err(CmdError::Arity);
+            at_least!(3);
+            let mut flags = ZAddFlags::default();
+            let mut i = 1;
+            while i < n {
+                let a = args[i];
+                match () {
+                    _ if a.eq_ignore_ascii_case(b"nx") => flags.nx = true,
+                    _ if a.eq_ignore_ascii_case(b"xx") => flags.xx = true,
+                    _ if a.eq_ignore_ascii_case(b"gt") => flags.gt = true,
+                    _ if a.eq_ignore_ascii_case(b"lt") => flags.lt = true,
+                    _ if a.eq_ignore_ascii_case(b"ch") => flags.ch = true,
+                    _ if a.eq_ignore_ascii_case(b"incr") => flags.incr = true,
+                    _ => break,
+                }
+                i += 1;
+            }
+            let rest = &args[i..];
+            if rest.is_empty() || rest.len() % 2 != 0 {
+                return Err(CmdError::Syntax);
+            }
+            if flags.nx && flags.xx {
+                return Err(CmdError::Msg("ERR XX and NX options at the same time are not compatible"));
+            }
+            if (flags.gt && flags.lt) || ((flags.gt || flags.lt) && flags.nx) {
+                return Err(CmdError::Msg("ERR GT, LT, and/or NX options at the same time are not compatible"));
+            }
+            if flags.incr && rest.len() > 2 {
+                return Err(CmdError::Msg("ERR INCR option supports a single increment-element pair"));
             }
             let mut members = SmallVec::new();
-            for pair in args[1..].chunks_exact(2) {
+            for pair in rest.chunks_exact(2) {
                 members.push((float(pair[0])?, sb(pair[1])));
             }
-            Cmd::ZAdd { key: args[0], members }
+            Cmd::ZAdd { key: args[0], flags, members }
         }
         b"zcard" => { exact!(1); Cmd::ZCard(args[0]) }
         b"zrange" => {
+            at_least!(3);
+            let (mut by_score, mut by_lex, mut rev, mut limit, mut with_scores) = (false, false, false, None, false);
+            let mut i = 3;
+            while i < n {
+                let a = args[i];
+                match () {
+                    _ if a.eq_ignore_ascii_case(b"byscore") => by_score = true,
+                    _ if a.eq_ignore_ascii_case(b"bylex") => by_lex = true,
+                    _ if a.eq_ignore_ascii_case(b"rev") => rev = true,
+                    _ if a.eq_ignore_ascii_case(b"withscores") => with_scores = true,
+                    _ if a.eq_ignore_ascii_case(b"limit") && i + 2 < n => {
+                        limit = Some((int(args[i + 1])?, int(args[i + 2])?));
+                        i += 2;
+                    }
+                    _ => return Err(CmdError::Syntax),
+                }
+                i += 1;
+            }
+            if by_score && by_lex {
+                return Err(CmdError::Syntax);
+            }
+            if limit.is_some() && !by_score && !by_lex {
+                return Err(CmdError::Msg("ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX"));
+            }
+            if with_scores && by_lex {
+                return Err(CmdError::Msg("ERR syntax error, WITHSCORES not supported in combination with BYLEX"));
+            }
+            // REV avec BYSCORE / BYLEX : la plage s'écrit max puis min
+            let (lo, hi) = if rev && (by_score || by_lex) { (args[2], args[1]) } else { (args[1], args[2]) };
+            let range = if by_score {
+                ZRangeBy::Score(score_bound(lo)?, score_bound(hi)?)
+            } else if by_lex {
+                ZRangeBy::Lex(lex_bound(lo)?, lex_bound(hi)?)
+            } else {
+                ZRangeBy::Rank(int(args[1])?, int(args[2])?)
+            };
+            Cmd::ZRange { key: args[0], range, rev, limit, with_scores }
+        }
+        b"zrevrange" => {
             between!(3, 4);
             let with_scores = match args.get(3) {
                 Some(s) if s.eq_ignore_ascii_case(b"withscores") => true,
                 Some(_) => return Err(CmdError::Syntax),
                 None => false,
             };
-            Cmd::ZRange { key: args[0], start: int(args[1])?, stop: int(args[2])?, with_scores }
+            Cmd::ZRange { key: args[0], range: ZRangeBy::Rank(int(args[1])?, int(args[2])?), rev: true, limit: None, with_scores }
+        }
+        b"zrangebyscore" | b"zrevrangebyscore" | b"zrangebylex" | b"zrevrangebylex" => {
+            at_least!(3);
+            let rev = lc.starts_with(b"zrev");
+            let lex = lc.ends_with(b"lex");
+            let (mut limit, mut with_scores) = (None, false);
+            let mut i = 3;
+            while i < n {
+                let a = args[i];
+                if a.eq_ignore_ascii_case(b"withscores") && !lex {
+                    with_scores = true;
+                } else if a.eq_ignore_ascii_case(b"limit") && i + 2 < n {
+                    limit = Some((int(args[i + 1])?, int(args[i + 2])?));
+                    i += 2;
+                } else {
+                    return Err(CmdError::Syntax);
+                }
+                i += 1;
+            }
+            let (lo, hi) = if rev { (args[2], args[1]) } else { (args[1], args[2]) };
+            let range = if lex {
+                ZRangeBy::Lex(lex_bound(lo)?, lex_bound(hi)?)
+            } else {
+                ZRangeBy::Score(score_bound(lo)?, score_bound(hi)?)
+            };
+            Cmd::ZRange { key: args[0], range, rev, limit, with_scores }
+        }
+        b"zrank" | b"zrevrank" => {
+            between!(2, 3);
+            let with_score = match args.get(2) {
+                Some(s) if s.eq_ignore_ascii_case(b"withscore") => true,
+                Some(_) => return Err(CmdError::Syntax),
+                None => false,
+            };
+            Cmd::ZRank { key: args[0], member: args[1], rev: &*lc == b"zrevrank", with_score }
+        }
+        b"zcount" => {
+            exact!(3);
+            Cmd::ZCount { key: args[0], range: ZRangeBy::Score(score_bound(args[1])?, score_bound(args[2])?) }
+        }
+        b"zlexcount" => {
+            exact!(3);
+            Cmd::ZCount { key: args[0], range: ZRangeBy::Lex(lex_bound(args[1])?, lex_bound(args[2])?) }
+        }
+        b"zpopmin" | b"zpopmax" => {
+            between!(1, 2);
+            let count = match args.get(1) {
+                Some(c) => Some(arg_u64(c).ok_or(CmdError::Msg("ERR value is out of range, must be positive"))?),
+                None => None,
+            };
+            Cmd::ZPop { key: args[0], max: &*lc == b"zpopmax", count }
+        }
+        b"zremrangebyrank" => {
+            exact!(3);
+            Cmd::ZRemRange { key: args[0], range: ZRangeBy::Rank(int(args[1])?, int(args[2])?) }
+        }
+        b"zremrangebyscore" => {
+            exact!(3);
+            Cmd::ZRemRange { key: args[0], range: ZRangeBy::Score(score_bound(args[1])?, score_bound(args[2])?) }
+        }
+        b"zremrangebylex" => {
+            exact!(3);
+            Cmd::ZRemRange { key: args[0], range: ZRangeBy::Lex(lex_bound(args[1])?, lex_bound(args[2])?) }
+        }
+        b"zmscore" => { at_least!(2); Cmd::ZMScore { key: args[0], members: borrowed!(1) } }
+        b"zrandmember" => {
+            between!(1, 3);
+            let count = match args.get(1) {
+                Some(c) => Some(int(c)?),
+                None => None,
+            };
+            let with_scores = match args.get(2) {
+                Some(s) if s.eq_ignore_ascii_case(b"withscores") => true,
+                Some(_) => return Err(CmdError::Syntax),
+                None => false,
+            };
+            Cmd::ZRandMember { key: args[0], count, with_scores }
         }
         b"zscore" => { exact!(2); Cmd::ZScore { key: args[0], member: sb(args[1]) } }
         b"zrem" => { at_least!(2); Cmd::ZRem { key: args[0], members: owned!(1) } }
@@ -917,6 +1144,8 @@ pub enum CmdError {
     NotInt,
     /// Flottant attendu.
     NotFloat,
+    /// Message de Redis tel quel.
+    Msg(&'static str),
 }
 
 impl CmdError {
@@ -929,6 +1158,7 @@ impl CmdError {
             CmdError::Syntax => "ERR syntax error".into(),
             CmdError::NotInt => "ERR value is not an integer or out of range".into(),
             CmdError::NotFloat => "ERR value is not a valid float".into(),
+            CmdError::Msg(m) => m.into(),
         }
     }
 }
@@ -1014,6 +1244,8 @@ impl<'a> Cmd<'a> {
             Cmd::SPop { count, .. } => count.unwrap_or(1) as usize,
             Cmd::ZAdd { members, .. } => members.len(),
             Cmd::ZRem { members, .. } => members.len(),
+            Cmd::ZPop { count, .. } => count.unwrap_or(1).max(1) as usize,
+            Cmd::ZRemRange { .. } => 1,
             _ => 0,
         };
         n as u64
@@ -1175,7 +1407,17 @@ mod tests {
         assert_eq!(err(b"ZADD z x m\r\n"), "ERR value is not a valid float");
         assert_eq!(err(b"SET k v EX\r\n"), "ERR syntax error");
         assert_eq!(err(b"SET k v FOO\r\n"), "ERR syntax error");
-        assert_eq!(err(b"ZRANGE z 0 1 REV\r\n"), "ERR syntax error");
+        assert_eq!(err(b"ZRANGE z 0 1 FOO\r\n"), "ERR syntax error");
+        assert_eq!(
+            err(b"ZRANGE z 0 1 LIMIT 0 1\r\n"),
+            "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX"
+        );
+        assert_eq!(err(b"ZADD z NX XX 1 m\r\n"), "ERR XX and NX options at the same time are not compatible");
+        assert_eq!(err(b"ZADD z GT LT 1 m\r\n"), "ERR GT, LT, and/or NX options at the same time are not compatible");
+        assert_eq!(err(b"ZADD z INCR 1 a 2 b\r\n"), "ERR INCR option supports a single increment-element pair");
+        assert_eq!(err(b"ZCOUNT z x 1\r\n"), "ERR min or max is not a float");
+        assert_eq!(err(b"ZLEXCOUNT z a b\r\n"), "ERR min or max not valid string range item");
+        assert_eq!(err(b"ZADD z 1 m NaN n\r\n"), "ERR value is not a valid float");
         assert_eq!(err(b"FooBar\r\n"), "ERR unknown command 'foobar'");
     }
 

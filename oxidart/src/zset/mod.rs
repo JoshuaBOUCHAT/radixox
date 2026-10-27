@@ -11,6 +11,8 @@ pub mod small;
 
 use std::cmp::Ordering;
 
+use radixox_lib::cmd::{LexBound, ScoreBound, ZRangeBy};
+
 pub use large::{Added, ZLarge};
 pub use small::ZSmall;
 
@@ -120,6 +122,54 @@ impl ZSet {
             Self::Small(z) => z.lower_bound(probe),
             Self::Large(z) => z.lower_bound(probe) as usize,
         }
+    }
+
+    /// Rangs `[lo, hi)` des entrées de score dans `[min, max]` (bornes exclues si `excl`).
+    pub fn score_range(&self, min: ScoreBound, max: ScoreBound) -> (usize, usize) {
+        let (a, b) = (encode_score(min.value), encode_score(max.value));
+        let lo = self.lower_bound(|s, _| if (if min.excl { a < s } else { a <= s }) { Ordering::Less } else { Ordering::Greater });
+        let hi = self.lower_bound(|s, _| if (if max.excl { b <= s } else { b < s }) { Ordering::Less } else { Ordering::Greater });
+        (lo, hi.max(lo))
+    }
+
+    /// Rangs `[lo, hi)` des membres dans `[min, max]` lexicographique (comme Redis, sens
+    /// défini seulement si tous les scores sont égaux).
+    pub fn lex_range(&self, min: LexBound<'_>, max: LexBound<'_>) -> (usize, usize) {
+        let first_not_before = |b: LexBound<'_>, upper: bool| -> usize {
+            match b {
+                LexBound::Min => 0,
+                LexBound::Max => self.len(),
+                // borne basse incluse / haute exclue : premier membre ≥ x
+                LexBound::Incl(x) if !upper => self.lower_bound(|_, m| if x <= m { Ordering::Less } else { Ordering::Greater }),
+                LexBound::Excl(x) if upper => self.lower_bound(|_, m| if x <= m { Ordering::Less } else { Ordering::Greater }),
+                // basse exclue / haute incluse : premier membre > x
+                LexBound::Incl(x) | LexBound::Excl(x) => self.lower_bound(|_, m| if x < m { Ordering::Less } else { Ordering::Greater }),
+            }
+        };
+        let (lo, hi) = (first_not_before(min, false), first_not_before(max, true));
+        (lo, hi.max(lo))
+    }
+
+    /// Rangs `[lo, hi)` de `start..=stop` (négatifs depuis la fin), comme Redis.
+    pub fn rank_range(&self, start: i64, stop: i64) -> (usize, usize) {
+        let len = self.len() as i64;
+        let start = if start < 0 { (len + start).max(0) } else { start };
+        let stop = if stop < 0 { len + stop } else { stop.min(len - 1) };
+        if start > stop || start >= len { (0, 0) } else { (start as usize, stop as usize + 1) }
+    }
+
+    /// Les rangs `[lo, hi)` d'une plage.
+    pub fn resolve(&self, range: ZRangeBy<'_>) -> (usize, usize) {
+        match range {
+            ZRangeBy::Rank(a, b) => self.rank_range(a, b),
+            ZRangeBy::Score(a, b) => self.score_range(a, b),
+            ZRangeBy::Lex(a, b) => self.lex_range(a, b),
+        }
+    }
+
+    /// Membres des rangs `[lo, hi)`, copiés (avant de les retirer).
+    pub fn members_in(&self, lo: usize, hi: usize) -> Vec<Vec<u8>> {
+        self.iter_from(lo).take(hi.saturating_sub(lo)).map(|(_, m)| m.to_vec()).collect()
     }
 
     /// `(score, membre)` à partir du rang `r`, croissants.

@@ -23,7 +23,10 @@ pub use hash::{
     cmd_hset, cmd_hvals,
 };
 pub use sset::{cmd_sadd, cmd_scard, cmd_sismember, cmd_smembers, cmd_spop, cmd_srem};
-pub use zset::{cmd_zadd, cmd_zcard, cmd_zincrby, cmd_zrange, cmd_zrem, cmd_zscore};
+pub use zset::{
+    cmd_zadd, cmd_zcard, cmd_zcount, cmd_zincrby, cmd_zmscore, cmd_zpop, cmd_zrandmember, cmd_zrange, cmd_zrank, cmd_zrem,
+    cmd_zremrange, cmd_zscore,
+};
 
 use oxidart::OxidArt;
 use radixox_lib::cmd::Cmd;
@@ -176,7 +179,13 @@ pub fn hint_keys<'a>(cmd: &Cmd<'a>, mut push: impl FnMut(&'a [u8])) -> bool {
         | Cmd::ZRange { key: k, .. }
         | Cmd::ZScore { key: k, .. }
         | Cmd::ZRem { key: k, .. }
-        | Cmd::ZIncrBy { key: k, .. } => push(k),
+        | Cmd::ZIncrBy { key: k, .. }
+        | Cmd::ZRank { key: k, .. }
+        | Cmd::ZCount { key: k, .. }
+        | Cmd::ZPop { key: k, .. }
+        | Cmd::ZRemRange { key: k, .. }
+        | Cmd::ZMScore { key: k, .. }
+        | Cmd::ZRandMember { key: k, .. } => push(k),
         Cmd::Del(keys) | Cmd::Exists(keys) => keys.iter().for_each(|k| push(k)),
         Cmd::MGet(keys) => keys.iter().for_each(|k| push(k)),
         Cmd::MSet(pairs) => pairs.iter().for_each(|(k, _)| push(k)),
@@ -198,6 +207,8 @@ pub fn hint_field<'c>(cmd: &'c Cmd<'_>) -> Option<(&'c [u8], oxidart::ZProbe)> {
         Cmd::HDel { fields, .. } | Cmd::HMGet { fields, .. } => fields.first().map(|f| (f.as_slice(), Index)),
         Cmd::SAdd { members, .. } | Cmd::SRem { members, .. } => members.first().map(|m| (m.as_slice(), Index)),
         Cmd::ZScore { member, .. } => Some((member, Index)),
+        Cmd::ZMScore { members, .. } => members.first().map(|m| (*m, Index)),
+        Cmd::ZRank { member, .. } => Some((member, Tree)),
         Cmd::ZIncrBy { member, .. } => Some((member, Tree)),
         Cmd::ZRem { members, .. } => members.first().map(|m| (m.as_slice(), Tree)),
         Cmd::ZAdd { members, .. } => members.first().map(|(s, m)| (m.as_slice(), Add(*s))),
@@ -324,14 +335,15 @@ pub fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         Cmd::SMembers(key) => cmd_smembers(art, key),
         Cmd::SPop { key, count } => cmd_spop(art, key, count),
         // ── ZSet ─────────────────────────────────────────────────────────────
-        Cmd::ZAdd { key, members } => cmd_zadd(art, key, &members),
+        Cmd::ZAdd { key, flags, members } => cmd_zadd(art, key, flags, &members),
         Cmd::ZCard(key) => cmd_zcard(art, key),
-        Cmd::ZRange {
-            key,
-            start,
-            stop,
-            with_scores,
-        } => cmd_zrange(art, key, start, stop, with_scores),
+        Cmd::ZRange { key, range, rev, limit, with_scores } => cmd_zrange(art, key, range, rev, limit, with_scores),
+        Cmd::ZRank { key, member, rev, with_score } => cmd_zrank(art, key, member, rev, with_score),
+        Cmd::ZCount { key, range } => cmd_zcount(art, key, range),
+        Cmd::ZPop { key, max, count } => cmd_zpop(art, key, max, count),
+        Cmd::ZRemRange { key, range } => cmd_zremrange(art, key, range),
+        Cmd::ZMScore { key, members } => cmd_zmscore(art, key, &members),
+        Cmd::ZRandMember { key, count, with_scores } => cmd_zrandmember(art, key, count, with_scores),
         Cmd::ZScore { key, member } => cmd_zscore(art, key, member),
         Cmd::ZRem { key, members } => cmd_zrem(art, key, &members),
         Cmd::ZIncrBy { key, delta, member } => cmd_zincrby(art, key, delta, member),

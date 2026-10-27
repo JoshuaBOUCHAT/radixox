@@ -1,12 +1,17 @@
 use oxidart::OxidArt;
 use oxidart::error::TypeError;
+use oxidart::zcommand::ZAddReply;
+use radixox_lib::cmd::{ZAddFlags, ZRangeBy};
 use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::shared_frame::SharedFrame as Frame;
 
-pub fn cmd_zadd(art: &mut OxidArt, key: &[u8], score_members: &[(f64, SharedByte)]) -> Frame {
+pub fn cmd_zadd(art: &mut OxidArt, key: &[u8], flags: ZAddFlags, score_members: &[(f64, SharedByte)]) -> Frame {
     // cmd_zadd peut créer le nœud zset : oxidart exige une clé possédée ici.
-    match art.cmd_zadd(SharedByte::from_slice(key), score_members, None) {
-        Ok(added) => Frame::Integer(added as i64),
+    match art.cmd_zadd_opts(SharedByte::from_slice(key), flags, score_members, None) {
+        Ok(ZAddReply::Count(n)) => Frame::Integer(n as i64),
+        Ok(ZAddReply::Score(Some(s))) => score_bulk(s),
+        Ok(ZAddReply::Score(None)) => Frame::Null,
+        Err(TypeError::NotAFloat) if flags.incr => Frame::Error("ERR resulting score is not a number (NaN)".into()),
         Err(e) => type_error(e),
     }
 }
@@ -24,11 +29,12 @@ pub fn cmd_zcard(art: &mut OxidArt, key: &[u8]) -> Frame {
 pub fn cmd_zrange(
     art: &mut OxidArt,
     key: &[u8],
-    start: i64,
-    stop: i64,
+    range: ZRangeBy<'_>,
+    rev: bool,
+    limit: Option<(i64, i64)>,
     with_scores: bool,
 ) -> Frame {
-    match art.cmd_zrange(key, start, stop, with_scores) {
+    match art.cmd_zrange_by(key, range, rev, limit, with_scores) {
         Ok(result) => Frame::Array(result.into_iter().map(Frame::BulkString).collect()),
         Err(redis_type) => Frame::Error(format!(
             "WRONGTYPE Operation against a key holding the wrong kind of value (expected zset, got {})",
@@ -77,5 +83,75 @@ fn type_error(e: TypeError) -> Frame {
         TypeError::NotAFloat => Frame::Error("ERR value is not a valid float".into()),
         TypeError::OutOfMemory => Frame::Error("OOM handle table full (RADIXOX_HANDLES_MAX)".into()),
         TypeError::NotAInt => Frame::Error("ERR internal error".into()),
+    }
+}
+
+fn wrongtype(t: oxidart::value::RedisType) -> Frame {
+    Frame::Error(format!(
+        "WRONGTYPE Operation against a key holding the wrong kind of value (expected zset, got {})",
+        t.as_str()
+    ))
+}
+
+fn score_bulk(s: f64) -> Frame {
+    Frame::BulkString(SharedByte::from_slice(s.to_string().as_bytes()))
+}
+
+/// `[membre, score, …]` à plat (RESP2).
+fn pairs(v: Vec<(SharedByte, f64)>, with_scores: bool) -> Frame {
+    let mut out = Vec::with_capacity(v.len() * (1 + with_scores as usize));
+    for (m, s) in v {
+        out.push(Frame::BulkString(m));
+        if with_scores {
+            out.push(score_bulk(s));
+        }
+    }
+    Frame::Array(out)
+}
+
+pub fn cmd_zrank(art: &mut OxidArt, key: &[u8], member: &[u8], rev: bool, with_score: bool) -> Frame {
+    match art.cmd_zrank(key, member, rev) {
+        Ok(Some((r, s))) if with_score => Frame::Array(vec![Frame::Integer(r as i64), score_bulk(s)]),
+        Ok(Some((r, _))) => Frame::Integer(r as i64),
+        Ok(None) => Frame::Null,
+        Err(t) => wrongtype(t),
+    }
+}
+
+pub fn cmd_zcount(art: &mut OxidArt, key: &[u8], range: ZRangeBy<'_>) -> Frame {
+    match art.cmd_zcount(key, range) {
+        Ok(n) => Frame::Integer(n as i64),
+        Err(t) => wrongtype(t),
+    }
+}
+
+/// Sans count : `[membre, score]` (vide si absent) ; avec : à plat.
+pub fn cmd_zpop(art: &mut OxidArt, key: &[u8], max: bool, count: Option<u64>) -> Frame {
+    match art.cmd_zpop(key, max, count.unwrap_or(1)) {
+        Ok(v) => pairs(v, true),
+        Err(t) => wrongtype(t),
+    }
+}
+
+pub fn cmd_zremrange(art: &mut OxidArt, key: &[u8], range: ZRangeBy<'_>) -> Frame {
+    match art.cmd_zremrange(key, range) {
+        Ok(n) => Frame::Integer(n as i64),
+        Err(t) => wrongtype(t),
+    }
+}
+
+pub fn cmd_zmscore(art: &mut OxidArt, key: &[u8], members: &[&[u8]]) -> Frame {
+    match art.cmd_zmscore(key, members) {
+        Ok(v) => Frame::Array(v.into_iter().map(|s| s.map_or(Frame::Null, score_bulk)).collect()),
+        Err(t) => wrongtype(t),
+    }
+}
+
+/// Sans count : un membre (nul si absent) ; avec : tableau (vide si absent).
+pub fn cmd_zrandmember(art: &mut OxidArt, key: &[u8], count: Option<i64>, with_scores: bool) -> Frame {
+    match art.cmd_zrandmember(key, count) {
+        Ok(v) if count.is_none() => v.into_iter().next().map_or(Frame::Null, |(m, _)| Frame::BulkString(m)),
+        Ok(v) => pairs(v, with_scores),
+        Err(t) => wrongtype(t),
     }
 }

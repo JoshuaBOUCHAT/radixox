@@ -54,7 +54,8 @@ pub fn plan<'a>(cmd: &Cmd<'a>) -> Journal<'a> {
         | Cmd::HDel { .. }
         | Cmd::SAdd { .. }
         | Cmd::SRem { .. }
-        | Cmd::ZRem { .. } => Journal::IfChanged,
+        | Cmd::ZRem { .. }
+        | Cmd::ZRemRange { .. } => Journal::IfChanged,
         // Toutes les écritures (`write_weight` > 0) ; le reste est lu ou
         // propre à la connexion (§3.1).
         c if c.is_write() => Journal::Verbatim,
