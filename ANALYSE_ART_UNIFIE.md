@@ -945,6 +945,24 @@ Débit (pipeline 64, 50 connexions, 2 M requêtes, ZSet d'1 M membres) :
 ZRANGE WITHSCORES était à 0,89 M/s (sous Valkey) : seconde descente de la clé et score
 formaté par `String` ; corrigé (`format_score`, entiers sans allocation).
 
+Puis (7977c4b, ec84134 ; débit compté côté serveur, `total_commands_processed`) : ZADD
+**1,19 M/s**, ZINCRBY **1,34 M/s**, ZRANK **2,00 M/s**, ZRANGEBYSCORE 0,88 M/s, petits ZSet
+2,30 M/s. ZADD passait de 11 200 à 7 100 instructions : 3 descentes du B+tree au lieu de 2
+(`update` = `find` + `remove`, qui refaisait `locate`), balayage des 24 séparateurs resté
+scalaire (somme de booléens ; masque `u64` + `popcnt` le vectorise), deux recherches dans
+l'index (`score` puis `add` → `upsert`), et l'entrée connue `(s, h)` retrouvée dans sa
+feuille par égalité de poignée au lieu d'un départage par membre (deux défauts de cache par
+ex-aequo). Mesures annexes : balayage SIMD contre dichotomie neutre en AVX-512 comme en AVX2
+(`x86-64-v3`) ; feuilles non triées ≤ 1 % (décalages) ; préfixe de 8 o du membre dans la
+feuille écarté (41 → 24 entrées par feuille, inutile sur des membres à préfixe commun).
+Reste dans ZADD : `tie` à l'insertion (~11 % des cycles, ex-aequo à placer par membre).
+
+Contre l'ancien ZSet `std` (`BTreeSet` + `HashMap`, 337909f), mêmes conditions : ZSCORE
+2,24 → 3,03 M/s, ZADD 0,85 → 1,12, ZINCRBY 0,95 → 1,31, ZRANGE 0 9 1,15 → 1,61, ZRANGE au
+rang 500 000 **2 155/s → 1,47 M/s** (rang en O(n) → O(log n)), petits ZSet 1,44 → 2,01 ;
+RSS 100–107 → 76–86 o/membre. L'ancien exécutait moins d'instructions (ZADD 5 000) mais
+plus de cycles (5 840 contre 4 390).
+
 Leviers restants (mémoire) : petite forme directement dans la valeur oxidart
 (`Tag::ZSetSmall`, spec §13.3 : −3,2 o/membre sur les petits), répertoires de l'index en
 64 o (~−1,5 o), remplissage des seaux.
