@@ -15,6 +15,8 @@ set -euo pipefail
 #   RECORDS=1000000 OPS=2000000 ./bench_compare.sh   # smaller run (defaults 5M / 10M)
 #   RADIXOX_* variables of the calling shell reach RadixOx (e.g. RADIXOX_MIN_WAIT_US=10).
 #   WARMUP=2: run latencies leave out the first WARMUP seconds (JVM warm-up of YCSB).
+#   TARGET=350000: run phase throttled to that many ops/s (YCSB -target), the same for both
+#                  servers: latencies compared at equal load, not each at its own maximum.
 #   PROFILE=performance: power profile held during the bench (PROFILE=keep: leave as is).
 #   MHz rows: mean frequency of the server's and of YCSB's CPUs during each phase.
 #   CPU rows: /proc/stat on each server's own CPUs during each phase (softirq included):
@@ -63,6 +65,7 @@ PORT=6379
 RECORDS="${RECORDS:-5000000}"
 OPS="${OPS:-10000000}"
 THREADS=100
+TARGET="${TARGET:-}"
 FIELDLENGTH=100
 
 RADIXOX_BIN="${RADIXOX_BIN:-$SCRIPT_DIR/target/release/radixox}"
@@ -215,6 +218,7 @@ run_ycsb() {
       -threads "$THREADS" \
       -p hdrhistogram.percentiles=95,99,99.9,99.99 \
       -p status.interval=1 -p hdrhistogram.fileoutput=true -p hdrhistogram.output.path="$HDR_DIR/" \
+      ${TARGET:+-target "$TARGET"} \
       $extra_args \
       >"$outfile" 2>&1
   fi
