@@ -445,6 +445,71 @@ mod tests {
         }
     }
 
+    /// Compactage de la slab du B+tree : grands ZSet (racines, feuilles de bout, nœuds
+    /// internes), une partie supprimée ; passe forcée, puis invariants (parents compris) et
+    /// contenus gardés, slab rétrécie.
+    #[test]
+    fn btree_compaction_keeps_zsets() {
+        use crate::value::{alloc_zset, free_zset, zset_mut, zset_ref};
+        use std::collections::BTreeMap;
+        crate::value::init_slabs();
+        let mut rng = Rng(0x2F6B_1D4E_9A3C_7051);
+        let member = |z: u64, i: u64| format!("z{z}-membre-{i}").into_bytes();
+        let mut zs: Vec<(u32, BTreeMap<Vec<u8>, u64>)> = Vec::new();
+        for z in 0..24u64 {
+            let idx = alloc_zset(ZSet::new());
+            let mut model = BTreeMap::new();
+            for _ in 0..(200 + rng.below(6000)) {
+                let (m, sc) = (member(z, rng.below(8000)), encode_score(rng.below(500) as f64));
+                zset_mut(idx).add(sc, &m).unwrap();
+                model.insert(m, sc);
+            }
+            zs.push((idx, model));
+        }
+        // trous : un ZSet sur trois supprimé, des plages retirées ailleurs
+        let mut kept = Vec::new();
+        for (k, (idx, mut model)) in zs.into_iter().enumerate() {
+            if k % 3 == 0 {
+                free_zset(idx);
+                continue;
+            }
+            let len = zset_ref(idx).len() as u32;
+            if let ZSet::Large(z) = zset_mut(idx)
+                && len > 600
+            {
+                let (lo, hi) = (len / 4, len / 2);
+                let gone = zset_ref(idx).members_in(lo as usize, hi as usize);
+                let ZSet::Large(z2) = zset_mut(idx) else { unreachable!() };
+                let _ = z;
+                z2.remove_range(idx, lo, hi);
+                for m in gone {
+                    model.remove(&m);
+                }
+            }
+            kept.push((idx, model));
+        }
+        while lazy::step(1 << 20) {}
+        let span_before = btree::compact::holes_bytes();
+        let mut c = btree::compact::want(true).expect("passe");
+        while btree::compact::step(&mut c, 64).is_none() {}
+        assert!(c.moved > 0);
+        assert!(btree::compact::holes_bytes() < span_before.max(1), "trous {} (avant {span_before})", btree::compact::holes_bytes());
+        for (idx, model) in &kept {
+            zset_ref(*idx).verify().unwrap();
+            let got: Vec<(u64, Vec<u8>)> = zset_ref(*idx).iter().map(|(s, m)| (s, m.to_vec())).collect();
+            let mut want: Vec<(u64, Vec<u8>)> = model.iter().map(|(m, &s)| (s, m.clone())).collect();
+            want.sort();
+            assert_eq!(got, want);
+            // encore modifiable après déplacement
+            zset_mut(*idx).add(encode_score(1.5), b"apres-compactage").unwrap();
+            zset_ref(*idx).verify().unwrap();
+        }
+        for (idx, _) in kept {
+            free_zset(idx);
+        }
+        while lazy::step(1 << 20) {}
+    }
+
     /// Différentiel contre le ZSet actuel (oracle, comme oxidart-legacy pour l'arbre) :
     /// ajouts, mises à jour, retraits, scores, rangs, parcours dans les deux sens, passage
     /// petite → grande par le nombre et par la longueur d'un membre, ex-aequo massifs.

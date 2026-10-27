@@ -373,6 +373,7 @@ const COMPACT_SLICE_UNITS: u32 = 512;
 enum MorePass {
     List(oxidart::list::compact::ListCompaction),
     Val(oxidart::ValCompaction),
+    ZTree(oxidart::zset::btree::compact::ZCompaction),
 }
 
 struct Gc {
@@ -385,10 +386,12 @@ struct Gc {
     compact_list_released: u64,
     compact_val_moved: u64,
     compact_val_released: u64,
-    /// Trous (List, valart) au moment de la dernière passe qui n'a rien rendu (des blocs
+    compact_ztree_moved: u64,
+    compact_ztree_released: u64,
+    /// Trous (List, valart, B+tree des ZSet) au moment de la dernière passe qui n'a rien rendu (des blocs
     /// de bout ou des racines immobiles en haut de la slab) : pas de nouvelle passe avant
     /// 3 Mio de trous de plus.
-    more_fruitless: [u64; 2],
+    more_fruitless: [u64; 3],
     compact_passes: u64,
     compact_moved: u64,
     compact_released: u64,
@@ -406,7 +409,7 @@ struct Gc {
 impl Gc {
     fn from_env() -> Self {
         let on = |name: &str, default: bool| std::env::var(name).map_or(default, |v| v != "0");
-        Self { pass: None, enabled: on("RADIXOX_GC", true), log: on("RADIXOX_GC_LOG", false), max_slice_us: 0, started: None, compact: None, compact_more: None, compact_list_moved: 0, compact_list_released: 0, compact_val_moved: 0, compact_val_released: 0, more_fruitless: [0; 2], compact_passes: 0, compact_moved: 0, compact_released: 0, compact_max_slice_us: 0, compact_total_us: 0 }
+        Self { pass: None, enabled: on("RADIXOX_GC", true), log: on("RADIXOX_GC_LOG", false), max_slice_us: 0, started: None, compact: None, compact_more: None, compact_list_moved: 0, compact_list_released: 0, compact_val_moved: 0, compact_val_released: 0, compact_ztree_moved: 0, compact_ztree_released: 0, more_fruitless: [0; 3], compact_passes: 0, compact_moved: 0, compact_released: 0, compact_max_slice_us: 0, compact_total_us: 0 }
     }
 }
 
@@ -2199,13 +2202,16 @@ impl Core {
                 );
                 let _ = std::fmt::Write::write_fmt(
                     &mut info,
-                    format_args!("compact_list_moved_blocks:{}\r\ncompact_list_released_bytes:{}\r\nlist_slab_holes_bytes:{}\r\ncompact_valart_moved_nodes:{}\r\ncompact_valart_released_bytes:{}\r\nvalart_slab_holes_bytes:{}\r\n",
+                    format_args!("compact_list_moved_blocks:{}\r\ncompact_list_released_bytes:{}\r\nlist_slab_holes_bytes:{}\r\ncompact_valart_moved_nodes:{}\r\ncompact_valart_released_bytes:{}\r\nvalart_slab_holes_bytes:{}\r\ncompact_zset_tree_moved_nodes:{}\r\ncompact_zset_tree_released_bytes:{}\r\nzset_tree_slab_holes_bytes:{}\r\n",
                     self.gc.compact_list_moved,
                     self.gc.compact_list_released,
                     oxidart::list::compact::holes_bytes(),
                     self.gc.compact_val_moved,
                     self.gc.compact_val_released,
-                    self.art.valart_holes_bytes()),
+                    self.art.valart_holes_bytes(),
+                    self.gc.compact_ztree_moved,
+                    self.gc.compact_ztree_released,
+                    oxidart::zset::btree::compact::holes_bytes()),
                 );
                 extend_encode(&mut self.outs[s].out, &Frame::BulkString(SharedByte::from_slice(info.as_bytes())));
             }
@@ -2476,14 +2482,17 @@ impl Core {
             match self.gc.compact_more.take() {
                 Some(MorePass::List(c)) => self.gc.compact_list_moved += c.moved,
                 Some(MorePass::Val(c)) => self.gc.compact_val_moved += c.moved,
+                Some(MorePass::ZTree(c)) => self.gc.compact_ztree_moved += c.moved,
                 None => {}
             }
             return false;
         }
         let t0 = Instant::now();
-        let (done, list) = match self.gc.compact_more.as_mut() {
-            Some(MorePass::List(c)) => (oxidart::list::compact::step(c, COMPACT_SLICE_UNITS), true),
-            Some(MorePass::Val(c)) => (self.art.valart_compact_step(c, COMPACT_SLICE_UNITS), false),
+        // 0 : List, 1 : valart, 2 : B+tree des ZSet
+        let (done, which) = match self.gc.compact_more.as_mut() {
+            Some(MorePass::List(c)) => (oxidart::list::compact::step(c, COMPACT_SLICE_UNITS), 0),
+            Some(MorePass::Val(c)) => (self.art.valart_compact_step(c, COMPACT_SLICE_UNITS), 1),
+            Some(MorePass::ZTree(c)) => (oxidart::zset::btree::compact::step(c, COMPACT_SLICE_UNITS), 2),
             None => return false,
         };
         let us = t0.elapsed().as_micros() as u64;
@@ -2492,17 +2501,15 @@ impl Core {
         if let Some((moved, released)) = done {
             self.gc.compact_more = None;
             self.gc.compact_passes += 1;
-            if list {
-                self.gc.compact_list_moved += moved;
-                self.gc.compact_list_released += released as u64;
-            } else {
-                self.gc.compact_val_moved += moved;
-                self.gc.compact_val_released += released as u64;
-            }
-            let holes = if list { oxidart::list::compact::holes_bytes() } else { self.art.valart_holes_bytes() };
-            self.gc.more_fruitless[!list as usize] = if released == 0 { holes } else { 0 };
+            let (m, r, holes, what) = match which {
+                0 => (&mut self.gc.compact_list_moved, &mut self.gc.compact_list_released, oxidart::list::compact::holes_bytes(), "blocs de List"),
+                1 => (&mut self.gc.compact_val_moved, &mut self.gc.compact_val_released, self.art.valart_holes_bytes(), "nœuds valart"),
+                _ => (&mut self.gc.compact_ztree_moved, &mut self.gc.compact_ztree_released, oxidart::zset::btree::compact::holes_bytes(), "nœuds du B+tree des ZSet"),
+            };
+            *m += moved;
+            *r += released as u64;
+            self.gc.more_fruitless[which] = if released == 0 { holes } else { 0 };
             if self.gc.log {
-                let what = if list { "blocs de List" } else { "nœuds valart" };
                 eprintln!("[compact] fin : {moved} {what} déplacés, {} Kio rendus", released >> 10);
             }
         }
@@ -2543,6 +2550,16 @@ impl Core {
                 eprintln!("[compact] passe : {} Kio de trous dans la slab valart", self.art.valart_holes_bytes() >> 10);
             }
             self.gc.compact_more = Some(MorePass::Val(c));
+            return;
+        }
+        if self.compact_allowed()
+            && oxidart::zset::btree::compact::holes_bytes() > self.gc.more_fruitless[2] + (3 << 20)
+            && let Some(c) = oxidart::zset::btree::compact::want(false)
+        {
+            if self.gc.log {
+                eprintln!("[compact] passe : {} Kio de trous dans la slab du B+tree des ZSet", oxidart::zset::btree::compact::holes_bytes() >> 10);
+            }
+            self.gc.compact_more = Some(MorePass::ZTree(c));
             return;
         }
         let idle = self.now.saturating_duration_since(self.last_rx) >= GC_IDLE_AFTER;

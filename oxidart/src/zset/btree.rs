@@ -33,7 +33,7 @@ const MAX_H: usize = 12;
 /// Sous ce remplissage, deux feuilles voisines fusionnent.
 const MERGE_BELOW: usize = L / 4;
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct Leaf {
     n: u16,
     prev: u32,
@@ -42,7 +42,7 @@ pub struct Leaf {
     handles: [u32; L],
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct Internal {
     /// Nombre d'enfants (≥ 1).
     n: u16,
@@ -52,11 +52,28 @@ pub struct Internal {
     count: [u32; I],
 }
 
-#[derive(Clone)]
-#[repr(align(64))]
-pub enum BNode {
-    Leaf(Leaf),
-    Internal(Internal),
+const LEAF: u8 = 0;
+const INTERNAL: u8 = 1;
+
+/// Nœud de la slab : étiquette et parent dans les 8 premiers octets (là où l'étiquette
+/// d'un enum n'utilisait qu'un octet, alignement oblige), puis la feuille ou le nœud
+/// interne. Le parent sert au compactage (`compact.rs`) : un nœud déplacé corrige son
+/// parent et, pour un nœud interne, ses enfants, sans redescente.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+pub struct BNode {
+    kind: u8,
+    _pad: [u8; 3],
+    /// Nœud interne parent ; `NONE` pour la racine (et la tête d'un sous-arbre décroché).
+    parent: u32,
+    body: Body,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+union Body {
+    leaf: Leaf,
+    internal: Internal,
 }
 
 const _: () = assert!(size_of::<BNode>() == 512);
@@ -90,26 +107,24 @@ fn init_slab() -> &'static mut HiSlab<BNode> {
 /// même nœud.
 #[inline]
 fn leaf(i: u32) -> &'static Leaf {
-    match unsafe { slab().get_unchecked(i) } {
-        BNode::Leaf(l) => l,
-        BNode::Internal(_) => unreachable!("feuille attendue"),
-    }
+    let n = unsafe { slab().get_unchecked(i) };
+    debug_assert_eq!(n.kind, LEAF, "feuille attendue");
+    unsafe { &n.body.leaf }
 }
 
 /// Point de passage de toute écriture d'une feuille : barrière de save (les feuilles
 /// sont ce que la save lit, en suivant leur chaînage T0 ; SAVE_DESIGN.md §2.A).
 #[inline]
 fn leaf_mut(i: u32) -> &'static mut Leaf {
-    super::save::before_leaf_write(i, || leaf(i).clone());
-    match unsafe { slab().get_unchecked_mut(i) } {
-        BNode::Leaf(l) => l,
-        BNode::Internal(_) => unreachable!("feuille attendue"),
-    }
+    super::save::before_leaf_write(i, || *leaf(i));
+    let n = unsafe { slab().get_unchecked_mut(i) };
+    debug_assert_eq!(n.kind, LEAF, "feuille attendue");
+    unsafe { &mut n.body.leaf }
 }
 
 /// Libère une feuille (point de passage, comme [`leaf_mut`]).
 fn free_leaf(i: u32) {
-    super::save::before_leaf_write(i, || leaf(i).clone());
+    super::save::before_leaf_write(i, || *leaf(i));
     slab().remove(i);
 }
 
@@ -134,18 +149,32 @@ impl Leaf {
 
 #[inline]
 fn internal(i: u32) -> &'static mut Internal {
-    match unsafe { slab().get_unchecked_mut(i) } {
-        BNode::Internal(n) => n,
-        BNode::Leaf(_) => unreachable!("nœud interne attendu"),
-    }
+    let n = unsafe { slab().get_unchecked_mut(i) };
+    debug_assert_eq!(n.kind, INTERNAL, "nœud interne attendu");
+    unsafe { &mut n.body.internal }
+}
+
+/// Parent du nœud `i` (`NONE` : racine).
+#[inline]
+fn parent(i: u32) -> u32 {
+    unsafe { slab().get_unchecked(i) }.parent
+}
+
+/// Pas de barrière : la save ne lit pas le parent (seulement les feuilles et leur
+/// chaînage).
+#[inline]
+fn set_parent(i: u32, p: u32) {
+    unsafe { slab().get_unchecked_mut(i) }.parent = p;
 }
 
 fn new_leaf() -> u32 {
-    slab().insert(BNode::Leaf(Leaf { n: 0, prev: NONE, next: NONE, scores: [0; L], handles: [0; L] }))
+    let leaf = Leaf { n: 0, prev: NONE, next: NONE, scores: [0; L], handles: [0; L] };
+    slab().insert(BNode { kind: LEAF, _pad: [0; 3], parent: NONE, body: Body { leaf } })
 }
 
 fn new_internal() -> u32 {
-    slab().insert(BNode::Internal(Internal { n: 0, sep_s: [0; I - 1], sep_h: [0; I - 1], child: [NONE; I], count: [0; I] }))
+    let internal = Internal { n: 0, sep_s: [0; I - 1], sep_h: [0; I - 1], child: [NONE; I], count: [0; I] };
+    slab().insert(BNode { kind: INTERNAL, _pad: [0; 3], parent: NONE, body: Body { internal } })
 }
 
 fn free_node(i: u32) {
@@ -351,6 +380,7 @@ impl BTree {
         lf.scores[..k].copy_from_slice(&ts[..k]);
         lf.handles[..k].copy_from_slice(&th[..k]);
         let r = new_leaf();
+        set_parent(r, if self.height > 0 { path[self.height as usize - 1].0 } else { NONE });
         let lr = leaf_mut(r);
         let rn = L + 1 - k;
         lr.n = rn as u16;
@@ -368,6 +398,8 @@ impl BTree {
             let node = internal(p);
             node.count[ci] -= cnt;
             let n = node.n as usize;
+            set_parent(r, p);
+            let node = internal(p);
             if n < I {
                 node.child.copy_within(ci + 1..n, ci + 2);
                 node.count.copy_within(ci + 1..n, ci + 2);
@@ -412,11 +444,17 @@ impl BTree {
             nq.sep_s[..rn - 1].copy_from_slice(&tss[k..]);
             nq.sep_h[..rn - 1].copy_from_slice(&tsh[k..]);
             let qcnt = tn[k..].iter().sum();
+            // les enfants passés à droite changent de parent
+            for &c in &tc[k..] {
+                set_parent(c, q);
+            }
             carry = ((tss[k - 1], tsh[k - 1]), q, qcnt);
         }
         // La racine s'est coupée.
         let ((ss, sh), r, cnt) = carry;
         let root = new_internal();
+        set_parent(self.root, root);
+        set_parent(r, root);
         let nr = internal(root);
         nr.n = 2;
         nr.child[0] = self.root;
@@ -563,6 +601,7 @@ impl BTree {
         while self.height > 0 && internal(self.root).n == 1 {
             let old = self.root;
             self.root = internal(old).child[0];
+            set_parent(self.root, NONE);
             free_node(old);
             self.height -= 1;
         }
@@ -816,6 +855,9 @@ impl BTree {
                         node.sep_h[i - 1] = k.1;
                     }
                 }
+                for &(c, _, _) in group {
+                    set_parent(c, q);
+                }
                 up.push((q, group.iter().map(|g| g.1).sum(), group[0].2));
             }
             level = up;
@@ -1001,7 +1043,7 @@ impl BTree {
             };
         }
         let mut leaves = Vec::new();
-        let (n, _) = Self::verify_rec(self.root, self.height, None, None, tie, &mut leaves)?;
+        let (n, _) = Self::verify_rec(self.root, NONE, self.height, None, None, tie, &mut leaves)?;
         if n != self.len {
             return Err(format!("len {} mais {n} entrées", self.len));
         }
@@ -1029,12 +1071,17 @@ impl BTree {
     }
 
     /// Rend le nombre d'entrées et la plus petite clé du sous-arbre.
-    fn verify_rec(i: u32, h: u8, lo: Option<(u64, u32)>, hi: Option<(u64, u32)>, tie: &impl Tie, leaves: &mut Vec<u32>) -> Result<(u32, (u64, u32)), String> {
+    fn verify_rec(i: u32, up: u32, h: u8, lo: Option<(u64, u32)>, hi: Option<(u64, u32)>, tie: &impl Tie, leaves: &mut Vec<u32>) -> Result<(u32, (u64, u32)), String> {
         let in_bounds = |k: (u64, u32)| {
             lo.is_none_or(|lo| kcmp(tie, k, lo) != Ordering::Less) && hi.is_none_or(|hi| kcmp(tie, k, hi) == Ordering::Less)
         };
-        match (h, unsafe { slab().get_unchecked(i) }) {
-            (0, BNode::Leaf(lf)) => {
+        let bn = unsafe { slab().get_unchecked(i) };
+        if bn.parent != up {
+            return Err(format!("nœud {i} : parent {} au lieu de {up}", bn.parent));
+        }
+        match (h, bn.kind) {
+            (0, LEAF) => {
+                let lf = unsafe { &bn.body.leaf };
                 if lf.n == 0 {
                     return Err(format!("feuille {i} vide"));
                 }
@@ -1046,7 +1093,8 @@ impl BTree {
                 leaves.push(i);
                 Ok((lf.n as u32, (lf.scores[0], lf.handles[0])))
             }
-            (h, BNode::Internal(node)) if h > 0 => {
+            (h, INTERNAL) if h > 0 => {
+                let node = unsafe { &bn.body.internal };
                 let n = node.n as usize;
                 if n == 0 {
                     return Err(format!("interne {i} sans enfant"));
@@ -1056,7 +1104,7 @@ impl BTree {
                 for c in 0..n {
                     let clo = if c == 0 { lo } else { Some((node.sep_s[c - 1], node.sep_h[c - 1])) };
                     let chi = if c + 1 == n { hi } else { Some((node.sep_s[c], node.sep_h[c])) };
-                    let (got, cmin) = Self::verify_rec(node.child[c], h - 1, clo, chi, tie, leaves)?;
+                    let (got, cmin) = Self::verify_rec(node.child[c], i, h - 1, clo, chi, tie, leaves)?;
                     if got != node.count[c] {
                         return Err(format!("interne {i} : compte de l'enfant {c} = {} au lieu de {got}", node.count[c]));
                     }
@@ -1290,5 +1338,194 @@ mod tests {
             t.verify(&tie).unwrap();
             t.free_all();
         }
+    }
+}
+
+/// Compactage de la slab du B+tree (comme la slab des nœuds, MEMORY_ARCH.md §17.2) : les
+/// nœuds les plus hauts descendent dans les trous les plus bas, puis la fin de la slab est
+/// rendue. Chaque nœud connaît son parent : un déplacement corrige le parent (ou, pour une
+/// racine, l'en-tête du ZSet, retrouvé par une table racine → en-tête construite au début
+/// de la passe et revérifiée), les enfants d'un nœud interne, les voisines d'une feuille
+/// (ou les bouts dans l'en-tête). Un nœud dont la référence ne se vérifie pas (sous-arbre
+/// décroché) ne bouge pas.
+///
+/// Interdit pendant une save et tant que des libérations de ZSet attendent (`lazy` : elles
+/// tiennent des idx de nœuds) : la passe s'arrête d'elle-même dans ce cas.
+pub mod compact {
+    use std::collections::HashMap;
+
+    use super::{BNode, INTERNAL, LEAF, NONE, internal, leaf, leaf_mut, parent, set_parent, slab};
+    use crate::zset::ZSet;
+
+    /// Nœuds par page de 2 Mio.
+    const PAGE_NODES: u32 = ((2 << 20) / size_of::<BNode>()) as u32;
+    /// Coût fixe d'un déplacement (copie de 8 lignes + références), en lignes de cache.
+    const MOVE_COST: u32 = 12;
+
+    /// Une passe en cours.
+    #[derive(Debug)]
+    pub struct ZCompaction {
+        target: u32,
+        keep: u32,
+        scan: u32,
+        pub moved: u64,
+        /// Racine → idx de l'en-tête du ZSet.
+        roots: HashMap<u32, u32>,
+    }
+
+    /// Octets de trous sous le dernier nœud occupé.
+    pub fn holes_bytes() -> u64 {
+        let s = slab();
+        let span = s.last_occupied().map_or(0, |l| l + 1);
+        (span - s.len()) as u64 * size_of::<BNode>() as u64
+    }
+
+    fn roots() -> HashMap<u32, u32> {
+        let mut m = HashMap::new();
+        crate::value::zset_slab_mut().for_each_occupied(|idx, z| {
+            if let ZSet::Large(l) = z
+                && !l.tree.is_empty()
+            {
+                m.insert(l.tree.root, idx);
+            }
+        });
+        m
+    }
+
+    fn blocked() -> bool {
+        crate::zset::save::is_saving() || crate::zset::lazy::pending() > 0
+    }
+
+    /// Une passe si les trous sous la fin dépassent 3 Mio (4 Mio au-delà de 256 Mio) ;
+    /// `force` : toujours, sans garder de libre (tests).
+    pub fn want(force: bool) -> Option<ZCompaction> {
+        if blocked() {
+            return None;
+        }
+        let s = slab();
+        let span = s.last_occupied()? + 1;
+        let slab_bytes = span as u64 * size_of::<BNode>() as u64;
+        let threshold = if slab_bytes > 256 << 20 { 4 << 20 } else { 3 << 20 };
+        if !force && holes_bytes() <= threshold {
+            return None;
+        }
+        let keep = if force { 0 } else { PAGE_NODES };
+        let target = if force { s.len() } else { (s.len() + keep).next_multiple_of(PAGE_NODES) };
+        (target < span).then(|| ZCompaction { target, keep, scan: span, moved: 0, roots: roots() })
+    }
+
+    /// En-tête du ZSet dont `root` est la racine (vérifié) ; la table est refaite une fois
+    /// si elle ne le connaît pas (ZSet créé pendant la passe).
+    fn header_of(c: &mut ZCompaction, root: u32) -> Option<&'static mut super::BTree> {
+        let mut hit = c.roots.get(&root).copied();
+        if hit.is_none() {
+            c.roots = roots();
+            hit = c.roots.get(&root).copied();
+        }
+        let z = crate::value::zset_slab_mut().get_mut(hit?)?;
+        match z {
+            ZSet::Large(l) if l.tree.root == root => Some(&mut l.tree),
+            _ => None,
+        }
+    }
+
+    /// Une tranche d'au plus `budget` unités. `Some((déplacés, octets rendus))` quand la
+    /// passe est finie (ou arrêtée : save, libérations en attente).
+    pub fn step(c: &mut ZCompaction, budget: u32) -> Option<(u64, usize)> {
+        if blocked() {
+            return Some((c.moved, 0));
+        }
+        let mut spent = 0;
+        while spent < budget {
+            let Some(src) = slab().prev_occupied(c.scan).filter(|&s| s >= c.target) else { return Some(finish(c)) };
+            c.scan = src;
+            let (kind, up) = {
+                let n = unsafe { slab().get_unchecked(src) };
+                (n.kind, n.parent)
+            };
+            // la référence vers `src` : en-tête (racine) ou rang chez le parent
+            let at = if up == NONE {
+                if header_of(c, src).is_none() {
+                    spent += 1;
+                    continue;
+                }
+                None
+            } else {
+                let p = internal(up);
+                match p.child[..p.n as usize].iter().position(|&x| x == src) {
+                    Some(ci) => Some(ci),
+                    None => {
+                        spent += 1;
+                        continue;
+                    }
+                }
+            };
+            // SAFETY: rempli par `move_to` tout de suite, ou rendu.
+            let dst = unsafe { slab().reserve_lowest() };
+            if dst >= src || dst >= c.target {
+                unsafe { slab().unreserve(dst) };
+                return Some(finish(c));
+            }
+            // SAFETY: `src` occupé, `dst` réservé, aucune référence vivante dans la slab.
+            unsafe { slab().move_to(src, dst) };
+            let mut fixed = 1;
+            match at {
+                Some(ci) => internal(up).child[ci] = dst,
+                None => {
+                    let t = header_of(c, src).expect("en-tête vérifié");
+                    t.root = dst;
+                    if t.first == src {
+                        t.first = dst;
+                    }
+                    if t.last == src {
+                        t.last = dst;
+                    }
+                    let z = c.roots.remove(&src).expect("racine connue");
+                    c.roots.insert(dst, z);
+                }
+            }
+            if kind == INTERNAL {
+                let node = internal(dst);
+                let children = node.child;
+                for &ch in &children[..node.n as usize] {
+                    set_parent(ch, dst);
+                    fixed += 1;
+                }
+            } else {
+                debug_assert_eq!(kind, LEAF);
+                let (prev, next) = (leaf(dst).prev, leaf(dst).next);
+                // feuille de bout : l'en-tête, par la racine de son arbre
+                let mut tree = None;
+                if prev == NONE || next == NONE {
+                    let mut r = dst;
+                    while parent(r) != NONE {
+                        r = parent(r);
+                    }
+                    tree = header_of(c, r);
+                }
+                if prev != NONE {
+                    leaf_mut(prev).next = dst;
+                } else if let Some(t) = tree.as_deref_mut() {
+                    t.first = dst;
+                }
+                if next != NONE {
+                    leaf_mut(next).prev = dst;
+                } else if let Some(t) = tree {
+                    t.last = dst;
+                }
+                fixed += 2;
+            }
+            c.moved += 1;
+            spent += MOVE_COST + fixed;
+        }
+        None
+    }
+
+    fn finish(c: &ZCompaction) -> (u64, usize) {
+        let s = slab();
+        let last = s.last_occupied().map_or(0, |l| l + 1);
+        let from = last.max(s.len() + c.keep);
+        // SAFETY: rien n'est occupé à partir de `last` ≤ `from`.
+        (c.moved, unsafe { s.release_above(from) })
     }
 }
