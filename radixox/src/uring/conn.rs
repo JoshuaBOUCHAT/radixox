@@ -161,6 +161,11 @@ impl ConnOut {
         self.job_pending || self.aof_wait || self.repl_wait || self.block_wait.is_some()
     }
 
+    /// Octets de sortie en attente : `out`, le send en vol, la grosse réponse.
+    pub fn pending_out(&self) -> usize {
+        self.out.len() + self.sending.len() + self.big.as_ref().map_or(0, |(b, at)| b.len().saturating_sub(*at))
+    }
+
     pub fn send_in_flight(&self) -> bool {
         !self.sending.is_empty() || self.big_sending
     }

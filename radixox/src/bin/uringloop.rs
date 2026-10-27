@@ -972,6 +972,13 @@ fn main() -> io::Result<()> {
     if let Some(kb) = std::env::var("RADIXOX_RING_BUF_KB").ok().and_then(|v| v.parse::<u32>().ok()) {
         cfg.buf_size = kb.max(4) << 10;
     }
+    // Sortie bornée (RUNTIME_ARCH.md §6.2 bis) : par client normal, et pour tous.
+    if let Some(mb) = std::env::var("RADIXOX_CLIENT_OUTPUT_LIMIT_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+        cfg.client_output_limit = if mb == 0 { usize::MAX } else { mb << 20 };
+    }
+    if let Some(mb) = std::env::var("RADIXOX_OUTPUT_BUDGET_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+        cfg.output_budget = if mb == 0 { usize::MAX } else { mb << 20 };
+    }
     // Commandes par tour au plus (RUNTIME_ARCH.md §2.1, §2.3).
     if let Some(n) = std::env::var("RADIXOX_BATCH_CMDS").ok().and_then(|v| v.parse::<usize>().ok()) {
         cfg.batch_cmds = n.max(1);

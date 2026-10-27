@@ -677,6 +677,8 @@ Environment variables:
 | `RADIXOX_SCAN_MAX_CURSORS_PER_CLIENT` | `128` | active `SCAN` cursors at most per connection (its own idle cursors are reclaimed first) |
 | `RADIXOX_TIMEOUT` | `0` | close a client idle for this many seconds (`0` = never), like Redis's `timeout` |
 | `RADIXOX_BATCH_CMDS` | `2048` | commands per slice of a loop turn; replies ready between slices are sent |
+| `RADIXOX_CLIENT_OUTPUT_LIMIT_MB` | `1024` | a normal client whose pending output (replies not yet sent) exceeds this is disconnected; `0` = no limit. Subscribers keep their own limits (32 MB, or 8 MB for 60 s) |
+| `RADIXOX_OUTPUT_BUDGET_MB` | `1024` | pending output of all connections together; above it, a connection gets its next command only once its previous replies are sent (nobody is disconnected); `0` = no budget |
 | `RADIXOX_RING_BUFS` / `RADIXOX_RING_BUF_KB` | `64` / `32` | receive buffer ring shared by all connections |
 | `RADIXOX_SEND_ASYNC` | off | run sends on kernel io-wq workers (`IOSQE_ASYNC`): helps clients without pipelining when a second core is available |
 | `RADIXOX_SQPOLL_CPU` / `RADIXOX_SQPOLL_IDLE_MS` / `RADIXOX_SQPOLL_SPIN_US` | unset / `1000` / `1000` | dedicated machines: a kernel SQPOLL thread pinned on this CPU submits and receives, so the loop makes no syscalls while busy (pair with `RADIXOX_SEND_ASYNC`). Burns that core; +10 % pipelined throughput measured, no gain without pipelining |

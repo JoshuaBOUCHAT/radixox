@@ -67,6 +67,12 @@ pub struct Config {
     /// `out` au-delà duquel une connexion qui a déjà un send en vol n'est plus
     /// tirée (backpressure, §6.2).
     pub out_backpressure: usize,
+    /// Sortie en attente d'un client normal au-delà de laquelle il est fermé
+    /// (`RADIXOX_CLIENT_OUTPUT_LIMIT_MB`, 0 = sans ; abonnés : leurs limites).
+    pub client_output_limit: usize,
+    /// Sortie en attente de toutes les connexions au-delà de laquelle celles qui en
+    /// ont encore ne sont plus tirées (`RADIXOX_OUTPUT_BUDGET_MB`, 0 = sans).
+    pub output_budget: usize,
     /// Largeur de la fenêtre d'exécution : commandes dont les clés descendent
     /// ensemble (`RADIXOX_PREFETCH`, défaut 64 = `PREFETCH_BATCH` ; 1 = une à une).
     pub prefetch: usize,
@@ -131,6 +137,8 @@ impl Default for Config {
             batch_cmds: 2048,
             flush_early: 64 << 10,
             out_backpressure: 1 << 20,
+            client_output_limit: 1 << 30,
+            output_budget: 1 << 30,
             prefetch: oxidart::PREFETCH_BATCH,
             amac: 16,
             amac_pf: 2,
@@ -569,6 +577,22 @@ fn produced_key<'a>(cmd: &Cmd<'a>) -> Option<&'a [u8]> {
     }
 }
 
+/// Tampons des connexions, au dernier relevé (`INFO`, RUNTIME_ARCH.md §6.2 bis).
+#[derive(Default, Clone, Copy)]
+struct OutStats {
+    /// Sortie en attente, toutes connexions ; la plus grosse.
+    total: usize,
+    max: usize,
+    /// Entrée recopiée (`rx`), toutes connexions.
+    input: usize,
+    /// Connexions qui avaient encore de la sortie pendant un dépassement du budget.
+    paused: usize,
+    /// Clients fermés pour sortie au-delà de `client_output_limit`, depuis le démarrage.
+    limit_closed: u64,
+    /// Relevés en dépassement du budget, depuis le démarrage.
+    over_checks: u64,
+}
+
 pub struct Core {
     pub art: OxidArt,
     cfg: Config,
@@ -581,6 +605,10 @@ pub struct Core {
     ready: Vec<Slot>,
     dirty: Vec<Slot>,
     closing: Vec<Slot>,
+    /// Sortie en attente de toutes les connexions au-delà de `output_budget`, au dernier
+    /// relevé (`out_check`) : celles qui en ont encore ne sont plus tirées.
+    out_over: bool,
+    out_stats: OutStats,
     /// Recv arrêtés faute de tampon, réarmés quand un tampon revient.
     starved: Vec<Slot>,
     jobs: std::collections::VecDeque<FlushJob>,
@@ -675,6 +703,8 @@ impl Core {
             ready: Vec::new(),
             dirty: Vec::new(),
             closing: Vec::new(),
+            out_over: false,
+            out_stats: OutStats::default(),
             starved: Vec::new(),
             jobs: Default::default(),
             conn_jobs: Default::default(),
@@ -997,6 +1027,7 @@ impl Core {
                     self.timers.push(Reverse((self.now + next, Timer::MemRelease)));
                 }
                 Timer::Gc => {
+                    self.out_check();
                     self.gc_trigger();
                     self.timers.push(Reverse((self.now + GC_CHECK_EVERY, Timer::Gc)));
                 }
@@ -1640,6 +1671,31 @@ impl Core {
             && !o.parked()
             && matches!(o.mode, Mode::Normal | Mode::Closing)
             && !(o.send_in_flight() && o.out.len() >= self.cfg.out_backpressure)
+            // budget global dépassé : une réponse à la fois, celle d'avant envoyée d'abord
+            && !(self.out_over && o.pending_out() > 0)
+    }
+
+    /// Relevé des tampons de toutes les connexions (minuteur du GC, 100 ms ; ~10 µs pour
+    /// 10 000 slots) : budget global de sortie, chiffres d'`INFO`. Pas de compteur tenu à
+    /// chaque écriture dans `out` : ses écritures sont partout, et le budget n'a pas
+    /// besoin d'être exact à l'octet.
+    fn out_check(&mut self) {
+        let (mut total, mut max, mut input, mut with_out) = (0, 0, 0, 0);
+        for (o, i) in self.outs.iter().zip(&self.ins) {
+            if o.mode == Mode::Free {
+                continue;
+            }
+            let n = o.pending_out();
+            total += n;
+            max = max.max(n);
+            with_out += (n > 0) as usize;
+            input += i.rx.len();
+        }
+        self.out_over = total > self.cfg.output_budget;
+        let st = &mut self.out_stats;
+        (st.total, st.max, st.input) = (total, max, input);
+        st.paused = if self.out_over { with_out } else { 0 };
+        st.over_checks += self.out_over as u64;
     }
 
     /// Rend la tête de la connexion exécutable. `rx` passe avant les morceaux :
@@ -2188,6 +2244,16 @@ impl Core {
                 self.repl_info(&mut info);
                 info.push_str("\r\n");
                 crate::exec::info_stats(&mut info);
+                let st = self.out_stats;
+                let _ = std::fmt::Write::write_fmt(
+                    &mut info,
+                    format_args!(
+                        "clients_output_bytes:{}\r\nclients_output_max_bytes:{}\r\nclients_input_bytes:{}\r\n\
+                         output_budget_exceeded:{}\r\noutput_budget_paused_clients:{}\r\noutput_budget_exceeded_checks:{}\r\n\
+                         client_output_limit_closed:{}\r\n",
+                        st.total, st.max, st.input, self.out_over as u8, st.paused, st.over_checks, st.limit_closed
+                    ),
+                );
                 let st = self.art.amac_stats;
                 let _ = std::fmt::Write::write_fmt(
                     &mut info,
@@ -2774,6 +2840,20 @@ impl Core {
     /// Envoie ce qui peut partir de `out` (tout, sauf à partir d'une réponse
     /// retenue). Rien à envoyer : la connexion attend le fsync (`release_held`).
     fn send(&mut self, slot: Slot) {
+        // Client normal au-delà de sa limite de sortie (abonnés : `publish` ; lien de
+        // réplication : ses propres plafonds) : fermé, comme `client-output-buffer-limit`.
+        // Ici : tout envoi passe par `send` (fin de tour, envoi anticipé, suite d'un CQE).
+        let o = &self.outs[slot as usize];
+        if !o.link && o.channels.is_empty() && o.pending_out() > self.cfg.client_output_limit {
+            eprintln!(
+                "[client] connexion {slot} : {} o de sortie en attente, au-delà de la limite ({} o) : fermée",
+                o.pending_out(),
+                self.cfg.client_output_limit
+            );
+            self.out_stats.limit_closed += 1;
+            self.drain(slot);
+            return;
+        }
         let upto = self.aof.as_ref().and_then(|w| w.release_upto());
         let o = &mut self.outs[slot as usize];
         debug_assert!(!o.send_in_flight());

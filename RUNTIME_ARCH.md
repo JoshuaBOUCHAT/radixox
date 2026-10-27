@@ -566,6 +566,33 @@ après chaque commande :
 - L'autocorking TCP du noyau fusionne de petits sends rapprochés : un seuil un peu bas
   coûte moins cher que prévu.
 
+### 6.2 bis Sortie bornée : limite par client, budget global (2026-10-27)
+
+La backpressure ci-dessus borne un client qui pipeline sans lire (~1 Mio + une réponse).
+Restaient deux trous : une seule réponse n'a pas de plafond (bornée par la donnée lue :
+RESP2 exige `*N` avant le premier élément, la réponse est tenue en entier), et rien ne
+bornait la **somme** des connexions (10 000 clients lents × une grosse réponse).
+
+- **Limite par client normal** (`RADIXOX_CLIENT_OUTPUT_LIMIT_MB`, 1024 par défaut, 0 =
+  sans) : sortie en attente (`out` + send en vol + `BigBuf`) au-delà → connexion fermée,
+  journal `[client]`, `client_output_limit_closed`. Vérifiée dans `send`, seul passage vers
+  le noyau (fin de tour, envoi anticipé, suite d'un CQE). Abonnés : leurs limites (32 Mo /
+  8 Mo 60 s) ; lien de réplication : ses plafonds. Redis n'en met pas par défaut aux clients
+  normaux ; 1 Gio, symétrique de `client-query-buffer-limit`.
+- **Budget global** (`RADIXOX_OUTPUT_BUDGET_MB`, 1024 par défaut, 0 = sans) : relevé au
+  minuteur du GC (100 ms, ~10 µs pour 10 000 slots ; pas de compteur tenu à chaque écriture
+  dans `out`, il y en a partout). Dépassé → une connexion qui a encore de la sortie en
+  attente n'est plus tirée (`drawable`) : **personne n'est fermé**, chacun reprend dès sa
+  réponse précédente envoyée (pipeline ramené à une réponse à la fois). Dépassement possible
+  pendant au plus un relevé. `INFO` : `clients_output_bytes`, `clients_output_max_bytes`,
+  `clients_input_bytes`, `output_budget_exceeded`, `output_budget_paused_clients`,
+  `output_budget_exceeded_checks`.
+- Tests : `tests/output_limits.rs` (GET de 3 Mo sous limite de 1 Mo fermé, serveur intact ;
+  20 GET de 512 Ko non lus sous budget de 1 Mo : pause, autres clients servis, toutes les
+  réponses arrivent entières, budget retombé).
+- Reste : le **budget global d'entrée** du §5.3 (`rx` toutes connexions) n'est pas fait ;
+  `clients_input_bytes` le montre déjà.
+
 ### 6.3 Ce qui est zero-copy, et ce qui ne l'est pas
 
 « Fixed » désigne trois mécanismes différents dans io_uring :
