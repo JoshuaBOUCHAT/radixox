@@ -649,6 +649,21 @@ Ajouts du 2026-10-22 :
   zone libre de 2 Mio ; vérifier par `AnonHugePages` (`/proc/self/smaps_rollup`), compté dans `INFO`.
   Avec `defrag=defer+madvise`, une faute sur une région `MADV_HUGEPAGE` peut compacter de
   façon synchrone : sans danger si **toutes** les fautes ont lieu hors de la boucle.
+- **État au 2026-10-27 : pas fait.** Ni le pool ni les HiSlab ne préparent de page : chaque
+  page neuve de 2 Mio est prise par la commande qui la touche, la boucle (et tous les
+  clients) attend. Mesuré sur la machine de dev (THP `always`, `defrag=defer+madvise`) :
+  première écriture dans 2 Mio alignés **p50 145 µs, p99 250–300 µs, max 340–410 µs**
+  (4 Kio : 1 µs ; total par Gio 77 ms en 2 Mio contre 283 ms en 4 Kio). Le pool en compte
+  57 sur un chargement de 140 Mo (`mem_pool_sync_faults`) ; une slab de nœuds de 128 o en
+  prend une tous les 16 K nœuds : piste probable d'une part du p99.9 de chargement (YCSB
+  *load*), à vérifier. `compact_stall` = 95 depuis le démarrage sur cette machine (origine
+  non attribuée). **Piste retenue** : `IORING_OP_MADVISE` + `MADV_POPULATE_WRITE`, exécuté
+  par un worker io-wq (la mise à zéro et une éventuelle compaction hors de notre thread) ;
+  le pool demande la page suivante quand il en entame une neuve, le cœur demande celle
+  d'après pour une slab dont la partie touchée approche de la dernière page préparée
+  (hislab n'expose que la frontière). 1–2 pages d'avance par région, comptées par
+  `mincore` (§10.1 bis). À vérifier d'abord : que `MADV_POPULATE_WRITE` passe par io_uring
+  depuis un worker. Mesure : `mem_pool_sync_faults` et p99.9 du chargement YCSB, avant/après.
 - **Pas de réservation THP par programme** : Linux n'a pas d'appel « garde-moi une huge
   page ». Notre réserve préparée en tient lieu. Seul hugetlbfs réserve vraiment.
 - **Découpage des THP sous-utilisées** (6.12+, `shrink_underused`, compteur
