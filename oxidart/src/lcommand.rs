@@ -172,9 +172,10 @@ impl OxidArt {
         let l = list_mut(idx);
         match span(start, stop, l.len()) {
             Some((a, b)) => {
+                // détachés d'un coup, rendus par tranches (`list::lazy`)
                 let tail = l.len() - 1 - b;
-                l.drop_end(a, true);
-                l.drop_end(tail, false);
+                list::lazy::release(l.detach_end(a, true));
+                list::lazy::release(l.detach_end(tail, false));
             }
             None => {
                 self.del(key);

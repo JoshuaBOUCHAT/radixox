@@ -636,6 +636,54 @@ impl List {
         removed as u32
     }
 
+    /// Détache les `n` premiers (`front`) ou derniers éléments en une List à part, sans
+    /// les toucher : la coupe est trouvée depuis le bout le plus proche (O(min(n, len − n)
+    /// / CAP)), la chaîne de blocs entiers passe d'un coup à la List rendue, et seules les
+    /// cases du bloc coupé (< CAP) sont retirées sur place. À rendre par
+    /// [`lazy::release`] (libération par tranches).
+    pub fn detach_end(&mut self, n: u32, front: bool) -> List {
+        let n = n.min(self.len);
+        if n == 0 {
+            return List::new();
+        }
+        if n == self.len {
+            return std::mem::replace(self, List::new());
+        }
+        // rang du premier élément gardé (devant) ou du premier retiré (derrière)
+        let c = self.locate(if front { n } else { self.len - n }).expect("coupe");
+        let b = block(c.block);
+        let below = (b.live_mask() & ((1u64 << c.slot) - 1) as Mask).count_ones();
+        let mut out = List::new();
+        if front {
+            // blocs avant `c` : détachés ; `below` cases de `c` : retirées sur place
+            if b.prev != NONE {
+                let last = b.prev;
+                (out.first, out.last, out.len) = (self.first, last, n - below);
+                block_mut(last).next = NONE;
+                block_mut(c.block).prev = NONE;
+                self.first = c.block;
+            }
+            self.len -= n - below;
+            for _ in 0..below {
+                drop(self.pop_front());
+            }
+        } else {
+            let from = b.live() - below;
+            if b.next != NONE {
+                let first = b.next;
+                (out.first, out.last, out.len) = (first, self.last, n - from);
+                block_mut(first).prev = NONE;
+                block_mut(c.block).next = NONE;
+                self.last = c.block;
+            }
+            self.len -= n - from;
+            for _ in 0..from {
+                drop(self.pop_back());
+            }
+        }
+        out
+    }
+
     /// Retire les `n` premiers (`front`) ou derniers éléments, par blocs entiers quand ils
     /// y passent.
     pub fn drop_end(&mut self, mut n: u32, front: bool) {
@@ -801,9 +849,30 @@ mod tests {
                         assert_eq!(got as usize, want);
                     }
                     12 => {
-                        let n = r.below(40) as u32;
+                        let cap = if r.below(4) == 0 { 400 } else { 40 };
+                        let n = r.below(cap) as u32;
                         let front = r.below(2) == 0;
-                        l.drop_end(n, front);
+                        if r.below(2) == 0 {
+                            l.drop_end(n, front);
+                        } else {
+                            let mut d = l.detach_end(n, front);
+                            d.verify().unwrap();
+                            assert!(d.len() <= n.min(m.len() as u32));
+                            let want: Vec<Vec<u8>> = if front {
+                                m.iter().take(n as usize).map(|v| v.to_vec()).collect()
+                            } else {
+                                m.iter().skip(m.len().saturating_sub(n as usize)).map(|v| v.to_vec()).collect()
+                            };
+                            let got: Vec<Vec<u8>> = d.iter().map(|v| v.to_vec()).collect();
+                            // la List détachée tient les blocs entiers ; le reste du bloc coupé
+                            // est parti sur place : ses éléments sont une fin de `want`
+                            if front {
+                                assert_eq!(got[..], want[..got.len()]);
+                            } else {
+                                assert_eq!(got[..], want[want.len() - got.len()..]);
+                            }
+                            d.clear();
+                        }
                         for _ in 0..n.min(m.len() as u32) {
                             if front { m.pop_front(); } else { m.pop_back(); }
                         }
