@@ -191,6 +191,7 @@ pub(crate) fn alloc_zset(val: ZSet) -> u32 {
 /// sinon l'en-tête part tout de suite et le contenu d'un grand ZSet est rendu par tranches
 /// (`zset::lazy`).
 pub(crate) fn free_zset(idx: u32) {
+    crate::zset::lazy::exhume(idx);
     if crate::zset::save::defer_zset(idx) {
         return;
     }
@@ -258,12 +259,6 @@ pub(crate) fn list_ref(idx: u32) -> &'static List {
 pub(crate) fn list_mut(idx: u32) -> &'static mut List {
     crate::list::save::before_header_write(idx, || *list_ref(idx));
     list_slab().get_mut(idx).unwrap()
-}
-
-/// Précharge la case de l'en-tête de la List `idx` (chaînes AMAC).
-#[inline]
-pub(crate) fn prefetch_list(idx: u32) {
-    radixox_lib::prefetch::prefetch_l1(list_slab().slot_ptr(idx) as *const u8);
 }
 
 // ─── Tag+ValUnion ↔ Value conversions ────────────────────────────────────────

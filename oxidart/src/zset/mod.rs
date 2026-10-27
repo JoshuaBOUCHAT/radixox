@@ -385,6 +385,66 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// Retraits de grandes plages (`ZLarge::remove_range`) : feuilles du milieu décrochées,
+    /// entrées d'index périmées tant que le nettoyage (`lazy::step`) n'est pas passé ;
+    /// membres retirés puis rajoutés, retirés, lus ; ZSet supprimé avec son cimetière.
+    #[test]
+    fn range_removal_with_stale_index() {
+        use crate::value::{alloc_zset, free_zset, zset_mut, zset_ref};
+        use std::collections::BTreeMap;
+        crate::value::init_slabs();
+        for (seed, scores) in [(21u64, 1u64 << 30), (22, 50), (23, 1)] {
+            let mut rng = Rng(0xD6E8_FEB8_6659_FD93 ^ seed);
+            let idx = alloc_zset(ZSet::new());
+            let mut model: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+            let member = |i: u64| format!("membre-{i}").into_bytes();
+            for round in 0..80 {
+                for _ in 0..rng.below(3000) {
+                    let (m, sc) = (member(rng.below(40_000)), encode_score(rng.below(scores) as f64));
+                    zset_mut(idx).add(sc, &m).unwrap();
+                    model.insert(m, sc);
+                }
+                let len = zset_ref(idx).len() as u32;
+                if len > 0 && rng.below(2) == 0 {
+                    let lo = rng.below(len as u64) as u32;
+                    let hi = lo + 1 + rng.below((len - lo) as u64) as u32;
+                    let gone: Vec<Vec<u8>> = zset_ref(idx).members_in(lo as usize, hi as usize);
+                    let ZSet::Large(z) = zset_mut(idx) else { panic!("grande forme attendue") };
+                    assert_eq!(z.remove_range(idx, lo, hi), hi - lo);
+                    for m in gone {
+                        model.remove(&m);
+                    }
+                }
+                // retirés : absents ; rajoutés : présents avec leur nouveau score
+                for _ in 0..200 {
+                    let m = member(rng.below(40_000));
+                    match rng.below(4) {
+                        0 => {
+                            let sc = encode_score(rng.below(scores) as f64);
+                            zset_mut(idx).add(sc, &m).unwrap();
+                            model.insert(m, sc);
+                        }
+                        1 => assert_eq!(zset_mut(idx).remove(&m), model.remove(&m), "round {round}"),
+                        _ => assert_eq!(zset_ref(idx).score(&m), model.get(&m).copied(), "round {round}"),
+                    }
+                }
+                if rng.below(3) == 0 {
+                    lazy::step(rng.below(5000) as u32);
+                }
+                zset_ref(idx).verify().unwrap();
+                assert_eq!(zset_ref(idx).len(), model.len());
+                let got: Vec<(u64, Vec<u8>)> = zset_ref(idx).iter().map(|(s, m)| (s, m.to_vec())).collect();
+                let mut want: Vec<(u64, Vec<u8>)> = model.iter().map(|(m, &s)| (s, m.clone())).collect();
+                want.sort();
+                assert_eq!(got, want, "round {round}");
+            }
+            // supprimé avant la fin du nettoyage : tout est rendu
+            free_zset(idx);
+            while lazy::step(1 << 20) {}
+            assert_eq!(lazy::pending(), 0);
+        }
+    }
+
     /// Différentiel contre le ZSet actuel (oracle, comme oxidart-legacy pour l'arbre) :
     /// ajouts, mises à jour, retraits, scores, rangs, parcours dans les deux sens, passage
     /// petite → grande par le nombre et par la longueur d'un membre, ex-aequo massifs.

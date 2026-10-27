@@ -400,12 +400,19 @@ impl OxidArt {
             if lo >= hi {
                 return Ok(0);
             }
-            let members = zset_ref(idx).members_in(lo, hi);
             let zset = zset_mut(idx);
-            for m in &members {
-                zset.remove(m);
-            }
-            (members.len() as u64, zset.is_empty())
+            let removed = match zset {
+                // grande plage : feuilles du milieu décrochées d'un coup, rendues par tranches
+                ZSet::Large(z) => z.remove_range(idx, lo as u32, hi as u32) as u64,
+                ZSet::Small(_) => {
+                    let members = zset_ref(idx).members_in(lo, hi);
+                    for m in &members {
+                        zset.remove(m);
+                    }
+                    members.len() as u64
+                }
+            };
+            (removed, zset.is_empty())
         };
         if empty {
             self.del(key);

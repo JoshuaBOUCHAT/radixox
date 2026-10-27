@@ -217,6 +217,13 @@ impl Index {
     /// Entrée du membre de hash `h` (`eq` : la poignée désigne-t-elle ce membre ?).
     #[inline]
     pub fn find(&self, h: u64, eq: impl Fn(u32) -> bool) -> Option<Loc> {
+        self.find_by(h, |x, _| eq(x))
+    }
+
+    /// Comme [`find`](Self::find), `eq(poignée, score)` (validation des entrées périmées
+    /// après un retrait de plage, `ZLarge`).
+    #[inline]
+    pub fn find_by(&self, h: u64, eq: impl Fn(u32, u64) -> bool) -> Option<Loc> {
         if self.root == NONE {
             return None;
         }
@@ -230,7 +237,7 @@ impl Index {
         loop {
             let bk = bucket(b);
             for i in 0..bk.n as usize {
-                if bk.ctrl[i] == f && eq(bk.handles[i]) {
+                if bk.ctrl[i] == f && eq(bk.handles[i], bk.scores[i]) {
                     return Some(Loc { node: b, i: i as u8 });
                 }
             }
@@ -348,6 +355,11 @@ impl Index {
 
     /// Retire le membre de hash `h` ; rend `(poignée, score)`.
     pub fn remove(&mut self, h: u64, eq: impl Fn(u32) -> bool) -> Option<(u32, u64)> {
+        self.remove_by(h, |x, _| eq(x))
+    }
+
+    /// Comme [`remove`](Self::remove), `eq(poignée, score)`.
+    pub fn remove_by(&mut self, h: u64, eq: impl Fn(u32, u64) -> bool) -> Option<(u32, u64)> {
         if self.root == NONE {
             return None;
         }
@@ -358,7 +370,7 @@ impl Index {
         let mut b = head;
         let at = loop {
             let bk = bucket(b);
-            if let Some(i) = (0..bk.n as usize).find(|&i| bk.ctrl[i] == f && eq(bk.handles[i])) {
+            if let Some(i) = (0..bk.n as usize).find(|&i| bk.ctrl[i] == f && eq(bk.handles[i], bk.scores[i])) {
                 break i;
             }
             if bk.next == NONE {

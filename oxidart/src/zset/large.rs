@@ -28,7 +28,7 @@ fn tie(a: u32, b: u32) -> Ordering {
 }
 
 #[inline]
-fn rehash(h: u32) -> u64 {
+pub(crate) fn rehash(h: u32) -> u64 {
     member_hash(member(h))
 }
 
@@ -109,7 +109,15 @@ pub enum Added {
 pub struct ZLarge {
     pub(crate) tree: BTree,
     pub(crate) index: Index,
+    /// Entrées de l'index dont le membre a été décroché par un retrait de plage
+    /// ([`remove_range`](Self::remove_range)) et pas encore nettoyé (`lazy`) : tant qu'il
+    /// y en a, une entrée trouvée n'est valable que si le B+tree la contient.
+    pub(crate) stale: u32,
 }
+
+/// Plage à partir de laquelle un retrait décroche les feuilles du milieu au lieu de
+/// retirer membre par membre.
+pub const CUT_MIN: u32 = 256;
 
 impl ZLarge {
     pub fn new() -> Self {
@@ -131,7 +139,7 @@ impl ZLarge {
                 }
             }
         }
-        let mut z = Self { tree: BTree::from_sorted(hs.iter().copied()), index: Index::new() };
+        let mut z = Self { tree: BTree::from_sorted(hs.iter().copied()), index: Index::new(), stale: 0 };
         for &(s, h) in &hs {
             let hm = rehash(h);
             if z.index.find(hm, |x| member(x) == member(h)).is_some() {
@@ -158,7 +166,36 @@ impl ZLarge {
     /// `(poignée, score)` de `m`.
     #[inline]
     pub fn get(&self, m: &[u8]) -> Option<(u32, u64)> {
-        self.index.find(member_hash(m), |h| member(h) == m).map(Index::entry)
+        self.find_live(member_hash(m), m).map(Index::entry)
+    }
+
+    /// Entrée de `m` (hash `hm`) dans l'index, sauf entrée périmée (membre décroché pas
+    /// encore nettoyé : sa poignée vit encore, le B+tree ne la contient plus).
+    #[inline]
+    fn find_live(&self, hm: u64, m: &[u8]) -> Option<super::index::Loc> {
+        self.index.find_by(hm, |h, s| member(h) == m && (self.stale == 0 || self.tree.find(s, h, &tie).is_some()))
+    }
+
+    /// Retire les rangs `[lo, hi)` ; `zset` : idx de l'en-tête. Au-delà de [`CUT_MIN`], les
+    /// feuilles du milieu sont décrochées d'un coup (leurs entrées d'index deviennent
+    /// périmées) et rendues par tranches (`lazy`) ; les bouts, membre par membre.
+    pub fn remove_range(&mut self, zset: u32, lo: u32, hi: u32) -> u32 {
+        let mut cut = 0;
+        if hi - lo >= CUT_MIN
+            && let Some((stack, n)) = self.tree.cut_middle(lo, hi)
+        {
+            cut = n;
+            self.stale += n;
+            super::lazy::bury(zset, stack);
+        }
+        for _ in 0..(hi - lo) - cut {
+            let (s, h) = BTree::entry(self.tree.select(lo).expect("rang de la plage"));
+            self.index.remove_by(rehash(h), |x, _| x == h).expect("entrée d'index");
+            let ok = self.tree.remove(s, h, &tie);
+            debug_assert!(ok);
+            super::save::free_handle(h);
+        }
+        hi - lo
     }
 
     /// Ajoute `m` ou change son score. `None` : table des poignées pleine.
@@ -171,7 +208,7 @@ impl ZLarge {
     /// table des poignées pleine.
     pub fn upsert(&mut self, m: &[u8], f: impl FnOnce(Option<u64>) -> Option<u64>) -> Option<Added> {
         let hm = member_hash(m);
-        if let Some(loc) = self.index.find(hm, |h| member(h) == m) {
+        if let Some(loc) = self.find_live(hm, m) {
             let (h, old) = Index::entry(loc);
             let Some(s) = f(Some(old)).filter(|&s| s != old) else { return Some(Added::Unchanged) };
             self.tree.update(old, h, s, &tie);
@@ -187,7 +224,11 @@ impl ZLarge {
 
     /// Retire `m` ; rend son score.
     pub fn remove(&mut self, m: &[u8]) -> Option<u64> {
-        let (h, s) = self.index.remove(member_hash(m), |h| member(h) == m)?;
+        let stale = self.stale;
+        let tree = self.tree;
+        let (h, s) = self
+            .index
+            .remove_by(member_hash(m), |h, s| member(h) == m && (stale == 0 || tree.find(s, h, &tie).is_some()))?;
         let ok = self.tree.remove(s, h, &tie);
         debug_assert!(ok);
         super::save::free_handle(h);
@@ -245,8 +286,8 @@ impl ZLarge {
     pub fn verify(&self) -> Result<(), String> {
         self.tree.verify(&tie)?;
         self.index.verify(rehash)?;
-        if self.tree.len() != self.index.len() {
-            return Err(format!("arbre {} entrées, index {}", self.tree.len(), self.index.len()));
+        if self.tree.len() + self.stale != self.index.len() {
+            return Err(format!("arbre {} entrées + {} périmées, index {}", self.tree.len(), self.stale, self.index.len()));
         }
         for (s, h) in self.tree.iter() {
             match self.index.find(rehash(h), |x| x == h).map(Index::entry) {

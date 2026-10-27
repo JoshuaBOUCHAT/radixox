@@ -865,6 +865,104 @@ impl BTree {
         }
     }
 
+    /// Chemin vers l'entrée de rang `r` (`r < len`) : nœuds internes et rangs d'enfant
+    /// dans `path`, rend la feuille.
+    fn path_to_rank(&self, mut r: u32, path: &mut [(u32, usize); MAX_H]) -> u32 {
+        let mut idx = self.root;
+        for slot in path.iter_mut().take(self.height as usize) {
+            let node = internal(idx);
+            let mut ci = 0;
+            while r >= node.count[ci] {
+                r -= node.count[ci];
+                ci += 1;
+            }
+            *slot = (idx, ci);
+            idx = node.child[ci];
+        }
+        idx
+    }
+
+    /// Partie lourde d'un retrait de plage `[lo, hi)` (commandes bornées) : décroche d'un
+    /// coup toutes les feuilles strictement entre celle du rang `lo` et celle du rang
+    /// `hi − 1`, en sous-arbres entiers (O(hauteur × I)), sans toucher à leurs entrées. Rend
+    /// la pile de ces sous-arbres (pour [`free_step`](Self::free_step)) et leur nombre
+    /// d'entrées ; `None` si les deux feuilles sont la même ou voisines. Le reste de la
+    /// plage (bouts des deux feuilles) garde les rangs `lo..` : à retirer par l'appelant.
+    pub(crate) fn cut_middle(&mut self, lo: u32, hi: u32) -> Option<(Vec<(u32, u8)>, u32)> {
+        if self.height == 0 || hi <= lo + 1 || hi > self.len {
+            return None;
+        }
+        let height = self.height as usize;
+        let (mut pl, mut pr) = ([(NONE, 0usize); MAX_H], [(NONE, 0usize); MAX_H]);
+        let ll = self.path_to_rank(lo, &mut pl);
+        let rl = self.path_to_rank(hi - 1, &mut pr);
+        if ll == rl || leaf(ll).next == rl {
+            return None;
+        }
+        // premier niveau où les chemins se séparent (même nœud, enfants différents)
+        let d0 = (0..height).find(|&d| pl[d].1 != pr[d].1).expect("chemins distincts");
+        let child_h = |d: usize| (height - d - 1) as u8;
+        let mut stack = Vec::new();
+        let (n0, a) = pl[d0];
+        let b = pr[d0].1;
+        {
+            // enfants a+1..b-1 décrochés ; le séparateur b-1 (devant b) devient celui de
+            // a / b, fixé plus bas
+            let node = internal(n0);
+            let n = node.n as usize;
+            stack.extend((a + 1..b).map(|c| (node.child[c], child_h(d0))));
+            node.child.copy_within(b..n, a + 1);
+            node.count.copy_within(b..n, a + 1);
+            node.sep_s.copy_within(b - 1..n - 1, a);
+            node.sep_h.copy_within(b - 1..n - 1, a);
+            node.n -= (b - a - 1) as u16;
+            pr[d0].1 = a + 1;
+        }
+        // sous la séparation : à gauche, les enfants à droite du chemin ; à droite, ceux à
+        // gauche (le chemin de droite devient l'enfant 0)
+        for d in d0 + 1..height {
+            let (p, x) = pl[d];
+            let node = internal(p);
+            stack.extend((x + 1..node.n as usize).map(|c| (node.child[c], child_h(d))));
+            node.n = (x + 1) as u16;
+            let (q, y) = pr[d];
+            let node = internal(q);
+            let n = node.n as usize;
+            stack.extend((0..y).map(|c| (node.child[c], child_h(d))));
+            node.child.copy_within(y..n, 0);
+            node.count.copy_within(y..n, 0);
+            node.sep_s.copy_within(y..n - 1, 0);
+            node.sep_h.copy_within(y..n - 1, 0);
+            node.n = (n - y) as u16;
+            pr[d].1 = 0;
+        }
+        leaf_mut(ll).next = rl;
+        leaf_mut(rl).prev = ll;
+        // comptes le long des deux chemins, du bas vers le haut
+        for d in (0..height).rev() {
+            for (p, ci) in [pl[d], pr[d]] {
+                let c = internal(p).child[ci];
+                let n = if d + 1 == height {
+                    leaf(c).n as u32
+                } else {
+                    let x = internal(c);
+                    x.count[..x.n as usize].iter().sum()
+                };
+                internal(p).count[ci] = n;
+            }
+        }
+        // séparateur entre les deux côtés : plus petite clé de la feuille de droite
+        let (rs, rh) = (leaf(rl).scores[0], leaf(rl).handles[0]);
+        let node = internal(n0);
+        node.sep_s[a] = rs;
+        node.sep_h[a] = rh;
+        let root = internal(self.root);
+        let len: u32 = root.count[..root.n as usize].iter().sum();
+        let removed = self.len - len;
+        self.len = len;
+        Some((stack, removed))
+    }
+
     /// Pile de départ de [`free_step`](Self::free_step) ; l'arbre devient vide.
     pub(crate) fn take_for_free(&mut self) -> Vec<(u32, u8)> {
         let stack = if self.root == NONE { Vec::new() } else { vec![(self.root, self.height)] };
@@ -1018,6 +1116,56 @@ mod tests {
         let got: Vec<_> = t.iter().map(model_key).collect();
         let want: Vec<_> = model.iter().copied().collect();
         assert_eq!(got, want);
+    }
+
+    /// Retrait de grandes plages : coupe des feuilles du milieu (`cut_middle`), bouts
+    /// retirés entrée par entrée, sous-arbres décrochés rendus ; contre un `BTreeSet`.
+    #[test]
+    fn cut_middle_against_btreeset() {
+        let tie = tie();
+        for (seed, scores) in [(11u64, 1u64 << 40), (12, 16), (13, 1)] {
+            let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ seed);
+            let mut t = BTree::new();
+            let mut model = BTreeSet::new();
+            let mut next_h = 0u32;
+            DEAD.with(|d| d.borrow_mut().clear());
+            for round in 0..60 {
+                for _ in 0..rng.below(4000) {
+                    let s = rng.below(scores);
+                    t.insert(s, next_h, &tie);
+                    model.insert(model_key((s, next_h)));
+                    next_h += 1;
+                }
+                let len = t.len();
+                if len < 2 {
+                    continue;
+                }
+                let lo = rng.below(len as u64) as u32;
+                let hi = lo + 1 + rng.below((len - lo) as u64) as u32;
+                let sorted: Vec<(u64, u32)> = t.iter().collect();
+                let mut cut = 0;
+                if let Some((mut stack, n)) = t.cut_middle(lo, hi) {
+                    cut = n;
+                    let mut freed = 0;
+                    let mut budget = u32::MAX;
+                    BTree::free_step(&mut stack, &mut budget, |h| {
+                        freed += 1;
+                        DEAD.with(|d| d.borrow_mut().insert(h));
+                    });
+                    assert_eq!(freed, n, "round {round}");
+                    t.verify(&tie).unwrap();
+                }
+                for _ in 0..(hi - lo) - cut {
+                    let (s, h) = BTree::entry(t.select(lo).unwrap());
+                    assert!(t.remove(s, h, &tie));
+                    DEAD.with(|d| d.borrow_mut().insert(h));
+                }
+                for &(s, h) in &sorted[lo as usize..hi as usize] {
+                    assert!(model.remove(&model_key((s, h))));
+                }
+                check(&t, &model);
+            }
+        }
     }
 
     /// Contre un `BTreeSet` + rangs calculés : insertions, suppressions, mises à jour,

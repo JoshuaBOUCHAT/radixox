@@ -55,7 +55,6 @@ pub(in super::super) struct Block {
 struct Waiter {
     slot: Slot,
     epoch: u32,
-    keys: SmallVec<[SharedByte; 2]>,
     kind: Kind,
     deadline: Option<Instant>,
 }
@@ -74,10 +73,6 @@ impl Blocked {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.waiters.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.waiters.len()
     }
 
     /// Des inscrits attendent peut-être `key` (vérifié au service).
@@ -99,7 +94,7 @@ impl Blocked {
             Kind::Move { dst, from_right, to_right } => Kind::Move { dst: dst.into_external(), from_right, to_right },
             k => k,
         };
-        self.waiters.insert(id, Waiter { slot, epoch, keys, kind, deadline });
+        self.waiters.insert(id, Waiter { slot, epoch, kind, deadline });
         id
     }
 
@@ -331,13 +326,6 @@ impl Serve<'_> {
 }
 
 impl Core {
-    /// Inscrit la commande bloquante de `slot`, pas servie à son exécution.
-    pub(super) fn block_register(&mut self, slot: Slot, b: Block) {
-        let o = &mut self.outs[slot as usize];
-        let id = self.blocked.register(slot, o.epoch, b, self.now);
-        o.block_wait = Some(id);
-    }
-
     /// Fin de la frame bloquante : si l'inscription attend encore (aucun producteur ne l'a
     /// servie dans la fenêtre), la connexion se parque et le délai est posé.
     pub(super) fn block_park(&mut self, slot: Slot) {
