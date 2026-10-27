@@ -100,6 +100,10 @@ pub struct ConnOut {
     /// `WAIT` : parquée jusqu'à ce que assez de réplicas aient acquitté sa
     /// dernière écriture (DURABILITY_DESIGN.md §10.6), comme `aof_wait`.
     pub repl_wait: bool,
+    /// Commande bloquante (BLPOP, BLMOVE, BZPOPMIN…) en attente : son inscription
+    /// dans le registre (`core::block`), comme `repl_wait`. Le producteur qui la
+    /// sert la remet à `None` et écrit la réponse.
+    pub block_wait: Option<u64>,
     /// Offset du flux atteint par la dernière écriture journalisée de la
     /// connexion (marque du §7.5) : ce que `WAIT` attend des réplicas.
     pub write_mark: u64,
@@ -141,6 +145,7 @@ impl ConnOut {
             job_pending: false,
             aof_wait: false,
             repl_wait: false,
+            block_wait: None,
             write_mark: 0,
             holds: Default::default(),
             channels: Vec::new(),
@@ -151,9 +156,9 @@ impl ConnOut {
     }
 
     /// Parquée : plus tirée, ce qu'elle reçoit attend dans `rx` (job, AOF
-    /// en retard, `WAIT`).
+    /// en retard, `WAIT`, commande bloquante).
     pub fn parked(&self) -> bool {
-        self.job_pending || self.aof_wait || self.repl_wait
+        self.job_pending || self.aof_wait || self.repl_wait || self.block_wait.is_some()
     }
 
     pub fn send_in_flight(&self) -> bool {

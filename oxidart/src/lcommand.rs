@@ -55,6 +55,11 @@ fn index(i: i64, len: u32) -> Option<u32> {
 }
 
 impl OxidArt {
+    /// Type de la valeur à `key`, sans la copier (`RedisType::None` : absente).
+    pub fn key_type(&mut self, key: &[u8]) -> RedisType {
+        self.get_ref(key).map_or(RedisType::None, |v| v.tag.redis_type())
+    }
+
     /// En-tête de la List à `key` : `None` si absente.
     fn list_idx(&mut self, key: &[u8]) -> Result<Option<u32>, RedisType> {
         match self.get_ref(key) {

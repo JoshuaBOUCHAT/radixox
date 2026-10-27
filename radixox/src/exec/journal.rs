@@ -37,11 +37,20 @@ pub enum Journal<'a> {
     IfChanged,
     /// `SPOP` : `SREM <clé> <membres tirés>`, lus dans la réponse (D4).
     SRem { key: &'a [u8] },
+    /// Commande bloquante servie à son exécution : l'opération faite (`LPOP` /
+    /// `RPOP` / `ZPOPMIN` / `ZPOPMAX` sur la clé de la réponse, `LMOVE`), comme
+    /// Redis la propage. Parquée : rien ici, le producteur qui la sert journalise.
+    Blocking { op: &'static [u8], lmove: Option<(&'a [u8], &'a [u8], bool, bool)> },
 }
 
 pub fn plan<'a>(cmd: &Cmd<'a>) -> Journal<'a> {
     match cmd {
         Cmd::SPop { key, .. } => Journal::SRem { key },
+        Cmd::BPop { right, .. } => Journal::Blocking { op: if *right { b"RPOP" } else { b"LPOP" }, lmove: None },
+        Cmd::BZPop { max, .. } => Journal::Blocking { op: if *max { b"ZPOPMAX" } else { b"ZPOPMIN" }, lmove: None },
+        Cmd::BLMove { src, dst, from_right, to_right, .. } => {
+            Journal::Blocking { op: b"LMOVE", lmove: Some((src, dst, *from_right, *to_right)) }
+        }
         Cmd::Set { opts, .. } => match opts.condition {
             SetCondition::Always => Journal::Verbatim,
             SetCondition::IfNotExists | SetCondition::IfExists => Journal::IfChanged,
@@ -82,6 +91,34 @@ pub fn finish(j: Journal<'_>, reply: &[u8], raw: &[u8], now: u64, out: &mut Stre
                 out.push(now, raw);
             }
         }
+        Journal::Blocking { op, lmove } => {
+            let mut cmd = Vec::with_capacity(64);
+            match lmove {
+                // servie : la réponse est l'élément (nul ou vide : parquée)
+                Some((src, dst, fr, tr)) => {
+                    if reply.first() != Some(&b'$') || reply.starts_with(b"$-1") {
+                        return;
+                    }
+                    let side = |r: bool| if r { &b"RIGHT"[..] } else { &b"LEFT"[..] };
+                    encode_array_len(&mut cmd, 5);
+                    for a in [op, src, dst, side(fr), side(tr)] {
+                        encode_bulk(&mut cmd, a);
+                    }
+                }
+                // servie : `[clé, …]`
+                None => {
+                    let mut items: Vec<&[u8]> = Vec::new();
+                    if reply.first() != Some(&b'*') || reply.starts_with(b"*-1") || !reply_bulks(reply, &mut items) {
+                        return;
+                    }
+                    let Some(key) = items.first() else { return };
+                    encode_array_len(&mut cmd, 2);
+                    encode_bulk(&mut cmd, op);
+                    encode_bulk(&mut cmd, key);
+                }
+            }
+            out.push(now, &cmd);
+        }
         Journal::SRem { key } => {
             let mut members: Vec<&[u8]> = Vec::new();
             if !spop_members(reply, &mut members) {
@@ -105,6 +142,11 @@ pub fn finish(j: Journal<'_>, reply: &[u8], raw: &[u8], now: u64, out: &mut Stre
 
 /// Membres d'une réponse de SPOP : `$n` (un), `*m` de bulk strings, ou nul.
 /// `false` : réponse d'une autre forme.
+/// Bulk strings d'une réponse (`$n` ou `*m` de bulk strings).
+fn reply_bulks<'r>(reply: &'r [u8], into: &mut Vec<&'r [u8]>) -> bool {
+    spop_members(reply, into)
+}
+
 fn spop_members<'r>(reply: &'r [u8], into: &mut Vec<&'r [u8]>) -> bool {
     fn line(d: &[u8]) -> Option<(i64, usize)> {
         let end = d.windows(2).position(|w| w == b"\r\n")?;

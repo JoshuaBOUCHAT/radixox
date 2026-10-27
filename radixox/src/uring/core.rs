@@ -36,6 +36,7 @@ use crate::tsc;
 use super::bufs::{Bid, BufPool};
 use super::conn::{ConnIn, ConnOut, Mode, Span};
 
+mod block;
 mod repl;
 
 /// Index de connexion = slot dans la table des fichiers enregistrés.
@@ -404,6 +405,8 @@ enum Timer {
     Wait,
     MemRelease,
     Gc,
+    /// Échéance d'une commande bloquante.
+    Block,
 }
 
 /// Suite à donner après l'exécution d'une frame.
@@ -439,6 +442,11 @@ enum After {
     RxBlock(Vec<u8>),
     RxTick(u64),
     Wait { replicas: u64, timeout_ms: u64 },
+    /// Commande bloquante pas servie : inscrite pendant la fenêtre, la connexion se
+    /// parque à la fin de la frame si personne ne l'a servie entre-temps.
+    Block(block::Block),
+    /// Déjà inscrite (fenêtre) : parquer si toujours en attente.
+    Blocked,
 }
 
 /// Limites de sortie des abonnés Pub/Sub (`client-output-buffer-limit pubsub`
@@ -506,7 +514,20 @@ fn stops_window(cmd: &Cmd<'_>) -> bool {
                 | Cmd::RxBlock(_)
                 | Cmd::RxTick(_)
                 | Cmd::Wait { .. }
+                | Cmd::BPop { .. }
+                | Cmd::BLMove { .. }
+                | Cmd::BZPop { .. }
         )
+}
+
+/// Clé qu'une commande peut créer ou remplir, et qu'un client bloqué peut attendre
+/// (§14.3) : seulement regardée quand le registre n'est pas vide.
+fn produced_key<'a>(cmd: &Cmd<'a>) -> Option<&'a [u8]> {
+    match *cmd {
+        Cmd::LPush { key, exists: false, .. } | Cmd::ZAdd { key, .. } | Cmd::ZIncrBy { key, .. } => Some(key),
+        Cmd::LMove { dst, .. } | Cmd::BLMove { dst, .. } => Some(dst),
+        _ => None,
+    }
 }
 
 pub struct Core {
@@ -581,6 +602,8 @@ pub struct Core {
     promoted: bool,
     /// Connexions en `WAIT`.
     waiters: Vec<repl::Waiter>,
+    /// Commandes bloquantes en attente, par clé (§14.3).
+    blocked: block::Blocked,
     /// Suites de fichiers en cours, dans l'ordre de leur demande (§8.6).
     fs_jobs: Vec<FsJob>,
     fs_seq: u32,
@@ -641,6 +664,7 @@ impl Core {
             loading: None,
             promoted: false,
             waiters: Vec::new(),
+            blocked: block::Blocked::default(),
             fs_jobs: Vec::new(),
             fs_seq: 0,
             cfg,
@@ -967,6 +991,7 @@ impl Core {
                     self.timers.push(Reverse((self.now + REPL_EVERY, Timer::Repl)));
                 }
                 Timer::Wait => self.wait_wake(),
+                Timer::Block => self.block_timeouts(),
             }
         }
     }
@@ -1307,6 +1332,7 @@ impl Core {
         o.job_pending = false;
         o.aof_wait = false;
         o.repl_wait = false;
+        o.block_wait = None;
         o.write_mark = 0;
         o.channels.clear();
         o.over_soft = None;
@@ -1659,7 +1685,8 @@ impl Core {
         let aof_files_busy = self.aof_files_busy();
         {
             let job_budget = self.cfg.job_budget;
-            let Core { art, ins, outs, bufs, persist, journal, aof, cfg, held, follow, .. } = self;
+            let Core { art, ins, outs, bufs, persist, journal, aof, cfg, held, follow, blocked, ready, dirty, now, .. } = self;
+            let now = *now;
             // Réplica : les écritures des clients sont refusées (§10.1).
             let read_only = follow.is_some();
             // `always` : les réponses attendent le fsync qui couvre leur marque.
@@ -1763,6 +1790,7 @@ impl Core {
                     let mut fits = true;
                     let hinted = o.client.authed
                         && o.channels.is_empty()
+                        && (blocked.is_empty() || produced_key(c).is_none_or(|k| !blocked.watched(k)))
                         && crate::exec::hint_keys(c, |k| {
                             if n < B {
                                 flat[n] = k;
@@ -1884,9 +1912,51 @@ impl Core {
                 #[cfg(radixox_gc_debug)]
                 GC_DEBUG_RAW.with(|r| *r.borrow_mut() = raw.to_vec());
                 let plan = journal.is_some().then(|| (journal::plan(&cmd), o.out.len()));
-                afters.push((slot, run_cmd(cmd, art, o, job_budget)));
+                // Producteur sur une clé attendue (§14.3). LPUSH / RPUSH sur clé absente :
+                // service direct, seul le reste est posé ; les autres : exécutés, puis servis.
+                let produced = if blocked.is_empty() || !o.client.authed || !o.channels.is_empty() {
+                    None
+                } else {
+                    produced_key(&cmd).filter(|k| blocked.watched(k))
+                };
+                let hand_off = match &cmd {
+                    Cmd::LPush { key, vals, right, exists: false }
+                        if produced.is_some() && art.key_type(key) == oxidart::value::RedisType::None =>
+                    {
+                        Some((*key, *right, vals.clone()))
+                    }
+                    _ => None,
+                };
+                let mut after = if let Some((_, _, vals)) = &hand_off {
+                    // longueur après le push, avant le service (comme Redis)
+                    extend_encode(&mut o.out, &Frame::Integer(vals.len() as i64));
+                    After::Continue
+                } else {
+                    run_cmd(cmd, art, o, job_budget)
+                };
+                if let After::Block(b) = after {
+                    o.block_wait = Some(blocked.register(slot, o.epoch, b, now));
+                    after = After::Blocked;
+                }
+                afters.push((slot, after));
                 if let (Some(stream), Some((plan, start))) = (journal.as_mut(), plan) {
                     journal_finish(stream, plan, start, release_upto, held, slot, o, raw, art.now);
+                }
+                if let Some(key) = produced {
+                    let mut sv = block::Serve {
+                        art,
+                        outs,
+                        ins,
+                        journal: journal.as_mut(),
+                        release_upto,
+                        held,
+                        dirty,
+                        ready,
+                    };
+                    match hand_off {
+                        Some((key, right, vals)) => sv.push_hand_off(blocked, key, right, &vals),
+                        None => sv.serve_key(blocked, key),
+                    }
                 }
             }
             if art.in_window() {
@@ -2049,6 +2119,8 @@ impl Core {
                 );
                 extend_encode(&mut self.outs[s].out, &Frame::BulkString(SharedByte::from_slice(info.as_bytes())));
             }
+            After::Block(_) => unreachable!("inscrite dans la fenêtre"),
+            After::Blocked => self.block_park(slot),
             After::Subscribe(channels) => self.subscribe(slot, &channels),
             After::Unsubscribe(channels) => self.unsubscribe(slot, &channels),
             After::Publish { channel, message } => {
@@ -2541,6 +2613,7 @@ impl Core {
             self.outs[s].repl_wait = false;
             self.waiters.retain(|w| w.slot != slot);
         }
+        self.block_forget(slot);
         self.cancel_recv(slot);
         let o = &mut self.outs[s];
         if o.send_in_flight() && !o.send_cancelled {
@@ -2627,6 +2700,10 @@ impl Core {
                     self.conn_jobs.iter().any(|&(js, je, _)| js as usize == s && je == o.epoch),
                     "slot {s} parqué sans job"
                 );
+            }
+            if let Some(id) = o.block_wait {
+                assert!(i.spans.is_empty(), "slot {s} bloqué : l'anneau ne doit pas être retenu");
+                assert!(self.blocked.contains(id), "slot {s} bloqué hors registre");
             }
             if o.repl_wait {
                 assert!(i.spans.is_empty(), "slot {s} en WAIT : l'anneau ne doit pas être retenu");
@@ -2837,6 +2914,42 @@ fn runtime(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) 
         Cmd::RxBlock(b) => After::RxBlock(b.to_vec()),
         Cmd::RxTick(now) => After::RxTick(now),
         Cmd::Wait { replicas, timeout_ms } => After::Wait { replicas, timeout_ms },
+        // Bloquantes : servies tout de suite si une clé a de quoi, sinon inscrites (§14.3).
+        Cmd::BPop { keys, right, timeout } => match crate::exec::list::try_bpop(art, &keys, right) {
+            Some(f) => {
+                extend_encode(&mut o.out, &f);
+                After::Continue
+            }
+            None => After::Block(block::Block {
+                keys: keys.iter().map(SharedByte::from_slice).collect(),
+                kind: block::Kind::Pop { right },
+                timeout,
+            }),
+        },
+        Cmd::BLMove { src, dst, from_right, to_right, timeout } => {
+            match crate::exec::list::try_blmove(art, src, dst, from_right, to_right) {
+                Some(f) => {
+                    extend_encode(&mut o.out, &f);
+                    After::Continue
+                }
+                None => After::Block(block::Block {
+                    keys: std::iter::once(SharedByte::from_slice(src)).collect(),
+                    kind: block::Kind::Move { dst: SharedByte::from_slice(dst), from_right, to_right },
+                    timeout,
+                }),
+            }
+        }
+        Cmd::BZPop { keys, max, timeout } => match crate::exec::try_bzpop(art, &keys, max) {
+            Some(f) => {
+                extend_encode(&mut o.out, &f);
+                After::Continue
+            }
+            None => After::Block(block::Block {
+                keys: keys.iter().map(SharedByte::from_slice).collect(),
+                kind: block::Kind::ZPop { max },
+                timeout,
+            }),
+        },
         _ => unreachable!("commande sans dépendance au runtime"),
     }
 }

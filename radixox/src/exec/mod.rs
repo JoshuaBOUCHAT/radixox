@@ -24,6 +24,7 @@ pub use hash::{
     cmd_hset, cmd_hvals,
 };
 pub use sset::{cmd_sadd, cmd_scard, cmd_sismember, cmd_smembers, cmd_spop, cmd_srem};
+pub use zset::try_bzpop;
 pub use zset::{
     cmd_zadd, cmd_zcard, cmd_zcount, cmd_zincrby, cmd_zmscore, cmd_zpop, cmd_zrandmember, cmd_zrange, cmd_zrank, cmd_zrem,
     cmd_zremrange, cmd_zscore,
@@ -88,6 +89,9 @@ pub fn execute_into<'a>(
         | Cmd::RxBlock(_)
         | Cmd::RxTick(_)
         | Cmd::Wait { .. }
+        | Cmd::BPop { .. }
+        | Cmd::BLMove { .. }
+        | Cmd::BZPop { .. }
         | Cmd::Info => return Executed::Runtime(cmd),
         Cmd::Ping(msg) => resp_pong(msg),
         Cmd::Auth { user, pass } => auth::cmd_auth(user, pass, &mut client.authed),
