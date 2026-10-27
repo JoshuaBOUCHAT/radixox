@@ -199,6 +199,43 @@ fn partition(n: usize, mut pred: impl FnMut(usize) -> bool) -> usize {
     lo
 }
 
+/// Combien des `n` premiers scores de la colonne sont `< s`, et `<= s`. Balayage sans
+/// branche de toute la colonne (taille fixe, masque par rang) : vectorisé par LLVM
+/// (`target-cpu=native` ; AVX-512 : 8 `u64` par comparaison). Remplace une dichotomie
+/// dont chaque comparaison était un saut imprévisible (~47 mauvaises prédictions par
+/// ZADD).
+#[inline(always)]
+fn count_scores<const N: usize>(col: &[u64; N], n: usize, s: u64) -> (usize, usize) {
+    let (mut lt, mut le) = (0usize, 0usize);
+    for (i, &x) in col.iter().enumerate() {
+        let live = i < n;
+        lt += (live & (x < s)) as usize;
+        le += (live & (x <= s)) as usize;
+    }
+    (lt, le)
+}
+
+/// Rang dans un nœud de la clé `(s, ·)` : entrées strictement avant elle (`upper` faux),
+/// ou avant ou égales (`upper` vrai). `cmp(h)` = la clé comparée à l'entrée de poignée `h`,
+/// appelé seulement dans la plage des scores égaux (vide en général).
+#[inline(always)]
+fn search<const N: usize>(scores: &[u64; N], handles: &[u32; N], n: usize, s: u64, upper: bool, mut cmp: impl FnMut(u32) -> Ordering) -> usize {
+    let (lt, le) = count_scores(scores, n, s);
+    if lt == le {
+        return lt;
+    }
+    lt + partition(le - lt, |k| {
+        let o = cmp(handles[lt + k]);
+        if upper { o != Ordering::Less } else { o == Ordering::Greater }
+    })
+}
+
+/// La clé `(·, h)` comparée à l'entrée de poignée `e`, à score égal.
+#[inline(always)]
+fn key_cmp(tie: &impl Tie, h: u32, e: u32) -> Ordering {
+    if h == e { Ordering::Equal } else { tie.tie(h, e) }
+}
+
 /// Position dans une feuille : `leaf`, rang `pos` dans la feuille.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cursor {
@@ -268,7 +305,7 @@ impl BTree {
         for d in 0..self.height as usize {
             let node = internal(idx);
             let n = node.n as usize;
-            let ci = partition(n - 1, |i| kcmp(tie, (node.sep_s[i], node.sep_h[i]), key) != Ordering::Greater);
+            let ci = search(&node.sep_s, &node.sep_h, n - 1, s, true, |e| key_cmp(tie, h, e));
             node.count[ci] += 1;
             right_edge &= ci == n - 1;
             path[d] = (idx, ci);
@@ -276,7 +313,7 @@ impl BTree {
         }
         let lf = leaf_mut(idx);
         let n = lf.n as usize;
-        let pos = partition(n, |i| kcmp(tie, (lf.scores[i], lf.handles[i]), key) == Ordering::Less);
+        let pos = search(&lf.scores, &lf.handles, n, s, false, |e| key_cmp(tie, h, e));
         debug_assert!(pos == n || kcmp(tie, (lf.scores[pos], lf.handles[pos]), key) != Ordering::Equal, "déjà présente");
         if n < L {
             lf.scores.copy_within(pos..n, pos + 1);
@@ -386,11 +423,10 @@ impl BTree {
         if self.root == NONE {
             return None;
         }
-        let key = (s, h);
         let mut idx = self.root;
         for slot in path.iter_mut().take(self.height as usize) {
             let node = internal(idx);
-            let ci = partition(node.n as usize - 1, |i| kcmp(tie, (node.sep_s[i], node.sep_h[i]), key) != Ordering::Greater);
+            let ci = search(&node.sep_s, &node.sep_h, node.n as usize - 1, s, true, |e| key_cmp(tie, h, e));
             if ci > 0 && node.sep_s[ci - 1] == s && node.sep_h[ci - 1] == h {
                 *sep = Some((idx, ci - 1));
             }
@@ -398,7 +434,7 @@ impl BTree {
             idx = node.child[ci];
         }
         let lf = leaf(idx);
-        let pos = partition(lf.n as usize, |i| kcmp(tie, (lf.scores[i], lf.handles[i]), key) == Ordering::Less);
+        let pos = search(&lf.scores, &lf.handles, lf.n as usize, s, false, |e| key_cmp(tie, h, e));
         (pos < lf.n as usize && lf.scores[pos] == s && lf.handles[pos] == h).then_some(Cursor { leaf: idx, pos: pos as u16 })
     }
 
@@ -573,12 +609,12 @@ impl BTree {
         (rank, c)
     }
 
-    /// Chaînes AMAC : enfant du nœud interne `i` vers lequel descend la sonde
-    /// (`probe(s, h)` = sonde comparée à l'entrée), préchargé.
+    /// Chaînes AMAC : enfant du nœud interne `i` vers lequel descend la clé `(s, ·)`
+    /// (`cmp(h)` = la clé comparée à l'entrée de poignée `h`, à score égal), préchargé.
     #[inline]
-    pub fn child_toward(i: u32, mut probe: impl FnMut(u64, u32) -> Ordering) -> u32 {
+    pub fn child_toward(i: u32, s: u64, cmp: impl FnMut(u32) -> Ordering) -> u32 {
         let node = internal(i);
-        let ci = partition(node.n as usize - 1, |k| probe(node.sep_s[k], node.sep_h[k]) != Ordering::Less);
+        let ci = search(&node.sep_s, &node.sep_h, node.n as usize - 1, s, true, cmp);
         let c = node.child[ci];
         prefetch(c);
         c
@@ -598,9 +634,35 @@ impl BTree {
         &lf.handles[..lf.n as usize]
     }
 
+    /// Comme [`lower_bound`](Self::lower_bound), pour une clé `(s, ·)` : les nœuds sont
+    /// balayés sans branche, `cmp(h)` (la clé comparée à l'entrée de poignée `h`) ne sert
+    /// qu'à score égal.
+    pub fn lower_bound_key(&self, s: u64, mut cmp: impl FnMut(u32) -> Ordering) -> (u32, Option<Cursor>) {
+        if self.root == NONE {
+            return (0, None);
+        }
+        let mut rank = 0;
+        let mut idx = self.root;
+        for _ in 0..self.height {
+            let node = internal(idx);
+            let ci = search(&node.sep_s, &node.sep_h, node.n as usize - 1, s, true, &mut cmp);
+            rank += node.count[..ci].iter().sum::<u32>();
+            idx = node.child[ci];
+        }
+        let lf = leaf(idx);
+        let pos = search(&lf.scores, &lf.handles, lf.n as usize, s, false, &mut cmp);
+        rank += pos as u32;
+        let c = if pos < lf.n as usize {
+            Some(Cursor { leaf: idx, pos: pos as u16 })
+        } else {
+            (lf.next != NONE).then_some(Cursor { leaf: lf.next, pos: 0 })
+        };
+        (rank, c)
+    }
+
     /// Rang de `(s, h)` (présente).
     pub fn rank(&self, s: u64, h: u32, tie: &impl Tie) -> u32 {
-        self.lower_bound(|es, eh| kcmp(tie, (s, h), (es, eh))).0
+        self.lower_bound_key(s, |e| key_cmp(tie, h, e)).0
     }
 
     /// Position de l'entrée de rang `r` (`None` : `r ≥ len`).

@@ -91,8 +91,7 @@ pub(crate) fn step(
             }
         }
         FieldStep::ZTree { left } => {
-            let probe = (*zscore, field);
-            *idx = BTree::child_toward(*idx, |s, h| probe.cmp(&(s, member(h))));
+            *idx = BTree::child_toward(*idx, *zscore, |h| field.cmp(member(h)));
             if left == 1 { FieldStep::Done } else { FieldStep::ZTree { left: left - 1 } }
         }
         _ => FieldStep::Done,

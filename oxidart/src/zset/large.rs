@@ -214,6 +214,13 @@ impl ZLarge {
         self.iter_from(0)
     }
 
+    /// Premier rang dont le score est `> s` (`after_equal`) ou `>= s` : bornes par score,
+    /// nœuds balayés sans branche.
+    pub fn score_bound(&self, s: u64, after_equal: bool) -> u32 {
+        let o = if after_equal { Ordering::Greater } else { Ordering::Less };
+        self.tree.lower_bound_key(s, |_| o).0
+    }
+
     /// Premier rang dont l'entrée n'est pas avant la sonde (`probe(score, membre)`).
     pub fn lower_bound(&self, mut probe: impl FnMut(u64, &[u8]) -> Ordering) -> u32 {
         self.tree.lower_bound(|s, h| probe(s, member(h))).0

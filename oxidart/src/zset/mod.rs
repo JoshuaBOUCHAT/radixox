@@ -138,8 +138,13 @@ impl ZSet {
     /// Rangs `[lo, hi)` des entrées de score dans `[min, max]` (bornes exclues si `excl`).
     pub fn score_range(&self, min: ScoreBound, max: ScoreBound) -> (usize, usize) {
         let (a, b) = (encode_score(min.value), encode_score(max.value));
-        let lo = self.lower_bound(|s, _| if (if min.excl { a < s } else { a <= s }) { Ordering::Less } else { Ordering::Greater });
-        let hi = self.lower_bound(|s, _| if (if max.excl { b <= s } else { b < s }) { Ordering::Less } else { Ordering::Greater });
+        let (lo, hi) = match self {
+            Self::Large(z) => (z.score_bound(a, min.excl) as usize, z.score_bound(b, !max.excl) as usize),
+            Self::Small(_) => (
+                self.lower_bound(|s, _| if min.excl { a < s } else { a <= s }.then_some(Ordering::Less).unwrap_or(Ordering::Greater)),
+                self.lower_bound(|s, _| if max.excl { b <= s } else { b < s }.then_some(Ordering::Less).unwrap_or(Ordering::Greater)),
+            ),
+        };
         (lo, hi.max(lo))
     }
 
