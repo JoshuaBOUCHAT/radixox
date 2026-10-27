@@ -366,27 +366,82 @@ pub fn with_score_text<R>(f: f64, k: impl FnOnce(&[u8]) -> R) -> R {
     float_text(f, k)
 }
 
-/// Flottant non entier : `Display` dans 64 octets sur la pile (forme la plus courte, ≤ 17
-/// chiffres significatifs) ; au-delà (exposants extrêmes écrits en entier), `to_string`.
+/// Flottant non entier : chiffres les plus courts par zmij (≤ 17 significatifs, arrondi au
+/// pair entre deux candidats, comme Valkey), en forme décimale sans exposant comme `Display`, dans 64 octets sur la pile ; au-delà
+/// (exposants extrêmes écrits en entier), `to_string`.
+#[inline(never)]
 fn float_text<R>(f: f64, k: impl FnOnce(&[u8]) -> R) -> R {
-    use std::fmt::Write;
-    struct Stack {
-        buf: [u8; 64],
-        len: usize,
+    if !f.is_finite() {
+        return k(if f > 0.0 { b"inf" } else { b"-inf" });
     }
-    impl Write for Stack {
-        fn write_str(&mut self, s: &str) -> std::fmt::Result {
-            let dst = self.buf.get_mut(self.len..self.len + s.len()).ok_or(std::fmt::Error)?;
-            dst.copy_from_slice(s.as_bytes());
-            self.len += s.len();
-            Ok(())
+    let mut rb = zmij::Buffer::new();
+    let s = rb.format_finite(f).as_bytes();
+    // cas courant : déjà décimal sans exposant (`123.456`, `0.00123`), tel quel
+    if !s.contains(&b'e') && !s.ends_with(b".0") {
+        return k(s);
+    }
+    let (neg, s) = match s.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        _ => (false, s),
+    };
+    // `mantisse[e exposant]`, mantisse `d+[.d+]`
+    let (mant, exp) = match s.iter().position(|&c| c == b'e') {
+        Some(e) => (&s[..e], std::str::from_utf8(&s[e + 1..]).unwrap().parse::<i32>().unwrap()),
+        None => (s, 0),
+    };
+    let mut digits = [0u8; 24];
+    let (mut n, mut int_len) = (0, None);
+    for &c in mant {
+        if c == b'.' {
+            int_len = Some(n);
+        } else {
+            digits[n] = c;
+            n += 1;
         }
     }
-    let mut st = Stack { buf: [0; 64], len: 0 };
-    match write!(st, "{f}") {
-        Ok(()) => k(&st.buf[..st.len]),
-        Err(_) => k(f.to_string().as_bytes()),
+    // position de la virgule dans `digits`, zéros de tête et de queue retirés
+    let mut point = int_len.unwrap_or(n) as i32 + exp;
+    let lead = digits[..n].iter().take_while(|&&c| c == b'0').count();
+    let d = &digits[lead..n];
+    point -= lead as i32;
+    let d = &d[..d.len() - d.iter().rev().take_while(|&&c| c == b'0').count()];
+    let len = neg as usize
+        + if point <= 0 {
+            2 + (-point) as usize + d.len()
+        } else if point as usize >= d.len() {
+            point as usize
+        } else {
+            d.len() + 1
+        };
+    if len > 64 {
+        return k(f.to_string().as_bytes());
     }
+    let mut buf = [0u8; 64];
+    let mut i = 0;
+    let mut put = |b: &[u8]| {
+        buf[i..i + b.len()].copy_from_slice(b);
+        i += b.len();
+    };
+    if neg {
+        put(b"-");
+    }
+    if point <= 0 {
+        put(b"0.");
+        for _ in 0..-point {
+            put(b"0");
+        }
+        put(d);
+    } else if point as usize >= d.len() {
+        put(d);
+        for _ in d.len()..point as usize {
+            put(b"0");
+        }
+    } else {
+        put(&d[..point as usize]);
+        put(b".");
+        put(&d[point as usize..]);
+    }
+    k(&buf[..i])
 }
 
 #[cfg(test)]
@@ -644,12 +699,19 @@ mod tests {
         for f in [0.0, 1.0, -1.0, 42.0, -987654321.0, 1e14, 999999999999999.0, 1.5, -2.25, 1e15, 1e300, f64::INFINITY, f64::NEG_INFINITY, 1e-7, 0.1, 1.0 / 3.0, -2.0 / 3.0, 1e-20, 1e-300, 5e-324, f64::MAX, 1e16 + 0.5] {
             assert_eq!(format_score(f).as_slice(), f.to_string().as_bytes(), "{f}");
         }
-        // bits tirés au hasard : tous les exposants, dont ceux qui débordent les 64 octets
+        // égalité entre deux plus courts : zmij arrondit au pair, comme Valkey
+        assert_eq!(format_score(1658206780088562.25).as_slice(), b"1658206780088562.2");
+        // bits tirés au hasard, tous les exposants : mêmes chiffres les plus courts que
+        // `to_string` (relus à l'identique, même longueur, sans exposant)
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-        for _ in 0..100_000 {
+        for _ in 0..200_000 {
             let f = f64::from_bits(rng.next());
             if !f.is_nan() {
-                assert_eq!(format_score(f).as_slice(), f.to_string().as_bytes(), "{f}");
+                let (got, want) = (format_score(f), f.to_string());
+                let got = std::str::from_utf8(got.as_slice()).unwrap();
+                assert_eq!(got.parse::<f64>().unwrap(), f, "{want}");
+                assert_eq!(got.len(), want.len(), "{want} : {got}");
+                assert!(!got.contains('e'), "{got}");
             }
         }
     }

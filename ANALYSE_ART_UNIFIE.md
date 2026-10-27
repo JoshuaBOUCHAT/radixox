@@ -1017,8 +1017,18 @@ hasard). CPU serveur par requête, 1 000 ZSet de 100 membres, pipeline 16 :
 | ZRANGE 0 -1 WITHSCORES (flottants) | 13,0 µs | 7,16 µs | ×0,79 → ×1,44 |
 | ZUNION WITHSCORES | 6,68 µs | 5,76 µs | ×3,9 → ×4,4 |
 
-Reste : un score flottant coûte ~47 ns (`core::fmt`, Grisu + mise en forme) contre ~2 pour
-un entier ; un ryu remis en forme décimale (pas d'exposant, comme `Display`) le réduirait.
+Puis les flottants : `core::fmt` (~47 ns par score) remplacé par zmij (successeur de ryu,
+même auteur), sortie passée telle quelle quand elle est déjà décimale sans exposant (cas
+courant), remise en forme décimale sinon (exposant, entier ≥ 1e15 en `.0`) ; branche hors
+ligne (`#[inline(never)]`). ZRANGE 0 -1 WITHSCORES (flottants) : 7,25 → 4,17 µs (−43 %,
+~21 ns par score), débit ×1,44 → ×2,2 contre Valkey. ryu seul : 5,85 µs ; zmij sans le
+passage direct : 5,8 µs (la remise en forme coûtait plus que la conversion). Différence
+avec `to_string` : entre deux plus courts équidistants, zmij arrondit au pair, comme Valkey
+(`1658206780088562.25` → `…562.2`, `to_string` donne `…562.3`). ZUNION (avec ou sans
+scores, entiers) +5 à 7 % de cycles à instructions égales : disposition du binaire.
+
+Écart restant avec Valkey, antérieur : Valkey écrit les exposants (`1e-7`, `2.5e+20`,
+`1e+300`), RadixOx toujours en décimal (`0.0000001`, 301 chiffres pour 1e300).
 
 ## 14. List — architecture retenue (2026-10-27, implémentée le même jour, §14.9)
 
