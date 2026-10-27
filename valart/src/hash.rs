@@ -827,7 +827,7 @@ impl ValTrees {
         }
     }
 
-    /// Octets des blocs overflow du Hash (MiMalloc en direct, invisibles pour
+    /// Octets des blocs overflow du Hash (pool, invisibles pour
     /// l'allocateur global). Parcours complet, pour les benchs.
     pub fn hash_overflow_bytes(&self, root: u32) -> usize {
         let mut total = 0;

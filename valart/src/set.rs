@@ -777,8 +777,8 @@ impl ValTrees {
         }
     }
 
-    /// Octets des blocs overflow du Set. Ils sont alloués par MiMalloc en
-    /// direct : invisibles pour l'allocateur global, comme le slab
+    /// Octets des blocs overflow du Set. Ils sont alloués dans le pool :
+    /// invisibles pour l'allocateur global, comme le slab
     /// ([`Self::slab_bytes`]). Parcours complet, pour les benchs.
     pub fn set_overflow_bytes(&self, root: u32) -> usize {
         let mut total = 0;

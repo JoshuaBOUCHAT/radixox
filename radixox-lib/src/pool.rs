@@ -989,7 +989,7 @@ pub unsafe fn shrink(ptr: *mut u8, old: usize, new: usize) {
 
 // ─── Formes courtes des `SharedByte` et des `CompactPath` d'oxidart ──────────
 
-/// Emplacement d'un objet en forme courte (≤ 16 Kio de données) : le pool, ou mimalloc sous
+/// Emplacement d'un objet en forme courte (≤ 16 Kio de données) : le pool, ou la libc sous
 /// `radixox_nopool` / `radixox_sysalloc` (ASan ne voit pas les objets du pool). Nul : le
 /// pool est plein, l'appelant passe en forme longue (`external`).
 ///
@@ -1014,9 +1014,7 @@ pub unsafe fn short_free(base: *mut u8, size: usize) {
 pub unsafe fn short_shrink(base: *mut u8, old: usize, new: usize) {
     unsafe { shrink(base, old, new) }
 }
-// mi_malloc plutôt que MiMalloc.alloc : ce dernier passe par mi_malloc_aligned qui, sur
-// page vide, sur-alloue size+align-1 (106 B → bloc 128 au lieu de 112). mi_malloc
-// garantit déjà un alignement ≥ 8.
+// malloc de la libc : alignement ≥ 16 garanti.
 #[cfg(any(radixox_nopool, radixox_sysalloc))]
 #[inline]
 pub unsafe fn short_alloc(size: usize) -> *mut u8 {
@@ -1027,13 +1025,13 @@ pub unsafe fn short_alloc(size: usize) -> *mut u8 {
 pub unsafe fn short_free(base: *mut u8, _size: usize) {
     unsafe { crate::raw_alloc::free(base) }
 }
-/// mimalloc : le bloc garde sa taille, rien à compter.
+/// libc : le bloc garde sa taille, rien à compter.
 #[cfg(any(radixox_nopool, radixox_sysalloc))]
 #[inline]
 pub unsafe fn short_shrink(_base: *mut u8, _old: usize, _new: usize) {}
 
 /// Objet de structure aligné sur 8 (pages des nœuds, §17) : le pool jusqu'à 16 Kio, sinon
-/// (ou plage pleine) `external` ; mimalloc sans pool. `size` multiple de 8.
+/// (ou plage pleine) `external` ; la libc sans pool. `size` multiple de 8.
 ///
 /// # Safety
 /// Mono-thread ; libérer par [`struct_free`] avec la même taille.

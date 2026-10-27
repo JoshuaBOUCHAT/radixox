@@ -12,8 +12,6 @@ use std::time::Instant;
 use oxidart::{OxidArt, Value};
 use radixox_lib::shared_byte::SharedByte;
 
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn xorshift(x: &mut u64) -> u64 {
     *x ^= *x << 13;

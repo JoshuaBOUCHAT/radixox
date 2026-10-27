@@ -424,7 +424,7 @@ pub fn info_memory(out: &mut String, gc_enabled: bool, gc_running: bool, gc_max_
             l.held_bytes, l.dirty_bytes, l.released_bytes, l.top_bytes, l.slab_held_bytes, l.slab_live_bytes,
         );
     }
-    if cfg!(radixox_heapcount) {
+    if cfg!(not(radixox_sysalloc)) {
         use radixox_lib::raw_alloc::heap;
         let _ = write!(out, "mem_heap_bytes:{}\r\nmem_heap_peak_bytes:{}\r\n", heap::bytes(), heap::peak());
     }

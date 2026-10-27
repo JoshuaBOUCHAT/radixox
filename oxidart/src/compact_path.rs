@@ -159,7 +159,7 @@ impl CompactPath {
     }
 
     /// Emplacement dans le pool (adresse de l'en-tête, taille), `None` hors pool (inline,
-    /// forme longue, ou mimalloc sans pool). Vérificateur du GC.
+    /// forme longue, ou libc sans pool). Vérificateur du GC.
     pub(crate) fn pool_slot(&self) -> Option<(usize, usize)> {
         if !pool::ENABLED || !self.is_heap() || self.len_lo() & Self::LONG != 0 {
             return None;

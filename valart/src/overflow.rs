@@ -329,7 +329,7 @@ impl SetOverflow {
         Layout::from_size_align(self.block_bytes(), 8).unwrap()
     }
 
-    /// Taille du bloc alloué (octets demandés à MiMalloc).
+    /// Taille du bloc alloué (octets demandés au pool).
     pub fn block_bytes(&self) -> usize {
         set_block_size(self.capacity(), self.child_capacity())
     }
@@ -831,7 +831,7 @@ impl HashOverflow {
         Layout::from_size_align(self.block_bytes(), 8).unwrap()
     }
 
-    /// Taille du bloc alloué (octets demandés à MiMalloc).
+    /// Taille du bloc alloué (octets demandés au pool).
     pub fn block_bytes(&self) -> usize {
         hash_block_size(self.capacity(), self.child_capacity())
     }

@@ -17,8 +17,6 @@ ordered-float = "5.1.0"
 hislab = { version = "0.2.5", features = ["rand"] }
 radixox-lib = { workspace = true }
 valart = { workspace = true }
-mimalloc = { workspace = true }
-libmimalloc-sys = { workspace = true }
 
 rand = "0.8"
 crc32fast = "1.4"

@@ -10,10 +10,11 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("RadixOx requires Linux to run (io_uring).");
 
-/// Mesure de l'allocateur par défaut (`INFO` : `mem_heap_bytes`), MEMORY_ARCH.md §17.6.
-#[cfg(radixox_heapcount)]
+/// Allocateur de RadixOx pour tout le processus (MEMORY_ARCH.md §18.12) ; la libc sous
+/// `--cfg radixox_sysalloc` (AddressSanitizer).
+#[cfg(not(radixox_sysalloc))]
 #[global_allocator]
-static HEAP: radixox_lib::raw_alloc::heap::Counting = radixox_lib::raw_alloc::heap::Counting;
+static HEAP: radixox_lib::raw_alloc::heap::RxAlloc = radixox_lib::raw_alloc::heap::RxAlloc;
 
 use std::io;
 use std::net::TcpListener;

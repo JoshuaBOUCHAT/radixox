@@ -14,8 +14,6 @@ categories = ["data-structures"]
 radixox-lib = { workspace = true }
 hislab = { version = "0.2.5", features = ["rand"] }
 foldhash = "0.2"
-mimalloc = { workspace = true }
-libmimalloc-sys = { workspace = true }
 
 [dev-dependencies]
 fastrand = "2"

@@ -14,17 +14,16 @@
 //!    plusieurs fois ; snapshot mémoire après chaque tour (dérive ?)
 //! 3. shrink : on retire la moitié des clés → est-ce que la mémoire revient ?
 //!
-//! Allocateur global : MiMalloc instrumenté (comme les overflows de valart et
-//! les `SharedByte`, alloués par MiMalloc en direct).
+//! Allocateur global : allocateur système instrumenté (les overflows de valart et
+//! les `SharedByte` vont au pool, hors compte).
 //! « vivant » = octets demandés à l'allocateur + slab mmap et overflows de
 //! valart. « RSS » = mémoire résidente réelle du processus
 //! (`/proc/self/statm`), delta par rapport à juste avant la création de la
 //! structure : inclut l'arrondi aux classes de taille, les trous, et les pages
 //! jamais rendues.
 
-use std::alloc::{GlobalAlloc, Layout};
+use std::alloc::{GlobalAlloc, Layout, System};
 
-use mimalloc::MiMalloc;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -45,22 +44,22 @@ unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
         ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-        unsafe { MiMalloc.alloc(layout) }
+        unsafe { System.alloc(layout) }
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
         ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-        unsafe { MiMalloc.alloc_zeroed(layout) }
+        unsafe { System.alloc_zeroed(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         ALLOCATED.fetch_sub(layout.size(), Ordering::Relaxed);
-        unsafe { MiMalloc.dealloc(ptr, layout) }
+        unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOCATED.fetch_add(new_size, Ordering::Relaxed);
         ALLOCATED.fetch_sub(layout.size(), Ordering::Relaxed);
         ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-        unsafe { MiMalloc.realloc(ptr, layout, new_size) }
+        unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
 
@@ -128,7 +127,7 @@ impl Hist {
 }
 
 trait SetLike {
-    /// Mémoire hors allocateur global (valart : slab mmap + overflows MiMalloc).
+    /// Mémoire hors allocateur global (valart : slab mmap + overflows du pool).
     fn extra_bytes(&self) -> usize {
         0
     }

@@ -11,10 +11,12 @@
 //! - Petits objets épinglés (§18.6) : slabs de 64 Kio par classe, pris au tas.
 //!
 //! Mono-thread : état global en `static mut` (ARCHITECTURE.md §1, `RUST_TEST_THREADS=1`).
+//! Sert aussi d'allocateur global du binaire ([`crate::raw_alloc::heap::RxAlloc`]).
 //! Les tests construisent leurs propres [`Large`], plus petits.
 
 use std::collections::VecDeque;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 pub const GRANULE_SHIFT: u32 = 12;
@@ -376,29 +378,35 @@ impl Large {
 
     /// Objet de `size` octets, aligné sur 8 ; nul si la plage est pleine.
     pub fn alloc(&mut self, size: usize) -> *mut u8 {
-        if size >= HEAP_MIN {
-            let n = size.div_ceil(GRANULE);
-            if n > LEN as usize {
-                return null_mut();
-            }
-            return self.alloc_granules(n as u32).map_or(null_mut(), |g| self.addr(g));
+        match Route::of(size, 8) {
+            Some(r) => self.alloc_route(r),
+            None => null_mut(),
         }
-        self.slab_alloc(size)
     }
 
     /// # Safety
     /// `ptr` vient de [`Large::alloc`] de ce tas avec la même `size`, pas encore rendu.
     pub unsafe fn free(&mut self, ptr: *mut u8, size: usize) {
-        if size >= HEAP_MIN {
-            let g = self.granule_of(ptr);
-            self.free_granules(g, size.div_ceil(GRANULE) as u32, Instant::now());
-        } else {
-            unsafe { self.slab_free(ptr, size) }
+        unsafe { self.free_route(ptr, Route::of(size, 8).expect("taille servie par le tas")) }
+    }
+
+    fn alloc_route(&mut self, r: Route) -> *mut u8 {
+        match r {
+            Route::Heap(n) => self.alloc_granules(n).map_or(null_mut(), |g| self.addr(g)),
+            Route::Slab(c) => self.slab_alloc(c),
         }
     }
 
-    fn slab_alloc(&mut self, size: usize) -> *mut u8 {
-        let c = class_of(size.max(1));
+    /// # Safety
+    /// `ptr` vient de [`Large::alloc_route`] de ce tas avec la même route, pas encore rendu.
+    unsafe fn free_route(&mut self, ptr: *mut u8, r: Route) {
+        match r {
+            Route::Heap(n) => self.free_granules(self.granule_of(ptr), n, Instant::now()),
+            Route::Slab(c) => unsafe { self.slab_free(ptr, c) },
+        }
+    }
+
+    fn slab_alloc(&mut self, c: usize) -> *mut u8 {
         let id = match self.slabs.partial[c] {
             NONE => {
                 let Some(g) = self.alloc_granules(SLAB_GRANULES) else { return null_mut() };
@@ -414,9 +422,9 @@ impl Large {
         self.slabs.take(id, base)
     }
 
-    unsafe fn slab_free(&mut self, ptr: *mut u8, size: usize) {
+    unsafe fn slab_free(&mut self, ptr: *mut u8, c: usize) {
         let id = unsafe { *self.owner.add(self.granule_of(ptr) as usize) };
-        debug_assert_eq!(self.slabs.slab(id).class as usize, class_of(size.max(1)));
+        debug_assert_eq!(self.slabs.slab(id).class as usize, c);
         let base = self.addr(self.slabs.slab(id).start);
         if let Some(g) = unsafe { self.slabs.give(id, base, ptr) } {
             self.free_granules(g, SLAB_GRANULES, Instant::now());
@@ -503,6 +511,37 @@ const CLASSES: [u32; 43] = {
     }
     t
 };
+
+/// Où vit un bloc : suite de `n` granules (alignée sur 4 Kio), ou emplacement de la classe
+/// `c`. Une classe sert un alignement qui la divise : ses emplacements sont à des multiples
+/// de sa taille depuis un début de slab, lui-même aligné sur un granule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    Heap(u32),
+    Slab(usize),
+}
+
+impl Route {
+    /// `None` : alignement au-delà d'un granule, ou plus grand que la plage.
+    #[inline]
+    fn of(size: usize, align: usize) -> Option<Route> {
+        if align <= 8 && size < HEAP_MIN {
+            return Some(Route::Slab(class_of(size.max(1))));
+        }
+        if align > GRANULE {
+            return None;
+        }
+        let s = size.max(1).next_multiple_of(align);
+        if s < HEAP_MIN {
+            let c = class_of(s);
+            if CLASSES[c] as usize % align == 0 {
+                return Some(Route::Slab(c));
+            }
+        }
+        let n = size.div_ceil(GRANULE);
+        (n <= LEN as usize).then_some(Route::Heap(n as u32))
+    }
+}
 
 #[inline]
 fn class_of(size: usize) -> usize {
@@ -643,22 +682,45 @@ impl Slabs {
 
 static mut LARGE: Option<Large> = None;
 static mut DISABLED: bool = false;
+/// Dans le tas (ou son initialisation) : une allocation qui y revient — ses tables (`Vec`,
+/// `VecDeque`), la lecture de l'environnement — part dans la libc ([`with`] rend `None`).
+static mut BUSY: bool = false;
+/// La plage, lisible de tout thread ([`owns`]) : fixée une fois à l'initialisation.
+static RANGE_BASE: AtomicUsize = AtomicUsize::new(0);
+static RANGE_LEN: AtomicUsize = AtomicUsize::new(0);
 
+/// `f` sur le tas global, créé au premier appel. `None` : déjà dedans, ou plage refusée.
 #[allow(static_mut_refs)]
 #[inline]
-fn global() -> Option<&'static mut Large> {
+fn with<R>(f: impl FnOnce(&mut Large) -> R) -> Option<R> {
     unsafe {
-        if let Some(l) = LARGE.as_mut() {
-            return Some(l);
-        }
-        if DISABLED {
+        if BUSY {
             return None;
         }
-        let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-        let gb = env("RADIXOX_LARGE_VIRT_GB", 64) as usize;
-        let decay = Duration::from_secs(env("RADIXOX_MEMORY_DECAY", 10));
+        BUSY = true;
+        let l = match LARGE.as_mut() {
+            Some(l) => Some(l),
+            None if DISABLED => None,
+            None => init(),
+        };
+        let r = l.map(f);
+        BUSY = false;
+        r
+    }
+}
+
+/// Sous [`BUSY`] : ses allocations (environnement, message) vont à la libc.
+#[cold]
+#[allow(static_mut_refs)]
+unsafe fn init() -> Option<&'static mut Large> {
+    let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let gb = env("RADIXOX_LARGE_VIRT_GB", 64) as usize;
+    let decay = Duration::from_secs(env("RADIXOX_MEMORY_DECAY", 10));
+    unsafe {
         match Large::new(gb << 30, decay) {
             Some(l) => {
+                RANGE_BASE.store(l.base, Relaxed);
+                RANGE_LEN.store(l.nb as usize * GRANULE, Relaxed);
                 LARGE = Some(l);
                 LARGE.as_mut()
             }
@@ -671,34 +733,65 @@ fn global() -> Option<&'static mut Large> {
     }
 }
 
+/// `a` est dans la plage du tas global (de tout thread).
+#[inline]
+pub fn owns(a: usize) -> bool {
+    a.wrapping_sub(RANGE_BASE.load(Relaxed)) < RANGE_LEN.load(Relaxed)
+}
+
 /// Objet de `size` octets (aligné sur 8) ; la libc si la plage est pleine ou absente.
 ///
 /// # Safety
 /// Mono-thread ; libérer par [`free`] avec la même taille.
 pub unsafe fn malloc(size: usize) -> *mut u8 {
-    if let Some(l) = global() {
-        let p = l.alloc(size);
-        if !p.is_null() {
-            return p;
-        }
+    match with(|l| l.alloc(size)) {
+        Some(p) if !p.is_null() => p,
+        _ => unsafe { libc::malloc(size) as *mut u8 },
     }
-    unsafe { libc::malloc(size) as *mut u8 }
 }
 
 /// # Safety
 /// `ptr` vient de [`malloc`] avec cette `size`, pas encore rendu.
 pub unsafe fn free(ptr: *mut u8, size: usize) {
-    #[allow(static_mut_refs)]
-    match unsafe { LARGE.as_mut() } {
-        Some(l) if l.owns(ptr as usize) => unsafe { l.free(ptr, size) },
-        _ => unsafe { libc::free(ptr as *mut _) },
+    if owns(ptr as usize) {
+        with(|l| unsafe { l.free(ptr, size) }).expect("libération d'un objet du tas depuis le tas");
+    } else {
+        unsafe { libc::free(ptr as *mut _) }
     }
 }
 
+/// Allocateur global ([`crate::raw_alloc::heap::RxAlloc`]) : bloc de `size` octets aligné
+/// sur `align`. Nul (l'appelant prend la libc) : alignement au-delà de 4 Kio, plage pleine
+/// ou absente, ou appel revenu du tas lui-même.
+#[inline]
+pub fn global_alloc(size: usize, align: usize) -> *mut u8 {
+    let Some(r) = Route::of(size, align) else { return null_mut() };
+    with(|l| l.alloc_route(r)).unwrap_or(null_mut())
+}
+
+/// # Safety
+/// `ptr` vient de [`global_alloc`] avec ces `size` et `align` ([`owns`] vrai), pas encore
+/// rendu ; thread du tas.
+#[inline]
+pub unsafe fn global_free(ptr: *mut u8, size: usize, align: usize) {
+    let r = Route::of(size, align).expect("route d'un bloc servi");
+    with(|l| unsafe { l.free_route(ptr, r) }).expect("libération d'un bloc du tas depuis le tas");
+}
+
+/// Un bloc servi pour `(old, align)` sert aussi `new` sans bouger.
+#[inline]
+pub fn global_fits(old: usize, new: usize, align: usize) -> bool {
+    Route::of(old, align).is_some_and(|r| Route::of(new, align) == Some(r))
+}
+
 /// Appelé par la boucle avec le rendu du pool. Vrai s'il en reste à rendre tout de suite.
+#[allow(static_mut_refs)]
 pub fn release_step(now: Instant) -> bool {
-    #[allow(static_mut_refs)]
-    unsafe { LARGE.as_mut() }.is_some_and(|l| l.release_step(now))
+    // jamais créé : rien à rendre (et ne pas le créer ici)
+    if unsafe { LARGE.is_none() } {
+        return false;
+    }
+    with(|l| l.release_step(now)).unwrap_or(false)
 }
 
 pub fn stats() -> Option<Stats> {

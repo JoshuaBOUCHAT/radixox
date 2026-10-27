@@ -8,15 +8,14 @@
 //! `clone()` (bump de refcount, pas d'allocation), donc le coût d'allocation
 //! des clés est hors mesure pour tout le monde.
 //!
-//! Mémoire : allocateur global instrumenté au-dessus de MiMalloc (octets
+//! Mémoire : allocateur global instrumenté au-dessus de l'allocateur système (octets
 //! demandés, sans l'arrondi aux classes de taille), mesuré après la phase
-//! d'insertion. Les clés sont partagées et allouées via MiMalloc en direct :
-//! hors compte. Pour valart on ajoute le slab (mmap) et les overflows (MiMalloc
+//! d'insertion. Les clés sont partagées et allouées via l'allocateur système en direct :
+//! hors compte. Pour valart on ajoute le slab (mmap) et les overflows (allocateur système
 //! en direct), tous deux invisibles pour l'allocateur global.
 
-use std::alloc::{GlobalAlloc, Layout};
+use std::alloc::{GlobalAlloc, Layout, System};
 
-use mimalloc::MiMalloc;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::hint::black_box;
@@ -34,16 +33,16 @@ static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
-        unsafe { MiMalloc.alloc(layout) }
+        unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         ALLOCATED.fetch_sub(layout.size(), Ordering::Relaxed);
-        unsafe { MiMalloc.dealloc(ptr, layout) }
+        unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOCATED.fetch_add(new_size, Ordering::Relaxed);
         ALLOCATED.fetch_sub(layout.size(), Ordering::Relaxed);
-        unsafe { MiMalloc.realloc(ptr, layout, new_size) }
+        unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
 
@@ -111,7 +110,7 @@ fn time(f: impl FnOnce() -> usize, expected: usize) -> Duration {
 
 /// Les quatre phases, communes à toutes les structures.
 trait MapLike {
-    /// Mémoire hors allocateur global (valart : slab mmap + overflows MiMalloc).
+    /// Mémoire hors allocateur global (valart : slab mmap + overflows du pool).
     fn extra_bytes(&self) -> usize {
         0
     }

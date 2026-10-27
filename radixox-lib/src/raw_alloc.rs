@@ -1,31 +1,11 @@
-//! Allocation brute des blocs `SharedByte`, `CompactPath` et overflows valart.
-//!
-//! mimalloc en direct (`mi_malloc` et pas `MiMalloc.alloc`, qui passe par
-//! `mi_malloc_aligned` et sur-alloue). Avec `--cfg radixox_sysalloc`
-//! (RUSTFLAGS), malloc/free de la libc à la place, pour qu'AddressSanitizer
-//! voie ces blocs :
+//! Allocation brute des blocs `SharedByte`, `CompactPath` et overflows valart quand le
+//! pool est absent (`--cfg radixox_nopool`) ou sous `--cfg radixox_sysalloc` : malloc/free
+//! de la libc (AddressSanitizer voit ces blocs) :
 //!
 //! ```text
 //! RUSTFLAGS="-Zsanitizer=address --cfg radixox_sysalloc" cargo +nightly test ...
 //! ```
 
-#[cfg(not(radixox_sysalloc))]
-mod imp {
-    #[inline]
-    pub unsafe fn malloc(size: usize) -> *mut u8 {
-        unsafe { libmimalloc_sys::mi_malloc(size) as *mut u8 }
-    }
-    #[inline]
-    pub unsafe fn zalloc(size: usize) -> *mut u8 {
-        unsafe { libmimalloc_sys::mi_zalloc(size) as *mut u8 }
-    }
-    #[inline]
-    pub unsafe fn free(ptr: *mut u8) {
-        unsafe { libmimalloc_sys::mi_free(ptr as *mut _) }
-    }
-}
-
-#[cfg(radixox_sysalloc)]
 mod imp {
     unsafe extern "C" {
         #[link_name = "malloc"]
@@ -140,25 +120,65 @@ pub mod external {
     }
 }
 
-/// Allocateur par défaut du processus (glibc) compté, sous `--cfg radixox_heapcount` :
-/// mesure de ce qui échappe encore au pool, aux slabs et à `external` (MEMORY_ARCH.md
-/// §17.6). Le binaire le déclare `#[global_allocator]` ; sans le cfg, rien n'est compté.
-/// Atomiques : tous les threads du processus passent par là.
+/// Allocateur global du binaire (MEMORY_ARCH.md §18.12) : le tas de [`crate::large`]
+/// (slabs par classe sous 16 Kio, granules de 4 Kio au-delà), compté (`INFO` :
+/// `mem_heap_bytes`). La libc sert ce que le tas ne peut pas :
+/// - un autre thread que le premier à allouer (le tas est mono-thread) ;
+/// - un alignement au-delà de 4 Kio, une plage pleine ou refusée ;
+/// - les allocations faites depuis le tas lui-même (ses tables, son initialisation).
+///
+/// Un bloc se rend là d'où il vient, reconnu à son adresse ([`crate::large::owns`]).
+/// Un autre thread qui rendrait un bloc du tas arrête le processus : jamais le cas
+/// (ARCHITECTURE.md §1, un seul thread métier).
 pub mod heap {
     use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
-    static BYTES: AtomicU64 = AtomicU64::new(0);
-    static PEAK: AtomicU64 = AtomicU64::new(0);
+    use crate::large;
 
-    pub struct Counting;
+    // Thread du tas seulement : sans atomique.
+    static mut BYTES: u64 = 0;
+    static mut PEAK: u64 = 0;
+    /// Thread du tas : adresse de son [`MARK`] (0 : personne n'a encore alloué).
+    static OWNER: AtomicUsize = AtomicUsize::new(0);
+    thread_local! { static MARK: u8 = const { 0 }; }
+
+    pub struct RxAlloc;
+
+    /// Vrai sur le thread du tas (le premier à allouer).
+    #[inline]
+    fn on_owner() -> bool {
+        let me = MARK.with(|m| m as *const u8 as usize);
+        let o = OWNER.load(Relaxed);
+        o == me || (o == 0 && OWNER.compare_exchange(0, me, Relaxed, Relaxed).is_ok())
+    }
+
+    #[cold]
+    fn foreign_free() -> ! {
+        let msg = b"radixox: bloc du tas rendu par un autre thread\n";
+        unsafe {
+            libc::write(2, msg.as_ptr() as *const _, msg.len());
+            libc::abort()
+        }
+    }
+
+    #[inline]
+    fn count(add: usize, sub: usize) {
+        unsafe {
+            BYTES = BYTES + add as u64 - sub as u64;
+            PEAK = PEAK.max(BYTES);
+        }
+        if add >= 4096 {
+            trace(add);
+        }
+    }
 
     /// `RADIXOX_HEAP_TRACE=octets` : pile d'appel de chaque allocation d'au moins cette
     /// taille sur stderr (binaire avec symboles : `CARGO_PROFILE_RELEASE_STRIP=none`,
     /// `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`). Lu une fois, sous la garde.
+    #[cold]
     fn trace(size: usize) {
         use std::cell::Cell;
-        use std::sync::atomic::AtomicUsize;
         thread_local! { static IN: Cell<bool> = const { Cell::new(false) }; }
         // usize::MAX : pas encore lu ; 0 : éteint
         static MIN: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -177,45 +197,57 @@ pub mod heap {
         IN.with(|g| g.set(false));
     }
 
-    unsafe impl GlobalAlloc for Counting {
-        #[inline]
+    unsafe impl GlobalAlloc for RxAlloc {
         unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            let p = unsafe { System.alloc(l) };
-            if !p.is_null() {
-                let now = BYTES.fetch_add(l.size() as u64, Relaxed) + l.size() as u64;
-                PEAK.fetch_max(now, Relaxed);
-                if l.size() >= 4096 {
-                    trace(l.size());
+            if on_owner() {
+                let p = large::global_alloc(l.size(), l.align());
+                if !p.is_null() {
+                    count(l.size(), 0);
+                    return p;
                 }
             }
-            p
+            unsafe { System.alloc(l) }
         }
-        #[inline]
+
         unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-            BYTES.fetch_sub(l.size() as u64, Relaxed);
-            unsafe { System.dealloc(p, l) }
+            if !large::owns(p as usize) {
+                return unsafe { System.dealloc(p, l) };
+            }
+            if !on_owner() {
+                foreign_free();
+            }
+            unsafe { large::global_free(p, l.size(), l.align()) };
+            count(0, l.size());
         }
-        #[inline]
+
         unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
-            let q = unsafe { System.realloc(p, l, new) };
+            if large::owns(p as usize) && large::global_fits(l.size(), new, l.align()) {
+                if !on_owner() {
+                    foreign_free();
+                }
+                count(new, l.size());
+                return p;
+            }
+            // SAFETY: contrat de `realloc` (taille non nulle, arrondie sans débordement).
+            let nl = unsafe { Layout::from_size_align_unchecked(new, l.align()) };
+            let q = unsafe { self.alloc(nl) };
             if !q.is_null() {
-                BYTES.fetch_sub(l.size() as u64, Relaxed);
-                let now = BYTES.fetch_add(new as u64, Relaxed) + new as u64;
-                PEAK.fetch_max(now, Relaxed);
-                if new >= 4096 {
-                    trace(new);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(p, q, l.size().min(new));
+                    self.dealloc(p, l);
                 }
             }
             q
         }
     }
 
-    /// Octets demandés vivants (sans l'en-tête ni l'arrondi de glibc).
+    /// Octets demandés vivants dans le tas (sans l'arrondi de classe ; la part servie par la
+    /// libc n'est pas comptée).
     pub fn bytes() -> u64 {
-        BYTES.load(Relaxed)
+        unsafe { BYTES }
     }
 
     pub fn peak() -> u64 {
-        PEAK.load(Relaxed)
+        unsafe { PEAK }
     }
 }

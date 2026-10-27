@@ -128,7 +128,7 @@ l'atomicité (RUNTIME_ARCH §8.1).
 
 | Type | Représentation |
 |---|---|
-| String | `SharedByte` : buffer à refcount mono-thread de 8 o (pas d'atomique), mimalloc |
+| String | `SharedByte` : buffer à refcount mono-thread de 8 o (pas d'atomique), pool (≤ 16 Kio) puis tas des grands objets |
 | Entier | `i64` (seuls INCR / INCRBY en créent ; `SET n 42` stocke une chaîne), formaté à la lecture |
 | Hash, Set | ≤ 8 entrées : bloc compact de `SharedByte` ; au-delà : **valart** (`valart/`), un radix compact par conteneur, slab unique partagé (nœuds de 128 o) |
 | ZSet | ≤ 128 membres de ≤ 64 o : un bloc en colonnes (scores 2/4/8 o) ; au-delà : index haché à seaux (membre → score) + B+tree compté (ordre, rangs), membres = objets à poignée (MEMORY_ARCH §19) ; ANALYSE_ART_UNIFIE §13, état en §13.12 |

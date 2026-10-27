@@ -1666,6 +1666,9 @@ allocation d'au moins 64 Kio (agrégée par `scripts/heap_sites.py`).
 Pistes : KEYS écrit directement dans le tampon de sortie ; nouveau ZSet ; à décider, un
 `#[global_allocator]` sur l'allocateur de RadixOx (repli glibc hors du thread métier).
 
+(Le `--cfg radixox_heapcount` de cette mesure n'existe plus : depuis §18.12, `INFO` compte
+toujours le tas, et `RADIXOX_HEAP_TRACE` marche sur toute build.)
+
 ### 18.11 Grosses réponses : `BigBuf` (KEYS, 2026-10-26)
 
 `radixox-lib/src/big_buf.rs` : tampon sur un mapping à lui (`MAP_NORESERVE`,
@@ -1684,6 +1687,42 @@ split, suppression, `drop_front`, GC, compactage).
 
 `KEYS *` sur 1M UUID (réponse ~44 Mo) : pic glibc 91,9 → 5,9 Mo (inchangé par le KEYS) ;
 pic de RSS = 145 + 43 Mo, retour à 147 Mo dès l'envoi fini.
+
+### 18.12 Allocateur global (2026-10-27)
+
+Le binaire déclare `#[global_allocator] RxAlloc` (`radixox-lib/src/raw_alloc.rs`,
+`heap`) : tout le tas Rust du processus (`Vec`, `Box`, `String`, tampons, tables) va au
+tas de `large` (§18.4, §18.6). mimalloc et jemalloc ne sont plus des dépendances.
+
+- **Route** (`large::Route::of(size, align)`) : alignement ≤ 8 et < 16 Kio → slab de la
+  classe ; sinon, taille arrondie à l'alignement, et une classe **multiple** de
+  l'alignement le sert (ses emplacements sont à des multiples de sa taille depuis un
+  début de slab aligné sur 4 Kio) ; sinon une suite de granules (alignée sur 4 Kio).
+  Au-delà de 4 Kio d'alignement : la libc. `realloc` reste sur place si l'ancienne et la
+  nouvelle taille ont la même route, sinon copie.
+- **Réentrance** : toute entrée dans le tas pose `BUSY`. Une allocation qui revient
+  pendant ce temps (les `Vec` / `VecDeque` du tas lui-même, l'initialisation qui lit
+  l'environnement) part dans la libc. Un bloc se rend là d'où il vient, reconnu à son
+  adresse (`large::owns`, plage fixée à l'initialisation, lisible de tout thread).
+- **Threads** : le tas sert le premier thread qui alloue (le thread principal ; identité =
+  adresse d'un `thread_local!` constant, sans allocation). Un autre thread alloue dans la
+  libc ; s'il rendait un bloc du tas, le processus s'arrête avec un message (jamais le
+  cas : un seul thread métier, SQPOLL et io-wq sont des threads noyau).
+- **Comptes** : `INFO` `mem_heap_bytes` / `mem_heap_peak_bytes` (octets demandés vivants
+  dans le tas, hors arrondi de classe) dans toute build ; ~5,5 Mo au démarrage. Ces blocs
+  comptent aussi dans `mem_large_*` / `mem_slab_*`. Le rendu au système des suites libres
+  (§18.5) vaut pour eux.
+- **Repli** : `--cfg radixox_sysalloc` (ASan) n'installe pas `RxAlloc` ; `radixox_nopool`
+  passe les objets courts à la libc au lieu de mimalloc (les mesures avec ou sans pool
+  d'avant le 2026-10-27 comparaient à mimalloc).
+
+Mesures (débit compté côté serveur, pipeline 64 sauf mention, deux passes alternées
+contre la glibc) : SET 4,01–4,08 contre 3,99–4,03 M/s ; GET 3,91–3,92 contre 3,93–3,94 ;
+ZADD 1,17–1,20 contre 1,15–1,20 ; SET sans pipeline 293 contre 291–293 K/s ; HSET dans le
+bruit (instructions de la glibc elle-même entre 4 635 et 4 763 par HSET selon le passage).
+L'allocateur pèse ≤ 0,1 % des instructions d'un HSET : le serveur alloue rarement sur ses
+chemins chauds. Les méthodes de `RxAlloc` ne sont pas `#[inline]` : sinon la LTO les recopie
+à chaque `push`.
 
 ## 19. Objets à poignée (2026-10-26 ; implémenté le 2026-10-27, `radixox-lib/src/handle.rs`)
 

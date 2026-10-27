@@ -18,7 +18,7 @@
 //! Petites formes : le nœud garde le plus long préfixe d'entrées qui tient
 //! (≤ 8 entrées, ≤ 64 o), la page prend le reste (≤ 8 entrées).
 //!
-//! Page : taille = classe mimalloc du besoin (on paie la classe de toute façon),
+//! Page : taille = classe de taille du besoin (on paie la classe de toute façon),
 //! réduite seulement quand le besoin passe sous ¾ du bloc. Changements de forme
 //! avec hystérésis aussi (montée à 17 / 33 entrées, descente à 12 / 24).
 
@@ -56,7 +56,7 @@ fn trash() -> NonNull<u8> {
     NonNull::from(&TRASH).cast()
 }
 
-/// Classe de taille mimalloc : 8 o par 8 o jusqu'à 64, puis 4 classes par
+/// Classe de taille (schéma de mimalloc) : 8 o par 8 o jusqu'à 64, puis 4 classes par
 /// doublement (80, 96, 112, 128, 160, …).
 pub(crate) fn alloc_class(size: usize) -> usize {
     if size <= 64 {
@@ -1288,7 +1288,7 @@ impl Node {
         self.pg_block8 = (new_block / 8) as u16;
     }
 
-    /// Garantit un bloc d'au moins `need` octets (classe mimalloc).
+    /// Garantit un bloc d'au moins `need` octets (classe de taille).
     fn page_grow(&mut self, need: usize) {
         if need > self.block() {
             self.page_resize(alloc_class(need));

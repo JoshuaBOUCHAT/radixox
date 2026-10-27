@@ -15,7 +15,7 @@ use crate::prefetch::PreFetch;
 /// ```
 ///
 /// La forme longue est allouée par `external` (allocateur des grands objets, MEMORY_ARCH §18) ; la courte par le pool
-/// ([`crate::pool`]) par défaut, par mimalloc sous `--cfg radixox_nopool` ou
+/// ([`crate::pool`]) par défaut, par la libc sous `--cfg radixox_nopool` ou
 /// `--cfg radixox_sysalloc` (ASan ne voit pas les objets du pool).
 #[repr(transparent)]
 pub struct SharedByte {
@@ -171,7 +171,7 @@ impl SharedByte {
     }
 
     /// Emplacement dans le pool (adresse de l'en-tête, taille), `None` hors pool
-    /// (forme longue, ou forme courte dans mimalloc). Vérificateur du GC.
+    /// (forme longue, ou forme courte dans la libc). Vérificateur du GC.
     pub fn pool_slot(&self) -> Option<(usize, usize)> {
         (crate::pool::ENABLED && !self.is_external())
             .then(|| (self.header_ptr() as usize, Self::slot(self.len())))

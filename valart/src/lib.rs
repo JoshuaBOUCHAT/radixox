@@ -360,7 +360,7 @@ impl ValTrees {
 
     /// Octets occupés dans le slab (nœuds vivants × 128 B). Le slab est un
     /// mmap : invisible pour l'allocateur global, à ajouter à part, comme les
-    /// overflows (MiMalloc en direct).
+    /// overflows (pool).
     pub fn slab_bytes(&self) -> usize {
         self.nodes.count_occupied() * size_of::<ValNode>()
     }

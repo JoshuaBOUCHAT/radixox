@@ -1,5 +1,5 @@
 //! Petits conteneurs : Hash et Set d'au plus [`SMALL_MAX`] entrées, rangés
-//! dans un seul bloc mimalloc au lieu d'un arbre valart.
+//! dans un seul bloc du pool au lieu d'un arbre valart.
 //!
 //! ```text
 //! bloc : [n u8 | cap u8 | 6 o de pad | entrée × cap]

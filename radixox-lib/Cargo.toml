@@ -10,9 +10,7 @@ keywords = ["redis", "resp", "protocol", "bytes", "server"]
 categories = ["network-programming", "parser-implementations"]
 
 [dependencies]
-mimalloc = { workspace = true }
-libmimalloc-sys = { workspace = true }
 libc = "0.2"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(radixox_sysalloc)', 'cfg(radixox_nopool)', 'cfg(radixox_gc_debug)', 'cfg(radixox_heapcount)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(radixox_sysalloc)', 'cfg(radixox_nopool)', 'cfg(radixox_gc_debug)'] }

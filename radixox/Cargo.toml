@@ -38,4 +38,4 @@ strip = true
 opt-level = 3
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(radixox_gc_debug)', 'cfg(radixox_heapcount)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(radixox_gc_debug)', 'cfg(radixox_sysalloc)'] }

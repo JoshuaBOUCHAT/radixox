@@ -697,8 +697,10 @@ small hashes and sets, valart overflow blocks. 64 KiB bump blocks on 2 MiB huge 
 counter per block, compacted in the loop's idle moments (and in bounded slices under load);
 the node slab is compacted in the background too and its tail returned to the system. Memory
 freed by deletions goes back to the system, which mimalloc alone never did after scattered
-deletions. Larger values go to jemalloc. `INFO` shows `mem_pool_*`, `gc_*` and `compact_*`.
-Build with `RUSTFLAGS="--cfg radixox_nopool"` to use mimalloc instead.
+deletions. Larger values and pinned objects go to RadixOx's large-object heap (4 KiB granules,
+size-class slabs), which is also the process's global allocator: no mimalloc, no jemalloc.
+`INFO` shows `mem_pool_*`, `mem_large_*`, `mem_heap_*`, `gc_*` and `compact_*`. Build with
+`RUSTFLAGS="--cfg radixox_nopool"` to put small objects in the libc allocator instead.
 
 ### Security
 
@@ -795,7 +797,7 @@ a simulated kernel.
 
 **Values**
 - Strings: `SharedByte`, an 8-byte single-threaded reference-counted buffer (no atomics,
-  4-byte header), allocated in the pool up to 16 KiB and in jemalloc beyond. Integers are
+  4-byte header), allocated in the pool up to 16 KiB and in the large-object heap beyond. Integers are
   stored as `i64` and formatted on read.
 - Hash and Set: up to 8 entries, one compact block of `SharedByte` pointers; beyond that,
   **valart**, a compact radix tree per container.
@@ -855,8 +857,6 @@ Tests: `cargo test -p oxidart --features regex`, `cargo test -p radixox-lib`,
 MIT
 
 Built with [io-uring](https://github.com/tokio-rs/io-uring),
-[mimalloc](https://github.com/microsoft/mimalloc),
-[jemalloc](https://github.com/tikv/jemallocator),
 [regex-automata](https://github.com/rust-lang/regex) and
 [hislab](https://github.com/JoshuaBOUCHAT/hislab). Benchmarked against
 [Valkey](https://github.com/valkey-io/valkey).
