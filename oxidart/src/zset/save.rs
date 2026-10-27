@@ -62,11 +62,24 @@ struct ZSave {
 
 static mut ZSAVE: Option<ZSave> = None;
 
-#[inline]
+/// Lu à chaque écriture de feuille ou d'en-tête : toujours inliné, init à part.
+#[inline(always)]
 fn zsave() -> &'static mut ZSave {
     #[allow(static_mut_refs)]
     unsafe {
-        ZSAVE.get_or_insert_with(ZSave::default)
+        match ZSAVE.as_mut() {
+            Some(z) => z,
+            None => init_zsave(),
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn init_zsave() -> &'static mut ZSave {
+    #[allow(static_mut_refs)]
+    unsafe {
+        ZSAVE.insert(ZSave::default())
     }
 }
 

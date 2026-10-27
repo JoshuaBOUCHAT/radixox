@@ -63,14 +63,26 @@ const _: () = assert!(size_of::<BNode>() == 512);
 
 static mut SLAB: Option<HiSlab<BNode>> = None;
 
-#[inline]
+/// Accès à chaque nœud : toujours inliné. L'initialisation reste hors du chemin chaud
+/// (avec elle dedans, l'accesseur n'était pas inliné : un vrai appel et un cadre de pile
+/// de 248 o par nœud lu, ~13 % d'un ZADD).
+#[inline(always)]
 fn slab() -> &'static mut HiSlab<BNode> {
     #[allow(static_mut_refs)]
     unsafe {
         match SLAB.as_mut() {
             Some(s) => s,
-            None => SLAB.insert(HiSlab::new(0, 1 << 24).expect("slab du B+tree des ZSet")),
+            None => init_slab(),
         }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn init_slab() -> &'static mut HiSlab<BNode> {
+    #[allow(static_mut_refs)]
+    unsafe {
+        SLAB.insert(HiSlab::new(0, 1 << 24).expect("slab du B+tree des ZSet"))
     }
 }
 
