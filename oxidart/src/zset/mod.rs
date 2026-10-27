@@ -494,8 +494,17 @@ mod tests {
         while btree::compact::step(&mut c, 64).is_none() {}
         assert!(c.moved > 0);
         assert!(btree::compact::holes_bytes() < span_before.max(1), "trous {} (avant {span_before})", btree::compact::holes_bytes());
+        // puis l'index
+        let index_before = index::compact::holes_bytes();
+        let mut c = index::compact::want(true).expect("passe de l'index");
+        while index::compact::step(&mut c, 64).is_none() {}
+        assert!(c.moved > 0);
+        assert!(index::compact::holes_bytes() < index_before.max(1));
         for (idx, model) in &kept {
             zset_ref(*idx).verify().unwrap();
+            for (m, &sc) in model {
+                assert_eq!(zset_ref(*idx).score(m), Some(sc));
+            }
             let got: Vec<(u64, Vec<u8>)> = zset_ref(*idx).iter().map(|(s, m)| (s, m.to_vec())).collect();
             let mut want: Vec<(u64, Vec<u8>)> = model.iter().map(|(m, &s)| (s, m.clone())).collect();
             want.sort();

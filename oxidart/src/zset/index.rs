@@ -36,6 +36,9 @@ struct Bucket {
     /// Seau suivant de la chaîne (au-delà des 16 niveaux seulement).
     next: u32,
     handles: [u32; B],
+    /// Répertoire parent, seau précédent d'une chaîne, ou `NONE` (racine) : compactage.
+    /// Dans les 4 octets que l'alignement des scores laissait libres.
+    parent: u32,
     scores: [u64; B],
 }
 
@@ -46,6 +49,8 @@ struct Dir {
     /// Log2 de la longueur de la plage de chaque case.
     span: [u8; FANOUT],
     child: [u32; FANOUT],
+    /// Répertoire parent, ou `NONE` (racine) : compactage.
+    parent: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -105,11 +110,22 @@ fn dir(i: u32) -> &'static mut Dir {
 }
 
 fn new_bucket() -> u32 {
-    slab().insert(INode { b: Bucket { n: 0, ctrl: [0; B], next: NONE, handles: [0; B], scores: [0; B] } })
+    slab().insert(INode { b: Bucket { n: 0, ctrl: [0; B], next: NONE, handles: [0; B], parent: NONE, scores: [0; B] } })
 }
 
 fn new_dir(child: u32, span: u8) -> u32 {
-    slab().insert(INode { d: Dir { tag: DIR, span: [span; FANOUT], child: [child; FANOUT] } })
+    slab().insert(INode { d: Dir { tag: DIR, span: [span; FANOUT], child: [child; FANOUT], parent: NONE } })
+}
+
+/// Parent du nœud `i` (répertoire ou seau).
+#[inline]
+fn parent(i: u32) -> u32 {
+    if is_dir(i) { dir(i).parent } else { bucket(i).parent }
+}
+
+#[inline]
+fn set_parent(i: u32, p: u32) {
+    if is_dir(i) { dir(i).parent = p } else { bucket(i).parent = p }
 }
 
 fn free_node(i: u32) {
@@ -284,11 +300,14 @@ impl Index {
             // Seau plein : un seau d'une seule case devient un répertoire, puis on coupe.
             let (d, dl, s) = if level == 0 {
                 self.root = new_dir(b, 4);
+                set_parent(b, self.root);
                 (self.root, 0, nibble(h, 0))
             } else {
                 let (p, ps) = path[level - 1];
                 if dir(p).span[ps as usize] == 0 {
                     let d = new_dir(b, 4);
+                    set_parent(d, p);
+                    set_parent(b, d);
                     dir(p).child[ps as usize] = d;
                     (d, level, nibble(h, level))
                 } else {
@@ -309,6 +328,7 @@ impl Index {
         let half = len / 2;
         let old = dir(d).child[s];
         let nb = new_bucket();
+        set_parent(nb, d);
         {
             let dr = dir(d);
             for c in base..base + len {
@@ -347,6 +367,7 @@ impl Index {
             }
             if bk.next == NONE {
                 let nb = new_bucket();
+                set_parent(nb, b);
                 bucket(b).next = nb;
             }
             b = bucket(b).next;
@@ -456,9 +477,11 @@ impl Index {
             free_node(d);
             if level == 1 {
                 self.root = b;
+                set_parent(b, NONE);
             } else {
                 let (p, ps) = path[level - 2];
                 dir(p).child[ps as usize] = b;
+                set_parent(b, p);
             }
             level -= 1;
         }
@@ -573,7 +596,10 @@ impl Index {
     /// Vérificateur : plages alignées et homogènes, empreintes, chaînes seulement au
     /// dernier niveau, `len`, et chaque entrée retrouvée par son hash (routage).
     pub fn verify(&self, rehash: impl Fn(u32) -> u64) -> Result<(), String> {
-        fn rec(i: u32, level: usize, rehash: &impl Fn(u32) -> u64, n: &mut u32) -> Result<(), String> {
+        fn rec(i: u32, up: u32, level: usize, rehash: &impl Fn(u32) -> u64, n: &mut u32) -> Result<(), String> {
+            if parent(i) != up {
+                return Err(format!("nœud {i} : parent {} au lieu de {up}", parent(i)));
+            }
             if is_dir(i) {
                 if level == LEVELS {
                     return Err(format!("répertoire {i} au-delà du dernier niveau"));
@@ -594,15 +620,20 @@ impl Index {
                     if is_dir(dr.child[s]) && k != 0 {
                         return Err(format!("répertoire {i} : sous-répertoire sur une plage de 2^{k}"));
                     }
-                    rec(dr.child[s], level + 1, rehash, n)?;
+                    rec(dr.child[s], i, level + 1, rehash, n)?;
                     s += len;
                 }
                 return Ok(());
             }
             let mut b = i;
             let mut link = 0;
+            let mut prev = up;
             while b != NONE {
                 let bk = *bucket(b);
+                if link > 0 && bk.parent != prev {
+                    return Err(format!("seau chaîné {b} : parent {} au lieu de {prev}", bk.parent));
+                }
+                prev = b;
                 if bk.n as usize > B || (link > 0 && level < LEVELS) {
                     return Err(format!("seau {b} : n = {} ou chaîne au niveau {level}", bk.n));
                 }
@@ -621,7 +652,7 @@ impl Index {
             return if self.len == 0 { Ok(()) } else { Err("index vide avec len > 0".into()) };
         }
         let mut n = 0;
-        rec(self.root, 0, &rehash, &mut n)?;
+        rec(self.root, NONE, 0, &rehash, &mut n)?;
         if n != self.len {
             return Err(format!("len {} mais {n} entrées", self.len));
         }
@@ -742,5 +773,157 @@ mod tests {
         eprintln!("index : remplissage {fill:.3}, {buckets} seaux, {dirs} répertoires, {per:.1} o/entrée");
         assert!(per < 25.0, "{per} o/entrée");
         idx.free_all();
+    }
+}
+
+/// Compactage de la slab de l'index (comme celle du B+tree) : les nœuds les plus hauts
+/// descendent dans les trous les plus bas, puis la fin de la slab est rendue. Chaque nœud
+/// connaît son parent : un répertoire (toutes les cases qui pointent le nœud sont
+/// corrigées : un seau couvre une plage de cases), le seau précédent d'une chaîne (son
+/// `next`), ou l'en-tête du ZSet pour la racine (table racine → en-tête, revérifiée). Les
+/// enfants d'un répertoire et le maillon suivant d'un seau reçoivent le nouveau parent.
+/// Une référence qui ne se vérifie pas (index décroché) : le nœud ne bouge pas.
+///
+/// Interdit pendant une save et tant que des libérations de ZSet attendent : la passe
+/// s'arrête d'elle-même dans ce cas.
+pub mod compact {
+    use std::collections::HashMap;
+
+    use super::{FANOUT, INode, NONE, bucket, dir, is_dir, parent, set_parent, slab};
+    use crate::zset::ZSet;
+
+    const PAGE_NODES: u32 = ((2 << 20) / size_of::<INode>()) as u32;
+    /// Coût fixe d'un déplacement (copie + références), en lignes de cache.
+    const MOVE_COST: u32 = 6;
+
+    #[derive(Debug)]
+    pub struct ICompaction {
+        target: u32,
+        keep: u32,
+        scan: u32,
+        pub moved: u64,
+        /// Racine de l'index → idx de l'en-tête du ZSet.
+        roots: HashMap<u32, u32>,
+    }
+
+    pub fn holes_bytes() -> u64 {
+        let s = slab();
+        let span = s.last_occupied().map_or(0, |l| l + 1);
+        (span - s.len()) as u64 * size_of::<INode>() as u64
+    }
+
+    fn roots() -> HashMap<u32, u32> {
+        let mut m = HashMap::new();
+        crate::value::zset_slab_mut().for_each_occupied(|idx, z| {
+            if let ZSet::Large(l) = z
+                && l.index.root != NONE
+            {
+                m.insert(l.index.root, idx);
+            }
+        });
+        m
+    }
+
+    fn blocked() -> bool {
+        crate::zset::save::is_saving() || crate::zset::lazy::pending() > 0
+    }
+
+    pub fn want(force: bool) -> Option<ICompaction> {
+        if blocked() {
+            return None;
+        }
+        let s = slab();
+        let span = s.last_occupied()? + 1;
+        let slab_bytes = span as u64 * size_of::<INode>() as u64;
+        let threshold = if slab_bytes > 256 << 20 { 4 << 20 } else { 3 << 20 };
+        if !force && holes_bytes() <= threshold {
+            return None;
+        }
+        let keep = if force { 0 } else { PAGE_NODES };
+        let target = if force { s.len() } else { (s.len() + keep).next_multiple_of(PAGE_NODES) };
+        (target < span).then(|| ICompaction { target, keep, scan: span, moved: 0, roots: roots() })
+    }
+
+    fn header_of(c: &mut ICompaction, root: u32) -> Option<&'static mut super::Index> {
+        let mut hit = c.roots.get(&root).copied();
+        if hit.is_none() {
+            c.roots = roots();
+            hit = c.roots.get(&root).copied();
+        }
+        match crate::value::zset_slab_mut().get_mut(hit?)? {
+            ZSet::Large(l) if l.index.root == root => Some(&mut l.index),
+            _ => None,
+        }
+    }
+
+    /// La référence vers `src` existe-t-elle bien (parent qui la tient) ?
+    fn referenced(c: &mut ICompaction, src: u32, up: u32) -> bool {
+        if up == NONE {
+            return header_of(c, src).is_some();
+        }
+        if is_dir(up) {
+            dir(up).child.contains(&src)
+        } else {
+            bucket(up).next == src
+        }
+    }
+
+    pub fn step(c: &mut ICompaction, budget: u32) -> Option<(u64, usize)> {
+        if blocked() {
+            return Some((c.moved, 0));
+        }
+        let mut spent = 0;
+        while spent < budget {
+            let Some(src) = slab().prev_occupied(c.scan).filter(|&s| s >= c.target) else { return Some(finish(c)) };
+            c.scan = src;
+            let up = parent(src);
+            if !referenced(c, src, up) {
+                spent += 1;
+                continue;
+            }
+            // SAFETY: rempli par `move_to` tout de suite, ou rendu.
+            let dst = unsafe { slab().reserve_lowest() };
+            if dst >= src || dst >= c.target {
+                unsafe { slab().unreserve(dst) };
+                return Some(finish(c));
+            }
+            // SAFETY: `src` occupé, `dst` réservé, aucune référence vivante dans la slab.
+            unsafe { slab().move_to(src, dst) };
+            let mut fixed = 1;
+            if up == NONE {
+                header_of(c, src).expect("en-tête vérifié").root = dst;
+                let z = c.roots.remove(&src).expect("racine connue");
+                c.roots.insert(dst, z);
+            } else if is_dir(up) {
+                for ch in dir(up).child.iter_mut().filter(|ch| **ch == src) {
+                    *ch = dst;
+                }
+            } else {
+                bucket(up).next = dst;
+            }
+            if is_dir(dst) {
+                let dr = *dir(dst);
+                let mut s = 0;
+                while s < FANOUT {
+                    set_parent(dr.child[s], dst);
+                    fixed += 1;
+                    s += 1 << dr.span[s];
+                }
+            } else if bucket(dst).next != NONE {
+                set_parent(bucket(dst).next, dst);
+                fixed += 1;
+            }
+            c.moved += 1;
+            spent += MOVE_COST + fixed;
+        }
+        None
+    }
+
+    fn finish(c: &ICompaction) -> (u64, usize) {
+        let s = slab();
+        let last = s.last_occupied().map_or(0, |l| l + 1);
+        let from = last.max(s.len() + c.keep);
+        // SAFETY: rien n'est occupé à partir de `last` ≤ `from`.
+        (c.moved, unsafe { s.release_above(from) })
     }
 }
