@@ -885,7 +885,18 @@ Code : `radixox-lib/src/handle.rs` (poignées), `oxidart/src/zset/` (`btree.rs`,
 - NaN refusé au parseur (`arg_f64`) et en résultat de ZINCRBY (`ERR resulting score is
   not a number (NaN)`), comme Redis.
 
-Reste : AMAC (étape 6), save par barrière (étape 7 : aujourd'hui la save écrit encore les
-ZSet d'un bloc au `begin`), rechargement par `from_sorted`, mesures (étape 8), commandes
-manquantes (ZRANGEBYSCORE, ZRANK, ZCOUNT…, dont les briques existent : `lower_bound`,
-`rank`, `select`). La libération d'un grand ZSet (DEL) est encore synchrone.
+**Étapes 6 et 7 faites (2026-10-27).**
+- AMAC (`zset/amac.rs`) : chaînes de la phase 1 bis comme au §13.6 ; `exec::hint_field`
+  rend le membre et ce qui suit l'index (`ZProbe` : index seul, ancienne entrée, ou
+  `(score, membre)` d'un ZADD). ZRANGE : pipeline dans la commande (`large::Range`).
+  Différentiels oxidart (`amac_matches_plain_tree`) et serveur (`tests/amac.rs`) étendus à
+  la grande forme.
+- Save : SAVE_DESIGN.md §D (barrières en-têtes + feuilles, format v3 en ligne, listes
+  différées). Test `amac_and_gc_during_save_keep_t0` : fenêtres AMAC et passes du GC entre
+  chaque tranche, dump = vue T0.
+- DEL / écrasement / expiration d'un grand ZSet (> 512 membres) : machine à état
+  (`zset/lazy.rs`), la clé disparaît tout de suite, membres, feuilles, nœuds puis index
+  rendus par tranches en fond (~4 K unités par tranche), gelée pendant une save. Mesuré :
+  DEL d'1 M membres 0,03 ms, tout rendu en moins de 2 s, PING max 0,21 ms.
+
+Reste : mesures (étape 8), commandes manquantes.

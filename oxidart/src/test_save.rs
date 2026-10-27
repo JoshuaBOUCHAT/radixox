@@ -55,7 +55,7 @@ thread_local! {
 
 fn random_op(art: &mut OxidArt, rng: &mut Rng) {
     let k = key(rng);
-    match rng.below(16) {
+    match rng.below(20) {
         0..=2 => art.set(sb(&k), Value::String(sb(&val(rng)))),
         3 => art.set_ttl(sb(&k), Duration::from_secs(1 + rng.below(5)), Value::String(sb(&val(rng)))),
         4 => {
@@ -106,9 +106,27 @@ fn random_op(art: &mut OxidArt, rng: &mut Rng) {
             let items: VecDeque<_> = (0..rng.below(5)).map(|i| sb(&format!("item-{i}"))).collect();
             art.set(sb(&format!("l{}", rng.below(10))), Value::List(items));
         }
+        // grands ZSet (au-delà de 128 membres : index, B+tree, poignées), mutés et
+        // supprimés pendant la save ; libération par tranches entre deux opérations
+        16 | 17 => {
+            let pairs: Vec<_> = (0..1 + rng.below(30))
+                .map(|_| ((rng.below(40) as f64) - 20.0, sb(&format!("member:{}", rng.below(700)))))
+                .collect();
+            let _ = art.cmd_zadd(sb(&format!("bigz{}", rng.below(3))), &pairs, None);
+        }
+        18 => {
+            let members: Vec<_> = (0..1 + rng.below(20)).map(|_| sb(&format!("member:{}", rng.below(700)))).collect();
+            let _ = art.cmd_zrem(format!("bigz{}", rng.below(3)).as_bytes(), &members);
+            let _ = art.cmd_zincrby(sb(&format!("bigz{}", rng.below(3))), 0.5, sb(&format!("member:{}", rng.below(700))));
+        }
+        19 if rng.below(8) == 0 => {
+            art.del(format!("bigz{}", rng.below(3)).as_bytes());
+            art.zset_free_step(64);
+        }
         _ => {
             let _ = art.get(k.as_bytes());
             art.set_now(art.now + rng.below(2));
+            art.zset_free_step(64);
         }
     }
 }
@@ -646,6 +664,14 @@ fn reload_reads_version_1() {
     for _ in 0..2_000 {
         random_op(&mut art, &mut rng);
     }
+    // Les ZSet sont dans leur enregistrement depuis la v3 (en v1 / v2 : dans la section
+    // du début) : sans ZSet, le corps est le même d'une version à l'autre.
+    for i in 0..20 {
+        art.del(format!("z{i}").as_bytes());
+    }
+    for i in 0..3 {
+        art.del(format!("bigz{i}").as_bytes());
+    }
     let (v2, _) = dump_digest_of(&mut art);
     // En-tête v2 = v1 + 36 octets (seq, replid, offset) après la graine.
     const AFTER_SEED: usize = 4 + 1 + 1 + 8 + 8;
@@ -1001,4 +1027,120 @@ fn compaction_pipeline_moves_parents_and_children_together() {
         assert_eq!(art.get(k.as_bytes()), Some(Value::String(sb(v))), "{k}");
     }
     assert_eq!(art.map.last_occupied().unwrap() + 1, art.map.len(), "slab dense");
+}
+
+/// Un dump v2 garde ses ZSet dans la section du début, l'enregistrement de la clé ne
+/// porte que l'idx : toujours lisible (et rechargé en grande forme au-delà de 128).
+#[test]
+fn reload_reads_version_2_zset_section() {
+    use crate::save::format;
+    use radixox_lib::varint::{put_bytes, put_varint};
+    let mut out = format::MAGIC.to_vec();
+    out.push(format::VERSION_2);
+    out.push(format::TTL_UNIT_SECONDS);
+    out.extend_from_slice(&1_000u64.to_le_bytes()); // t0
+    out.extend_from_slice(&0u64.to_le_bytes()); // graine
+    out.extend_from_slice(&[0; 8 + 20 + 8]); // position du journal
+    // section ZSet : deux ZSet, idx 7 (3 membres) et 9 (300 membres)
+    put_varint(&mut out, 2);
+    put_varint(&mut out, 7);
+    put_varint(&mut out, 3);
+    for (s, m) in [(2.0f64, "b"), (1.0, "a"), (2.0, "a2")] {
+        out.extend_from_slice(&s.to_le_bytes());
+        put_bytes(&mut out, m.as_bytes());
+    }
+    put_varint(&mut out, 9);
+    put_varint(&mut out, 300);
+    for i in 0..300 {
+        out.extend_from_slice(&((i % 10) as f64).to_le_bytes());
+        put_bytes(&mut out, format!("m{i:03}").as_bytes());
+    }
+    put_varint(&mut out, 0); // section List
+    for (key, idx) in [("k", 7u64), ("l", 9)] {
+        out.push(format::T_ZSET);
+        put_varint(&mut out, 0);
+        put_varint(&mut out, 1);
+        out.extend_from_slice(key.as_bytes());
+        put_varint(&mut out, idx);
+    }
+    out.push(format::T_END);
+    let mut back = OxidArt::new();
+    back.set_now(1_000);
+    back.load_dump(&out).expect("reload v2");
+    let names = |r: Vec<SharedByte>| r.iter().map(|b| String::from_utf8(b.to_vec()).unwrap()).collect::<Vec<_>>();
+    assert_eq!(names(back.cmd_zrange(b"k", 0, -1, false).unwrap()), ["a", "a2", "b"]);
+    assert_eq!(back.cmd_zcard(b"l").unwrap(), 300);
+    assert_eq!(names(back.cmd_zrange(b"l", 0, 2, false).unwrap()), ["m000", "m010", "m020"]);
+    // et la v3 qu'on réécrit se relit pareil
+    let (v3, _) = dump_digest_of(&mut back);
+    let (again, _) = reload(&v3, 1_000);
+    assert_eq!(expected(&again), expected(&back));
+}
+
+/// AMAC, GC et save ne se gênent pas : entre deux tranches de la save, des fenêtres AMAC
+/// (indices de clés et chaînes ZSet de la phase 1 bis) mutent les ZSet et des passes
+/// complètes du GC déplacent leurs membres et leurs petits blocs. Le dump reste la vue T0,
+/// et les réponses avec indice sont celles d'un arbre témoin sans indice ni save.
+#[test]
+fn amac_and_gc_during_save_keep_t0() {
+    use crate::ZProbe;
+    let mut rng = Rng(0x5EED_A3AC_0000_0001);
+    let mut art = OxidArt::new();
+    let mut plain = OxidArt::new();
+    art.set_now(1_000);
+    plain.set_now(1_000);
+    let zkey = |rng: &mut Rng| format!("bigz{}", rng.below(4));
+    let zmember = |rng: &mut Rng| format!("member:{}", rng.below(600));
+    // une commande ZSet : (op, clé, membre, score)
+    type Op = (u8, String, String, f64);
+    let apply = |a: &mut OxidArt, (op, k, m, s): &Op| -> String {
+        match op {
+            0 | 1 => format!("{:?}", a.cmd_zadd(sb(k), &[(*s, sb(m))], None)),
+            2 => format!("{:?}", a.cmd_zrem(k.as_bytes(), &[sb(m)])),
+            3 => format!("{:?}", a.cmd_zincrby(sb(k), 1.0, sb(m))),
+            4 => format!("{:?}", a.cmd_zscore(k.as_bytes(), sb(m))),
+            _ => format!("{:?}", a.del(k.as_bytes())),
+        }
+    };
+    let draw = |rng: &mut Rng| -> Op {
+        let op = match rng.below(40) {
+            0 => 5,
+            n => (n % 5) as u8,
+        };
+        (op, zkey(rng), zmember(rng), rng.below(50) as f64 - 25.0)
+    };
+    for round in 0..12 {
+        for _ in 0..3000 {
+            let op = draw(&mut rng);
+            assert_eq!(apply(&mut art, &op), apply(&mut plain, &op));
+        }
+        let expect = expected(&art);
+        let mut wrng = Rng(rng.next() | 1);
+        let got = save_all(&mut art, || 2, |a| {
+            // une fenêtre AMAC de 1 à 32 commandes ZSet
+            let ops: Vec<Op> = (0..1 + wrng.below(32)).map(|_| draw(&mut wrng)).collect();
+            let keys: Vec<&[u8]> = ops.iter().map(|o| o.1.as_bytes()).collect();
+            let mut hints = vec![crate::Hint::NONE; ops.len()];
+            a.amac_descend(&keys, 8, &mut hints);
+            let zp = |o: &Op| match o.0 {
+                0 | 1 => ZProbe::Add(o.3),
+                2 | 3 => ZProbe::Tree,
+                _ => ZProbe::Index,
+            };
+            let items: Vec<_> = ops.iter().zip(&hints).map(|(o, h)| (*h, o.2.as_bytes(), zp(o))).collect();
+            a.amac_fields(&items, 8);
+            a.begin_window();
+            let got: Vec<String> = ops.iter().zip(&hints).map(|(o, h)| a.with_hint(o.1.as_bytes(), *h, |a| apply(a, o))).collect();
+            a.end_window();
+            let want: Vec<String> = ops.iter().map(|o| apply(&mut plain, o)).collect();
+            assert_eq!(got, want, "round {round}");
+            if wrng.below(6) == 0 {
+                a.gc_full_pass();
+            }
+            a.zset_free_step(32);
+        });
+        assert_eq!(got, expect, "round {round}");
+        assert_eq!(expected(&art), expected(&plain), "round {round}");
+        radixox_lib::handle::verify().unwrap();
+    }
 }

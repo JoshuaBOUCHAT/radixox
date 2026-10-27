@@ -378,6 +378,7 @@ impl OxidArt {
         });
         self.save.t0 = self.now;
         valart().begin_save();
+        zset::save::begin();
     }
 
     /// Termine la save (fin normale ou abandon) : images libérées, liste
@@ -394,6 +395,7 @@ impl OxidArt {
         self.save.barrier.finish();
         self.save.clear_images();
         valart().end_save();
+        zset::save::end();
     }
 
     /// Une tranche de ce que la save laisse à libérer : feuilles des images
@@ -405,7 +407,23 @@ impl OxidArt {
         if !self.save.leftover.is_empty() {
             return false;
         }
+        let rest = zset::save::drain_step(rest);
+        if !zset::save::deferred_empty() {
+            return false;
+        }
         valart().drain_deferred(rest)
+    }
+
+    /// Une tranche de la libération des grands ZSet supprimés (`zset::lazy`), au plus
+    /// `budget` nœuds et membres ; rien pendant une save. Vrai s'il en reste.
+    pub fn zset_free_step(&mut self, budget: u32) -> bool {
+        zset::lazy::step(budget)
+    }
+
+    /// Des grands ZSet attendent d'être libérés, et ça peut avancer maintenant (pas de
+    /// save en cours).
+    pub fn zset_free_pending(&self) -> bool {
+        zset::lazy::pending() > 0 && !self.is_saving()
     }
 
     /// Nombre de nœuds qui ont une page de débordement.

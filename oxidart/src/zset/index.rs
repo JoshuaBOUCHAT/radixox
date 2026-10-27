@@ -492,6 +492,34 @@ impl Index {
         *self = Self::new();
     }
 
+    /// Libération reprenable : `stack` part de [`take_for_free`](Self::take_for_free) ; un
+    /// nœud par unité de `budget`. Pile vide = fini.
+    pub(crate) fn free_step(stack: &mut Vec<u32>, budget: &mut u32) {
+        while *budget > 0
+            && let Some(i) = stack.pop()
+        {
+            if is_dir(i) {
+                let dr = *dir(i);
+                let mut s = 0;
+                while s < FANOUT {
+                    stack.push(dr.child[s]);
+                    s += 1 << dr.span[s];
+                }
+            } else if bucket(i).next != NONE {
+                stack.push(bucket(i).next);
+            }
+            free_node(i);
+            *budget -= 1;
+        }
+    }
+
+    /// Pile de départ de [`free_step`](Self::free_step) ; l'index devient vide.
+    pub(crate) fn take_for_free(&mut self) -> Vec<u32> {
+        let stack = if self.root == NONE { Vec::new() } else { vec![self.root] };
+        *self = Self::new();
+        stack
+    }
+
     /// `(seaux, répertoires)` (mesures).
     pub fn node_counts(&self) -> (u32, u32) {
         let mut acc = (0, 0);

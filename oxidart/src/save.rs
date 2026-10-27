@@ -290,9 +290,11 @@ pub struct JournalPos {
 /// précédente (le DFS écrit chaque sous-arbre d'un bloc).
 pub mod format {
     pub const MAGIC: [u8; 4] = *b"RXDB";
-    /// Écrite : 2 (position du journal dans l'en-tête, condensé dans le pied,
-    /// DURABILITY_DESIGN.md §6.3). Lues : 1 et 2.
-    pub const VERSION: u8 = 2;
+    /// Écrite : 3 (ZSet dans l'enregistrement de sa clé, écrit en flux sur sa vue T0 ;
+    /// section ZSet vide). 2 : position du journal dans l'en-tête, condensé dans le pied
+    /// (DURABILITY_DESIGN.md §6.3), ZSet dans la section du début. Lues : 1, 2 et 3.
+    pub const VERSION: u8 = 3;
+    pub const VERSION_2: u8 = 2;
     pub const VERSION_1: u8 = 1;
     pub const TTL_UNIT_SECONDS: u8 = 0;
     pub const T_STRING: u8 = 1;
@@ -338,7 +340,8 @@ use std::collections::HashMap;
 
 use crate::OxidArt;
 use crate::digest::{self, Digest};
-use crate::value::{for_each_list, for_each_zset, valart};
+use crate::value::{for_each_list, valart};
+use crate::zset::save::ZSer;
 
 const ROOT_RADIX: u16 = u16::MAX;
 
@@ -356,6 +359,7 @@ enum Container {
     None,
     Hash,
     Set,
+    ZSet,
 }
 
 /// Curseur d'une save en cours : un seul DFS, reprenable d'une tranche à
@@ -373,6 +377,8 @@ pub struct SaveCursor {
     min_trunc: usize,
     container: Container,
     ser: ValSer,
+    /// Grand ZSet en cours d'écriture (`Container::ZSet`).
+    zser: Option<ZSer>,
     /// Enregistrements visités pas encore écrits (au plus `PIPE_DEPTH + 1`),
     /// dans l'ordre du DFS. Voir `PIPE_DEPTH`.
     pending: VecDeque<Pending>,
@@ -383,8 +389,7 @@ pub struct SaveCursor {
     digest: Digest,
     /// Préfixe des termes du conteneur valart en cours.
     ctr_prefix: Option<crc32fast::Hasher>,
-    /// Sommes des éléments des ZSet / List de la section, par idx.
-    zset_sums: HashMap<u32, (u64, u64)>,
+    /// Sommes des éléments des List de la section, par idx.
     list_sums: HashMap<u32, (u64, u64)>,
 }
 
@@ -454,8 +459,10 @@ enum PVal {
     Int(i64),
     Hash(u32),
     Set(u32),
-    /// ZSet/List : idx dans la section.
+    /// List : idx dans la section.
     Idx(u32),
+    /// ZSet : idx de son en-tête (vue T0 lue à l'écriture, comme une racine valart, I6).
+    ZSet(u32),
     /// Valeur déjà encodée (petit Hash/Set : sérialisé à la visite, aucun
     /// pointeur vers le bloc ne survit à la tranche).
     Encoded(Vec<u8>),
@@ -537,19 +544,8 @@ impl OxidArt {
         out.extend_from_slice(&pos.replid);
         out.extend_from_slice(&pos.offset.to_le_bytes());
 
-        let mut zset_sums = HashMap::new();
-        let mut n = 0u64;
-        for_each_zset(|_, _| n += 1);
-        put_varint(out, n);
-        for_each_zset(|idx, z| {
-            put_varint(out, idx as u64);
-            put_varint(out, z.len() as u64);
-            for (score, member) in z.iter() {
-                out.extend_from_slice(&crate::zset::decode_score(score).to_le_bytes());
-                put_bytes(out, member);
-            }
-            zset_sums.insert(idx, digest::zset_inner(z.iter().map(|(s, m)| (crate::zset::decode_score(s), m))));
-        });
+        // v3 : section ZSet vide (chaque ZSet est écrit dans son enregistrement)
+        put_varint(out, 0);
         let mut list_sums = HashMap::new();
         let mut n = 0u64;
         for_each_list(|_, _| n += 1);
@@ -574,12 +570,12 @@ impl OxidArt {
             min_trunc: usize::MAX,
             container: Container::None,
             ser: ValSer::default(),
+            zser: None,
             pending: VecDeque::with_capacity(PIPE_DEPTH + 1),
             spare: Vec::new(),
             done: false,
             digest: Digest::default(),
             ctr_prefix: None,
-            zset_sums,
             list_sums,
         }
     }
@@ -598,8 +594,9 @@ impl OxidArt {
                 Container::None => true,
                 Container::Hash => valart().hash_ser_step(&mut cur.ser, out, &mut budget),
                 Container::Set => valart().set_ser_step(&mut cur.ser, out, &mut budget),
+                Container::ZSet => cur.zser.as_mut().expect("ZSet en cours").step(out, &mut budget, &mut cur.digest),
             };
-            if cur.container != Container::None {
+            if matches!(cur.container, Container::Hash | Container::Set) {
                 cur.digest_entries(&out[mark..], cur.container == Container::Hash);
             }
             if !finished {
@@ -607,6 +604,7 @@ impl OxidArt {
                 return false;
             }
             cur.container = Container::None;
+            cur.zser = None;
             if budget == 0 {
                 cur.own_pending(); // I5
                 return false;
@@ -777,11 +775,8 @@ impl SaveCursor {
                     }
                     self.digest.add(digest::head_term(&self.path, ty, exp, members.len() as u64));
                 }
-                Tag::Hash | Tag::Set => key = Some((p(), self.path.clone(), exp)),
-                Tag::ZSet => {
-                    let sums = self.zset_sums.get(&val.idx).copied().unwrap_or_default();
-                    self.digest.add(digest::seq_term(&self.path, ty, exp, sums));
-                }
+                // ZSet : terme ajouté par son sérialiseur, qui lit la vue T0
+                Tag::Hash | Tag::Set | Tag::ZSet => key = Some((p(), self.path.clone(), exp)),
                 Tag::List => {
                     let sums = self.list_sums.get(&val.idx).copied().unwrap_or_default();
                     self.digest.add(digest::seq_term(&self.path, ty, exp, sums));
@@ -823,7 +818,8 @@ impl SaveCursor {
                     }
                     PVal::Encoded(buf)
                 }
-                Tag::ZSet | Tag::List => PVal::Idx(val.idx),
+                Tag::ZSet => PVal::ZSet(val.idx),
+                Tag::List => PVal::Idx(val.idx),
                 Tag::None => unreachable!(),
             }
         };
@@ -857,6 +853,14 @@ fn emit_oldest(cur: &mut SaveCursor, out: &mut Vec<u8>, budget: &mut u32) {
             cur.container = Container::Set;
         }
         PVal::Idx(idx) => put_varint(out, *idx as u64),
+        PVal::ZSet(idx) => {
+            let (_, key, exp) = p.key.take().expect("clé d'un ZSet");
+            cur.zser = crate::zset::save::ser_begin(*idx, &key, exp, out, &mut cur.digest);
+            if cur.zser.is_some() {
+                cur.container = Container::ZSet;
+            }
+            sub(budget, 1);
+        }
         PVal::Encoded(buf) => {
             out.extend_from_slice(buf);
             sub(budget, 1 + (buf.len() >> 12) as u32);

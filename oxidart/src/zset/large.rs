@@ -125,7 +125,7 @@ impl ZLarge {
                 Some(h) => hs.push((s, h)),
                 None => {
                     for (_, h) in hs {
-                        unsafe { handle::free(h) };
+                        super::save::free_handle(h);
                     }
                     return None;
                 }
@@ -133,7 +133,14 @@ impl ZLarge {
         }
         let mut z = Self { tree: BTree::from_sorted(hs.iter().copied()), index: Index::new() };
         for &(s, h) in &hs {
-            z.index.insert(rehash(h), h, s, rehash);
+            let hm = rehash(h);
+            if z.index.find(hm, |x| member(x) == member(h)).is_some() {
+                // membre en double (dump corrompu) : tout est rendu (l'arbre tient toutes
+                // les poignées)
+                z.release();
+                return None;
+            }
+            z.index.insert(hm, h, s, rehash);
         }
         Some(z)
     }
@@ -177,7 +184,7 @@ impl ZLarge {
         let (h, s) = self.index.remove(member_hash(m), |h| member(h) == m)?;
         let ok = self.tree.remove(s, h, &tie);
         debug_assert!(ok);
-        unsafe { handle::free(h) };
+        super::save::free_handle(h);
         Some(s)
     }
 
@@ -215,7 +222,7 @@ impl ZLarge {
     /// Rend tout : membres, nœuds de l'arbre et de l'index ; reste vide.
     pub fn release(&mut self) {
         for (_, h) in self.tree.iter() {
-            unsafe { handle::free(h) };
+            super::save::free_handle(h);
         }
         self.tree.free_all();
         self.index.free_all();

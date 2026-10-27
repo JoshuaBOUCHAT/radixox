@@ -109,15 +109,34 @@ deferred_drops: Vec<(NodeType, u32)>,   // hash_drop / set_drop pendant une save
 - **L'évicteur TTL est en pause.**
 - Les getters gardent `&mut self` : hors save, une lecture qui trouve une clé expirée la supprime et recompresse ; pendant une save, elle renvoie seulement « absent ». Les commandes qui ne font que lire (`hash_root`, `cmd_zcard`, `cmd_zscore`…) lisent la valeur par référence après avoir trouvé le nœud, sans demander de `NodeValMut` (qui passerait par `node_mut` et déclencherait une capture).
 
-### D. ZSet et List (v1)
+### D. ZSet (v3, 2026-10-27) et List (v1)
+**ZSet : progressif, derrière la barrière** (`oxidart/src/zset/save.rs`). Le ZSet est écrit
+dans l'enregistrement de sa clé (format v3 : cardinal T0 puis `(score f64, membre)` dans
+l'ordre), par le DFS, en flux (`Container::ZSet`, budget 1 par feuille + 1 par entrée) :
+- en-têtes (slab des ZSet) : `SaveBarrier<ZImage>`, point de passage `zset_mut` ; image =
+  copie profonde du bloc (petite forme) ou en-tête du B+tree (grande) ;
+- feuilles du B+tree : `SaveBarrier<Leaf>`, points de passage `leaf_mut` / `free_leaf` ; la
+  save suit le chaînage T0 des feuilles ; nœuds internes et index jamais lus (reconstruits
+  au rechargement, feuilles pleines par `from_sorted`), donc sans barrière ;
+- listes différées : poignées libérées (ZREM) et ZSet supprimés pendant la save, vidées
+  par `drain_deferred` ; la libération par tranches des grands ZSet (`zset::lazy`) est
+  gelée pendant une save (comme UNLINK, §F) ;
+- le GC continue : les images gardent des poignées, la save lit l'en-tête vivant d'un ZSet
+  intact (bloc déplacé compris).
+Mesuré (1 M membres, serveur release) : PING max 0,87 ms pendant le BGSAVE (avant : 340 ms
+de boucle bloquée au `begin`). Lecture des dumps v1 / v2 (section ZSet du début) gardée.
+
+**List (v1)** : sérialisée intégralement au `begin`, de façon bloquante, dans la section du
+fichier indexée par idx de slab. Pas de barrière sur sa slab.
+
+Historique (ZSet v1, 2026-10-21) :
 Sérialisés **intégralement au `begin`**, de façon bloquante, dans une section du fichier indexée par idx de slab. L'enregistrement d'une clé ZSet/List référence cet idx T0. Pas de barrière sur leurs slabs.
 
 **Coût mesuré (2026-10-21)** : 340 ms de boucle bloquée au `begin` pour un ZSet d'1 M membres
 (crc des petits morceaux 31 %, encodage 20 %, zstd ~22 %), linéaire. YCSB crée un ZSet
 `_indices` d'un membre par clé : à 5 M clés, une réécriture AOF bloque ~1,5 s (max mesuré
 1,566 s), et le buffer de la section reste en mémoire toute la save. Sans ZSet ni List, le
-`begin` prend 19 µs (1 M clés String). Correction prévue : ZSet sur slab derrière la barrière
-(ANALYSE_ART_UNIFIE.md §13.8), pas de rustine sur l'ancienne structure.
+`begin` prend 19 µs (1 M clés String). Corrigé par la v3 ci-dessus.
 
 ### E. Buckets de collision valart
 Copiés intégralement au T0 (rarissimes), **en profondeur** (clones rc+1) : ils sont modifiés et droppés sans barrière ni liste différée. Fait : `CollisionBuckets::snapshot_t0` au `begin_save`, `get_t0` dans les parcours T0, `clear_t0` à `finish_save`.
@@ -135,7 +154,8 @@ Copiés intégralement au T0 (rarissimes), **en profondeur** (clones rc+1) : ils
 | Oxidart `Node` | `SaveBarrier<NodeImage>` | `node_mut(idx)` / `try_node_mut(idx)`, `remove_node(idx)` (modifier l'overflow d'un nœud = appeler `node_mut` sur lui avant ; `remove_node` avant de libérer son overflow) |
 | Valart `ValNode` | `SaveBarrier<ValNodeImage>` (une seule pour Hash et Set) | `hash_node_mut`, `set_node_mut`, `free_hash_node`, `free_set_node` |
 | Collisions valart | aucune | copie au T0 |
-| ZSet, List | aucune | sérialisés au `begin` |
+| ZSet (en-têtes, feuilles du B+tree) | `SaveBarrier<ZImage>`, `SaveBarrier<Leaf>` | `zset_mut`, `leaf_mut`, `free_leaf` (§D) |
+| List | aucune | sérialisée au `begin` |
 
 Audit : plus aucun `map.get_mut`, `map.remove` ou `nodes.get_unchecked_mut` hors des points de passage (sauf `set_parent_idx` et `map.tag`/`untag`, non sérialisés). Fait côté oxidart (étape 1).
 

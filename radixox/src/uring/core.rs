@@ -1032,6 +1032,7 @@ impl Core {
             || self.bgsave.as_ref().is_some_and(|b| b.wants_slice())
             || self.gc.pass.is_some()
             || self.gc.compact.is_some()
+            || self.art.zset_free_pending()
     }
 
     pub fn mode(&self, slot: Slot) -> Mode {
@@ -2371,7 +2372,15 @@ impl Core {
     }
 
     fn free_step(&mut self) -> bool {
-        let Some(mut job) = self.jobs.pop_front() else { return false };
+        let Some(mut job) = self.jobs.pop_front() else {
+            // grands ZSet supprimés (libération par tranches, gelée pendant une save)
+            if !self.art.zset_free_pending() {
+                return false;
+            }
+            // 1 par nœud ou membre : ~4K membres rendus par tranche
+            self.art.zset_free_step(16 * FREE_BUDGET as u32);
+            return true;
+        };
         if job.step(&mut self.art, FREE_BUDGET) == Step::More {
             self.jobs.push_back(job);
         }

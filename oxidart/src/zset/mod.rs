@@ -5,6 +5,8 @@ pub(crate) mod amac;
 pub mod btree;
 pub mod index;
 pub mod large;
+pub(crate) mod lazy;
+pub(crate) mod save;
 pub mod small;
 
 use std::cmp::Ordering;
@@ -28,6 +30,24 @@ impl Default for ZSet {
 impl ZSet {
     pub fn new() -> Self {
         Self::Small(ZSmall::new())
+    }
+
+    /// Depuis des `(score, membre)` triés, sans doublon de membre : petite forme si elle
+    /// suffit, sinon grande, feuilles pleines (rechargement). `None` : un membre en double
+    /// ou la table des poignées pleine.
+    pub fn from_sorted<'a>(entries: impl ExactSizeIterator<Item = (u64, &'a [u8])> + Clone) -> Option<Self> {
+        if entries.len() <= small::MAX_MEMBERS && entries.clone().all(|(_, m)| m.len() <= small::MAX_MEMBER_LEN) {
+            let mut z = ZSmall::new();
+            for (s, m) in entries {
+                if z.find(m).is_some() {
+                    z.free();
+                    return None;
+                }
+                z.insert(s, m);
+            }
+            return Some(Self::Small(z));
+        }
+        ZLarge::from_sorted(entries).map(Self::Large)
     }
 
     pub fn len(&self) -> usize {
@@ -120,6 +140,14 @@ impl ZSet {
 
     pub fn iter(&self) -> ZIter<'_> {
         self.iter_from(0)
+    }
+
+    /// Retire le contenu d'une grande forme (le ZSet reste vide, sans rien à rendre).
+    pub(crate) fn take_large(&mut self) -> Option<ZLarge> {
+        match self {
+            Self::Large(z) => Some(std::mem::take(z)),
+            Self::Small(_) => None,
+        }
     }
 
     /// Rend tout (comme `drop`).

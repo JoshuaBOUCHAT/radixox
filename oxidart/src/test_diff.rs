@@ -526,10 +526,7 @@ fn fuzz(seed: u64, ops: usize, keys: Keys, stats: &mut Stats) {
     back.check();
     assert!(back.gc_audit_unique().is_empty(), "SharedByte partagés après reload");
     assert_eq!(content_new(&back, b""), want, "reload v2 ← ancien");
-    let mut back_old = Old::new();
-    back_old.set_now(now);
-    back_old.load_dump(&dump_new).expect("reload ancien ← v2");
-    assert_eq!(content_old(&back_old, b""), want, "reload ancien ← v2");
+    // Dump v3 (ZSet en ligne) : l'ancien arbre, figé, ne lit que les v1 / v2.
     // reload = arbre canonique : même nombre de nœuds que l'original, une
     // fois ses clés expirées (pas encore nettoyées) supprimées
     let mut stale = Vec::new();
@@ -726,10 +723,7 @@ fn fuzz_containers(seed: u64, ops: usize, seen: &mut [usize; 4]) {
     back.check();
     assert!(back.gc_audit_unique().is_empty(), "SharedByte partagés après reload");
     assert_eq!(content_new(&back, b""), want, "reload des conteneurs");
-    let mut back_old = Old::new();
-    back_old.set_now(new.now);
-    back_old.load_dump(&dump_new).expect("reload ancien ← v2");
-    assert_eq!(content_old(&back_old, b""), want, "reload ancien ← v2");
+    // Dump v3 (ZSet en ligne) : l'ancien arbre, figé, ne lit que les v1 / v2.
 }
 
 #[test]

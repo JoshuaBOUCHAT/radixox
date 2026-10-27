@@ -165,7 +165,7 @@ impl<R: Read> DumpReader<R> {
             return Err(DumpError("magic invalide").into());
         }
         rd.version = rd.byte()?;
-        if !matches!(rd.version, format::VERSION_1 | format::VERSION) {
+        if !matches!(rd.version, format::VERSION_1 | format::VERSION_2 | format::VERSION) {
             return Err(DumpError("version inconnue").into());
         }
         if rd.byte()? != format::TTL_UNIT_SECONDS {
@@ -354,6 +354,25 @@ impl<R: Read> DumpReader<R> {
     }
 
     fn zset(&mut self) -> Result<ZSet, LoadError> {
+        if self.version >= format::VERSION {
+            // v3 : en ligne, dans l'ordre (score, membre) strictement croissant
+            let n = self.varint()?;
+            let mut entries: Vec<(u64, SharedByte)> = Vec::new();
+            for _ in 0..n {
+                let score = f64::from_bits(self.u64_le()?);
+                if score.is_nan() {
+                    return Err(DumpError("score NaN").into());
+                }
+                let m = self.bytes()?;
+                let s = encode_score(score);
+                if entries.last().is_some_and(|(ps, pm)| (*ps, pm.as_slice()) >= (s, m.as_slice())) {
+                    return Err(DumpError("ZSet hors d'ordre").into());
+                }
+                entries.push((s, m));
+            }
+            return ZSet::from_sorted(entries.iter().map(|(s, m)| (*s, m.as_slice())))
+                .ok_or(DumpError("ZSet : membre en double ou table des poignées pleine").into());
+        }
         let idx = self.varint()? as u32;
         Ok(self.zsets.remove(&idx).ok_or(DumpError("ZSet absent de la section"))?)
     }

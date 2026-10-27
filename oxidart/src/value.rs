@@ -186,17 +186,34 @@ fn set_to_members(root: u32) -> Vec<SharedByte> {
 pub(crate) fn alloc_zset(val: ZSet) -> u32 {
     zset_slab().insert(val)
 }
+/// Libère le ZSet `idx`. Pendant une save, différé (la vue T0 peut encore le lire) ;
+/// sinon l'en-tête part tout de suite et le contenu d'un grand ZSet est rendu par tranches
+/// (`zset::lazy`).
 pub(crate) fn free_zset(idx: u32) {
-    zset_slab().remove(idx);
+    if crate::zset::save::defer_zset(idx) {
+        return;
+    }
+    if let Some(mut z) = zset_slab().remove(idx) {
+        crate::zset::lazy::release(&mut z);
+    }
 }
 pub(crate) fn zset_ref(idx: u32) -> &'static ZSet {
     zset_slab().get(idx).unwrap()
 }
+/// Point de passage de toute modification d'un ZSet (en-tête ou petite forme) : barrière
+/// de save.
 pub(crate) fn zset_mut(idx: u32) -> &'static mut ZSet {
+    crate::zset::save::before_header_write(idx, || crate::zset::save::ZImage::of(zset_ref(idx)));
     zset_slab().get_mut(idx).unwrap()
 }
 
-/// Parcourt tous les ZSet du slab (section ZSet de la save).
+/// Bitmap de présence de la slab des ZSet (vue T0 de la save).
+pub(crate) fn zset_slab_occupancy(buf: &mut Vec<u64>) {
+    zset_slab().copy_occupancy(buf);
+}
+
+#[cfg(test)]
+/// Parcourt tous les ZSet du slab (tests).
 pub(crate) fn for_each_zset(f: impl FnMut(u32, &ZSet)) {
     zset_slab().for_each_occupied(f);
 }
@@ -295,7 +312,12 @@ pub(crate) unsafe fn value_take_raw(tag: Tag, val: ValUnion) -> Value {
             }
             Tag::HashSmall => Value::Hash(small::into_entries::<2>(val.ptr).into_iter().map(|[f, v]| (f, v)).collect()),
             Tag::SetSmall => Value::Set(small::into_entries::<1>(val.ptr).into_iter().map(|[m]| m).collect()),
-            Tag::ZSet => Value::ZSet(zset_slab().remove(val.idx).expect("zset slot")),
+            Tag::ZSet => {
+                // pendant une save, le ZSet reste pour la vue T0 : copie
+                let z = zset_ref(val.idx).clone();
+                free_zset(val.idx);
+                Value::ZSet(z)
+            }
             Tag::List => Value::List(list_slab().remove(val.idx).expect("list slot")),
         }
     }

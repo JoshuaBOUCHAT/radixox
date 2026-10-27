@@ -74,12 +74,49 @@ fn slab() -> &'static mut HiSlab<BNode> {
     }
 }
 
-/// Mono-thread ; l'appelant ne garde jamais deux références au même nœud.
+/// Lecture d'une feuille. Mono-thread ; l'appelant ne garde jamais deux références au
+/// même nœud.
 #[inline]
-fn leaf(i: u32) -> &'static mut Leaf {
+fn leaf(i: u32) -> &'static Leaf {
+    match unsafe { slab().get_unchecked(i) } {
+        BNode::Leaf(l) => l,
+        BNode::Internal(_) => unreachable!("feuille attendue"),
+    }
+}
+
+/// Point de passage de toute écriture d'une feuille : barrière de save (les feuilles
+/// sont ce que la save lit, en suivant leur chaînage T0 ; SAVE_DESIGN.md §2.A).
+#[inline]
+fn leaf_mut(i: u32) -> &'static mut Leaf {
+    super::save::before_leaf_write(i, || leaf(i).clone());
     match unsafe { slab().get_unchecked_mut(i) } {
         BNode::Leaf(l) => l,
         BNode::Internal(_) => unreachable!("feuille attendue"),
+    }
+}
+
+/// Libère une feuille (point de passage, comme [`leaf_mut`]).
+fn free_leaf(i: u32) {
+    super::save::before_leaf_write(i, || leaf(i).clone());
+    slab().remove(i);
+}
+
+/// Feuille T0 `i` pour la save : celle du slab si intacte, sinon son image.
+pub(crate) fn leaf_t0<R>(i: u32, f: impl FnOnce(&Leaf) -> R) -> R {
+    super::save::take_leaf(i, |img| f(img.unwrap_or_else(|| leaf(i))))
+}
+
+impl Leaf {
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (u64, u32)> + '_ {
+        (0..self.n as usize).map(|i| (self.scores[i], self.handles[i]))
+    }
+
+    pub(crate) fn next_leaf(&self) -> u32 {
+        self.next
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.n as usize
     }
 }
 
@@ -101,6 +138,11 @@ fn new_internal() -> u32 {
 
 fn free_node(i: u32) {
     slab().remove(i);
+}
+
+/// Bitmap de présence de la slab (vue T0 de la save).
+pub(crate) fn slab_occupancy(buf: &mut Vec<u64>) {
+    slab().copy_occupancy(buf);
 }
 
 /// Préchargement d'un nœud (chaînes AMAC, plages).
@@ -201,7 +243,7 @@ impl BTree {
         self.len += 1;
         if self.root == NONE {
             let l = new_leaf();
-            let lf = leaf(l);
+            let lf = leaf_mut(l);
             lf.n = 1;
             lf.scores[0] = s;
             lf.handles[0] = h;
@@ -220,7 +262,7 @@ impl BTree {
             path[d] = (idx, ci);
             idx = node.child[ci];
         }
-        let lf = leaf(idx);
+        let lf = leaf_mut(idx);
         let n = lf.n as usize;
         let pos = partition(n, |i| kcmp(tie, (lf.scores[i], lf.handles[i]), key) == Ordering::Less);
         debug_assert!(pos == n || kcmp(tie, (lf.scores[pos], lf.handles[pos]), key) != Ordering::Equal, "déjà présente");
@@ -248,15 +290,15 @@ impl BTree {
         lf.scores[..k].copy_from_slice(&ts[..k]);
         lf.handles[..k].copy_from_slice(&th[..k]);
         let r = new_leaf();
-        let lr = leaf(r);
+        let lr = leaf_mut(r);
         let rn = L + 1 - k;
         lr.n = rn as u16;
         lr.scores[..rn].copy_from_slice(&ts[k..]);
         lr.handles[..rn].copy_from_slice(&th[k..]);
         lr.prev = idx;
         lr.next = old_next;
-        leaf(idx).next = r;
-        if old_next == NONE { self.last = r } else { leaf(old_next).prev = r }
+        leaf_mut(idx).next = r;
+        if old_next == NONE { self.last = r } else { leaf_mut(old_next).prev = r }
         let mut carry = ((ts[k], th[k]), r, rn as u32);
         // Remontée par la pile.
         for d in (0..self.height as usize).rev() {
@@ -363,7 +405,7 @@ impl BTree {
             internal(p).count[ci] -= 1;
         }
         self.len -= 1;
-        let lf = leaf(c.leaf);
+        let lf = leaf_mut(c.leaf);
         let (pos, n) = (c.pos as usize, lf.n as usize);
         lf.scores.copy_within(pos + 1..n, pos);
         lf.handles.copy_within(pos + 1..n, pos);
@@ -388,7 +430,7 @@ impl BTree {
         }
         if n == 0 {
             self.unlink_leaf(c.leaf);
-            free_node(c.leaf);
+            free_leaf(c.leaf);
             self.remove_child(&path, height);
         } else if n < MERGE_BELOW && height > 0 {
             self.try_merge(path[height - 1]);
@@ -410,13 +452,13 @@ impl BTree {
         };
         let (a, b) = (node.child[left_ci], node.child[right_ci]);
         let lb = leaf(b).clone();
-        let la = leaf(a);
+        let la = leaf_mut(a);
         let (na, nb) = (la.n as usize, lb.n as usize);
         la.scores[na..na + nb].copy_from_slice(&lb.scores[..nb]);
         la.handles[na..na + nb].copy_from_slice(&lb.handles[..nb]);
         la.n += nb as u16;
         self.unlink_leaf(b);
-        free_node(b);
+        free_leaf(b);
         let node = internal(p);
         node.count[left_ci] += node.count[right_ci];
         Self::drop_child(node, right_ci);
@@ -467,15 +509,15 @@ impl BTree {
             let lf = leaf(l);
             (lf.prev, lf.next)
         };
-        if prev == NONE { self.first = next } else { leaf(prev).next = next }
-        if next == NONE { self.last = prev } else { leaf(next).prev = prev }
+        if prev == NONE { self.first = next } else { leaf_mut(prev).next = next }
+        if next == NONE { self.last = prev } else { leaf_mut(next).prev = prev }
     }
 
     /// Change le score de `(old, h)` en `new` sur place si l'ordre de la feuille le
     /// permet (aucun compte ne bouge), sinon retire puis insère. Faux si absente.
     pub fn update(&mut self, old: u64, h: u32, new: u64, tie: &impl Tie) -> bool {
         let Some(c) = self.find(old, h, tie) else { return false };
-        let lf = leaf(c.leaf);
+        let lf = leaf_mut(c.leaf);
         let (pos, n) = (c.pos as usize, lf.n as usize);
         let key = (new, h);
         // jamais la première entrée d'une feuille : elle peut être un séparateur
@@ -635,15 +677,15 @@ impl BTree {
             if cur == NONE || leaf(cur).n as usize == L {
                 let l = new_leaf();
                 if cur != NONE {
-                    leaf(cur).next = l;
-                    leaf(l).prev = cur;
+                    leaf_mut(cur).next = l;
+                    leaf_mut(l).prev = cur;
                 } else {
                     t.first = l;
                 }
                 level.push((l, 0, (s, h)));
                 cur = l;
             }
-            let lf = leaf(cur);
+            let lf = leaf_mut(cur);
             lf.scores[lf.n as usize] = s;
             lf.handles[lf.n as usize] = h;
             lf.n += 1;
@@ -687,12 +729,41 @@ impl BTree {
                     rec(c, h - 1);
                 }
             }
-            free_node(i);
+            if h == 0 { free_leaf(i) } else { free_node(i) }
         }
         if self.root != NONE {
             rec(self.root, self.height);
         }
         *self = Self::new();
+    }
+
+    /// Libération reprenable : `stack` part de `[(racine, hauteur)]` ; des nœuds entiers
+    /// jusqu'à épuiser `budget` (1 par nœud + 1 par entrée), `free(poignée)` pour chaque
+    /// entrée d'une feuille. Pile vide = fini.
+    pub(crate) fn free_step(stack: &mut Vec<(u32, u8)>, budget: &mut u32, mut free: impl FnMut(u32)) {
+        while *budget > 0
+            && let Some((i, h)) = stack.pop()
+        {
+            if h == 0 {
+                let lf = leaf(i);
+                let n = lf.n as usize;
+                lf.handles[..n].iter().for_each(|&x| free(x));
+                free_leaf(i);
+                *budget = budget.saturating_sub(1 + n as u32);
+            } else {
+                let node = internal(i);
+                stack.extend(node.child[..node.n as usize].iter().map(|&c| (c, h - 1)));
+                free_node(i);
+                *budget = budget.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Pile de départ de [`free_step`](Self::free_step) ; l'arbre devient vide.
+    pub(crate) fn take_for_free(&mut self) -> Vec<(u32, u8)> {
+        let stack = if self.root == NONE { Vec::new() } else { vec![(self.root, self.height)] };
+        *self = Self::new();
+        stack
     }
 
     /// Feuilles et nœuds internes (mesures).
