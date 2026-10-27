@@ -225,11 +225,13 @@ impl OxidArt {
             self.list_idx(dst)?;
         }
         let l = list_mut(si);
-        let v = match from {
+        // vide : seulement par l'API générique (`set` d'une `Value::List` vide)
+        let Some(v) = (match from {
             End::Left => l.pop_front(),
             End::Right => l.pop_back(),
-        }
-        .expect("élément");
+        }) else {
+            return Ok(None);
+        };
         if src == dst {
             match to {
                 End::Left => l.push_front(v.clone()),

@@ -165,7 +165,7 @@ impl<R: Read> DumpReader<R> {
             return Err(DumpError("magic invalide").into());
         }
         rd.version = rd.byte()?;
-        if !matches!(rd.version, format::VERSION_1 | format::VERSION_2 | format::VERSION) {
+        if !matches!(rd.version, format::VERSION_1 | format::VERSION_2 | format::VERSION_3 | format::VERSION) {
             return Err(DumpError("version inconnue").into());
         }
         if rd.byte()? != format::TTL_UNIT_SECONDS {
@@ -354,7 +354,7 @@ impl<R: Read> DumpReader<R> {
     }
 
     fn zset(&mut self) -> Result<ZSet, LoadError> {
-        if self.version >= format::VERSION {
+        if self.version >= format::VERSION_3 {
             // v3 : en ligne, dans l'ordre (score, membre) strictement croissant
             let n = self.varint()?;
             let mut entries: Vec<(u64, SharedByte)> = Vec::new();
@@ -377,6 +377,11 @@ impl<R: Read> DumpReader<R> {
         Ok(self.zsets.remove(&idx).ok_or(DumpError("ZSet absent de la section"))?)
     }
     fn list(&mut self) -> Result<VecDeque<SharedByte>, LoadError> {
+        if self.version >= format::VERSION {
+            // v4 : en ligne, dans l'ordre
+            let n = self.varint()?;
+            return (0..n).map(|_| self.bytes()).collect::<Result<_, _>>();
+        }
         let idx = self.varint()? as u32;
         Ok(self.lists.remove(&idx).ok_or(DumpError("List absente de la section"))?)
     }

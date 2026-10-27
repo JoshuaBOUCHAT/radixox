@@ -92,13 +92,19 @@ pub(crate) fn zset_inner<'a>(items: impl Iterator<Item = (f64, &'a [u8])>) -> (u
 pub(crate) fn list_inner<'a>(items: impl Iterator<Item = &'a [u8]>) -> (u64, u64) {
     let (mut sum, mut n) = (0u64, 0u64);
     for item in items {
-        let mut h = Hasher::new();
-        part(&mut h, &n.to_le_bytes());
-        part(&mut h, item);
-        sum = sum.wrapping_add(h.finalize() as u64);
+        sum = sum.wrapping_add(list_item(n, item));
         n += 1;
     }
     (sum, n)
+}
+
+/// Terme de l'élément de rang `rank` d'une List.
+#[inline]
+pub(crate) fn list_item(rank: u64, item: &[u8]) -> u64 {
+    let mut h = Hasher::new();
+    part(&mut h, &rank.to_le_bytes());
+    part(&mut h, item);
+    h.finalize() as u64
 }
 
 /// Terme d'un ZSet ou d'une List, à partir de la somme de ses éléments.

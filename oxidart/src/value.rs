@@ -231,11 +231,6 @@ pub(crate) fn zset_slab_mut() -> &'static mut HiSlab<ZSet> {
     zset_slab()
 }
 
-/// Parcourt toutes les List du slab (section List de la save).
-pub(crate) fn for_each_list(f: impl FnMut(u32, &List)) {
-    list_slab().for_each_occupied(f);
-}
-
 pub(crate) fn alloc_list(val: VecDeque<SharedByte>) -> u32 {
     list_slab().insert(List::from_values(val))
 }
@@ -243,17 +238,25 @@ pub(crate) fn alloc_list_raw(l: List) -> u32 {
     list_slab().insert(l)
 }
 /// Libère la List `idx` : tout de suite si elle est petite, sinon par tranches
-/// (`list::lazy`).
+/// (`list::lazy`) ; pendant une save, après (la vue T0 peut encore la lire).
 pub(crate) fn free_list(idx: u32) {
-    if let Some(l) = list_slab().remove(idx) {
+    crate::list::save::before_header_write(idx, || *list_ref(idx));
+    if let Some(l) = list_slab().remove(idx)
+        && let Some(l) = crate::list::save::defer_list(l)
+    {
         crate::list::lazy::release(l);
     }
+}
+/// Bitmap de présence de la slab des en-têtes de List (vue T0 de la save).
+pub(crate) fn list_slab_occupancy(buf: &mut Vec<u64>) {
+    list_slab().copy_occupancy(buf);
 }
 pub(crate) fn list_ref(idx: u32) -> &'static List {
     list_slab().get(idx).unwrap()
 }
 /// Point de passage de toute modification d'un en-tête de List.
 pub(crate) fn list_mut(idx: u32) -> &'static mut List {
+    crate::list::save::before_header_write(idx, || *list_ref(idx));
     list_slab().get_mut(idx).unwrap()
 }
 
@@ -337,6 +340,7 @@ pub(crate) unsafe fn value_take_raw(tag: Tag, val: ValUnion) -> Value {
                 Value::ZSet(z)
             }
             Tag::List => {
+                crate::list::save::before_header_write(val.idx, || *list_ref(val.idx));
                 let mut l = list_slab().remove(val.idx).expect("list slot");
                 let mut out = VecDeque::with_capacity(l.len() as usize);
                 while let Some(v) = l.pop_front() {

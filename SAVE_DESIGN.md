@@ -126,8 +126,18 @@ l'ordre), par le DFS, en flux (`Container::ZSet`, budget 1 par feuille + 1 par e
 Mesuré (1 M membres, serveur release) : PING max 0,87 ms pendant le BGSAVE (avant : 340 ms
 de boucle bloquée au `begin`). Lecture des dumps v1 / v2 (section ZSet du début) gardée.
 
-**List (v1)** : sérialisée intégralement au `begin`, de façon bloquante, dans la section du
-fichier indexée par idx de slab. Pas de barrière sur sa slab.
+**List (v4, 2026-10-27) : CoW, derrière la barrière** (`oxidart/src/list/save.rs`,
+ANALYSE_ART_UNIFIE.md §14.4). Écrite dans l'enregistrement de sa clé (cardinal T0 puis
+éléments dans l'ordre), en flux (`Container::List`, budget 1 par bloc + 1 par élément) :
+- en-têtes (slab des List) : `SaveBarrier<List>`, points de passage `list_mut` /
+  `free_list` ; image = l'en-tête (`first`, `len`) ;
+- blocs : `SaveBarrier<BlockImage>`, points de passage `block_mut` / `free_block` ; image =
+  bloc suivant + valeurs vivantes **clonées** (rc + 1 : le GC les épingle, une valeur
+  retirée pendant la save reste lisible par l'image, sans liste différée de valeurs) ;
+- une List supprimée pendant la save garde ses blocs (liste différée, rendue par tranches
+  après) ; la libération par tranches des grandes List (`list::lazy`) est gelée.
+Au `begin` : deux copies de bitmap, rien d'autre. Dumps v1 à v3 (List dans la section du
+début) toujours lus.
 
 Historique (ZSet v1, 2026-10-21) :
 Sérialisés **intégralement au `begin`**, de façon bloquante, dans une section du fichier indexée par idx de slab. L'enregistrement d'une clé ZSet/List référence cet idx T0. Pas de barrière sur leurs slabs.
@@ -155,7 +165,7 @@ Copiés intégralement au T0 (rarissimes), **en profondeur** (clones rc+1) : ils
 | Valart `ValNode` | `SaveBarrier<ValNodeImage>` (une seule pour Hash et Set) | `hash_node_mut`, `set_node_mut`, `free_hash_node`, `free_set_node` |
 | Collisions valart | aucune | copie au T0 |
 | ZSet (en-têtes, feuilles du B+tree) | `SaveBarrier<ZImage>`, `SaveBarrier<Leaf>` | `zset_mut`, `leaf_mut`, `free_leaf` (§D) |
-| List | aucune | sérialisée au `begin` |
+| List | en-têtes + blocs (images clonées) | flux, CoW (v4) |
 
 Audit : plus aucun `map.get_mut`, `map.remove` ou `nodes.get_unchecked_mut` hors des points de passage (sauf `set_parent_idx` et `map.tag`/`untag`, non sérialisés). Fait côté oxidart (étape 1).
 

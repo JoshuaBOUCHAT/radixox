@@ -381,6 +381,7 @@ impl OxidArt {
         self.save.t0 = self.now;
         valart().begin_save();
         zset::save::begin();
+        list::save::begin();
     }
 
     /// Termine la save (fin normale ou abandon) : images libérées, liste
@@ -398,6 +399,7 @@ impl OxidArt {
         self.save.clear_images();
         valart().end_save();
         zset::save::end();
+        list::save::end();
     }
 
     /// Une tranche de ce que la save laisse à libérer : feuilles des images
@@ -411,6 +413,10 @@ impl OxidArt {
         }
         let rest = zset::save::drain_step(rest);
         if !zset::save::deferred_empty() {
+            return false;
+        }
+        let rest = list::save::drain_step(rest);
+        if !list::save::deferred_empty() {
             return false;
         }
         valart().drain_deferred(rest)

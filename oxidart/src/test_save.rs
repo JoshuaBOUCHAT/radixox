@@ -106,6 +106,39 @@ fn random_op(art: &mut OxidArt, rng: &mut Rng) {
             let items: VecDeque<_> = (0..rng.below(5)).map(|i| sb(&format!("item-{i}"))).collect();
             art.set(sb(&format!("l{}", rng.below(10))), Value::List(items));
         }
+        // List sur plusieurs blocs, mutées et supprimées pendant la save (CoW des blocs et
+        // des en-têtes, liste différée, libération par tranches)
+        15 => {
+            use crate::lcommand::End;
+            let lk = format!("l{}", rng.below(10));
+            let end = if rng.below(2) == 0 { End::Left } else { End::Right };
+            match rng.below(9) {
+                0..=2 => {
+                    let vals: Vec<_> = (0..1 + rng.below(80)).map(|_| sb(&val(rng))).collect();
+                    let _ = art.cmd_lpush(lk.as_bytes(), end, &vals, false);
+                }
+                3 => {
+                    let _ = art.cmd_lpop(lk.as_bytes(), end, rng.below(40));
+                }
+                4 => {
+                    let _ = art.cmd_lrem(lk.as_bytes(), rng.below(5) as i64 - 2, val(rng).as_bytes());
+                }
+                5 => {
+                    let _ = art.cmd_linsert(lk.as_bytes(), rng.below(2) == 0, val(rng).as_bytes(), sb(&val(rng)));
+                    let _ = art.cmd_lset(lk.as_bytes(), rng.below(100) as i64 - 50, sb(&val(rng)));
+                }
+                6 => {
+                    let _ = art.cmd_ltrim(lk.as_bytes(), rng.below(20) as i64, -(rng.below(20) as i64) - 1);
+                }
+                7 => {
+                    let _ = art.cmd_lmove(lk.as_bytes(), format!("l{}", rng.below(10)).as_bytes(), end, End::Right);
+                }
+                _ => {
+                    art.del(lk.as_bytes());
+                    art.zset_free_step(64);
+                }
+            }
+        }
         // grands ZSet (au-delà de 128 membres : index, B+tree, poignées), mutés et
         // supprimés pendant la save ; libération par tranches entre deux opérations
         16 | 17 => {
@@ -664,10 +697,13 @@ fn reload_reads_version_1() {
     for _ in 0..2_000 {
         random_op(&mut art, &mut rng);
     }
-    // Les ZSet sont dans leur enregistrement depuis la v3 (en v1 / v2 : dans la section
-    // du début) : sans ZSet, le corps est le même d'une version à l'autre.
+    // Les ZSet sont dans leur enregistrement depuis la v3, les List depuis la v4 (avant :
+    // dans la section du début) : sans eux, le corps est le même d'une version à l'autre.
     for i in 0..20 {
         art.del(format!("z{i}").as_bytes());
+    }
+    for i in 0..10 {
+        art.del(format!("l{i}").as_bytes());
     }
     for i in 0..3 {
         art.del(format!("bigz{i}").as_bytes());
