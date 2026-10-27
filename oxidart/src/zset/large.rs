@@ -163,16 +163,22 @@ impl ZLarge {
 
     /// Ajoute `m` ou change son score. `None` : table des poignées pleine.
     pub fn add(&mut self, s: u64, m: &[u8]) -> Option<Added> {
+        self.upsert(m, |_| Some(s))
+    }
+
+    /// Ajoute ou met à jour `m` en une seule recherche dans l'index : `f(ancien score)`
+    /// donne le nouveau, ou `None` pour ne rien changer (`Added::Unchanged`). `None` :
+    /// table des poignées pleine.
+    pub fn upsert(&mut self, m: &[u8], f: impl FnOnce(Option<u64>) -> Option<u64>) -> Option<Added> {
         let hm = member_hash(m);
         if let Some(loc) = self.index.find(hm, |h| member(h) == m) {
             let (h, old) = Index::entry(loc);
-            if old == s {
-                return Some(Added::Unchanged);
-            }
+            let Some(s) = f(Some(old)).filter(|&s| s != old) else { return Some(Added::Unchanged) };
             self.tree.update(old, h, s, &tie);
             Index::set_score(loc, s);
             return Some(Added::Updated(old));
         }
+        let Some(s) = f(None) else { return Some(Added::Unchanged) };
         let h = handle::new_obj(m)?;
         self.tree.insert(s, h, &tie);
         self.index.insert(hm, h, s, rehash);

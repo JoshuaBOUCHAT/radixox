@@ -258,34 +258,39 @@ impl OxidArt {
         }
         let (mut added, mut updated) = (0u32, 0u32);
         let mut last = None;
-        for (score, member) in score_members {
+        for &(score, ref member) in score_members {
             last = None;
-            match zset.score(member).map(decode_score) {
-                Some(old) => {
-                    if flags.nx {
-                        continue;
+            let mut nan = false;
+            // une seule recherche du membre : la décision se prend sur son ancien score
+            let r = zset
+                .upsert(member, |old| match old.map(decode_score) {
+                    Some(_) if flags.nx => None,
+                    None if flags.xx => None,
+                    Some(old) => {
+                        let new = if flags.incr { old + score } else { score };
+                        if new.is_nan() {
+                            nan = true;
+                            return None;
+                        }
+                        if (flags.gt && new <= old) || (flags.lt && new >= old) {
+                            return None;
+                        }
+                        last = Some(new);
+                        (new != old).then(|| encode_score(new))
                     }
-                    let new = if flags.incr { old + score } else { *score };
-                    if new.is_nan() {
-                        return Err(TypeError::NotAFloat);
+                    None => {
+                        last = Some(score);
+                        Some(encode_score(score))
                     }
-                    if (flags.gt && new <= old) || (flags.lt && new >= old) {
-                        continue;
-                    }
-                    if new != old {
-                        zset.add(encode_score(new), member).ok_or(TypeError::OutOfMemory)?;
-                        updated += 1;
-                    }
-                    last = Some(new);
-                }
-                None => {
-                    if flags.xx {
-                        continue;
-                    }
-                    zset.add(encode_score(*score), member).ok_or(TypeError::OutOfMemory)?;
-                    added += 1;
-                    last = Some(*score);
-                }
+                })
+                .ok_or(TypeError::OutOfMemory)?;
+            if nan {
+                return Err(TypeError::NotAFloat);
+            }
+            match r {
+                Added::New => added += 1,
+                Added::Updated(_) => updated += 1,
+                Added::Unchanged => {}
             }
         }
         Ok(if flags.incr {
@@ -519,11 +524,15 @@ impl OxidArt {
             return Err(TypeError::NotAFloat);
         }
         let zset = self.get_zset_mut(None, key)?;
-        let new = zset.score(&member).map_or(0.0, decode_score) + increment;
+        let mut new = f64::NAN;
+        zset.upsert(&member, |old| {
+            new = old.map_or(0.0, decode_score) + increment;
+            (!new.is_nan()).then(|| encode_score(new))
+        })
+        .ok_or(TypeError::OutOfMemory)?;
         if new.is_nan() {
             return Err(TypeError::NotAFloat);
         }
-        zset.add(encode_score(new), &member).ok_or(TypeError::OutOfMemory)?;
         Ok(new)
     }
 }

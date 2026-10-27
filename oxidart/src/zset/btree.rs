@@ -206,13 +206,16 @@ fn partition(n: usize, mut pred: impl FnMut(usize) -> bool) -> usize {
 /// ZADD).
 #[inline(always)]
 fn count_scores<const N: usize>(col: &[u64; N], n: usize, s: u64) -> (usize, usize) {
-    let (mut lt, mut le) = (0usize, 0usize);
+    const { assert!(N < 64) };
+    // un bit par case : LLVM en fait des `vpcmpuq` vers des registres de masque, puis
+    // `popcnt` (la somme d'octets booléens, elle, restait scalaire sur les 24 séparateurs)
+    let (mut lt, mut le) = (0u64, 0u64);
     for (i, &x) in col.iter().enumerate() {
-        let live = i < n;
-        lt += (live & (x < s)) as usize;
-        le += (live & (x <= s)) as usize;
+        lt |= ((x < s) as u64) << i;
+        le |= ((x <= s) as u64) << i;
     }
-    (lt, le)
+    let live = (1u64 << n) - 1;
+    ((lt & live).count_ones() as usize, (le & live).count_ones() as usize)
 }
 
 /// Rang dans un nœud de la clé `(s, ·)` : entrées strictement avant elle (`upper` faux),
@@ -448,6 +451,12 @@ impl BTree {
         let mut path = [(NONE, 0usize); MAX_H];
         let mut sep = None;
         let Some(c) = self.locate(s, h, tie, &mut path, &mut sep) else { return false };
+        self.remove_at(c, &path, sep);
+        true
+    }
+
+    /// Retire l'entrée en `c`, trouvée par [`Self::locate`] (pile `path`, séparateur `sep`).
+    fn remove_at(&mut self, c: Cursor, path: &[(u32, usize); MAX_H], sep: Option<(u32, usize)>) {
         let height = self.height as usize;
         for &(p, ci) in &path[..height] {
             internal(p).count[ci] -= 1;
@@ -479,12 +488,11 @@ impl BTree {
         if n == 0 {
             self.unlink_leaf(c.leaf);
             free_leaf(c.leaf);
-            self.remove_child(&path, height);
+            self.remove_child(path, height);
         } else if n < MERGE_BELOW && height > 0 {
             self.try_merge(path[height - 1]);
         }
         self.collapse_root();
-        true
     }
 
     /// Feuille sous ¼ : fusion avec une voisine du même parent, sous ¼ aussi.
@@ -564,7 +572,9 @@ impl BTree {
     /// Change le score de `(old, h)` en `new` sur place si l'ordre de la feuille le
     /// permet (aucun compte ne bouge), sinon retire puis insère. Faux si absente.
     pub fn update(&mut self, old: u64, h: u32, new: u64, tie: &impl Tie) -> bool {
-        let Some(c) = self.find(old, h, tie) else { return false };
+        let mut path = [(NONE, 0usize); MAX_H];
+        let mut sep = None;
+        let Some(c) = self.locate(old, h, tie, &mut path, &mut sep) else { return false };
         let lf = leaf_mut(c.leaf);
         let (pos, n) = (c.pos as usize, lf.n as usize);
         let key = (new, h);
@@ -577,7 +587,7 @@ impl BTree {
         if fits {
             lf.scores[pos] = new;
         } else {
-            self.remove(old, h, tie);
+            self.remove_at(c, &path, sep);
             self.insert(new, h, tie);
         }
         true

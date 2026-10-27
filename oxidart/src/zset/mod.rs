@@ -74,18 +74,24 @@ impl ZSet {
     /// Ajoute `m` ou change son score (encodé). `None` : table des poignées pleine
     /// (le ZSet est inchangé).
     pub fn add(&mut self, s: u64, m: &[u8]) -> Option<Added> {
+        self.upsert(m, |_| Some(s))
+    }
+
+    /// Ajoute ou met à jour `m` en une seule recherche : `f(ancien score)` (encodés) donne
+    /// le nouveau, ou `None` pour ne rien changer (`Added::Unchanged`). `None` : table des
+    /// poignées pleine (le ZSet est inchangé).
+    pub fn upsert(&mut self, m: &[u8], f: impl FnOnce(Option<u64>) -> Option<u64>) -> Option<Added> {
         let small = match self {
-            Self::Large(z) => return z.add(s, m),
+            Self::Large(z) => return z.upsert(m, f),
             Self::Small(z) => z,
         };
         if let Some(i) = small.find(m) {
             let old = small.score(i);
-            if old == s {
-                return Some(Added::Unchanged);
-            }
+            let Some(s) = f(Some(old)).filter(|&s| s != old) else { return Some(Added::Unchanged) };
             small.set_score(i, s);
             return Some(Added::Updated(old));
         }
+        let Some(s) = f(None) else { return Some(Added::Unchanged) };
         if small.insert(s, m) {
             return Some(Added::New);
         }
