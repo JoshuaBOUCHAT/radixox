@@ -968,3 +968,136 @@ Leviers restants (mémoire) : petite forme directement dans la valeur oxidart
 64 o (~−1,5 o), remplissage des seaux.
 
 Reste : ZSCAN, ZUNION / ZINTER / ZDIFF (STORE), BZPOP*.
+
+## 14. List — architecture retenue (2026-10-27, pas implémentée)
+
+### 14.0 Pourquoi, et pour quels usages
+
+Aujourd'hui une List est un `VecDeque<SharedByte>` dans une HiSlab, sans aucune commande.
+Le tampon du `VecDeque` vit dans le tas Rust (immobile, recopié en entier à chaque
+doublement), et la save le sérialise d'un coup au `begin` (bloquant).
+
+Usages visés, par ordre d'importance :
+- **files de travaux** (`LPUSH` + `BRPOP` / `BLMOVE`) : opérations aux deux bouts ; la liste
+  se vide par ses éléments les plus anciens ;
+- **file fiable** (`LMOVE` vers une liste « en cours », puis `LREM` à la fin du travail) :
+  le `LREM` porte sur une liste courte (le nombre de travaux en cours) ;
+- **derniers N** (`LPUSH` + `LTRIM 0 N-1`) : bornées par construction.
+
+**Décision (utilisateur, 2026-10-27)** : complexités de Redis (bouts en O(1), milieu et
+positions en O(n)), pas d'index par valeur en v1 (option plus tard, §14.8) ; **blocs
+chaînés** (un saut par bloc, pas par valeur) et **pierres tombales** pour les retraits,
+rares : un retrait trouvé coûte O(1), la case morte part quand un pop l'atteint.
+
+### 14.1 Structure
+
+```text
+en-tête (slab des listes)          blocs (HiSlab<Block>, 256 o, alignés sur 64)
+┌───────────────────────┐   ┌──────────────────────┐   ┌──────────────────────┐
+│ first, last : u32     │──▶│ prev, next : u32     │◀─▶│ prev, next : u32     │
+│ len : u32 (vivants)   │   │ lo, hi : u8          │   │ lo, hi : u8          │
+│ blocks : u32          │   │ dead : u32 (masque)  │   │ dead : u32           │
+└───────────────────────┘   │ slots : [SharedByte; 30]  │ slots : [SharedByte; 30]
+                            └──────────────────────┘   └──────────────────────┘
+```
+
+- **Bloc** : 16 o d'en-tête + 30 cases de 8 o = 256 o (4 lignes de cache). Cases occupées
+  `[lo, hi)` ; bit `i` de `dead` = case `i` morte (pierre tombale). Vivants du bloc =
+  `hi − lo − popcnt(dead)`. Coût : 256 o / 30 ≈ **8,5 o par élément** en plus de la valeur
+  (Redis, listpack : ~2 à 11 o, valeur en ligne).
+- **`push_back`** : case `hi` du dernier bloc s'il reste de la place, sinon un bloc neuf
+  (`lo = hi = 0`). **`push_front`** : case `lo − 1` du premier bloc, sinon un bloc neuf
+  rempli par la fin (`lo = hi = 30`). O(1).
+- **`pop_front` / `pop_back`** : saute les cases mortes du bout (et efface leurs bits),
+  prend la première vivante ; bloc vide → décroché et rendu. O(1) amorti : une pierre
+  tombale n'est sautée qu'une fois.
+- **Retrait d'une case trouvée** (`LREM`) : bit mort, valeur rendue (différée pendant une
+  save, §14.4), `len −= 1`. Au bout du bloc, `lo` / `hi` reculent tout de suite (avec les
+  morts voisines). Bloc sans vivant → décroché. Bloc à moins de ¼ de vivants dont un voisin
+  a la place → fusion (≤ 30 copies) : la mémoire reste bornée même si les retraits
+  touchent le milieu (sans fusion, pire cas 256 o par élément).
+- **Insertion au milieu** (`LINSERT`) : dans le bloc, réécriture compacte (morts retirées,
+  ≤ 30 copies) ; bloc plein → coupé en deux. O(position) pour trouver, O(1) ensuite.
+- **Position `i`** (`LINDEX`, `LSET`, début de `LRANGE`, `LTRIM`) : on part du bout le plus
+  proche en sautant des blocs entiers par leurs vivants, puis le rang dans le bloc se lit
+  par le masque. O(distance / 30).
+
+### 14.2 Commandes
+
+| commandes | coût |
+|---|---|
+| `LPUSH` `RPUSH` `LPUSHX` `RPUSHX` | O(1) par élément |
+| `LPOP` `RPOP` (`count`) | O(1) par élément |
+| `LMOVE` `RPOPLPUSH` (même liste : rotation) | O(1) |
+| `LLEN` | O(1) |
+| `LINDEX` `LSET` | O(distance au bout / 30) |
+| `LRANGE` | O(début / 30 + nombre rendu) |
+| `LTRIM` | O(retirés), blocs entiers d'un coup |
+| `LINSERT` `LREM` `LPOS` (`RANK` `COUNT` `MAXLEN`) | O(n) de parcours, comme Redis ; chaque retrait O(1) |
+| `BLPOP` `BRPOP` `BLMOVE` `BRPOPLPUSH` | §14.3 |
+
+`LMPOP` / `BLMPOP` : plus tard.
+
+### 14.3 Commandes bloquantes
+
+Sur les connexions parquées (RUNTIME_ARCH.md §7), prévues pour ça :
+- clé vide → la connexion se parque ; inscription `(slot, epoch)` dans la file d'attente de
+  la clé (FIFO, comme Redis : servies dans l'ordre d'arrivée) et timer du timeout ;
+- un push sur une clé qui a des inscrits sert le premier inscrit **après** la commande
+  (après la transaction pour `MULTI`) ; il reçoit sa réponse et sa connexion est rejouée au
+  tour suivant (§7) ;
+- journal (AOF, réplication) : un `BLPOP` servi est écrit comme le `LPOP` / `LMOVE`
+  effectif, comme Redis le propage ; timeout et connexion morte : rien.
+
+### 14.4 Save, GC, AMAC
+
+- **Save progressive derrière la barrière**, comme les feuilles du B+tree (SAVE_DESIGN.md
+  §D) : en-têtes en `SaveBarrier` (image : `first`, `len`), blocs en `SaveBarrier<Block>`,
+  points de passage `block_mut` / `free_block` ; la save suit le chaînage T0 des blocs et
+  écrit `len` puis les éléments vivants, en flux (budget 1 par bloc + 1 par élément).
+  Valeurs retirées pendant la save → liste différée. Format de l'enregistrement : celui de
+  la List v1 (cardinal puis éléments), relu tel quel. Remplace la sérialisation bloquante
+  au `begin`.
+- **GC** : la phase `Lists` visite les `SharedByte` des cases vivantes, blocs dans l'ordre
+  de la slab (parcours linéaire, comme aujourd'hui).
+- **Compactage de la slab des blocs** : facile ici (contrairement au B+tree) : un bloc
+  déplacé n'est référencé que par ses deux voisins (`prev.next`, `next.prev`) ou par
+  l'en-tête (`first` / `last`), atteignables depuis le bloc lui-même. Pas en v1 ; même
+  mécanisme que la slab des nœuds ensuite.
+- **AMAC** : en-tête → premier ou dernier bloc selon la commande ; pour un pop, les octets
+  de la valeur rendue.
+
+### 14.5 Ordre de travail
+
+1. blocs + en-tête seuls, tests contre `VecDeque` (pushs, pops, retraits, insertions,
+   positions, fusions) ;
+2. branchement : remplace `HiSlab<VecDeque<SharedByte>>` (valeur, digest, GC, chargement) ;
+3. commandes non bloquantes, différentiel contre Valkey (comme `zset_vs_valkey.py`) ;
+4. commandes bloquantes (parquage, timers, journal) ;
+5. save progressive ;
+6. AMAC ;
+7. mesures contre Valkey (`LPUSH`/`RPOP` avec et sans pipeline, `BRPOP`, `LRANGE`,
+   mémoire par élément, petites listes).
+
+### 14.6 Points ouverts
+
+- **Petites listes** : une liste d'un élément coûte un bloc de 256 o, contre quelques
+  dizaines d'octets chez Valkey (listpack). Si les mesures le montrent : premier bloc plus
+  petit, ou petite forme (comme `HashSmall`).
+- **Taille de bloc** : 30 cases (256 o) en v1 ; 62 (512 o) divise par deux les sauts des
+  parcours au prix des petites listes. À mesurer.
+
+### 14.7 Options écartées (ne pas reproposer)
+
+| option | pourquoi |
+|---|---|
+| un nœud par élément (liste doublement chaînée) | un saut par valeur, ~16 o de liens par élément |
+| `VecDeque` | tampon immobile dans le tas, recopie entière en grandissant, save bloquante |
+| index par valeur en v1 | ~40 o par élément et un coût à chaque push pour un usage rare (§14.0) |
+
+### 14.8 Plus tard : index par valeur (option)
+
+Index haché valeur → occurrences (comme l'index du ZSet), pour `LREM` / `LPOS` / `LINSERT`
+en O(clé + retirés). Les pierres tombales gardent les positions `(bloc, case)` stables, ce
+qui le rend possible ; seules la fusion et la coupe de blocs devraient mettre à jour les
+entrées déplacées (≤ 30). Créé à la demande sur une liste, jamais pour une file pure.
