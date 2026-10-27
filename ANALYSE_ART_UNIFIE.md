@@ -969,7 +969,7 @@ Leviers restants (mémoire) : petite forme directement dans la valeur oxidart
 
 Reste : ZSCAN, ZUNION / ZINTER / ZDIFF (STORE), BZPOP* (service direct par `ZADD` / `ZINCRBY`, même mécanisme que les listes : §14.3).
 
-## 14. List — architecture retenue (2026-10-27, pas implémentée)
+## 14. List — architecture retenue (2026-10-27, implémentée le même jour, §14.9)
 
 ### 14.0 Pourquoi, et pour quels usages
 
@@ -1135,3 +1135,46 @@ Index haché valeur → occurrences (comme l'index du ZSet), pour `LREM` / `LPOS
 en O(clé + retirés). Les pierres tombales gardent les positions `(bloc, case)` stables, ce
 qui le rend possible ; seules la fusion et la coupe de blocs devraient mettre à jour les
 entrées déplacées (≤ 30). Créé à la demande sur une liste, jamais pour une file pure.
+
+### 14.9 Implémentation (2026-10-27) et mesures
+
+Étapes 1 à 5 de §14.5 faites (85148cc → c490e23) : `oxidart/src/list/` (blocs, `lazy`,
+`save`), `oxidart/src/lcommand.rs`, `radixox/src/exec/list.rs`, bloquantes dans
+`radixox/src/uring/core/block.rs`. Différentiel `scripts/list_vs_valkey.py` : 0 écart
+(listes de 3 000 éléments comprises) ; tests `radixox/tests/list.rs` (service direct,
+ordre d'arrivée, délai, plusieurs clés, chaîne BLMOVE, BZPOPMIN, inscrit mort, pipeline
+derrière un BLPOP) ; AOF rejoué = même condensé (les bloquantes sont journalisées en
+`LPOP` / `LMOVE` / `ZPOPMIN`). Save en CoW : format v4.
+
+Étape 6 (AMAC) non faite : la descente de la clé est déjà préchargée (indices), et les
+commandes chaudes ne font que 0 à 5 défauts du dernier niveau de cache par commande
+(RPOP ~1, LPUSH ~5) ; rien à recouvrir.
+
+Débit compté côté serveur (`total_commands_processed`, pipeline 64, 50 connexions ;
+`valkey-benchmark` sature avant RadixOx sur les pops et arrondit la durée) :
+
+| commande | RadixOx | Valkey 9.1 |
+|---|---|---|
+| LPUSH (10 000 List) | 1,9–3,1 M/s | 0,56 M/s |
+| RPOP | 4,4–5,3 M/s | 2,6 M/s |
+| LRANGE l 0 9 | 0,9–1,6 M/s | 0,9 M/s |
+| LRANGE (1 M éléments) 0 99 | 0,33 M/s | 0,18 M/s |
+| LINDEX au milieu d'1 M | **35 K/s** | **380 K/s** |
+
+Mémoire (RSS par élément, éléments de 16 o, `scripts/bench_list.sh`) : 1 × 1 M **36 o**
+contre 18 ; 100 000 × 10 **56 o** contre 23.
+
+Taille de bloc (`--cfg radixox_list128` / `radixox_list512`) : sans effet mesurable sur
+LPUSH, RPOP, LRANGE court (un bout seulement) ; LINDEX au milieu proportionnel aux cases
+(14 : 17,6 K/s, 30 : 37 K/s, 61 : 77 K/s) ; petites List 43 / 56 / 81 o par élément. 30
+gardé.
+
+Les deux écarts avec Valkey viennent de la forme, pas du code :
+- **mémoire** : un pointeur de 8 o par case + l'objet `SharedByte` (en-tête 4 o, granule
+  du pool) contre les octets en ligne d'un listpack (~2 o d'en-tête) ;
+- **LINDEX au milieu** : un saut par bloc de 30 éléments (~17 000 pour le milieu d'1 M,
+  ~9 cycles chacun : déjà au débit mémoire) contre un nœud de ~8 Kio (~450 éléments) chez
+  Valkey.
+Pistes, à décider : éléments courts en ligne dans le bloc (listpack dans un bloc de taille
+fixe) ; petite forme pour les List courtes ; index grossier par groupes de blocs pour les
+positions.

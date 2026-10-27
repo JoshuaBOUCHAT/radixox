@@ -20,9 +20,18 @@ use radixox_lib::shared_byte::SharedByte;
 pub mod lazy;
 pub mod save;
 
-/// Cases par bloc.
+/// Cases par bloc : 30 (bloc de 256 o) ; mesures : `--cfg radixox_list128` (14 cases,
+/// 128 o), `--cfg radixox_list512` (61 cases, 512 o, masque sur 64 bits).
+#[cfg(not(any(radixox_list128, radixox_list512)))]
 pub const CAP: usize = 30;
+#[cfg(radixox_list128)]
+pub const CAP: usize = 14;
+#[cfg(radixox_list512)]
+pub const CAP: usize = 61;
+#[cfg(not(radixox_list512))]
 type Mask = u32;
+#[cfg(radixox_list512)]
+type Mask = u64;
 const _: () = assert!(CAP <= Mask::BITS as usize);
 const NONE: u32 = u32::MAX;
 /// Sous ce nombre de vivants, un bloc tente une fusion avec un voisin.
@@ -170,7 +179,8 @@ fn slab() -> &'static mut HiSlab<Block> {
 fn init_slab() -> &'static mut HiSlab<Block> {
     #[allow(static_mut_refs)]
     unsafe {
-        SLAB.insert(HiSlab::new(0, 1 << 26).expect("slab des blocs de List"))
+        // 16 Gio virtuels, quelle que soit la taille de bloc
+        SLAB.insert(HiSlab::new(0, ((16usize << 30) / size_of::<Block>()) as u32).expect("slab des blocs de List"))
     }
 }
 

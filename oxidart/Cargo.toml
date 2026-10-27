@@ -37,4 +37,4 @@ regex = ["dep:regex-automata"]
 oxidart-legacy = { path = "../oxidart-legacy", features = ["regex"] }
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(radixox_nopool)', 'cfg(radixox_sysalloc)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(radixox_nopool)', 'cfg(radixox_sysalloc)', 'cfg(radixox_list128)', 'cfg(radixox_list512)'] }

@@ -529,7 +529,8 @@ own synchronization.
 | Expiration | `EXPIRE` `PEXPIRE` `PERSIST` `TTL` `PTTL` |
 | Hash | `HSET` `HMSET` `HGET` `HMGET` `HGETALL` `HDEL` `HEXISTS` `HLEN` `HKEYS` `HVALS` `HINCRBY` |
 | Set | `SADD` `SREM` `SISMEMBER` `SCARD` `SMEMBERS` `SPOP` |
-| Sorted set | `ZADD` (`NX` `XX` `GT` `LT` `CH` `INCR`) `ZREM` `ZSCORE` `ZMSCORE` `ZCARD` `ZINCRBY` `ZRANGE` (`BYSCORE` `BYLEX` `REV` `LIMIT` `WITHSCORES`) `ZREVRANGE` `ZRANGEBYSCORE` `ZREVRANGEBYSCORE` `ZRANGEBYLEX` `ZREVRANGEBYLEX` `ZRANK` `ZREVRANK` (`WITHSCORE`) `ZCOUNT` `ZLEXCOUNT` `ZPOPMIN` `ZPOPMAX` `ZREMRANGEBYRANK` `ZREMRANGEBYSCORE` `ZREMRANGEBYLEX` `ZRANDMEMBER` |
+| Sorted set | `ZADD` (`NX` `XX` `GT` `LT` `CH` `INCR`) `ZREM` `ZSCORE` `ZMSCORE` `ZCARD` `ZINCRBY` `ZRANGE` (`BYSCORE` `BYLEX` `REV` `LIMIT` `WITHSCORES`) `ZREVRANGE` `ZRANGEBYSCORE` `ZREVRANGEBYSCORE` `ZRANGEBYLEX` `ZREVRANGEBYLEX` `ZRANK` `ZREVRANK` (`WITHSCORE`) `ZCOUNT` `ZLEXCOUNT` `ZPOPMIN` `ZPOPMAX` `ZREMRANGEBYRANK` `ZREMRANGEBYSCORE` `ZREMRANGEBYLEX` `ZRANDMEMBER` `BZPOPMIN` `BZPOPMAX` |
+| List | `LPUSH` `RPUSH` `LPUSHX` `RPUSHX` `LPOP` `RPOP` (`count`) `LLEN` `LRANGE` `LINDEX` `LSET` `LINSERT` `LREM` `LTRIM` `LPOS` (`RANK` `COUNT` `MAXLEN`) `LMOVE` `RPOPLPUSH` `BLPOP` `BRPOP` `BLMOVE` `BRPOPLPUSH` |
 | Pub/Sub | `SUBSCRIBE` `UNSUBSCRIBE` `PUBLISH` |
 | Replication | `REPLICATE` (`host port [AUTH pass]`, `STOP host port`) `REPLICAOF NO ONE` `WAIT` `DEBUG DIGEST` (internal: `RXHELLO` `RXLOAD` `RXBLOCK` `RXTICK`) |
 
@@ -801,6 +802,11 @@ a simulated kernel.
   stored as `i64` and formatted on read.
 - Hash and Set: up to 8 entries, one compact block of `SharedByte` pointers; beyond that,
   **valart**, a compact radix tree per container.
+- List: blocks of 30 `SharedByte` pointers (256 bytes) chained both ways, tombstones for
+  removals in the middle (cleared when a pop reaches them), O(1) at both ends. Blocking
+  commands are served directly by the producer: an `LPUSH` on a key clients wait for hands
+  them its elements and stores only the rest. Saved progressively behind the copy-on-write
+  barrier; deleting a large one is done in slices.
 - Sorted set: up to 128 members of ≤ 64 bytes, one columnar block (2/4/8-byte scores); beyond, a hashed bucket trie (member → score, never rehashed) + a counted B+tree (order, ranks in O(log n)), members stored once behind relocatable handles. Saved progressively behind the copy-on-write barrier; deleting a large one is done in slices in the background.
 
 **Single-threaded on purpose**: no locks, no contention, predictable tail latency. Scaling
