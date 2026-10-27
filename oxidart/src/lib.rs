@@ -55,6 +55,7 @@ pub mod new_node;
 
 pub mod hcommand;
 pub mod krange;
+pub mod lcommand;
 pub mod list;
 mod prefetch_batch;
 pub use prefetch_batch::{AmacStats, Hint, PREFETCH_BATCH, ZProbe};

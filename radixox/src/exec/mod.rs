@@ -11,6 +11,7 @@ pub mod fs_task;
 pub mod client;
 pub mod jobs;
 pub mod journal;
+pub mod list;
 pub mod persist;
 mod hash;
 pub mod scan;
@@ -185,7 +186,17 @@ pub fn hint_keys<'a>(cmd: &Cmd<'a>, mut push: impl FnMut(&'a [u8])) -> bool {
         | Cmd::ZPop { key: k, .. }
         | Cmd::ZRemRange { key: k, .. }
         | Cmd::ZMScore { key: k, .. }
-        | Cmd::ZRandMember { key: k, .. } => push(k),
+        | Cmd::ZRandMember { key: k, .. }
+        | Cmd::LPush { key: k, .. }
+        | Cmd::LPop { key: k, .. }
+        | Cmd::LLen(k)
+        | Cmd::LRange { key: k, .. }
+        | Cmd::LIndex { key: k, .. }
+        | Cmd::LSet { key: k, .. }
+        | Cmd::LInsert { key: k, .. }
+        | Cmd::LRem { key: k, .. }
+        | Cmd::LTrim { key: k, .. }
+        | Cmd::LPos { key: k, .. } => push(k),
         Cmd::Del(keys) | Cmd::Exists(keys) => keys.iter().for_each(|k| push(k)),
         Cmd::MGet(keys) => keys.iter().for_each(|k| push(k)),
         Cmd::MSet(pairs) => pairs.iter().for_each(|(k, _)| push(k)),
@@ -347,6 +358,24 @@ pub fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         Cmd::ZScore { key, member } => cmd_zscore(art, key, member),
         Cmd::ZRem { key, members } => cmd_zrem(art, key, &members),
         Cmd::ZIncrBy { key, delta, member } => cmd_zincrby(art, key, delta, member),
+        // ── List ─────────────────────────────────────────────────────────────
+        Cmd::LPush { key, vals, right, exists } => list::cmd_lpush(art, key, &vals, right, exists),
+        Cmd::LPop { key, right, count } => list::cmd_lpop(art, key, right, count),
+        Cmd::LLen(key) => list::cmd_llen(art, key),
+        Cmd::LRange { key, start, stop } => list::cmd_lrange(art, key, start, stop),
+        Cmd::LIndex { key, index } => list::cmd_lindex(art, key, index),
+        Cmd::LSet { key, index, val } => list::cmd_lset(art, key, index, val),
+        Cmd::LInsert { key, after, pivot, val } => list::cmd_linsert(art, key, after, pivot, val),
+        Cmd::LRem { key, count, val } => list::cmd_lrem(art, key, count, val),
+        Cmd::LTrim { key, start, stop } => list::cmd_ltrim(art, key, start, stop),
+        Cmd::LPos { key, val, rank, count, maxlen } => list::cmd_lpos(art, key, val, rank, count, maxlen),
+        Cmd::LMove { src, dst, from_right, to_right } => list::cmd_lmove(art, src, dst, from_right, to_right),
+        // les bloquantes passent par le cœur (attente, service direct) ; ici, sans attente
+        Cmd::BPop { keys, right, .. } => list::try_bpop(art, &keys, right).unwrap_or(Frame::NullArray),
+        Cmd::BLMove { src, dst, from_right, to_right, .. } => {
+            list::try_blmove(art, src, dst, from_right, to_right).unwrap_or(Frame::NullArray)
+        }
+        Cmd::BZPop { keys, max, .. } => zset::try_bzpop(art, &keys, max).unwrap_or(Frame::NullArray),
         // ── Should not reach here (handled in dispatch) ───────────────────
         Cmd::FlushDb
         | Cmd::Ping(_)

@@ -155,3 +155,19 @@ pub fn cmd_zrandmember(art: &mut OxidArt, key: &[u8], count: Option<i64>, with_s
         Err(t) => wrongtype(t),
     }
 }
+
+/// BZPOPMIN / BZPOPMAX sans attente : la première clé non vide, `[clé, membre, score]` ;
+/// `None` sinon (l'appelant parque la connexion).
+pub fn try_bzpop(art: &mut OxidArt, keys: &[&[u8]], max: bool) -> Option<Frame> {
+    for &k in keys {
+        match art.cmd_zpop(k, max, 1) {
+            Ok(mut v) if !v.is_empty() => {
+                let (m, s) = v.pop().unwrap();
+                return Some(Frame::Array(vec![Frame::BulkString(SharedByte::from_slice(k)), Frame::BulkString(m), score_bulk(s)]));
+            }
+            Ok(_) => {}
+            Err(t) => return Some(wrongtype(t)),
+        }
+    }
+    None
+}

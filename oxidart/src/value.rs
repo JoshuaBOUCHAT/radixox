@@ -477,6 +477,14 @@ impl<'a> NodeValRef<'a> {
         }
     }
 
+    /// Idx de l'en-tête de la List dans son slab.
+    pub fn list_idx(self) -> Result<u32, RedisType> {
+        match self.tag {
+            Tag::List => Ok(unsafe { self.val.idx }),
+            _ => Err(self.tag.redis_type()),
+        }
+    }
+
     /// Idx du ZSet dans son slab.
     pub fn zset_idx(self) -> Result<u32, RedisType> {
         match self.tag {

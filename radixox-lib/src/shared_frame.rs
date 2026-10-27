@@ -11,6 +11,8 @@ pub enum SharedFrame {
     BulkString(SharedByte),
     Array(Vec<SharedFrame>),
     Null,
+    /// Tableau nul (`*-1`) : `LPOP key count` sur clé absente, timeout de `BLPOP`.
+    NullArray,
 }
 
 impl Hash for SharedFrame {
@@ -23,6 +25,7 @@ impl Hash for SharedFrame {
             SharedFrame::BulkString(_) => b'$',
             SharedFrame::Array(_) => b'*',
             SharedFrame::Null => b'_',
+            SharedFrame::NullArray => b'~',
         };
         prefix.hash(state);
         match self {
@@ -31,7 +34,7 @@ impl Hash for SharedFrame {
             SharedFrame::Error(s) => s.hash(state),
             SharedFrame::Integer(i) => i.hash(state),
             SharedFrame::Array(f) => f.iter().for_each(|f| f.hash(state)),
-            SharedFrame::Null => {}
+            SharedFrame::Null | SharedFrame::NullArray => {}
         }
     }
 }
@@ -43,7 +46,7 @@ impl SharedFrame {
             SharedFrame::Array(frames) => frames
                 .iter()
                 .fold(1 + digits_in(frames.len()) + 2, |m, f| m + f.encode_len()),
-            SharedFrame::Null => 5, // b"$-1\r\n"
+            SharedFrame::Null | SharedFrame::NullArray => 5, // b"$-1\r\n", b"*-1\r\n"
             SharedFrame::SimpleString(s) => 1 + s.len() + 2,
             SharedFrame::Error(s) => 1 + s.len() + 2,
             SharedFrame::Integer(i) => {
@@ -132,6 +135,9 @@ fn encode_frame(dst: &mut Vec<u8>, frame: &SharedFrame) {
         }
         SharedFrame::Null => {
             dst.extend_from_slice(b"$-1\r\n");
+        }
+        SharedFrame::NullArray => {
+            dst.extend_from_slice(b"*-1\r\n");
         }
     }
 }

@@ -314,6 +314,41 @@ pub enum Cmd<'a> {
     /// SPOP key [count]
     SPop { key: &'a [u8], count: Option<u64> },
 
+    // --- List --------------------------------------------------------
+    /// LPUSH / RPUSH (`right`) / LPUSHX / RPUSHX (`exists`) key element [element ...]
+    LPush {
+        key: &'a [u8],
+        vals: SmallVec<4, SharedByte>,
+        right: bool,
+        exists: bool,
+    },
+    /// LPOP / RPOP key [count]
+    LPop { key: &'a [u8], right: bool, count: Option<u64> },
+    /// LLEN key
+    LLen(&'a [u8]),
+    /// LRANGE key start stop
+    LRange { key: &'a [u8], start: i64, stop: i64 },
+    /// LINDEX key index
+    LIndex { key: &'a [u8], index: i64 },
+    /// LSET key index element
+    LSet { key: &'a [u8], index: i64, val: SharedByte },
+    /// LINSERT key BEFORE|AFTER pivot element
+    LInsert { key: &'a [u8], after: bool, pivot: &'a [u8], val: SharedByte },
+    /// LREM key count element
+    LRem { key: &'a [u8], count: i64, val: &'a [u8] },
+    /// LTRIM key start stop
+    LTrim { key: &'a [u8], start: i64, stop: i64 },
+    /// LPOS key element [RANK rank] [COUNT n] [MAXLEN len] (`rank ≠ 0`)
+    LPos { key: &'a [u8], val: &'a [u8], rank: i64, count: Option<u64>, maxlen: u64 },
+    /// LMOVE src dst LEFT|RIGHT LEFT|RIGHT ; RPOPLPUSH src dst
+    LMove { src: &'a [u8], dst: &'a [u8], from_right: bool, to_right: bool },
+    /// BLPOP / BRPOP key [key ...] timeout (secondes)
+    BPop { keys: SmallVec<4, &'a [u8]>, right: bool, timeout: f64 },
+    /// BLMOVE src dst LEFT|RIGHT LEFT|RIGHT timeout ; BRPOPLPUSH src dst timeout
+    BLMove { src: &'a [u8], dst: &'a [u8], from_right: bool, to_right: bool, timeout: f64 },
+    /// BZPOPMIN / BZPOPMAX key [key ...] timeout
+    BZPop { keys: SmallVec<4, &'a [u8]>, max: bool, timeout: f64 },
+
     // --- ZSet --------------------------------------------------------
     /// ZADD key [NX|XX] [GT|LT] [CH] [INCR] score member [score member ...]
     ZAdd {
@@ -643,6 +678,28 @@ fn float(s: &[u8]) -> Result<f64, CmdError> {
     arg_f64(s).ok_or(CmdError::NotFloat)
 }
 
+/// `LEFT` / `RIGHT` de LMOVE : vrai pour la droite.
+fn side(s: &[u8]) -> Result<bool, CmdError> {
+    if s.eq_ignore_ascii_case(b"right") {
+        Ok(true)
+    } else if s.eq_ignore_ascii_case(b"left") {
+        Ok(false)
+    } else {
+        Err(CmdError::Syntax)
+    }
+}
+
+/// Timeout des commandes bloquantes, en secondes (0 = sans fin).
+fn timeout(s: &[u8]) -> Result<f64, CmdError> {
+    let t = arg_f64(s)
+        .filter(|t| t.is_finite())
+        .ok_or(CmdError::Msg("ERR timeout is not a float or out of range"))?;
+    if t < 0.0 {
+        return Err(CmdError::Msg("ERR timeout is negative"));
+    }
+    Ok(t)
+}
+
 /// Borne de score de ZRANGEBYSCORE & co : `(` = exclue.
 fn score_bound(s: &[u8]) -> Result<ScoreBound, CmdError> {
     let (excl, v) = match s.split_first() {
@@ -927,6 +984,99 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
             }
             Cmd::ZAdd { key: args[0], flags, members }
         }
+        // ── List ─────────────────────────────────────────────────────────
+        b"lpush" | b"rpush" | b"lpushx" | b"rpushx" => {
+            at_least!(2);
+            Cmd::LPush { key: args[0], vals: owned!(1), right: lc[0] == b'r', exists: lc.len() == 6 }
+        }
+        b"lpop" | b"rpop" => {
+            between!(1, 2);
+            let count = match args.get(1) {
+                Some(c) => Some(arg_u64(c).ok_or(CmdError::Msg("ERR value is out of range, must be positive"))?),
+                None => None,
+            };
+            Cmd::LPop { key: args[0], right: lc[0] == b'r', count }
+        }
+        b"llen" => { exact!(1); Cmd::LLen(args[0]) }
+        b"lrange" => { exact!(3); Cmd::LRange { key: args[0], start: int(args[1])?, stop: int(args[2])? } }
+        b"lindex" => { exact!(2); Cmd::LIndex { key: args[0], index: int(args[1])? } }
+        b"lset" => { exact!(3); Cmd::LSet { key: args[0], index: int(args[1])?, val: sb(args[2]) } }
+        b"linsert" => {
+            exact!(4);
+            let after = if args[1].eq_ignore_ascii_case(b"after") {
+                true
+            } else if args[1].eq_ignore_ascii_case(b"before") {
+                false
+            } else {
+                return Err(CmdError::Syntax);
+            };
+            Cmd::LInsert { key: args[0], after, pivot: args[2], val: sb(args[3]) }
+        }
+        b"lrem" => { exact!(3); Cmd::LRem { key: args[0], count: int(args[1])?, val: args[2] } }
+        b"ltrim" => { exact!(3); Cmd::LTrim { key: args[0], start: int(args[1])?, stop: int(args[2])? } }
+        b"lpos" => {
+            at_least!(2);
+            let (mut rank, mut count, mut maxlen) = (1i64, None, 0u64);
+            let mut i = 2;
+            while i < n {
+                let val = *args.get(i + 1).ok_or(CmdError::Syntax)?;
+                let opt = args[i];
+                if opt.eq_ignore_ascii_case(b"rank") {
+                    rank = int(val)?;
+                    if rank == 0 {
+                        return Err(CmdError::Msg(
+                            "ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list",
+                        ));
+                    }
+                } else if opt.eq_ignore_ascii_case(b"count") {
+                    let c = int(val)?;
+                    count = Some(u64::try_from(c).map_err(|_| CmdError::Msg("ERR COUNT can't be negative"))?);
+                } else if opt.eq_ignore_ascii_case(b"maxlen") {
+                    let m = int(val)?;
+                    maxlen = u64::try_from(m).map_err(|_| CmdError::Msg("ERR MAXLEN can't be negative"))?;
+                } else {
+                    return Err(CmdError::Syntax);
+                }
+                i += 2;
+            }
+            Cmd::LPos { key: args[0], val: args[1], rank, count, maxlen }
+        }
+        b"lmove" => {
+            exact!(4);
+            Cmd::LMove { src: args[0], dst: args[1], from_right: side(args[2])?, to_right: side(args[3])? }
+        }
+        b"rpoplpush" => { exact!(2); Cmd::LMove { src: args[0], dst: args[1], from_right: true, to_right: false } }
+        b"blpop" | b"brpop" => {
+            at_least!(2);
+            let mut keys = SmallVec::new();
+            for k in &args[..n - 1] {
+                keys.push(*k);
+            }
+            Cmd::BPop { keys, right: lc[1] == b'r', timeout: timeout(args[n - 1])? }
+        }
+        b"blmove" => {
+            exact!(5);
+            Cmd::BLMove {
+                src: args[0],
+                dst: args[1],
+                from_right: side(args[2])?,
+                to_right: side(args[3])?,
+                timeout: timeout(args[4])?,
+            }
+        }
+        b"brpoplpush" => {
+            exact!(3);
+            Cmd::BLMove { src: args[0], dst: args[1], from_right: true, to_right: false, timeout: timeout(args[2])? }
+        }
+        b"bzpopmin" | b"bzpopmax" => {
+            at_least!(2);
+            let mut keys = SmallVec::new();
+            for k in &args[..n - 1] {
+                keys.push(*k);
+            }
+            Cmd::BZPop { keys, max: &*lc == b"bzpopmax", timeout: timeout(args[n - 1])? }
+        }
+
         b"zcard" => { exact!(1); Cmd::ZCard(args[0]) }
         b"zrange" => {
             at_least!(3);
@@ -1246,6 +1396,16 @@ impl<'a> Cmd<'a> {
             Cmd::ZRem { members, .. } => members.len(),
             Cmd::ZPop { count, .. } => count.unwrap_or(1).max(1) as usize,
             Cmd::ZRemRange { .. } => 1,
+            Cmd::LPush { vals, .. } => vals.len(),
+            Cmd::LPop { count, .. } => count.unwrap_or(1).max(1) as usize,
+            Cmd::LSet { .. }
+            | Cmd::LInsert { .. }
+            | Cmd::LRem { .. }
+            | Cmd::LTrim { .. }
+            | Cmd::LMove { .. }
+            | Cmd::BPop { .. }
+            | Cmd::BLMove { .. }
+            | Cmd::BZPop { .. } => 1,
             _ => 0,
         };
         n as u64
