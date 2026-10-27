@@ -909,4 +909,44 @@ ZREMRANGEBYRANK / BYSCORE / BYLEX, ZMSCORE, ZRANDMEMBER. Plages résolues en deu
 selon l'encodage du ZSet, non documenté). ZREMRANGEBY* et ZPOP retirent membre par membre
 (O(k log n), synchrone).
 
-Reste : mesures (étape 8) ; ZSCAN, ZUNION / ZINTER / ZDIFF (STORE), BZPOP*.
+**Mesures (étape 8, 2026-10-27, `scripts/bench_zset.sh`, ~3 min).** Contre Valkey 9.1.2,
+deux serveurs mono-thread épinglés sur le CPU 0, client sur 2–5, profil `performance`.
+Mémoire : RSS par membre, clé comprise, membres de 15 o, 1 M membres, état stable (+12 s) :
+
+| cas | RadixOx | Valkey | objectif §13.0 |
+|---|---|---|---|
+| grands (1000 × 1000), entiers | 78 o | 92 o | ≤ 70 |
+| grands, flottants | 76 o | 92 o | |
+| 1 × 1 M, scores croissants | 82 o | 87 o | |
+| 1 × 1 M, tous à 0 | 82 o | 88 o | |
+| petits (100 000 × 10) | 31 o | 23 o | ≤ 27 |
+
+- Grands : structures seules 66,1 o/membre (test `memory_breakdown`, `--ignored`) =
+  objets 20,0 + table 8,0 + B+tree 15,9 (feuilles remplies à 87 %) + index 22,3 (seaux à
+  71 %) ; le reste est de la RSS hors structures (pages du pool, slabs).
+- Petits : 92 o/membre avant correctif (chaque croissance du bloc laissait un trou dans le
+  pool jusqu'au GC) ; un ZADD à plusieurs membres pré-dimensionne maintenant le bloc
+  (`ZSmall::reserve`). Reste au-dessus de Valkey : bloc 19,2 o/membre, en-tête dans la slab
+  des ZSet (32 o par ZSet = 3,2 o/membre ici), réserve fixe du pool (2 pages = 4 Mo, 4
+  o/membre à ce volume), clé.
+
+Débit (pipeline 64, 50 connexions, 2 M requêtes, ZSet d'1 M membres) :
+
+| commande | RadixOx | Valkey |
+|---|---|---|
+| ZSCORE | 2,66 M/s (serveur à 74 % : minorant) | 1,60 M/s |
+| ZADD (mise à jour ou ajout) | 0,79–0,89 M/s | 0,44 M/s |
+| ZINCRBY | 0,89 M/s | 0,67 M/s |
+| ZRANK | 1,33 M/s | 0,80 M/s |
+| ZRANGE 500000 500009 WITHSCORES | 1,33 M/s | 1,14 M/s |
+| ZRANGEBYSCORE x +inf LIMIT 0 10 | 0,89 M/s | 0,36 M/s |
+| ZADD sur 100 000 petits ZSet | 2,00 M/s | 1,14 M/s |
+
+ZRANGE WITHSCORES était à 0,89 M/s (sous Valkey) : seconde descente de la clé et score
+formaté par `String` ; corrigé (`format_score`, entiers sans allocation).
+
+Leviers restants (mémoire) : petite forme directement dans la valeur oxidart
+(`Tag::ZSetSmall`, spec §13.3 : −3,2 o/membre sur les petits), répertoires de l'index en
+64 o (~−1,5 o), remplissage des seaux.
+
+Reste : ZSCAN, ZUNION / ZINTER / ZDIFF (STORE), BZPOP*.

@@ -94,7 +94,7 @@ fn wrongtype(t: oxidart::value::RedisType) -> Frame {
 }
 
 fn score_bulk(s: f64) -> Frame {
-    Frame::BulkString(SharedByte::from_slice(s.to_string().as_bytes()))
+    Frame::BulkString(oxidart::zset::format_score(s))
 }
 
 /// `[membre, score, …]` à plat (RESP2).

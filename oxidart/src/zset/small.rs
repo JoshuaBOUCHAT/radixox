@@ -257,6 +257,30 @@ impl ZSmall {
         true
     }
 
+    /// Prépare la place de `n_add` membres de `bytes_add` octets en tout, scores tenant
+    /// sur `width` octets : une seule réécriture du bloc au lieu d'une par ajout (un ZADD
+    /// à plusieurs membres ; sans ça, chaque croissance laisse un trou dans le pool jusqu'au
+    /// GC). Sans effet si la place y est déjà, ou si le seuil serait dépassé.
+    pub fn reserve(&mut self, n_add: usize, bytes_add: usize, scores: impl Iterator<Item = u64>) {
+        let (n, w, cap, used, bcap) = unsafe { hdr(self.0) };
+        let nw = scores.fold(w, |acc, s| acc.max(width_for(s) as usize));
+        let ncap = (n + n_add).min(MAX_MEMBERS);
+        let nbcap = used + bytes_add;
+        if (ncap <= cap && nbcap <= bcap && nw == w) || n + n_add > MAX_MEMBERS {
+            return;
+        }
+        let new = Self::alloc(nw, ncap.max(cap), nbcap.max(bcap), n, used);
+        unsafe {
+            let (src, dst) = (self.0.add(HEADER), new.0.add(HEADER));
+            for i in 0..n {
+                write_score(dst, nw, i, read_score(src, w, i));
+            }
+            ptr::copy_nonoverlapping(self.lens_ptr(), new.lens_ptr(), n);
+            ptr::copy_nonoverlapping(self.bytes_ptr(), new.bytes_ptr(), used);
+        }
+        std::mem::replace(self, new).free();
+    }
+
     /// Retire le rang `i` (le bloc garde sa place).
     pub fn remove_at(&mut self, i: usize) {
         let (n, w, _, used, _) = unsafe { hdr(self.0) };
@@ -459,6 +483,14 @@ mod tests {
                             model.insert(p, (s, m));
                         }
                     }
+                }
+                if step % 7 == 0 {
+                    // place préparée (ZADD à plusieurs membres), parfois avec des scores
+                    // plus larges que le bloc
+                    let k = rng.below(6) as usize;
+                    let wide = [encode_score(0.25), encode_score(70_000.0), encode_score(1.0)];
+                    z.reserve(k, k * rng.below(40) as usize, wide.into_iter().take(rng.below(4) as usize));
+                    check(&z, &model);
                 }
                 if step % 50 == 0 {
                     check(&z, &model);

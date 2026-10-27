@@ -100,6 +100,17 @@ impl ZSet {
         r
     }
 
+    /// Petite forme : place pour ces `(score, membre)` d'un coup (voir [`ZSmall::reserve`]).
+    pub fn reserve(&mut self, pairs: &[(f64, radixox_lib::shared_byte::SharedByte)]) {
+        if let Self::Small(z) = self
+            && pairs.len() > 1
+            && pairs.iter().all(|(_, m)| m.len() <= small::MAX_MEMBER_LEN)
+        {
+            let bytes = pairs.iter().map(|(_, m)| m.len()).sum();
+            z.reserve(pairs.len(), bytes, pairs.iter().map(|(s, _)| encode_score(*s)));
+        }
+    }
+
     /// Retire `m` ; rend son score.
     pub fn remove(&mut self, m: &[u8]) -> Option<u64> {
         match self {
@@ -311,6 +322,32 @@ pub fn decode_score(u: u64) -> f64 {
     f64::from_bits(if u >> 63 == 1 { u & !(1 << 63) } else { !u })
 }
 
+/// Texte d'un score, comme `f64::to_string` (même sortie), sans `String` pour les
+/// entiers (les plus fréquents : rangs, horodatages, compteurs).
+#[inline]
+pub fn format_score(f: f64) -> radixox_lib::shared_byte::SharedByte {
+    use radixox_lib::shared_byte::SharedByte;
+    if f.fract() == 0.0 && f.abs() < 1e15 {
+        let mut buf = [0u8; 20];
+        let (neg, mut v) = (f < 0.0, f.abs() as u64);
+        let mut i = buf.len();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        if neg {
+            i -= 1;
+            buf[i] = b'-';
+        }
+        return SharedByte::from_slice(&buf[i..]);
+    }
+    SharedByte::from_slice(f.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,6 +465,13 @@ mod tests {
     }
 
     #[test]
+    fn score_format_matches_display() {
+        for f in [0.0, 1.0, -1.0, 42.0, -987654321.0, 1e14, 999999999999999.0, 1.5, -2.25, 1e15, 1e300, f64::INFINITY, f64::NEG_INFINITY, 1e-7] {
+            assert_eq!(format_score(f).as_slice(), f.to_string().as_bytes(), "{f}");
+        }
+    }
+
+    #[test]
     fn score_encoding_keeps_order() {
         let v = [f64::NEG_INFINITY, -1e300, -2.5, -1.0, -f64::MIN_POSITIVE, 0.0, 5e-324, 1.0, 2.5, 1e300, f64::INFINITY];
         for w in v.windows(2) {
@@ -437,5 +481,45 @@ mod tests {
             assert_eq!(decode_score(encode_score(x)), x);
         }
         assert_eq!(encode_score(-0.0), encode_score(0.0));
+    }
+}
+
+#[cfg(test)]
+mod breakdown {
+    /// Décomposition mémoire (mesure, `--ignored`) : 1000 ZSet × 1000 membres de 15 o.
+    #[test]
+    #[ignore]
+    fn memory_breakdown() {
+        crate::value::init_slabs();
+        let mut zs: Vec<super::ZSet> = (0..1000).map(|_| super::ZSet::new()).collect();
+        let pool0 = radixox_lib::pool::live_bytes();
+        for (k, z) in zs.iter_mut().enumerate() {
+            for j in 0..1000u32 {
+                let _ = k;
+                z.add(super::encode_score((j * 7 % 1000) as f64), format!("member:{j:07}").as_bytes()).unwrap();
+            }
+        }
+        let n = 1_000_000f64;
+        let (h, table) = radixox_lib::handle::stats();
+        let pool = radixox_lib::pool::live_bytes() - pool0;
+        let bt = super::btree::slab_nodes() as f64 * 512.0;
+        let ix = super::index::slab_nodes() as f64 * 128.0;
+        let (mut leaves, mut internals, mut buckets, mut dirs) = (0, 0, 0, 0);
+        for z in &zs {
+            if let super::ZSet::Large(l) = z {
+                let (a, b) = l.tree.node_counts();
+                let (c, d) = l.index.node_counts();
+                (leaves, internals, buckets, dirs) = (leaves + a, internals + b, buckets + c, dirs + d);
+            }
+        }
+        eprintln!("poignées {h}, table {:.1} o/m, objets (pool) {:.1} o/m", table as f64 / n, pool as f64 / n);
+        eprintln!(
+            "B+tree {:.1} o/m ({leaves} feuilles, remplissage {:.2}, {internals} internes) ; index {:.1} o/m ({buckets} seaux, remplissage {:.2}, {dirs} rép.)",
+            bt / n,
+            n / (leaves as f64 * 41.0),
+            ix / n,
+            n / (buckets as f64 * 9.0)
+        );
+        eprintln!("total {:.1} o/m", (table as f64 + pool as f64 + bt + ix) / n);
     }
 }

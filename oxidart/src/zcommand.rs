@@ -175,6 +175,26 @@ mod oracle {
 
 }
 
+/// Entrées des rangs `[lo, hi)`, dans le sens demandé (scores formatés sans allocation).
+fn zrange_out(zset: &ZSet, lo: usize, hi: usize, rev: bool, with_scores: bool) -> Vec<SharedByte> {
+    let n = hi.saturating_sub(lo);
+    let mut out = Vec::with_capacity(if with_scores { 2 * n } else { n });
+    let mut push = |(s, m): (u64, &[u8])| {
+        out.push(SharedByte::from_slice(m));
+        if with_scores {
+            out.push(crate::zset::format_score(decode_score(s)));
+        }
+    };
+    if n > 0 {
+        if rev {
+            zset.iter_back_from(hi - 1).take(n).for_each(&mut push);
+        } else {
+            zset.iter_from(lo).take(n).for_each(&mut push);
+        }
+    }
+    out
+}
+
 /// Réponse de ZADD : un compte, ou le score (INCR ; `None` si rien n'a été fait).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ZAddReply {
@@ -233,6 +253,9 @@ impl OxidArt {
         } else {
             self.get_zset_mut(ttl, key)?
         };
+        if !flags.xx && !flags.incr {
+            zset.reserve(score_members);
+        }
         let (mut added, mut updated) = (0u32, 0u32);
         let mut last = None;
         for (score, member) in score_members {
@@ -313,29 +336,7 @@ impl OxidArt {
                 hi = lo + take;
             }
         }
-        Ok(self.zrange_out(key, lo, hi, rev, with_scores))
-    }
-
-    /// Entrées des rangs `[lo, hi)` de la ZSet `key` (présente), dans le sens demandé.
-    fn zrange_out(&mut self, key: &[u8], lo: usize, hi: usize, rev: bool, with_scores: bool) -> Vec<SharedByte> {
-        let Some(val) = self.get_ref(key) else { return Vec::new() };
-        let Ok(zset) = val.as_zset() else { return Vec::new() };
-        let n = hi.saturating_sub(lo);
-        let mut out = Vec::with_capacity(if with_scores { 2 * n } else { n });
-        let mut push = |(s, m): (u64, &[u8])| {
-            out.push(SharedByte::from_slice(m));
-            if with_scores {
-                out.push(SharedByte::from_slice(decode_score(s).to_string()));
-            }
-        };
-        if n > 0 {
-            if rev {
-                zset.iter_back_from(hi - 1).take(n).for_each(&mut push);
-            } else {
-                zset.iter_from(lo).take(n).for_each(&mut push);
-            }
-        }
-        out
+        Ok(zrange_out(zset, lo, hi, rev, with_scores))
     }
 
     /// ZRANK / ZREVRANK : `(rang, score)`.
