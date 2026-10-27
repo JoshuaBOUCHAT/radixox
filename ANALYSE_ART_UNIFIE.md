@@ -967,7 +967,7 @@ Leviers restants (mémoire) : petite forme directement dans la valeur oxidart
 (`Tag::ZSetSmall`, spec §13.3 : −3,2 o/membre sur les petits), répertoires de l'index en
 64 o (~−1,5 o), remplissage des seaux.
 
-Reste : ZSCAN, ZUNION / ZINTER / ZDIFF (STORE), BZPOP*.
+Reste : ZSCAN, ZUNION / ZINTER / ZDIFF (STORE), BZPOP* (service direct par `ZADD` / `ZINCRBY`, même mécanisme que les listes : §14.3).
 
 ## 14. List — architecture retenue (2026-10-27, pas implémentée)
 
@@ -1038,16 +1038,44 @@ en-tête (slab des listes)          blocs (HiSlab<Block>, 256 o, alignés sur 64
 
 `LMPOP` / `BLMPOP` : plus tard.
 
-### 14.3 Commandes bloquantes
+### 14.3 Commandes bloquantes : service direct (principe proactif)
 
-Sur les connexions parquées (RUNTIME_ARCH.md §7), prévues pour ça :
-- clé vide → la connexion se parque ; inscription `(slot, epoch)` dans la file d'attente de
-  la clé (FIFO, comme Redis : servies dans l'ordre d'arrivée) et timer du timeout ;
-- un push sur une clé qui a des inscrits sert le premier inscrit **après** la commande
-  (après la transaction pour `MULTI`) ; il reçoit sa réponse et sa connexion est rejouée au
-  tour suivant (§7) ;
-- journal (AOF, réplication) : un `BLPOP` servi est écrit comme le `LPOP` / `LMOVE`
-  effectif, comme Redis le propage ; timeout et connexion morte : rien.
+**Règle (utilisateur, 2026-10-27, très importante)** : celui qui produit sert. Un push sur
+une clé où des clients attendent **leur donne les éléments directement**, puis seulement le
+reste entre dans la liste ; rien n'est inséré pour être aussitôt retiré. Même règle pour
+les ZSet (`BZPOPMIN` / `BZPOPMAX` servis par `ZADD`, `ZINCRBY`). Pas d'événement, pas de
+réveil : le producteur fait la transition et écrit la réponse (connexions parquées,
+RUNTIME_ARCH.md §7).
+
+**Où vérifier, sans rien payer sur le chemin chaud** : un client n'attend que sur une clé
+**absente** (sur une clé non vide il est servi tout de suite, et chaque push sert les
+attentes aussitôt). Une liste ou un ZSet existant n'a donc jamais d'attente : la
+vérification n'a lieu **qu'à la création de la clé** (un compteur global d'attentes à zéro
+la saute tout à fait). Tout chemin qui crée une List ou un ZSet passe par ce point de
+service : `LPUSH` `RPUSH` `LMOVE` / `BLMOVE` (destination) `LINSERT` (non : clé requise)
+`ZADD` `ZINCRBY`, et plus tard `RENAME`, `RESTORE`, `*STORE`.
+
+**Sémantique de Redis, à l'identique** (vérifiée par le différentiel) :
+- attentes par clé en FIFO (ordre d'arrivée) ; un client qui attend sur plusieurs clés
+  (`BLPOP k1 k2 0`) est retiré de toutes dès qu'il est servi ;
+- les éléments servis sont ceux que Redis donnerait **après** le push complet : la clé
+  était vide, donc après `LPUSH k a b c` la liste serait `[c, b, a]` ; un `BLPOP` prend
+  `c`, un `BRPOP` prend `a`, le suivant dans la file prend l'élément suivant de son bout ;
+  le reste (éventuellement rien : aucun bloc alloué) devient la liste ;
+- réponse du push : la longueur **après le push, avant le service** (`LPUSH k a b c` → 3),
+  comme Redis ;
+- ZSet : la clé était vide, les membres ajoutés sont triés en mémoire ; `BZPOPMIN` prend le
+  plus petit `(score, membre)`, `BZPOPMAX` le plus grand, le reste est inséré ; réponse du
+  `ZADD` inchangée (nombre ajoutés, ou score avec `INCR`) ; `XX` sur clé absente : rien ;
+- `BLMOVE` / `BRPOPLPUSH` servi : l'élément est poussé dans la destination, qui peut à son
+  tour servir ses attentes (en chaîne, itératif, jamais récursif) ;
+- journal (AOF, réplication) : le push tel qu'envoyé, puis un `LPOP` / `RPOP` / `ZPOPMIN`
+  / `LMOVE` par client servi, comme Redis le propage ; le réplica rejoue donc le même état.
+
+**Attente** : clé absente → la connexion se parque, inscription `(slot, epoch)` dans la
+file de la clé, timer du timeout ; timeout ou connexion morte : désinscription, rien au
+journal. Le client servi reçoit sa réponse et sa connexion est rejouée au tour suivant
+(§7) : une commande rejouée peut reparquer.
 
 ### 14.4 Save, GC, AMAC
 
