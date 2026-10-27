@@ -103,6 +103,19 @@ fn init_slab() -> &'static mut HiSlab<BNode> {
     }
 }
 
+/// Slab du B+tree des ZSet : `(octets touchés, octets vivants, octets résidents)` ; zéros tant qu'il
+/// n'existe pas.
+pub(crate) fn slab_mem() -> (u64, u64, u64) {
+    #[allow(static_mut_refs)]
+    unsafe { SLAB.as_ref() }.map_or((0, 0, 0), crate::value::hislab_mem)
+}
+
+/// Voir [`crate::value::trim_tail`] ; 0 tant que la slab n'existe pas.
+pub(crate) fn trim_tail() -> usize {
+    #[allow(static_mut_refs)]
+    unsafe { SLAB.as_ref() }.map_or(0, crate::value::trim_tail)
+}
+
 /// Lecture d'une feuille. Mono-thread ; l'appelant ne garde jamais deux références au
 /// même nœud.
 #[inline]

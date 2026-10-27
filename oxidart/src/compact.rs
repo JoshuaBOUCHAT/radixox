@@ -87,6 +87,49 @@ pub struct CompactReport {
 }
 
 impl OxidArt {
+    /// Tous les HiSlab du processus : `(nom, (octets touchés, octets vivants, octets
+    /// résidents))`. Les pages d'un slab sont prises par le noyau à la première écriture,
+    /// sans passer par l'allocateur : seul ce compte les voit (MEMORY_ARCH.md §10.1).
+    pub fn slab_mem(&self) -> [(&'static str, (u64, u64, u64)); 7] {
+        let t = self.map.touched_bytes();
+        let nodes = (
+            t as u64,
+            self.map.len() as u64 * size_of::<crate::node::Node>() as u64,
+            self.map.resident_bytes() as u64,
+        );
+        let [zh, lh, va] = crate::value::value_slabs_mem();
+        [
+            ("nodes", nodes),
+            ("valart", va),
+            ("zset_headers", zh),
+            ("zset_tree", crate::zset::btree::slab_mem()),
+            ("zset_index", crate::zset::index::slab_mem()),
+            ("list_headers", lh),
+            ("list_blocks", crate::list::slab_mem()),
+        ]
+    }
+
+    /// Rognage de la fin de tous les HiSlab (voir `value::trim_tail`) : octets rendus.
+    /// Rien pendant une save (par prudence : rien ne bouge, mais l'image lit les slabs).
+    pub fn trim_slabs(&self) -> usize {
+        if self.is_saving() {
+            return 0;
+        }
+        let size = size_of::<crate::node::Node>();
+        let from = self.map.last_occupied().map_or(0, |l| l + 1) + ((2 << 20) / size) as u32;
+        let nodes = if self.map.touched_bytes() >= from as usize * size + crate::value::TRIM_THRESHOLD {
+            // SAFETY: rien n'est occupé au-dessus du dernier occupé.
+            unsafe { self.map.release_above(from) }
+        } else {
+            0
+        };
+        nodes
+            + crate::value::trim_value_slabs()
+            + crate::zset::btree::trim_tail()
+            + crate::zset::index::trim_tail()
+            + crate::list::trim_tail()
+    }
+
     /// Octets de trous sous le dernier nœud occupé.
     pub fn slab_holes_bytes(&self) -> u64 {
         let span = self.map.last_occupied().map_or(0, |l| l + 1);

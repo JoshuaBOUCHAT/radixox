@@ -87,6 +87,19 @@ fn init_slab() -> &'static mut HiSlab<INode> {
     }
 }
 
+/// Slab de l'index des ZSet : `(octets touchés, octets vivants, octets résidents)` ; zéros tant qu'il
+/// n'existe pas.
+pub(crate) fn slab_mem() -> (u64, u64, u64) {
+    #[allow(static_mut_refs)]
+    unsafe { SLAB.as_ref() }.map_or((0, 0, 0), crate::value::hislab_mem)
+}
+
+/// Voir [`crate::value::trim_tail`] ; 0 tant que la slab n'existe pas.
+pub(crate) fn trim_tail() -> usize {
+    #[allow(static_mut_refs)]
+    unsafe { SLAB.as_ref() }.map_or(0, crate::value::trim_tail)
+}
+
 #[inline]
 fn node(i: u32) -> &'static mut INode {
     unsafe { slab().get_unchecked_mut(i) }

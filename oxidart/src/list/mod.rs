@@ -195,6 +195,19 @@ fn init_slab() -> &'static mut HiSlab<Block> {
     }
 }
 
+/// Slab des blocs de List : `(octets touchés, octets vivants, octets résidents)` ; zéros tant qu'il
+/// n'existe pas.
+pub(crate) fn slab_mem() -> (u64, u64, u64) {
+    #[allow(static_mut_refs)]
+    unsafe { SLAB.as_ref() }.map_or((0, 0, 0), crate::value::hislab_mem)
+}
+
+/// Voir [`crate::value::trim_tail`] ; 0 tant que la slab n'existe pas.
+pub(crate) fn trim_tail() -> usize {
+    #[allow(static_mut_refs)]
+    unsafe { SLAB.as_ref() }.map_or(0, crate::value::trim_tail)
+}
+
 /// Lecture d'un bloc. Mono-thread ; jamais deux références au même bloc.
 #[inline(always)]
 pub(crate) fn block(i: u32) -> &'static Block {

@@ -404,6 +404,8 @@ struct Gc {
     compact_moved: u64,
     compact_released: u64,
     compact_max_slice_us: u64,
+    /// Fins de HiSlab rendues par le rognage (`OxidArt::trim_slabs`).
+    trimmed_bytes: u64,
     /// Temps passé dans les tranches de compactage (µs, cumul).
     compact_total_us: u64,
     enabled: bool,
@@ -417,7 +419,7 @@ struct Gc {
 impl Gc {
     fn from_env() -> Self {
         let on = |name: &str, default: bool| std::env::var(name).map_or(default, |v| v != "0");
-        Self { pass: None, enabled: on("RADIXOX_GC", true), log: on("RADIXOX_GC_LOG", false), max_slice_us: 0, started: None, compact: None, compact_more: None, compact_list_moved: 0, compact_list_released: 0, compact_val_moved: 0, compact_val_released: 0, compact_ztree_moved: 0, compact_ztree_released: 0, compact_zindex_moved: 0, compact_zindex_released: 0, more_fruitless: [0; 4], compact_passes: 0, compact_moved: 0, compact_released: 0, compact_max_slice_us: 0, compact_total_us: 0 }
+        Self { pass: None, enabled: on("RADIXOX_GC", true), log: on("RADIXOX_GC_LOG", false), max_slice_us: 0, started: None, compact: None, compact_more: None, compact_list_moved: 0, compact_list_released: 0, compact_val_moved: 0, compact_val_released: 0, compact_ztree_moved: 0, compact_ztree_released: 0, compact_zindex_moved: 0, compact_zindex_released: 0, more_fruitless: [0; 4], compact_passes: 0, compact_moved: 0, compact_released: 0, compact_max_slice_us: 0, compact_total_us: 0, trimmed_bytes: 0 }
     }
 }
 
@@ -2196,6 +2198,8 @@ impl Core {
                 );
                 info.push_str("\r\n");
                 crate::exec::info_memory(&mut info, self.gc.enabled, self.gc.pass.is_some(), self.gc.max_slice_us);
+                crate::exec::info_memory_total(&mut info, &self.art.slab_mem());
+                let _ = std::fmt::Write::write_fmt(&mut info, format_args!("mem_hislab_trimmed_bytes:{}\r\n", self.gc.trimmed_bytes));
                 let _ = std::fmt::Write::write_fmt(
                     &mut info,
                     format_args!(
@@ -2545,6 +2549,17 @@ impl Core {
     /// compactage de la slab des nœuds si ses trous dépassent le seuil.
     fn gc_trigger(&mut self) {
         use radixox_lib::pool;
+        // Rognage de la fin des HiSlab : rien ne bouge, indépendant du GC ; pas pendant
+        // un compactage (sa fin rend elle-même la fin de sa slab).
+        if self.gc.compact.is_none() && self.gc.compact_more.is_none() {
+            let n = self.art.trim_slabs();
+            if n > 0 {
+                self.gc.trimmed_bytes += n as u64;
+                if self.gc.log {
+                    eprintln!("[compact] fins de slabs rendues : {} Kio", n >> 10);
+                }
+            }
+        }
         if !self.gc.enabled || self.gc.pass.is_some() || self.gc.compact.is_some() || self.gc.compact_more.is_some() {
             return;
         }

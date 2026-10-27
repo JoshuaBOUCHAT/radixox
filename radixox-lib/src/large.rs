@@ -29,6 +29,8 @@ const SLAB: usize = SLAB_GRANULES as usize * GRANULE;
 /// Octets rendus au plus par appel de [`release_step`] (`MADV_DONTNEED` coûte en
 /// proportion des pages tenues).
 const RELEASE_BUDGET: u64 = 16 << 20;
+/// Taille de la file des suites sales en dessous de laquelle on ne la nettoie pas.
+const FIFO_MIN: usize = 4096;
 
 // Étiquette d'un granule de bord : premier (`START`) ou dernier granule d'une suite.
 // Les granules intérieurs ne sont jamais lus ; une jonction effacée par une fusion est
@@ -123,6 +125,9 @@ pub struct Stats {
     /// Slabs : granules tenus, et octets des objets vivants (taille de classe).
     pub slab_held_bytes: u64,
     pub slab_live_bytes: u64,
+    /// Tables par granule (étiquette, listes, propriétaire : 4 × 4 o par granule jusqu'au
+    /// sommet), sur des mappings à elles : pages résidentes (2 Mio chacune sous THP).
+    pub meta_bytes: u64,
 }
 
 /// Tas de granules + slabs, sur une plage.
@@ -140,6 +145,8 @@ pub struct Large {
     idx: [Index; 2],
     /// Suites sales à rendre : (début, libérée à).
     fifo: VecDeque<(u32, Instant)>,
+    /// Longueur de la file qui déclenche son nettoyage ([`Large::compact_fifo`]).
+    fifo_compact_at: usize,
     decay: Duration,
     held: u64,
     dirty: u64,
@@ -175,6 +182,7 @@ impl Large {
             maps,
             idx: [Index::EMPTY, Index::EMPTY],
             fifo: VecDeque::new(),
+            fifo_compact_at: FIFO_MIN,
             decay,
             held: 0,
             dirty: 0,
@@ -188,6 +196,12 @@ impl Large {
         a.wrapping_sub(self.base) < self.nb as usize * GRANULE
     }
 
+    /// Octets résidents, données jusqu'au sommet et tables (`mincore`, pour `INFO`).
+    pub fn resident(&self) -> u64 {
+        let (p, len) = self.maps[0];
+        crate::resident::region(p as usize, self.top as usize * GRANULE, len) + self.stats().meta_bytes
+    }
+
     pub fn stats(&self) -> Stats {
         Stats {
             held_bytes: self.held * GRANULE as u64,
@@ -196,6 +210,7 @@ impl Large {
             top_bytes: self.top as u64 * GRANULE as u64,
             slab_held_bytes: self.slabs.held_slabs * SLAB as u64,
             slab_live_bytes: self.slabs.live_bytes,
+            meta_bytes: self.maps[1..].iter().map(|&(p, len)| crate::resident::region(p as usize, self.top as usize * 4, len)).sum(),
         }
     }
 
@@ -332,6 +347,40 @@ impl Large {
         }
         self.link(start, len, true);
         self.fifo.push_back((start, now));
+        if self.fifo.len() >= self.fifo_compact_at {
+            self.compact_fifo();
+        }
+    }
+
+    /// Une entrée de la file par libération, réutilisation ou fusion comprise : sous un
+    /// trafic soutenu, elle suit le rythme des libérations × `decay`, pas la mémoire
+    /// (mesuré : 390 K entrées, 6 Mo dans la libc, pour un chargement de 140 Mo). Quand
+    /// elle double, on n'y garde que les suites encore libres et sales, une entrée par
+    /// suite (la dernière : `decay` court depuis la dernière libération), dans l'ordre :
+    /// bornée par le nombre de suites libres. La capacité en trop est rendue. Amorti :
+    /// O(log n) par libération ; les tableaux temporaires vont à la libc (sous `BUSY`).
+    fn compact_fifo(&mut self) {
+        let tag = self.tag;
+        // SAFETY: les entrées désignent des granules sous `top` (table de la plage).
+        let valid = |s: u32| unsafe { *tag.add(s as usize) } & (FREE | DIRTY | START) == FREE | DIRTY | START;
+        let mut live: Vec<(u32, u32)> =
+            self.fifo.iter().enumerate().filter(|(_, (s, _))| valid(*s)).map(|(i, &(s, _))| (s, i as u32)).collect();
+        live.sort_unstable();
+        let mut keep = vec![false; self.fifo.len()];
+        for (j, &(s, i)) in live.iter().enumerate() {
+            if live.get(j + 1).is_none_or(|&(t, _)| t != s) {
+                keep[i as usize] = true;
+            }
+        }
+        let mut i = 0;
+        self.fifo.retain(|_| {
+            i += 1;
+            keep[i - 1]
+        });
+        self.fifo_compact_at = (self.fifo.len() * 2).max(FIFO_MIN);
+        if self.fifo.capacity() > 2 * self.fifo_compact_at {
+            self.fifo.shrink_to(self.fifo_compact_at);
+        }
     }
 
     /// Rend au système les suites sales libérées depuis `decay`. Vrai s'il en reste à
@@ -799,6 +848,12 @@ pub fn stats() -> Option<Stats> {
     unsafe { LARGE.as_ref() }.map(Large::stats)
 }
 
+/// Voir [`Large::resident`] ; 0 sans tas.
+pub fn resident() -> u64 {
+    #[allow(static_mut_refs)]
+    unsafe { LARGE.as_ref() }.map_or(0, Large::resident)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -937,6 +992,30 @@ mod tests {
         l.release_step(now + Duration::from_secs(11));
         assert_eq!(l.stats().dirty_bytes, 0);
         assert_eq!(l.stats().released_bytes, 1 << 20);
+        l.check();
+    }
+
+    /// Va-et-vient d'objets ≥ 16 Kio (tampons qui grandissent) : la file des suites sales
+    /// reste bornée par les suites libres, pas par le nombre de libérations, et le rendu
+    /// marche toujours après nettoyage.
+    #[test]
+    fn churn_keeps_fifo_bounded() {
+        let mut l = Large::new(256 << 20, Duration::from_secs(10)).unwrap();
+        let keep: Vec<_> = (0..8).map(|_| l.alloc(64 << 10)).collect();
+        for i in 0..200_000usize {
+            let size = (16 << 10) + (i % 7) * 8192;
+            let p = l.alloc(size);
+            unsafe { l.free(p, size) };
+        }
+        assert!(l.fifo.len() < 2 * FIFO_MIN, "file : {} entrées", l.fifo.len());
+        assert!(l.fifo.capacity() <= 4 * FIFO_MIN, "capacité : {}", l.fifo.capacity());
+        l.check();
+        for &p in &keep {
+            unsafe { l.free(p, 64 << 10) };
+        }
+        l.release_step(Instant::now() + Duration::from_secs(11));
+        assert_eq!(l.stats().dirty_bytes, 0, "tout le sale est rendu après nettoyage");
+        assert_eq!(l.stats().held_bytes, 0);
         l.check();
     }
 }

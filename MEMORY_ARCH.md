@@ -539,6 +539,36 @@ les enfants d'un `Wide256` passent par lots séparés dans le même pipeline.
   (réservé / vivant), RSS, pages prêtes et rendues, passes de GC, octets évacués, objets
   épinglés, fautes de page synchrones.
 
+### 10.1 bis Tout le résident est compté (2026-10-27)
+
+Avant : ~86 Mo sur 236 de RSS (jeu mixte de 140 Mo de commandes) n'apparaissaient nulle
+part. Les HiSlab grandissent en touchant des pages, sans appel à l'allocateur ; `INFO` ne
+montrait que leurs trous.
+
+- **Mesure, pas estimation** : `mem_tracked_bytes` = pages résidentes (`mincore`) de chaque
+  région à nous — pool, `large` (tas Rust et slabs de classes compris), les 7 HiSlab
+  (`mem_hislab_<nom>_bytes`, plus `_touched_bytes` et `_live_bytes`), table des poignées,
+  tables par bloc du pool et par granule de `large` — plus `BigBuf` et le repli libc
+  (`mem_libc_bytes`, compté dans `RxAlloc`). Pourquoi `mincore` : sous THP `always`, une
+  première écriture prend tantôt 2 Mio, tantôt 4 Kio ; arrondir à 2 Mio comptait 8 Mo de
+  trop, ne pas arrondir 17 Mo de moins (tables de 4 × 64 Mio de `large` : 0,2 Mo écrits,
+  8 Mo résidents). hislab 0.2.6 : `touched_bytes`, `resident_bytes`.
+- **Écart** `mem_untracked_bytes` = `RssAnon` − compté : 0,2 Mo à vide, 2–3 Mo chargé ou
+  après suppressions (pile, binaire, libc pour elle-même). S'il grandit avec les données,
+  une région manque : `tests/memory.rs` le vérifie.
+- **Défaut trouvé : un HiSlab ne rendait jamais sa fin.** Le compactage se déclenche sur
+  les trous *sous* le dernier occupé ; un slab vidé par le haut (tous les ZSet supprimés,
+  dernières clés effacées) n'en a aucun. Mesuré : 22 Mo de B+tree et d'index de ZSet
+  résidents pour 0 ZSet. **Rognage** (`OxidArt::trim_slabs`, minuteur du GC, 100 ms) :
+  fin touchée rendue au-dessus du dernier occupé + 2 Mio gardés, dès qu'elle dépasse 2 Mio
+  de plus ; rien ne bouge (pas pendant une save ni un compactage). Vaut aussi pour les
+  en-têtes de ZSet et de List, qui n'ont pas de compactage. `mem_hislab_trimmed_bytes`.
+- **Défaut trouvé : la file des suites sales de `large` suivait le trafic.** Une entrée
+  par libération, périmées gardées jusqu'au `decay` (10 s), capacité jamais rendue :
+  390 K entrées, 6 Mo dans la libc pour un chargement. Nettoyée quand elle double (suites
+  encore libres et sales, une entrée par suite, la dernière), capacité rendue : bornée par
+  les suites libres ; 0,1 Mo au même chargement.
+
 ### 10.2 Victimes : CLOCK
 
 Les feuilles inline n'ont pas d'en-tête, et 4 o par clé coûteraient 5 à 10 % sur des

@@ -122,6 +122,11 @@ impl Handles {
         self.top as u64 * 8
     }
 
+    /// Octets résidents de la table (pages qui couvrent les cases touchées).
+    pub fn table_resident(&self) -> u64 {
+        crate::resident::region(self.slots as usize, self.top as usize * 8, self.map_len)
+    }
+
     /// Poignées vivantes et leur adresse.
     pub fn for_each_live(&self, mut f: impl FnMut(u32, usize)) {
         for h in 0..self.top {
@@ -393,6 +398,11 @@ pub fn verify() -> Result<(), String> {
 }
 
 /// `(poignées vivantes, octets de la table)`.
+/// Octets résidents de la table des poignées (0 sans table).
+pub fn table_resident() -> u64 {
+    unsafe { (*&raw const HANDLES).as_ref() }.map_or(0, Handles::table_resident)
+}
+
 pub fn stats() -> (u64, u64) {
     match unsafe { (*&raw const HANDLES).as_ref() } {
         Some(t) => (t.live() as u64, t.table_bytes()),

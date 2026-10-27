@@ -536,6 +536,51 @@ pub fn info_memory(out: &mut String, gc_enabled: bool, gc_running: bool, gc_max_
     }
 }
 
+/// Total résident compté, contre le RSS du processus (MEMORY_ARCH.md §10.1) : pages
+/// résidentes (`mincore`) de chaque région à nous — pool, `large` (tas Rust et slabs de
+/// classes compris), chaque HiSlab, table des poignées, tables par bloc et par granule —,
+/// plus `BigBuf` et le repli libc compté. `mem_untracked_bytes` = `RssAnon` − ce total :
+/// pile, binaire, ce que la libc tient pour elle (~1–2 Mo, fixes) ; s'il grandit avec les
+/// données, une région manque.
+pub fn info_memory_total(out: &mut String, slabs: &[(&str, (u64, u64, u64))]) {
+    use std::fmt::Write as _;
+    let mut slabs_total = 0u64;
+    for &(name, (touched, live, resident)) in slabs {
+        let _ = write!(
+            out,
+            "mem_hislab_{name}_bytes:{resident}\r\nmem_hislab_{name}_touched_bytes:{touched}\r\nmem_hislab_{name}_live_bytes:{live}\r\n"
+        );
+        slabs_total += resident;
+    }
+    let pool = radixox_lib::pool::resident();
+    let large = radixox_lib::large::resident();
+    let handles = radixox_lib::handle::table_resident();
+    let libc = if cfg!(radixox_sysalloc) { 0 } else { radixox_lib::raw_alloc::heap::libc_bytes() };
+    let _ = write!(
+        out,
+        "mem_hislab_bytes:{slabs_total}\r\nmem_pool_resident_bytes:{pool}\r\nmem_large_resident_bytes:{large}\r\nmem_handles_table_resident_bytes:{handles}\r\nmem_libc_bytes:{libc}\r\n"
+    );
+    let tracked = slabs_total + pool + large + handles + libc + radixox_lib::big_buf::bytes();
+    let (rss, anon) = proc_rss();
+    let _ = write!(
+        out,
+        "mem_tracked_bytes:{tracked}\r\nmem_rss_bytes:{rss}\r\nmem_rss_anon_bytes:{anon}\r\nmem_untracked_bytes:{}\r\n",
+        anon as i64 - tracked as i64
+    );
+}
+
+/// `(VmRSS, RssAnon)` du processus en octets (`/proc/self/status`, lu à la demande).
+fn proc_rss() -> (u64, u64) {
+    let Ok(s) = std::fs::read_to_string("/proc/self/status") else { return (0, 0) };
+    let kb = |key: &str| {
+        s.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .map_or(0, |k| k * 1024)
+    };
+    (kb("VmRSS:"), kb("RssAnon:"))
+}
+
 pub fn encode_krange(buf: &mut Vec<u8>, range: &oxidart::krange::RangeOut<'_>) {
     use oxidart::krange::RangeVal;
     use radixox_lib::shared_frame::{encode_array_len, encode_bulk};

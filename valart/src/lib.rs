@@ -361,6 +361,29 @@ impl ValTrees {
         self.save.is_active()
     }
 
+    /// Rend la fin touchée de la slab des nœuds au-dessus du dernier occupé, si elle
+    /// dépasse `2 Mio + seuil` (2 Mio gardés libres) ; rend les octets rendus. Rien ne
+    /// bouge : sûr hors save. Le compactage ne voit que les trous sous le dernier occupé.
+    pub fn trim_tail(&self, threshold: usize) -> usize {
+        if self.is_saving() {
+            return 0;
+        }
+        let size = size_of::<ValNode>();
+        let from = self.nodes.last_occupied().map_or(0, |l| l + 1) + ((2 << 20) / size) as u32;
+        if self.nodes.touched_bytes() < from as usize * size + threshold {
+            return 0;
+        }
+        // SAFETY: rien n'est occupé au-dessus du dernier occupé.
+        unsafe { self.nodes.release_above(from) }
+    }
+
+    /// Slab des nœuds : `(octets touchés, octets des nœuds vivants, octets résidents)`
+    /// (comptabilité mémoire).
+    pub fn slab_mem(&self) -> (u64, u64, u64) {
+        let t = self.nodes.touched_bytes();
+        (t as u64, self.nodes.len() as u64 * size_of::<ValNode>() as u64, self.nodes.resident_bytes() as u64)
+    }
+
     pub fn seed(&self) -> u64 {
         self.seed
     }

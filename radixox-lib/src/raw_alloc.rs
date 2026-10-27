@@ -132,13 +132,15 @@ pub mod external {
 /// (ARCHITECTURE.md §1, un seul thread métier).
 pub mod heap {
     use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
     use crate::large;
 
     // Thread du tas seulement : sans atomique.
     static mut BYTES: u64 = 0;
     static mut PEAK: u64 = 0;
+    /// Repli sur la libc : tout thread peut y allouer.
+    static LIBC: AtomicU64 = AtomicU64::new(0);
     /// Thread du tas : adresse de son [`MARK`] (0 : personne n'a encore alloué).
     static OWNER: AtomicUsize = AtomicUsize::new(0);
     thread_local! { static MARK: u8 = const { 0 }; }
@@ -206,11 +208,16 @@ pub mod heap {
                     return p;
                 }
             }
-            unsafe { System.alloc(l) }
+            let p = unsafe { System.alloc(l) };
+            if !p.is_null() {
+                LIBC.fetch_add(l.size() as u64, Relaxed);
+            }
+            p
         }
 
         unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
             if !large::owns(p as usize) {
+                LIBC.fetch_sub(l.size() as u64, Relaxed);
                 return unsafe { System.dealloc(p, l) };
             }
             if !on_owner() {
@@ -249,5 +256,10 @@ pub mod heap {
 
     pub fn peak() -> u64 {
         unsafe { PEAK }
+    }
+
+    /// Octets vivants repliés sur la libc (réentrance du tas, autre thread, plage pleine).
+    pub fn libc_bytes() -> u64 {
+        LIBC.load(Relaxed)
     }
 }

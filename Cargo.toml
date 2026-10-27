@@ -32,3 +32,7 @@ codegen-units = 1
 panic = "abort"
 strip = true
 opt-level = 3
+
+# hislab 0.2.6 (touched_bytes) pas encore publié : dépôt local voisin.
+[patch.crates-io]
+hislab = { path = "../hislab" }

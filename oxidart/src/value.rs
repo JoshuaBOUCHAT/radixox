@@ -99,6 +99,47 @@ pub(crate) fn valart() -> &'static mut ValTrees {
         VALART.assume_init_mut()
     }
 }
+/// Fin touchée d'un HiSlab rendue au-dessus du dernier occupé quand elle dépasse
+/// `2 Mio + TRIM_THRESHOLD` (2 Mio gardés libres contre les allers-retours) : un slab
+/// vidé par le haut (ZSet tous supprimés, dernières clés effacées) n'a aucun trou sous
+/// son dernier occupé, le compactage ne le voit pas. Rien ne bouge : sûr hors save.
+pub(crate) fn trim_tail<T>(s: &HiSlab<T>) -> usize {
+    let size = size_of::<T>();
+    let from = s.last_occupied().map_or(0, |l| l + 1) + ((2 << 20) / size).max(1) as u32;
+    if s.touched_bytes() < from as usize * size + TRIM_THRESHOLD {
+        return 0;
+    }
+    // SAFETY: rien n'est occupé au-dessus du dernier occupé.
+    unsafe { s.release_above(from) }
+}
+
+/// Seuil du rognage de la fin : une huge page. Rogner ne déplace rien ; au plus 2 Mio
+/// gardés + 2 Mio de seuil restent touchés au-dessus du dernier occupé, par slab.
+pub(crate) const TRIM_THRESHOLD: usize = 2 << 20;
+
+/// En-têtes de ZSet et de List, nœuds valart : voir [`trim_tail`]. Octets rendus.
+pub(crate) fn trim_value_slabs() -> usize {
+    if !SLAB_INIT.is_completed() {
+        return 0;
+    }
+    trim_tail(zset_slab()) + trim_tail(list_slab()) + valart().trim_tail(TRIM_THRESHOLD)
+}
+
+/// `(octets touchés, octets vivants, octets résidents)` d'un HiSlab.
+pub(crate) fn hislab_mem<T>(s: &HiSlab<T>) -> (u64, u64, u64) {
+    let t = s.touched_bytes();
+    (t as u64, s.len() as u64 * size_of::<T>() as u64, s.resident_bytes() as u64)
+}
+
+/// Slabs des en-têtes et arbres de valeurs : en-têtes de ZSet, en-têtes de List, nœuds
+/// valart (Hash, Set) ; voir [`hislab_mem`].
+pub(crate) fn value_slabs_mem() -> [(u64, u64, u64); 3] {
+    if !SLAB_INIT.is_completed() {
+        return [(0, 0, 0); 3];
+    }
+    [hislab_mem(zset_slab()), hislab_mem(list_slab()), valart().slab_mem()]
+}
+
 #[inline]
 fn zset_slab() -> &'static mut HiSlab<ZSet> {
     #[allow(static_mut_refs)]

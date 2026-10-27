@@ -102,6 +102,8 @@ pub struct Stats {
     pub sync_faults: u64,
     /// Allocations repliées en externe, plage pleine.
     pub range_full: u64,
+    /// Tables par bloc (compteurs, bits), pages résidentes jusqu'à la dernière page servie.
+    pub meta_resident: u64,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -273,7 +275,17 @@ impl Pool {
             pages_released: released,
             sync_faults: self.sync_faults,
             range_full: self.range_full,
+            meta_resident: self.meta_resident(),
         }
+    }
+
+    /// Pages résidentes des tables par bloc (`live`, `open`, `marked`, `handled`, `fill`) :
+    /// chacune écrite par le début, jusqu'au dernier bloc servi.
+    fn meta_resident(&self) -> u64 {
+        let blocks = self.next_page as usize * BLOCKS_PER_PAGE as usize;
+        let (u16s, bits) = (blocks * 2, blocks.div_ceil(64) * 8);
+        let used = [u16s, bits, bits, bits, u16s];
+        self.maps[1..].iter().zip(used).map(|(&(p, len), n)| crate::resident::region(p as usize, n, len)).sum()
     }
 
     pub fn gc_stats(&self) -> GcStats {
@@ -1155,6 +1167,14 @@ pub fn gc_unmark_all() {
 /// `None` tant que le pool n'a servi à rien (ou s'il est désactivé).
 pub fn stats() -> Option<(Stats, u64)> {
     global().map(|p| (p.stats(), p.reserve()))
+}
+
+/// Octets résidents du pool, données et tables (`mincore`, pour `INFO`) ; 0 sans pool.
+pub fn resident() -> u64 {
+    global().map_or(0, |p| {
+        let used = p.next_page as usize * PAGE;
+        crate::resident::region(p.base, used, p.nb_pages as usize * PAGE) + p.meta_resident()
+    })
 }
 
 pub fn gc_stats() -> Option<GcStats> {
