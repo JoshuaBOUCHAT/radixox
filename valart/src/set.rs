@@ -61,7 +61,9 @@ pub struct SetNode {
     overflow: Option<SetOverflow>,
     count: u8,
     parent_radix: u8,
-    _pad: u8,
+    /// 1 : racine du conteneur (désignée par oxidart, sans pointeur retour : le compactage
+    /// ne la déplace pas).
+    root: u8,
     // Même offset que dans `HashNode` (voir NODE_TYPE_OFFSET) : nécessaire
     // pour lire le tag depuis l'union sans connaître la variante active.
     pub(crate) node_type: NodeType,
@@ -111,7 +113,7 @@ impl SetNode {
             overflow: None,
             count: 0,
             parent_radix,
-            _pad: 0,
+            root: 0,
             node_type: NodeType::Set,
             parent_or_card,
         }
@@ -494,7 +496,49 @@ impl ValTrees {
 
     /// Crée un Set vide, retourne l'idx de sa racine (à stocker côté oxidart).
     pub fn set_create(&self) -> u32 {
-        self.alloc_set_node(0, 0)
+        let mut n = SetNode::new(0, 0);
+        n.root = 1;
+        self.nodes.insert(ValNode { set: ManuallyDrop::new(n) })
+    }
+
+    /// Compactage (`compact.rs`) : le nœud maintenant en `dst` ; son parent et ses enfants
+    /// pointent dessus (au dernier niveau, les enfants sont des seaux de collision, sans
+    /// pointeur retour). Rend le nombre de références corrigées. Jamais pendant une save.
+    pub(crate) fn set_relink(&mut self, dst: u32) -> u32 {
+        let (parent, radix) = {
+            let n = self.set_node(dst);
+            (n.parent_or_card, n.parent_radix)
+        };
+        let depth = self.set_depth(dst);
+        let p = self.set_node_mut(parent);
+        let slot = p.find(radix).expect("slot du nœud chez son parent");
+        p.set_child(slot, dst);
+        let mut fixed = 1;
+        if depth + 1 < DISPATCH_LEVELS {
+            for k in 0..self.set_node(dst).len() {
+                let n = self.set_node(dst);
+                let c = n.child(n.slot_at(k));
+                if c != NO_CHILD {
+                    self.set_node_mut(c).parent_or_card = dst;
+                    fixed += 1;
+                }
+            }
+        }
+        fixed
+    }
+
+    /// Profondeur d'un nœud (racine : 0), en remontant les pointeurs retour.
+    fn set_depth(&self, mut idx: u32) -> usize {
+        let mut d = 0;
+        while self.set_node(idx).root == 0 {
+            idx = self.set_node(idx).parent_or_card;
+            d += 1;
+        }
+        d
+    }
+
+    pub(crate) fn set_is_root(&self, idx: u32) -> bool {
+        self.set_node(idx).root != 0
     }
 
     /// SCARD, O(1).

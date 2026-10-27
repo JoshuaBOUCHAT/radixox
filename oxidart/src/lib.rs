@@ -58,6 +58,7 @@ pub mod krange;
 pub mod lcommand;
 pub mod list;
 mod prefetch_batch;
+pub use valart::ValCompaction;
 pub use prefetch_batch::{AmacStats, Hint, PREFETCH_BATCH, ZProbe};
 mod load;
 pub(crate) mod node;
@@ -420,6 +421,23 @@ impl OxidArt {
             return false;
         }
         valart().drain_deferred(rest)
+    }
+
+    /// Compactage de la slab valart (`valart::ValCompaction`) : une passe si ses trous
+    /// dépassent le seuil (`force` : toujours). Jamais pendant une save ni en même temps
+    /// qu'une passe du GC (au pilote d'y veiller).
+    pub fn valart_compact_want(&self, force: bool) -> Option<valart::ValCompaction> {
+        valart().compact_want(force)
+    }
+
+    /// Une tranche du compactage valart ; `Some((déplacés, octets rendus))` à la fin.
+    pub fn valart_compact_step(&mut self, c: &mut valart::ValCompaction, budget: u32) -> Option<(u64, usize)> {
+        valart().compact_step(c, budget)
+    }
+
+    /// Octets de trous sous la fin de la slab valart.
+    pub fn valart_holes_bytes(&self) -> u64 {
+        valart().compact_holes_bytes()
     }
 
     /// Une tranche de la libération des grands ZSet et des grandes List supprimés

@@ -41,7 +41,9 @@ pub struct HashNode {
     overflow: Option<HashOverflow>,
     count: u8,
     parent_radix: u8,
-    _pad: u8,
+    /// 1 : racine du conteneur (désignée par oxidart, sans pointeur retour : le compactage
+    /// ne la déplace pas).
+    root: u8,
     // Offset commun à toutes les variantes de `ValNode` (NODE_TYPE_OFFSET).
     pub(crate) node_type: NodeType,
     parent_or_card: u32,
@@ -91,7 +93,7 @@ impl HashNode {
             overflow: None,
             count: 0,
             parent_radix,
-            _pad: 0,
+            root: 0,
             node_type: NodeType::Hash,
             parent_or_card,
         }
@@ -528,7 +530,49 @@ impl ValTrees {
 
     /// Crée un Hash vide, retourne l'idx de sa racine (à stocker côté oxidart).
     pub fn hash_create(&self) -> u32 {
-        self.alloc_hash_node(0, 0)
+        let mut n = HashNode::new(0, 0);
+        n.root = 1;
+        self.nodes.insert(ValNode { hash: ManuallyDrop::new(n) })
+    }
+
+    /// Compactage (`compact.rs`) : le nœud maintenant en `dst` ; son parent et ses enfants
+    /// pointent dessus (au dernier niveau, les enfants sont des seaux de collision, sans
+    /// pointeur retour). Rend le nombre de références corrigées. Jamais pendant une save.
+    pub(crate) fn hash_relink(&mut self, dst: u32) -> u32 {
+        let (parent, radix) = {
+            let n = self.hash_node(dst);
+            (n.parent_or_card, n.parent_radix)
+        };
+        let depth = self.hash_depth(dst);
+        let p = self.hash_node_mut(parent);
+        let slot = p.find(radix).expect("slot du nœud chez son parent");
+        p.set_child(slot, dst);
+        let mut fixed = 1;
+        if depth + 1 < DISPATCH_LEVELS {
+            for k in 0..self.hash_node(dst).len() {
+                let n = self.hash_node(dst);
+                let c = n.child(n.slot_at(k));
+                if c != NO_CHILD {
+                    self.hash_node_mut(c).parent_or_card = dst;
+                    fixed += 1;
+                }
+            }
+        }
+        fixed
+    }
+
+    /// Profondeur d'un nœud (racine : 0), en remontant les pointeurs retour.
+    fn hash_depth(&self, mut idx: u32) -> usize {
+        let mut d = 0;
+        while self.hash_node(idx).root == 0 {
+            idx = self.hash_node(idx).parent_or_card;
+            d += 1;
+        }
+        d
+    }
+
+    pub(crate) fn hash_is_root(&self, idx: u32) -> bool {
+        self.hash_node(idx).root != 0
     }
 
     /// HLEN, O(1).

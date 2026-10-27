@@ -369,13 +369,26 @@ const COMPACT_SLICE_UNITS: u32 = 512;
 
 /// GC niveau A du pool, compactage de la slab des nœuds : passes en cours et réglages
 /// (`RADIXOX_GC`, `RADIXOX_GC_LOG`).
+/// Passe de compactage d'une slab autre que celle des nœuds.
+enum MorePass {
+    List(oxidart::list::compact::ListCompaction),
+    Val(oxidart::ValCompaction),
+}
+
 struct Gc {
     pass: Option<oxidart::gc::GcPass>,
     compact: Option<oxidart::compact::Compaction>,
-    /// Compactage de la slab des blocs de List (comme `compact`, pas en même temps).
-    compact_list: Option<oxidart::list::compact::ListCompaction>,
+    /// Compactage d'une autre slab (blocs de List, nœuds valart), comme `compact`, jamais
+    /// en même temps.
+    compact_more: Option<MorePass>,
     compact_list_moved: u64,
     compact_list_released: u64,
+    compact_val_moved: u64,
+    compact_val_released: u64,
+    /// Trous (List, valart) au moment de la dernière passe qui n'a rien rendu (des blocs
+    /// de bout ou des racines immobiles en haut de la slab) : pas de nouvelle passe avant
+    /// 3 Mio de trous de plus.
+    more_fruitless: [u64; 2],
     compact_passes: u64,
     compact_moved: u64,
     compact_released: u64,
@@ -393,7 +406,7 @@ struct Gc {
 impl Gc {
     fn from_env() -> Self {
         let on = |name: &str, default: bool| std::env::var(name).map_or(default, |v| v != "0");
-        Self { pass: None, enabled: on("RADIXOX_GC", true), log: on("RADIXOX_GC_LOG", false), max_slice_us: 0, started: None, compact: None, compact_list: None, compact_list_moved: 0, compact_list_released: 0, compact_passes: 0, compact_moved: 0, compact_released: 0, compact_max_slice_us: 0, compact_total_us: 0 }
+        Self { pass: None, enabled: on("RADIXOX_GC", true), log: on("RADIXOX_GC_LOG", false), max_slice_us: 0, started: None, compact: None, compact_more: None, compact_list_moved: 0, compact_list_released: 0, compact_val_moved: 0, compact_val_released: 0, more_fruitless: [0; 2], compact_passes: 0, compact_moved: 0, compact_released: 0, compact_max_slice_us: 0, compact_total_us: 0 }
     }
 }
 
@@ -1093,7 +1106,7 @@ impl Core {
             || self.bgsave.as_ref().is_some_and(|b| b.wants_slice())
             || self.gc.pass.is_some()
             || self.gc.compact.is_some()
-            || self.gc.compact_list.is_some()
+            || self.gc.compact_more.is_some()
             || self.art.zset_free_pending()
     }
 
@@ -2175,7 +2188,7 @@ impl Core {
                     &mut info,
                     format_args!(
                         "compact_running:{}\r\ncompact_passes:{}\r\ncompact_moved_nodes:{}\r\ncompact_released_bytes:{}\r\ncompact_max_slice_us:{}\r\ncompact_total_us:{}\r\ncompact_slab_holes_bytes:{}\r\n",
-                        (self.gc.compact.is_some() || self.gc.compact_list.is_some()) as u8,
+                        (self.gc.compact.is_some() || self.gc.compact_more.is_some()) as u8,
                         self.gc.compact_passes,
                         self.gc.compact_moved,
                         self.gc.compact_released,
@@ -2186,10 +2199,13 @@ impl Core {
                 );
                 let _ = std::fmt::Write::write_fmt(
                     &mut info,
-                    format_args!("compact_list_moved_blocks:{}\r\ncompact_list_released_bytes:{}\r\nlist_slab_holes_bytes:{}\r\n",
+                    format_args!("compact_list_moved_blocks:{}\r\ncompact_list_released_bytes:{}\r\nlist_slab_holes_bytes:{}\r\ncompact_valart_moved_nodes:{}\r\ncompact_valart_released_bytes:{}\r\nvalart_slab_holes_bytes:{}\r\n",
                     self.gc.compact_list_moved,
                     self.gc.compact_list_released,
-                    oxidart::list::compact::holes_bytes()),
+                    oxidart::list::compact::holes_bytes(),
+                    self.gc.compact_val_moved,
+                    self.gc.compact_val_released,
+                    self.art.valart_holes_bytes()),
                 );
                 extend_encode(&mut self.outs[s].out, &Frame::BulkString(SharedByte::from_slice(info.as_bytes())));
             }
@@ -2331,7 +2347,7 @@ impl Core {
     /// libération, BGSAVE) : la boucle doit envoyer les réponses du tour avant
     /// de la faire (RUNTIME_ARCH.md §2).
     pub fn has_jobs(&self) -> bool {
-        !self.conn_jobs.is_empty() || !self.jobs.is_empty() || self.bgsave_slice_due() || self.gc.pass.is_some() || self.gc.compact.is_some() || self.gc.compact_list.is_some()
+        !self.conn_jobs.is_empty() || !self.jobs.is_empty() || self.bgsave_slice_due() || self.gc.pass.is_some() || self.gc.compact.is_some() || self.gc.compact_more.is_some()
     }
 
     /// Une tranche de BGSAVE est à faire à ce tour-ci (pas de tranche à
@@ -2450,29 +2466,44 @@ impl Core {
         true
     }
 
-    /// Une tranche de compactage de la slab des blocs de List. Faux sans passe ; une save
-    /// ou un job arrête la passe (chaque déplacement laisse les List cohérentes).
+    /// Une tranche de compactage d'une autre slab (blocs de List, nœuds valart). Faux sans
+    /// passe ; une save ou un job arrête la passe (chaque déplacement laisse tout cohérent).
     fn compact_list_slice(&mut self) -> bool {
-        if self.gc.compact_list.is_none() {
+        if self.gc.compact_more.is_none() {
             return false;
         }
         if !self.compact_allowed() {
-            self.gc.compact_list_moved += self.gc.compact_list.take().map_or(0, |c| c.moved);
+            match self.gc.compact_more.take() {
+                Some(MorePass::List(c)) => self.gc.compact_list_moved += c.moved,
+                Some(MorePass::Val(c)) => self.gc.compact_val_moved += c.moved,
+                None => {}
+            }
             return false;
         }
-        let Some(c) = self.gc.compact_list.as_mut() else { return false };
         let t0 = Instant::now();
-        let done = oxidart::list::compact::step(c, COMPACT_SLICE_UNITS);
+        let (done, list) = match self.gc.compact_more.as_mut() {
+            Some(MorePass::List(c)) => (oxidart::list::compact::step(c, COMPACT_SLICE_UNITS), true),
+            Some(MorePass::Val(c)) => (self.art.valart_compact_step(c, COMPACT_SLICE_UNITS), false),
+            None => return false,
+        };
         let us = t0.elapsed().as_micros() as u64;
         self.gc.compact_max_slice_us = self.gc.compact_max_slice_us.max(us);
         self.gc.compact_total_us += us;
         if let Some((moved, released)) = done {
-            self.gc.compact_list = None;
+            self.gc.compact_more = None;
             self.gc.compact_passes += 1;
-            self.gc.compact_list_moved += moved;
-            self.gc.compact_list_released += released as u64;
+            if list {
+                self.gc.compact_list_moved += moved;
+                self.gc.compact_list_released += released as u64;
+            } else {
+                self.gc.compact_val_moved += moved;
+                self.gc.compact_val_released += released as u64;
+            }
+            let holes = if list { oxidart::list::compact::holes_bytes() } else { self.art.valart_holes_bytes() };
+            self.gc.more_fruitless[!list as usize] = if released == 0 { holes } else { 0 };
             if self.gc.log {
-                eprintln!("[compact] fin : {moved} blocs de List déplacés, {} Kio rendus", released >> 10);
+                let what = if list { "blocs de List" } else { "nœuds valart" };
+                eprintln!("[compact] fin : {moved} {what} déplacés, {} Kio rendus", released >> 10);
             }
         }
         true
@@ -2482,7 +2513,7 @@ impl Core {
     /// compactage de la slab des nœuds si ses trous dépassent le seuil.
     fn gc_trigger(&mut self) {
         use radixox_lib::pool;
-        if !self.gc.enabled || self.gc.pass.is_some() || self.gc.compact.is_some() || self.gc.compact_list.is_some() {
+        if !self.gc.enabled || self.gc.pass.is_some() || self.gc.compact.is_some() || self.gc.compact_more.is_some() {
             return;
         }
         if self.compact_allowed()
@@ -2495,12 +2526,23 @@ impl Core {
             return;
         }
         if self.compact_allowed()
+            && oxidart::list::compact::holes_bytes() > self.gc.more_fruitless[0] + (3 << 20)
             && let Some(c) = oxidart::list::compact::want(false)
         {
             if self.gc.log {
                 eprintln!("[compact] passe : {} Kio de trous dans la slab des blocs de List", oxidart::list::compact::holes_bytes() >> 10);
             }
-            self.gc.compact_list = Some(c);
+            self.gc.compact_more = Some(MorePass::List(c));
+            return;
+        }
+        if self.compact_allowed()
+            && self.art.valart_holes_bytes() > self.gc.more_fruitless[1] + (3 << 20)
+            && let Some(c) = self.art.valart_compact_want(false)
+        {
+            if self.gc.log {
+                eprintln!("[compact] passe : {} Kio de trous dans la slab valart", self.art.valart_holes_bytes() >> 10);
+            }
+            self.gc.compact_more = Some(MorePass::Val(c));
             return;
         }
         let idle = self.now.saturating_duration_since(self.last_rx) >= GC_IDLE_AFTER;

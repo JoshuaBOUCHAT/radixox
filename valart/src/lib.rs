@@ -11,12 +11,14 @@ use radixox_lib::save_barrier::{SaveBarrier, T0};
 use radixox_lib::shared_byte::SharedByte;
 
 mod common;
+mod compact;
 mod hash;
 mod overflow;
 mod set;
 
 use common::CollisionBuckets;
 use hash::HashNode;
+pub use compact::ValCompaction;
 pub use overflow::{HashOverflow, SetOverflow};
 use set::SetNode;
 
