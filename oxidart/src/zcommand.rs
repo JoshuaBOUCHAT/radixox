@@ -4,6 +4,9 @@
 //! plus que d'oracle aux tests différentiels.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::hash::BuildHasherDefault;
 
 use radixox_lib::cmd::{ZAddFlags, ZAggregate, ZOp, ZRangeBy};
 use radixox_lib::shared_byte::SharedByte;
@@ -655,6 +658,60 @@ impl ZInput {
     }
 }
 
+type MemberTable = HashMap<&'static [u8], f64, BuildHasherDefault<MemberHasher>>;
+
+/// Entrée sondée (ZINTER, ZDIFF, ZINTERCARD) : une petite forme se cherche en linéaire ;
+/// au-delà de 16 membres, une table construite une fois revient moins cher que les sondes.
+struct Probe<'a> {
+    input: &'a ZInput,
+    table: Option<MemberTable>,
+}
+
+impl<'a> Probe<'a> {
+    fn new(input: &'a ZInput) -> Self {
+        let linear = match *input {
+            ZInput::ZSet(i) => matches!(zset_ref(i), ZSet::Small(_)),
+            ZInput::SetSmall(_) => true,
+            _ => false,
+        };
+        let table = (linear && input.len() > 16).then(|| {
+            let mut t = MemberTable::with_capacity_and_hasher(input.len(), Default::default());
+            // SAFETY: comme dans `zsetop_with` : membres lus avant toute modification
+            input.for_each(|m, s| {
+                t.insert(unsafe { std::mem::transmute::<&[u8], &'static [u8]>(m) }, s);
+            });
+            t
+        });
+        Self { input, table }
+    }
+
+    #[inline]
+    fn score(&self, m: &[u8]) -> Option<f64> {
+        match &self.table {
+            Some(t) => t.get(m).copied(),
+            None => self.input.score(m),
+        }
+    }
+}
+
+/// Hasher des membres pour les tables d'une commande : le hash de valart (un seul appel
+/// par membre ; la longueur que `Hash for [u8]` écrit d'abord est ignorée).
+#[derive(Default)]
+struct MemberHasher(u64);
+
+impl std::hash::Hasher for MemberHasher {
+    #[inline]
+    fn write(&mut self, b: &[u8]) {
+        self.0 = crate::zset::large::member_hash(b);
+    }
+    #[inline]
+    fn write_usize(&mut self, _: usize) {}
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 /// Score pondéré : NaN (0 × ±inf) ramené à 0, comme Redis.
 #[inline]
 fn weighted(s: f64, w: f64) -> f64 {
@@ -694,70 +751,106 @@ impl OxidArt {
         Ok(out)
     }
 
-    /// ZUNION / ZINTER / ZDIFF : `(score, membre)` triés. `weights` vide : 1 partout ;
-    /// ZDIFF : scores de la première entrée, sans poids.
-    pub fn cmd_zsetop(&mut self, op: ZOp, keys: &[&[u8]], weights: &[f64], agg: ZAggregate) -> Result<Vec<(f64, SharedByte)>, RedisType> {
+    /// ZUNION / ZINTER / ZDIFF : `f` reçoit les `(score, membre)` triés, membres empruntés
+    /// aux entrées (aucune copie). `weights` vide : 1 partout ; ZDIFF : scores de la
+    /// première entrée, sans poids.
+    pub fn zsetop_with<R>(
+        &mut self,
+        op: ZOp,
+        keys: &[&[u8]],
+        weights: &[f64],
+        agg: ZAggregate,
+        f: impl FnOnce(&[(f64, &[u8])]) -> R,
+    ) -> Result<R, RedisType> {
         let ins = self.zop_inputs(keys)?;
         let w = |i: usize| weights.get(i).copied().unwrap_or(1.0);
-        let mut out: Vec<(f64, SharedByte)> = Vec::new();
+        // entrées par taille croissante, comme Redis (avec des infinis, l'ordre de
+        // l'agrégation change le résultat : inf + -inf → 0)
+        let mut order: Vec<usize> = (0..ins.len()).collect();
+        order.sort_by_key(|&i| ins[i].len());
+        // SAFETY: les membres restent dans les slabs (ZSet, valart, petites formes) tant
+        // que la base ne change pas ; rien n'est modifié avant le retour de `f`, et les
+        // tranches ne sortent pas de cette fonction.
+        let keep = |m: &[u8]| -> &'static [u8] { unsafe { std::mem::transmute::<&[u8], &'static [u8]>(m) } };
+        let mut out: Vec<(f64, &'static [u8])> = Vec::new();
         match op {
             ZOp::Union => {
-                let mut acc: std::collections::HashMap<Vec<u8>, f64> = std::collections::HashMap::new();
-                // dans l'ordre des tailles comme Redis : avec des infinis, l'ordre de
-                // l'agrégation change le résultat (inf + -inf → 0)
-                let mut order: Vec<usize> = (0..ins.len()).collect();
-                order.sort_by_key(|&i| ins[i].len());
+                let cap: usize = ins.iter().map(ZInput::len).sum();
+                out.reserve(cap);
+                let mut pos: HashMap<&'static [u8], u32, BuildHasherDefault<MemberHasher>> =
+                    HashMap::with_capacity_and_hasher(cap, Default::default());
                 for i in order {
+                    let wi = w(i);
                     ins[i].for_each(|m, s| {
-                        let v = weighted(s, w(i));
-                        acc.entry(m.to_vec()).and_modify(|a| *a = aggregate(agg, *a, v)).or_insert(v);
+                        let v = weighted(s, wi);
+                        match pos.entry(keep(m)) {
+                            Entry::Occupied(e) => {
+                                let a = &mut out[*e.get() as usize].0;
+                                *a = aggregate(agg, *a, v);
+                            }
+                            Entry::Vacant(e) => {
+                                e.insert(out.len() as u32);
+                                out.push((v, keep(m)));
+                            }
+                        }
                     });
                 }
-                out.extend(acc.into_iter().map(|(m, s)| (s, SharedByte::from_slice(m))));
             }
             ZOp::Inter => {
-                // la plus petite entrée, les autres sondées (dans l'ordre des tailles, comme Redis)
-                let mut order: Vec<usize> = (0..ins.len()).collect();
-                order.sort_by_key(|&i| ins[i].len());
+                // la plus petite entrée, les autres sondées
                 let first = order[0];
+                out.reserve(ins[first].len());
+                let probes: Vec<(usize, Probe)> = order[1..].iter().map(|&j| (j, Probe::new(&ins[j]))).collect();
                 ins[first].for_each(|m, s| {
                     let mut v = weighted(s, w(first));
-                    for &j in &order[1..] {
-                        match ins[j].score(m) {
+                    for (j, p) in &probes {
+                        let j = *j;
+                        match p.score(m) {
                             // pas ramené à 0 ici (Redis) : SUM → 0, MIN/MAX → inchangé
                             Some(sj) => v = aggregate(agg, v, sj * w(j)),
                             None => return,
                         }
                     }
-                    out.push((v, SharedByte::from_slice(m)));
+                    out.push((v, keep(m)));
                 });
             }
             ZOp::Diff => {
+                let probes: Vec<Probe> = ins[1..].iter().map(Probe::new).collect();
                 ins[0].for_each(|m, s| {
-                    if ins[1..].iter().all(|o| o.score(m).is_none()) {
-                        out.push((s, SharedByte::from_slice(m)));
+                    if probes.iter().all(|p| p.score(m).is_none()) {
+                        out.push((s, keep(m)));
                     }
                 });
             }
         }
-        // -0 = 0 comme Redis (jamais de NaN ici : `weighted` et `aggregate` les ramènent à 0)
-        out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal).then_with(|| a.1.as_slice().cmp(b.1.as_slice())));
-        Ok(out)
+        // -0 = 0 comme Redis (jamais de NaN ici : `weighted` et `aggregate` les ramènent à
+        // 0) ; membres uniques : tri instable
+        out.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal).then_with(|| a.1.cmp(b.1)));
+        Ok(f(&out))
     }
 
-    /// ZUNIONSTORE / ZINTERSTORE / ZDIFFSTORE : `dest` remplacée (quel que soit son type) par
-    /// le résultat, supprimée s'il est vide ; rend le cardinal.
+    /// [`Self::zsetop_with`] en `(score, membre)` possédés.
+    pub fn cmd_zsetop(&mut self, op: ZOp, keys: &[&[u8]], weights: &[f64], agg: ZAggregate) -> Result<Vec<(f64, SharedByte)>, RedisType> {
+        self.zsetop_with(op, keys, weights, agg, |r| r.iter().map(|&(s, m)| (s, SharedByte::from_slice(m))).collect())
+    }
+
+    /// ZUNIONSTORE / ZINTERSTORE / ZDIFFSTORE : `dest` remplacée (quel que soit son type)
+    /// par le résultat, construit d'un coup (trié, sans doublon : comme au rechargement)
+    /// avant la suppression de `dest`, qui peut être une entrée. Rend le cardinal.
     pub fn cmd_zsetop_store(&mut self, dest: &[u8], op: ZOp, keys: &[&[u8]], weights: &[f64], agg: ZAggregate) -> Result<u32, TypeError> {
-        let res = self.cmd_zsetop(op, keys, weights, agg).map_err(|_| TypeError::ValueNotSet)?;
+        // −0 rangé comme 0 (même ordre que le tri du résultat)
+        let z = self
+            .zsetop_with(op, keys, weights, agg, |r| ZSet::from_sorted(r.iter().map(|&(s, m)| (encode_score(s + 0.0), m))))
+            .map_err(|_| TypeError::ValueNotSet)?
+            .ok_or(TypeError::OutOfMemory)?;
         self.del(dest);
-        if res.is_empty() {
+        let n = z.len() as u32;
+        if n == 0 {
+            z.free();
             return Ok(0);
         }
-        // `res` est trié et sans doublon : construit d'un coup (comme au rechargement) ;
-        // −0 rangé comme 0 (même ordre que le tri de `res`)
-        let z = ZSet::from_sorted(res.iter().map(|(s, m)| (encode_score(*s + 0.0), m.as_slice()))).ok_or(TypeError::OutOfMemory)?;
         self.ensure_container(dest, None, Tag::ZSet, || alloc_zset(z)).map_err(|_| TypeError::ValueNotSet)?;
-        Ok(res.len() as u32)
+        Ok(n)
     }
 
     /// ZINTERCARD : cardinal de l'intersection, arrêté à `limit` (0 : sans limite).
@@ -765,9 +858,10 @@ impl OxidArt {
         let ins = self.zop_inputs(keys)?;
         let mut order: Vec<usize> = (0..ins.len()).collect();
         order.sort_by_key(|&i| ins[i].len());
+        let probes: Vec<Probe> = order[1..].iter().map(|&j| Probe::new(&ins[j])).collect();
         let mut n = 0u64;
         ins[order[0]].for_each_while(|m| {
-            if order[1..].iter().all(|&j| ins[j].score(m).is_some()) {
+            if probes.iter().all(|p| p.score(m).is_some()) {
                 n += 1;
             }
             limit == 0 || n < limit

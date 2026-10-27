@@ -215,3 +215,28 @@ pub fn cmd_zintercard(art: &mut OxidArt, keys: &[&[u8]], limit: u64) -> Frame {
         Err(t) => wrongtype(t),
     }
 }
+
+/// ZUNION / ZINTER / ZDIFF : réponse encodée directement depuis les membres empruntés.
+pub fn zsetop_reply(
+    art: &mut OxidArt,
+    op: radixox_lib::cmd::ZOp,
+    keys: &[&[u8]],
+    weights: &[f64],
+    agg: radixox_lib::cmd::ZAggregate,
+    with_scores: bool,
+    out: &mut Vec<u8>,
+) {
+    use radixox_lib::shared_frame::{encode_array_len, encode_bulk, extend_encode};
+    let r = art.zsetop_with(op, keys, weights, agg, |res| {
+        encode_array_len(out, res.len() * if with_scores { 2 } else { 1 });
+        for &(s, m) in res {
+            encode_bulk(out, m);
+            if with_scores {
+                encode_bulk(out, &oxidart::zset::format_score(s));
+            }
+        }
+    });
+    if let Err(t) = r {
+        extend_encode(out, &wrongtype(t));
+    }
+}

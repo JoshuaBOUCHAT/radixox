@@ -984,14 +984,22 @@ petite entrée et sonde les autres par l'index. Différentiel contre Valkey
 les lectures géantes si des entrées de plusieurs millions de membres apparaissent.
 
 Mesures (`scripts/bench_zset_ops.sh`, pipeline 16, 50 connexions, contre Valkey 9.1.2,
-mono-thread des deux côtés) : paires de 100 membres (moitié commune) ZUNION ×1,37,
-ZINTER ×5,3, ZDIFF ×8, ZINTERSTORE ×5,3, ZUNIONSTORE ×1,10, ZINTERCARD ×6,5 ; paires de
-10 000 membres ×1,9 à ×3 ; ZSCAN complet d'1 M membres 750 ms contre 1 080 (COUNT 100).
-Deux correctifs venus du bench : la destination d'un STORE est construite d'un coup
-(`ZSet::from_sorted`, comme au rechargement : ZUNIONSTORE ×0,58 → ×1,1), et la recherche
-de la petite forme compare d'abord les 8 derniers octets en un mot avant `memcmp` (membres
-à préfixe commun : ZINTERCARD 66 k → 240 k/s). Reste lent : ZUNION de petites entrées
-(table de hachage de `Vec<u8>` par appel).
+mono-thread des deux côtés). Paires de 100 membres (moitié commune) : ZUNION ×4,6
+(WITHSCORES ×3,6), ZINTER ×11,8, ZDIFF ×15,7, ZUNIONSTORE ×3,1, ZINTERSTORE ×8,
+ZINTERCARD ×13,4, ZINTERCARD LIMIT 10 ≥ ×2 (plafond de l'outil). Paires de 10 000
+membres : ×2,5 à ×4,3. ZSCAN complet d'1 M membres : 810 ms contre 1 090 (COUNT 100).
+
+Ce qui a compté, mesuré au profil :
+- membres **empruntés** aux entrées (`zsetop_with` passe des `&[u8]` à un rappel), pas de
+  copie : la réponse est encodée directement, la destination d'un STORE construite d'un
+  coup par `ZSet::from_sorted` (comme au rechargement) avant la suppression de `dest` ;
+- table de l'union avec le hash de valart (un appel par membre) au lieu de SipHash, à la
+  bonne taille d'emblée, valeurs dans un `Vec` (la table ne tient qu'un rang) ;
+- entrées sondées en petite forme (recherche linéaire) au-delà de 16 membres : table
+  construite une fois (`Probe`) ; ZINTERCARD LIMIT s'arrête à la limite ;
+- recherche de la petite forme : les 8 derniers octets comparés en un mot avant `memcmp`
+  (membres à préfixe commun) ; profite aussi à ZSCORE & co.
+Reste visible : le formatage des scores (WITHSCORES −30 %).
 
 ## 14. List — architecture retenue (2026-10-27, implémentée le même jour, §14.9)
 

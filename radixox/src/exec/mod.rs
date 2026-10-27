@@ -152,6 +152,10 @@ pub fn execute_into<'a>(
             }
             return Executed::Done;
         }
+        Cmd::ZSetOp { op, dest: None, keys, weights, agg, with_scores } => {
+            zset::zsetop_reply(art, op, &keys, &weights, agg, with_scores, out);
+            return Executed::Done;
+        }
         Cmd::ZScan { key, cursor, pattern, count, noscores } => {
             scan::cmd_zscan(art, client.id, key, cursor, pattern, count, noscores, out);
             return Executed::Done;

@@ -1,9 +1,9 @@
 #!/bin/bash
 # ZSet : opérations ensemblistes et ZSCAN, RadixOx contre Valkey (ANALYSE_ART_UNIFIE.md §13.12).
-# Une passe, ~1 min 30.
+# Une passe, ~2 min.
 #
 #   scripts/bench_zset_ops.sh
-#   N_SMALL=300000 N_MED=3000 scripts/bench_zset_ops.sh    # requêtes par test
+#   N_SMALL=1000000 N_MED=3000 scripts/bench_zset_ops.sh    # requêtes par test
 #
 # - Débit : valkey-benchmark, pipeline 16, 50 connexions. Paires de ZSet de même forme,
 #   moitié des membres en commun ; `__rand_int__` tire une paire au hasard à chaque
@@ -21,7 +21,7 @@ export RADIXOX_SAVE="${RADIXOX_SAVE-}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${OUT:-$(mktemp -d /tmp/bench_zset_ops.XXXX)}"
-N_SMALL="${N_SMALL:-100000}"
+N_SMALL="${N_SMALL:-300000}"
 N_MED="${N_MED:-1000}"
 RX_PORT=6511
 VK_PORT=6512
@@ -137,7 +137,8 @@ for s in rx vk; do
   load
   for t in "${TESTS[@]}"; do
     kind=${t%%|*}; c=${t#*|}
-    if [ "$kind" = S ]; then RES[$s|$c]=$(bench "$N_SMALL" 1000 $c); else RES[$s|$c]=$(bench "$N_MED" 100 $c); fi
+    if [ "$kind" = S ]; then RES[$s|$c]=$(bench "$N_SMALL" 1000 $c)
+    else RES[$s|$c]=$(bench "$([ $s = rx ] && echo $((N_MED * 4)) || echo "$N_MED")" 100 $c); fi
   done
   for n in 100 1000; do RES[$s|zscan$n]=$(zscan_full $n); done
   stop
@@ -154,7 +155,7 @@ for t in "${TESTS[@]}"; do
   a=${RES[rx|$c]}; b=${RES[vk|$c]}
   printf "%-72s %12s %12s %6sx\n" "$tag $c" "$a" "$b" "$(awk -v a="$a" -v b="$b" 'BEGIN { printf "%.2f", (b > 0 ? a / b : 0) }')"
 done
-echo "([100] : paires de 100 membres, $N_SMALL requêtes ; [10k] : paires de 10 000 membres, $N_MED requêtes)"
+echo "([100] : paires de 100 membres, $N_SMALL requêtes ; [10k] : paires de 10 000 membres, $N_MED requêtes (×4 pour RadixOx : valkey-benchmark mesure par pas de ~0,25 s))"
 echo "(vers $((N_SMALL * 2 / 1000)) k req/s : plafond de l'outil à $N_SMALL requêtes (~0,5 s fixes) ; monter N_SMALL pour départager)"
 echo
 echo "## ZSCAN complet d'1 M membres (un client, sans pipeline)"
