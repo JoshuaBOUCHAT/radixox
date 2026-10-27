@@ -92,6 +92,7 @@ pub fn execute_into<'a>(
         | Cmd::BPop { .. }
         | Cmd::BLMove { .. }
         | Cmd::BZPop { .. }
+        | Cmd::Shutdown { .. }
         | Cmd::Info => return Executed::Runtime(cmd),
         Cmd::Ping(msg) => resp_pong(msg),
         Cmd::Auth { user, pass } => auth::cmd_auth(user, pass, &mut client.authed),
@@ -407,6 +408,7 @@ pub fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         | Cmd::RxTick(_)
         | Cmd::Wait { .. }
         | Cmd::Info
+        | Cmd::Shutdown { .. }
         | Cmd::Auth { .. }
         | Cmd::Hello(_)
         | Cmd::Client(_)

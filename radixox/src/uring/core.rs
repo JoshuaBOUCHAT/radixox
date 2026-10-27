@@ -447,6 +447,9 @@ enum After {
     Block(block::Block),
     /// Déjà inscrite (fenêtre) : parquer si toujours en attente.
     Blocked,
+    /// SHUTDOWN : la boucle sauve (selon `save`) puis sort ; en cas d'échec sans
+    /// `force`, la connexion reçoit l'erreur et le serveur continue.
+    Shutdown { save: Option<bool>, force: bool },
 }
 
 /// Limites de sortie des abonnés Pub/Sub (`client-output-buffer-limit pubsub`
@@ -517,6 +520,7 @@ fn stops_window(cmd: &Cmd<'_>) -> bool {
                 | Cmd::BPop { .. }
                 | Cmd::BLMove { .. }
                 | Cmd::BZPop { .. }
+                | Cmd::Shutdown { .. }
         )
 }
 
@@ -604,6 +608,8 @@ pub struct Core {
     waiters: Vec<repl::Waiter>,
     /// Commandes bloquantes en attente, par clé (§14.3).
     blocked: block::Blocked,
+    /// SHUTDOWN reçu : (connexion, époque, save demandée, force), traité par la boucle.
+    shutdown: Option<(Slot, u32, Option<bool>, bool)>,
     /// Suites de fichiers en cours, dans l'ordre de leur demande (§8.6).
     fs_jobs: Vec<FsJob>,
     fs_seq: u32,
@@ -665,6 +671,7 @@ impl Core {
             promoted: false,
             waiters: Vec::new(),
             blocked: block::Blocked::default(),
+            shutdown: None,
             fs_jobs: Vec::new(),
             fs_seq: 0,
             cfg,
@@ -1021,6 +1028,27 @@ impl Core {
     }
 
     /// Opérations à soumettre (dans l'ordre d'émission).
+    /// SHUTDOWN demandé : (save demandée, `None` = réglage du serveur ; force).
+    pub fn take_shutdown(&mut self) -> Option<(Option<bool>, bool)> {
+        self.shutdown.as_ref().map(|&(_, _, save, force)| (save, force))
+    }
+
+    /// SHUTDOWN qui n'a pas pu sauver : l'erreur à la connexion qui l'a demandé, le
+    /// serveur continue.
+    pub fn shutdown_failed(&mut self, msg: &str) {
+        let Some((slot, epoch, ..)) = self.shutdown.take() else { return };
+        let s = slot as usize;
+        let o = &mut self.outs[s];
+        if o.epoch != epoch || !matches!(o.mode, Mode::Normal | Mode::Closing) {
+            return;
+        }
+        extend_encode(&mut o.out, &Frame::Error(format!("ERR Errors trying to SHUTDOWN. Check logs. ({msg})")));
+        if !o.dirty {
+            o.dirty = true;
+            self.dirty.push(slot);
+        }
+    }
+
     pub fn take_ops(&mut self, into: &mut Vec<Op>) {
         into.append(&mut self.ops);
     }
@@ -2121,6 +2149,7 @@ impl Core {
             }
             After::Block(_) => unreachable!("inscrite dans la fenêtre"),
             After::Blocked => self.block_park(slot),
+            After::Shutdown { save, force } => self.shutdown = Some((slot, self.outs[s].epoch, save, force)),
             After::Subscribe(channels) => self.subscribe(slot, &channels),
             After::Unsubscribe(channels) => self.unsubscribe(slot, &channels),
             After::Publish { channel, message } => {
@@ -2914,6 +2943,11 @@ fn runtime(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) 
         Cmd::RxBlock(b) => After::RxBlock(b.to_vec()),
         Cmd::RxTick(now) => After::RxTick(now),
         Cmd::Wait { replicas, timeout_ms } => After::Wait { replicas, timeout_ms },
+        Cmd::Shutdown { abort: true, .. } => {
+            extend_encode(&mut o.out, &Frame::Error("ERR No shutdown in progress.".into()));
+            After::Continue
+        }
+        Cmd::Shutdown { save, force, .. } => After::Shutdown { save, force },
         // Bloquantes : servies tout de suite si une clé a de quoi, sinon inscrites (§14.3).
         Cmd::BPop { keys, right, timeout } => match crate::exec::list::try_bpop(art, &keys, right) {
             Some(f) => {

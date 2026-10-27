@@ -164,6 +164,9 @@ pub enum Cmd<'a> {
     RxTick(u64),
     /// WAIT numreplicas timeout(ms)
     Wait { replicas: u64, timeout_ms: u64 },
+    /// SHUTDOWN [NOSAVE|SAVE] [NOW] [FORCE] [ABORT] : `save` `None` = le réglage du
+    /// serveur (comme un arrêt par signal).
+    Shutdown { save: Option<bool>, force: bool, abort: bool },
 
     // --- String / clés -----------------------------------------------
     /// GET key
@@ -1275,6 +1278,28 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
         b"rxblock" => { exact!(1); Cmd::RxBlock(args[0]) }
         b"rxtick" => { exact!(1); Cmd::RxTick(uint(args[0])?) }
         b"wait" => { exact!(2); Cmd::Wait { replicas: uint(args[0])?, timeout_ms: uint(args[1])? } }
+        b"shutdown" => {
+            let (mut save, mut force, mut abort) = (None, false, false);
+            for a in args {
+                if a.eq_ignore_ascii_case(b"nosave") && save.is_none() {
+                    save = Some(false);
+                } else if a.eq_ignore_ascii_case(b"save") && save.is_none() {
+                    save = Some(true);
+                } else if a.eq_ignore_ascii_case(b"now") {
+                    // pas d'attente des réplicas ici : sans effet
+                } else if a.eq_ignore_ascii_case(b"force") {
+                    force = true;
+                } else if a.eq_ignore_ascii_case(b"abort") {
+                    abort = true;
+                } else {
+                    return Err(CmdError::Syntax);
+                }
+            }
+            if abort && (save.is_some() || force) {
+                return Err(CmdError::Syntax);
+            }
+            Cmd::Shutdown { save, force, abort }
+        }
 
         _ => return Err(CmdError::Unknown),
     })

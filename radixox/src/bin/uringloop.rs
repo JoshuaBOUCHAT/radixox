@@ -222,9 +222,15 @@ fn exit_on_second_signal() {
 
 fn shutdown(core: &mut Core, save: bool) -> ! {
     exit_on_second_signal();
+    let e = try_shutdown(core, save);
+    eprintln!("[shutdown] {e}");
+    std::process::exit(1)
+}
+
+/// Flux de l'AOF sur disque, save si demandée, puis sortie. Rend l'erreur sans sortir.
+fn try_shutdown(core: &mut Core, save: bool) -> String {
     if let Err(e) = core.flush_journal_sync() {
-        eprintln!("[shutdown] échec de l'écriture de l'AOF : {e}");
-        std::process::exit(1)
+        return format!("échec de l'écriture de l'AOF : {e}");
     }
     if !save {
         std::process::exit(0)
@@ -242,10 +248,7 @@ fn shutdown(core: &mut Core, save: bool) -> ! {
             );
             std::process::exit(0)
         }
-        Err(e) => {
-            eprintln!("[shutdown] échec de la save : {e}");
-            std::process::exit(1)
-        }
+        Err(e) => format!("échec de la save : {e}"),
     }
 }
 
@@ -497,8 +500,6 @@ impl Server {
     /// Arrêt : les suites de fichiers en cours (rotation de l'AOF, renommage
     /// d'un dump) vont à leur terme avant l'écriture finale du journal.
     fn finish_fs(&mut self) -> io::Result<()> {
-        eprintln!("[shutdown] signal reçu : arrêt (second signal : sortie immédiate)");
-        exit_on_second_signal();
         loop {
             self.submit_ops()?;
             if !self.core.fs_pending() {
@@ -520,8 +521,23 @@ impl Server {
             self.core.set_now(Instant::now());
             self.harvest();
             if let Some(save) = self.stop.take() {
+                eprintln!("[shutdown] signal reçu : arrêt (second signal : sortie immédiate)");
+                exit_on_second_signal();
                 self.finish_fs()?;
                 shutdown(&mut self.core, save);
+            }
+            // SHUTDOWN : comme un signal (réglage par défaut identique) ; échec sans
+            // FORCE : erreur au client, le serveur continue.
+            if let Some((save, force)) = self.core.take_shutdown() {
+                eprintln!("[shutdown] SHUTDOWN reçu : arrêt");
+                self.finish_fs()?;
+                let save = save.unwrap_or(self.signals.as_ref().is_some_and(|s| s.save));
+                let e = try_shutdown(&mut self.core, save);
+                eprintln!("[shutdown] {e}");
+                if force {
+                    std::process::exit(1)
+                }
+                self.core.shutdown_failed(&e);
             }
             self.core.fire_timers();
             // Par tranches : les réponses des connexions qui ont fini partent
