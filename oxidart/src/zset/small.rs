@@ -166,9 +166,15 @@ impl ZSmall {
     pub fn find(&self, m: &[u8]) -> Option<usize> {
         let base = self.bytes_ptr();
         let mut off = 0;
+        // membres d'au moins 8 octets : les 8 derniers comparés d'abord en un mot (les
+        // membres d'un ZSet partagent souvent un préfixe, `user:…`), memcmp ensuite
+        let tail = (m.len() >= 8).then(|| unsafe { m.as_ptr().add(m.len() - 8).cast::<u64>().read_unaligned() });
         for (i, &l) in self.lens().iter().enumerate() {
             let l = l as usize;
-            if l == m.len() && unsafe { std::slice::from_raw_parts(base.add(off), l) } == m {
+            if l == m.len()
+                && tail.is_none_or(|t| unsafe { base.add(off + l - 8).cast::<u64>().read_unaligned() } == t)
+                && unsafe { std::slice::from_raw_parts(base.add(off), l) } == m
+            {
                 return Some(i);
             }
             off += l;

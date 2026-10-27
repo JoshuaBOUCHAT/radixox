@@ -619,6 +619,32 @@ impl ZInput {
         }
     }
 
+    /// Membres tant que `f` rend vrai.
+    fn for_each_while(&self, mut f: impl FnMut(&[u8]) -> bool) {
+        match *self {
+            ZInput::ZSet(i) => {
+                for (_, m) in zset_ref(i).iter() {
+                    if !f(m) {
+                        return;
+                    }
+                }
+            }
+            ZInput::SetTree(root, _) => {
+                // pas d'arrêt dans le parcours valart : le reste est sauté
+                let mut go = true;
+                crate::value::valart().set_for_each(root, |m| go = go && f(m));
+            }
+            ZInput::SetSmall(p) => {
+                for [m] in unsafe { crate::small::entries::<1>(p) } {
+                    if !f(m) {
+                        return;
+                    }
+                }
+            }
+            ZInput::Empty => {}
+        }
+    }
+
     fn score(&self, m: &[u8]) -> Option<f64> {
         match *self {
             ZInput::ZSet(i) => zset_ref(i).score(m).map(decode_score),
@@ -727,10 +753,10 @@ impl OxidArt {
         if res.is_empty() {
             return Ok(0);
         }
-        let zset = self.get_zset_mut(None, SharedByte::from_slice(dest))?;
-        for (s, m) in &res {
-            zset.add(encode_score(*s), m).ok_or(TypeError::OutOfMemory)?;
-        }
+        // `res` est trié et sans doublon : construit d'un coup (comme au rechargement) ;
+        // −0 rangé comme 0 (même ordre que le tri de `res`)
+        let z = ZSet::from_sorted(res.iter().map(|(s, m)| (encode_score(*s + 0.0), m.as_slice()))).ok_or(TypeError::OutOfMemory)?;
+        self.ensure_container(dest, None, Tag::ZSet, || alloc_zset(z)).map_err(|_| TypeError::ValueNotSet)?;
         Ok(res.len() as u32)
     }
 
@@ -740,10 +766,11 @@ impl OxidArt {
         let mut order: Vec<usize> = (0..ins.len()).collect();
         order.sort_by_key(|&i| ins[i].len());
         let mut n = 0u64;
-        ins[order[0]].for_each(|m, _| {
-            if (limit == 0 || n < limit) && order[1..].iter().all(|&j| ins[j].score(m).is_some()) {
+        ins[order[0]].for_each_while(|m| {
+            if order[1..].iter().all(|&j| ins[j].score(m).is_some()) {
                 n += 1;
             }
+            limit == 0 || n < limit
         });
         Ok(n)
     }

@@ -983,6 +983,16 @@ petite entrée et sonde les autres par l'index. Différentiel contre Valkey
 écart sur 10 × 20 000 commandes. Calcul en une fois (pas de tranches) : à reprendre avec
 les lectures géantes si des entrées de plusieurs millions de membres apparaissent.
 
+Mesures (`scripts/bench_zset_ops.sh`, pipeline 16, 50 connexions, contre Valkey 9.1.2,
+mono-thread des deux côtés) : paires de 100 membres (moitié commune) ZUNION ×1,37,
+ZINTER ×5,3, ZDIFF ×8, ZINTERSTORE ×5,3, ZUNIONSTORE ×1,10, ZINTERCARD ×6,5 ; paires de
+10 000 membres ×1,9 à ×3 ; ZSCAN complet d'1 M membres 750 ms contre 1 080 (COUNT 100).
+Deux correctifs venus du bench : la destination d'un STORE est construite d'un coup
+(`ZSet::from_sorted`, comme au rechargement : ZUNIONSTORE ×0,58 → ×1,1), et la recherche
+de la petite forme compare d'abord les 8 derniers octets en un mot avant `memcmp` (membres
+à préfixe commun : ZINTERCARD 66 k → 240 k/s). Reste lent : ZUNION de petites entrées
+(table de hachage de `Vec<u8>` par appel).
+
 ## 14. List — architecture retenue (2026-10-27, implémentée le même jour, §14.9)
 
 ### 14.0 Pourquoi, et pour quels usages
