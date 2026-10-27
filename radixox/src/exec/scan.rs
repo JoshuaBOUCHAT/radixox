@@ -289,17 +289,31 @@ pub fn cmd_scan(
     count: Option<usize>,
     ty: Option<&[u8]>,
 ) -> Result<(u64, ScanPage), Frame> {
-    let cursor: u64 = std::str::from_utf8(cursor)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| Frame::Error("ERR invalid cursor".into()))?;
     let ty = match ty {
         None => None,
         Some(t) => Some(redis_type(t).ok_or_else(|| Frame::Error("ERR unknown type name".into()))?),
     };
     let count = count.unwrap_or(DEFAULT_COUNT);
-    let now = art.now;
+    with_cursor(client_id, cursor, art.now, |from| {
+        let page = scan_page(art, from, pattern, count, ty);
+        let next = page.next.clone();
+        (page, next)
+    })
+}
 
+/// Curseur côté serveur, commun à SCAN et ZSCAN : `cursor` repris (0 : neuf), `page(from)`
+/// rend sa page et la position (octets) où reprendre, `None` à la fin. Rend le curseur
+/// suivant (0 : fini) et la page.
+pub fn with_cursor<R>(
+    client_id: u64,
+    cursor: &[u8],
+    now: u64,
+    page: impl FnOnce(&[u8]) -> (R, Option<Vec<u8>>),
+) -> Result<(u64, R), Frame> {
+    let cursor: u64 = std::str::from_utf8(cursor)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| Frame::Error("ERR invalid cursor".into()))?;
     CURSORS.with(|c| {
         let mut c = c.borrow_mut();
         // Reprise : le slot sort de la liste le temps de l'appel ; il garde
@@ -316,9 +330,9 @@ pub fn cmd_scan(
             (Some((idx, owner)), from)
         };
 
-        let page = scan_page(art, &from, pattern, count, ty);
+        let (page, next) = page(&from);
 
-        let Some(next) = page.next.clone() else {
+        let Some(next) = next else {
             if let Some((idx, _)) = slot {
                 c.release(idx);
             }
@@ -346,6 +360,60 @@ pub fn cmd_scan(
         c.store(idx, owner, next, now);
         Ok((c.encode(idx), page))
     })
+}
+
+/// ZSCAN key cursor [MATCH] [COUNT] [NOSCORES] : position = score encodé (8 octets) puis
+/// membre ; parcours dans l'ordre du ZSet, strictement après la dernière entrée rendue
+/// (une entrée présente tout le long sort au moins une fois). Petit ZSet : en entier.
+pub fn cmd_zscan(
+    art: &mut OxidArt,
+    client_id: u64,
+    key: &[u8],
+    cursor: &[u8],
+    pattern: Option<&[u8]>,
+    count: Option<usize>,
+    noscores: bool,
+    out: &mut Vec<u8>,
+) {
+    use radixox_lib::shared_frame::{encode_array_len, encode_bulk, extend_encode};
+    let now = art.now;
+    let mut err = None;
+    let r = with_cursor(client_id, cursor, now, |from| {
+        let from = (from.len() >= 8).then(|| (u64::from_be_bytes(from[..8].try_into().unwrap()), &from[8..]));
+        match art.zscan_page(key, from, count.unwrap_or(10)) {
+            Ok((items, next)) => (
+                items,
+                next.map(|(s, m)| {
+                    let mut b = s.to_be_bytes().to_vec();
+                    b.extend_from_slice(&m);
+                    b
+                }),
+            ),
+            Err(t) => {
+                err = Some(t);
+                (Vec::new(), None)
+            }
+        }
+    });
+    if err.is_some() {
+        extend_encode(out, &Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()));
+        return;
+    }
+    match r {
+        Err(e) => extend_encode(out, &e),
+        Ok((next, items)) => {
+            let items: Vec<_> = items.into_iter().filter(|(m, _)| pattern.is_none_or(|p| glob_match(p, m))).collect();
+            encode_array_len(out, 2);
+            encode_bulk(out, next.to_string().as_bytes());
+            encode_array_len(out, items.len() * if noscores { 1 } else { 2 });
+            for (m, s) in items {
+                encode_bulk(out, &m);
+                if !noscores {
+                    encode_bulk(out, &oxidart::zset::format_score(s));
+                }
+            }
+        }
+    }
 }
 
 fn scan_page(

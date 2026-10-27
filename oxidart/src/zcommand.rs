@@ -3,7 +3,9 @@
 //! `InnerZCommand` (l'ancien ZSet : `SmallVec` trié puis `BTreeSet` + `HashMap`) ne sert
 //! plus que d'oracle aux tests différentiels.
 
-use radixox_lib::cmd::{ZAddFlags, ZRangeBy};
+use std::cmp::Ordering;
+
+use radixox_lib::cmd::{ZAddFlags, ZAggregate, ZOp, ZRangeBy};
 use radixox_lib::shared_byte::SharedByte;
 
 use crate::{
@@ -587,5 +589,186 @@ impl OxidArt {
             return Err(TypeError::NotAFloat);
         }
         Ok(new)
+    }
+}
+
+/// Entrée d'une opération d'ensemble : ZSet, Set (score 1, comme Redis) ou clé absente.
+enum ZInput {
+    ZSet(u32),
+    SetTree(u32, u32),
+    SetSmall(*const u8),
+    Empty,
+}
+
+impl ZInput {
+    fn len(&self) -> usize {
+        match *self {
+            ZInput::ZSet(i) => zset_ref(i).len(),
+            ZInput::SetTree(_, card) => card as usize,
+            ZInput::SetSmall(p) => unsafe { crate::small::entries::<1>(p).len() },
+            ZInput::Empty => 0,
+        }
+    }
+
+    fn for_each(&self, mut f: impl FnMut(&[u8], f64)) {
+        match *self {
+            ZInput::ZSet(i) => zset_ref(i).iter().for_each(|(s, m)| f(m, decode_score(s))),
+            ZInput::SetTree(root, _) => crate::value::valart().set_for_each(root, |m| f(m, 1.0)),
+            ZInput::SetSmall(p) => unsafe { crate::small::entries::<1>(p) }.iter().for_each(|[m]| f(m, 1.0)),
+            ZInput::Empty => {}
+        }
+    }
+
+    fn score(&self, m: &[u8]) -> Option<f64> {
+        match *self {
+            ZInput::ZSet(i) => zset_ref(i).score(m).map(decode_score),
+            ZInput::SetTree(root, _) => crate::value::valart().set_contains(root, m).then_some(1.0),
+            ZInput::SetSmall(p) => unsafe { crate::small::find::<1>(p, m) }.map(|_| 1.0),
+            ZInput::Empty => None,
+        }
+    }
+}
+
+/// Score pondéré : NaN (0 × ±inf) ramené à 0, comme Redis.
+#[inline]
+fn weighted(s: f64, w: f64) -> f64 {
+    let x = s * w;
+    if x.is_nan() { 0.0 } else { x }
+}
+
+#[inline]
+fn aggregate(agg: ZAggregate, a: f64, b: f64) -> f64 {
+    match agg {
+        ZAggregate::Sum => {
+            let x = a + b;
+            if x.is_nan() { 0.0 } else { x }
+        }
+        // comme Redis : un NaN (poids × score des entrées sondées de ZINTER) laisse `a`
+        ZAggregate::Min => if b < a { b } else { a },
+        ZAggregate::Max => if b > a { b } else { a },
+    }
+}
+
+impl OxidArt {
+    fn zop_inputs(&mut self, keys: &[&[u8]]) -> Result<Vec<ZInput>, RedisType> {
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            out.push(match self.get_ref(k) {
+                None => ZInput::Empty,
+                Some(v) => unsafe {
+                    match v.tag {
+                        Tag::ZSet => ZInput::ZSet(v.val.idx),
+                        Tag::Set => ZInput::SetTree(v.val.idx, v.val.cont.card),
+                        Tag::SetSmall => ZInput::SetSmall(v.val.ptr),
+                        t => return Err(t.redis_type()),
+                    }
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    /// ZUNION / ZINTER / ZDIFF : `(score, membre)` triés. `weights` vide : 1 partout ;
+    /// ZDIFF : scores de la première entrée, sans poids.
+    pub fn cmd_zsetop(&mut self, op: ZOp, keys: &[&[u8]], weights: &[f64], agg: ZAggregate) -> Result<Vec<(f64, SharedByte)>, RedisType> {
+        let ins = self.zop_inputs(keys)?;
+        let w = |i: usize| weights.get(i).copied().unwrap_or(1.0);
+        let mut out: Vec<(f64, SharedByte)> = Vec::new();
+        match op {
+            ZOp::Union => {
+                let mut acc: std::collections::HashMap<Vec<u8>, f64> = std::collections::HashMap::new();
+                // dans l'ordre des tailles comme Redis : avec des infinis, l'ordre de
+                // l'agrégation change le résultat (inf + -inf → 0)
+                let mut order: Vec<usize> = (0..ins.len()).collect();
+                order.sort_by_key(|&i| ins[i].len());
+                for i in order {
+                    ins[i].for_each(|m, s| {
+                        let v = weighted(s, w(i));
+                        acc.entry(m.to_vec()).and_modify(|a| *a = aggregate(agg, *a, v)).or_insert(v);
+                    });
+                }
+                out.extend(acc.into_iter().map(|(m, s)| (s, SharedByte::from_slice(m))));
+            }
+            ZOp::Inter => {
+                // la plus petite entrée, les autres sondées (dans l'ordre des tailles, comme Redis)
+                let mut order: Vec<usize> = (0..ins.len()).collect();
+                order.sort_by_key(|&i| ins[i].len());
+                let first = order[0];
+                ins[first].for_each(|m, s| {
+                    let mut v = weighted(s, w(first));
+                    for &j in &order[1..] {
+                        match ins[j].score(m) {
+                            // pas ramené à 0 ici (Redis) : SUM → 0, MIN/MAX → inchangé
+                            Some(sj) => v = aggregate(agg, v, sj * w(j)),
+                            None => return,
+                        }
+                    }
+                    out.push((v, SharedByte::from_slice(m)));
+                });
+            }
+            ZOp::Diff => {
+                ins[0].for_each(|m, s| {
+                    if ins[1..].iter().all(|o| o.score(m).is_none()) {
+                        out.push((s, SharedByte::from_slice(m)));
+                    }
+                });
+            }
+        }
+        // -0 = 0 comme Redis (jamais de NaN ici : `weighted` et `aggregate` les ramènent à 0)
+        out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal).then_with(|| a.1.as_slice().cmp(b.1.as_slice())));
+        Ok(out)
+    }
+
+    /// ZUNIONSTORE / ZINTERSTORE / ZDIFFSTORE : `dest` remplacée (quel que soit son type) par
+    /// le résultat, supprimée s'il est vide ; rend le cardinal.
+    pub fn cmd_zsetop_store(&mut self, dest: &[u8], op: ZOp, keys: &[&[u8]], weights: &[f64], agg: ZAggregate) -> Result<u32, TypeError> {
+        let res = self.cmd_zsetop(op, keys, weights, agg).map_err(|_| TypeError::ValueNotSet)?;
+        self.del(dest);
+        if res.is_empty() {
+            return Ok(0);
+        }
+        let zset = self.get_zset_mut(None, SharedByte::from_slice(dest))?;
+        for (s, m) in &res {
+            zset.add(encode_score(*s), m).ok_or(TypeError::OutOfMemory)?;
+        }
+        Ok(res.len() as u32)
+    }
+
+    /// ZINTERCARD : cardinal de l'intersection, arrêté à `limit` (0 : sans limite).
+    pub fn cmd_zintercard(&mut self, keys: &[&[u8]], limit: u64) -> Result<u64, RedisType> {
+        let ins = self.zop_inputs(keys)?;
+        let mut order: Vec<usize> = (0..ins.len()).collect();
+        order.sort_by_key(|&i| ins[i].len());
+        let mut n = 0u64;
+        ins[order[0]].for_each(|m, _| {
+            if (limit == 0 || n < limit) && order[1..].iter().all(|&j| ins[j].score(m).is_some()) {
+                n += 1;
+            }
+        });
+        Ok(n)
+    }
+
+    /// Page de ZSCAN : jusqu'à `count` entrées examinées strictement après `from`
+    /// (`(score encodé, membre)`), dans l'ordre du ZSet ; et la position où reprendre
+    /// (`None` : fini). Un petit ZSet (ou qui tient dans `count`) est rendu en entier.
+    pub fn zscan_page(&mut self, key: &[u8], from: Option<(u64, &[u8])>, count: usize) -> Result<(Vec<(SharedByte, f64)>, Option<(u64, Vec<u8>)>), RedisType> {
+        let Some(v) = self.get_ref(key) else { return Ok((Vec::new(), None)) };
+        let zset = v.as_zset()?;
+        let all = |z: &ZSet| z.iter().map(|(s, m)| (SharedByte::from_slice(m), decode_score(s))).collect::<Vec<_>>();
+        if from.is_none() && (matches!(zset, ZSet::Small(_)) || zset.len() <= count) {
+            return Ok((all(zset), None));
+        }
+        let start = match from {
+            None => 0,
+            Some((fs, fm)) => zset.lower_bound(|s, m| if (s, m) <= (fs, fm) { Ordering::Greater } else { Ordering::Less }),
+        };
+        let mut out = Vec::with_capacity(count.min(zset.len().saturating_sub(start)));
+        let mut last = None;
+        for (s, m) in zset.iter_from(start).take(count) {
+            out.push((SharedByte::from_slice(m), decode_score(s)));
+            last = Some((s, m));
+        }
+        let next = (start + out.len() < zset.len()).then(|| last.map(|(s, m)| (s, m.to_vec()))).flatten();
+        Ok((out, next))
     }
 }

@@ -751,6 +751,32 @@ impl ValTrees {
         Some(key)
     }
 
+    /// Cardinal de la vue T0 de `set` (O(n), sans consommer les images) : pour un
+    /// appelant qui ne tient pas le cardinal T0 lui-même (oracle legacy).
+    pub fn set_count_t0(&self, root: u32) -> u32 {
+        let mut n = 0;
+        let mut stack = vec![(root, 0usize)];
+        while let Some((idx, depth)) = stack.pop() {
+            if depth == DISPATCH_LEVELS {
+                n += self.set_collisions.get_t0(idx).len() as u32;
+                continue;
+            }
+            let node: &SetNode = match self.save.peek(idx) {
+                Some(T0::Slab) => unsafe { &self.nodes.get_unchecked(idx).set },
+                Some(T0::Image(ValNodeImage::Set(x))) => x,
+                _ => panic!("nœud valart {idx} absent de la vue T0"),
+            };
+            for k in 0..node.len() {
+                let child = node.child(node.slot_at(k));
+                if child != NO_CHILD {
+                    stack.push((child, depth + 1));
+                }
+            }
+            n += node.len() as u32;
+        }
+        n
+    }
+
     /// Démarre la sérialisation du conteneur `root` pendant une save : écrit
     /// sa cardinalité T0 et prépare `ser`. Format : `varint nb | (varint len | membre)*`.
     /// `card` : cardinal T0 du conteneur (tenu par l'appelant, dans la valeur de la clé).

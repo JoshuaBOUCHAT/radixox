@@ -65,6 +65,9 @@ if len(sys.argv) > 5:
             args += [b"0" if k == b"zlex" else b"%d" % (i % 37 - 18), b"m%d" % i]
         for c in (rx, vk):
             send(c, args)
+for c in (rx, vk):
+    send(c, [b"SADD", b"sset"] + [b"m%d" % i for i in range(0, 400, 7)])
+    send(c, [b"SET", b"str", b"x"])
 ops = 0
 mismatch = 0
 for step in range(int(sys.argv[4]) if len(sys.argv) > 4 else 20000):
@@ -116,16 +119,57 @@ for step in range(int(sys.argv[4]) if len(sys.argv) > 4 else 20000):
             print("ZRANDMEMBER", k, n, a, b); mismatch += 1
         continue
     elif r < 89: cmd = [b"DEL", k]
+    elif r < 95:
+        # ZUNION/ZINTER/ZDIFF (+STORE), entrées : ZSet, Set (score 1), absente, chaîne (WRONGTYPE rare)
+        src = keys + [b"zlex", b"sset", b"nokey"] + ([b"str"] if rng.random() < .05 else [])
+        ins = [rng.choice(src) for _ in range(rng.randrange(1, 4))]
+        op = rng.choice([b"ZUNION", b"ZINTER", b"ZDIFF"])
+        store = rng.random() < .4
+        cmd = ([op + b"STORE", rng.choice(keys + [b"zdst"])] if store else [op]) + [b"%d" % len(ins)] + ins
+        if op != b"ZDIFF":
+            if rng.random() < .4:
+                cmd += [b"WEIGHTS"] + [rng.choice([b"1", b"2", b"-1", b"0.5", b"0", b"inf"]) for _ in ins]
+            if rng.random() < .4:
+                cmd += [b"AGGREGATE", rng.choice([b"SUM", b"MIN", b"MAX"])]
+        if not store and rng.random() < .5:
+            cmd += [b"WITHSCORES"]
+    elif r < 96:
+        ins = [rng.choice(keys + [b"sset", b"nokey"]) for _ in range(rng.randrange(1, 4))]
+        cmd = [b"ZINTERCARD", b"%d" % len(ins)] + ins + ([b"LIMIT", b"%d" % rng.randrange(0, 20)] if rng.random() < .5 else [])
+    elif r < 98:
+        # ZSCAN : parcours complet de chaque côté, comparé comme ensemble
+        pat = rng.choice([None, b"m1*", b"m?"])
+        nos = rng.random() < .3
+        res = []
+        for c in (rx, vk):
+            cur, got, n = b"0", {}, 0
+            while True:
+                q = [b"ZSCAN", k, cur] + ([b"MATCH", pat] if pat else []) + [b"COUNT", b"%d" % rng.randrange(1, 30)] + ([b"NOSCORES"] if nos else [])
+                cur, items = send(c, q)
+                step_ = 1 if nos else 2
+                for i in range(0, len(items), step_):
+                    got[items[i]] = None if nos else float(items[i + 1])
+                n += 1
+                if cur == b"0" or n > 10000:
+                    break
+            res.append(got)
+        if res[0] != res[1]:
+            mismatch += 1; print("ZSCAN", k, pat, nos, len(res[0]), len(res[1]))
+        continue
     else: cmd = [b"ZRANGE", k, b"0", b"-1", b"WITHSCORES"]
     a, b = send(rx, cmd), send(vk, cmd)
     ops += 1
+    if cmd[0].endswith(b"STORE") and norm(a) == norm(b):
+        q = [b"ZRANGE", cmd[1], b"0", b"-1", b"WITHSCORES"]
+        a, b = send(rx, q), send(vk, q)
+        cmd = cmd + [b"=>"] + q
     if norm(a) != norm(b):
         mismatch += 1
         if mismatch <= 15:
             print("DIFF", b" ".join(cmd).decode(errors="replace"))
             print("  radixox:", a)
             print("  valkey :", b)
-for k in keys + [b"zlex"]:
+for k in keys + [b"zlex", b"zdst"]:
     a = send(rx, [b"ZRANGE", k, b"0", b"-1", b"WITHSCORES"]); b = send(vk, [b"ZRANGE", k, b"0", b"-1", b"WITHSCORES"])
     if norm(a) != norm(b):
         mismatch += 1; print("FINAL DIFF", k)

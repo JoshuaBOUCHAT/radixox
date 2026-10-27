@@ -35,6 +35,22 @@ pub enum LexBound<'a> {
     Excl(&'a [u8]),
 }
 
+/// Opération d'ensemble des ZSet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZOp {
+    Union,
+    Inter,
+    Diff,
+}
+
+/// AGGREGATE de ZUNION / ZINTER.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZAggregate {
+    Sum,
+    Min,
+    Max,
+}
+
 /// Ce que désigne une plage de ZSet ; bornes toujours dans l'ordre (min, max), même
 /// pour les variantes REV (le parseur les remet dans l'ordre).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -405,6 +421,23 @@ pub enum Cmd<'a> {
         key: &'a [u8],
         members: SmallVec<4, SharedByte>,
     },
+
+    /// ZUNION / ZINTER / ZDIFF numkeys key [key ...] [WEIGHTS w ...] [AGGREGATE SUM|MIN|MAX]
+    /// [WITHSCORES] ; variantes STORE (`dest`). `weights` vide : tous à 1.
+    ZSetOp {
+        op: ZOp,
+        dest: Option<&'a [u8]>,
+        keys: SmallVec<4, &'a [u8]>,
+        weights: SmallVec<4, f64>,
+        agg: ZAggregate,
+        with_scores: bool,
+    },
+
+    /// ZINTERCARD numkeys key [key ...] [LIMIT limit] (0 : sans limite)
+    ZInterCard { keys: SmallVec<4, &'a [u8]>, limit: u64 },
+
+    /// ZSCAN key cursor [MATCH pattern] [COUNT count] [NOSCORES]
+    ZScan { key: &'a [u8], cursor: &'a [u8], pattern: Option<&'a [u8]>, count: Option<usize>, noscores: bool },
 
     /// ZINCRBY key increment member
     ZIncrBy {
@@ -1209,6 +1242,119 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
         b"zscore" => { exact!(2); Cmd::ZScore { key: args[0], member: sb(args[1]) } }
         b"zrem" => { at_least!(2); Cmd::ZRem { key: args[0], members: owned!(1) } }
         b"zincrby" => { exact!(3); Cmd::ZIncrBy { key: args[0], delta: float(args[1])?, member: sb(args[2]) } }
+        b"zunion" | b"zinter" | b"zdiff" | b"zunionstore" | b"zinterstore" | b"zdiffstore" => {
+            let store = lc.ends_with(b"store");
+            let op = match lc[1] {
+                b'u' => ZOp::Union,
+                b'i' => ZOp::Inter,
+                _ => ZOp::Diff,
+            };
+            let need: &'static str = match &*lc {
+                b"zunion" => "ERR at least 1 input key is needed for 'zunion' command",
+                b"zinter" => "ERR at least 1 input key is needed for 'zinter' command",
+                b"zdiff" => "ERR at least 1 input key is needed for 'zdiff' command",
+                b"zunionstore" => "ERR at least 1 input key is needed for 'zunionstore' command",
+                b"zinterstore" => "ERR at least 1 input key is needed for 'zinterstore' command",
+                _ => "ERR at least 1 input key is needed for 'zdiffstore' command",
+            };
+            let start = store as usize;
+            at_least!(start + 2);
+            let nk = int(args[start])?;
+            if nk <= 0 {
+                return Err(CmdError::Msg(need));
+            }
+            let nk = nk as usize;
+            let first = start + 1;
+            if n < first + nk {
+                return Err(CmdError::Syntax);
+            }
+            let mut keys = SmallVec::new();
+            for k in &args[first..first + nk] {
+                keys.push(*k);
+            }
+            let (mut weights, mut agg, mut with_scores) = (SmallVec::new(), ZAggregate::Sum, false);
+            let mut i = first + nk;
+            while i < n {
+                let a = args[i];
+                if op != ZOp::Diff && a.eq_ignore_ascii_case(b"weights") {
+                    if n < i + 1 + nk {
+                        return Err(CmdError::Syntax);
+                    }
+                    weights = SmallVec::new();
+                    for w in &args[i + 1..i + 1 + nk] {
+                        weights.push(arg_f64(w).ok_or(CmdError::Msg("ERR weight value is not a float"))?);
+                    }
+                    i += 1 + nk;
+                } else if op != ZOp::Diff && a.eq_ignore_ascii_case(b"aggregate") {
+                    let v = *args.get(i + 1).ok_or(CmdError::Syntax)?;
+                    agg = if v.eq_ignore_ascii_case(b"sum") {
+                        ZAggregate::Sum
+                    } else if v.eq_ignore_ascii_case(b"min") {
+                        ZAggregate::Min
+                    } else if v.eq_ignore_ascii_case(b"max") {
+                        ZAggregate::Max
+                    } else {
+                        return Err(CmdError::Syntax);
+                    };
+                    i += 2;
+                } else if !store && a.eq_ignore_ascii_case(b"withscores") {
+                    with_scores = true;
+                    i += 1;
+                } else {
+                    return Err(CmdError::Syntax);
+                }
+            }
+            Cmd::ZSetOp { op, dest: store.then(|| args[0]), keys, weights, agg, with_scores }
+        }
+        b"zintercard" => {
+            at_least!(2);
+            let nk = int(args[0])?;
+            if nk <= 0 {
+                return Err(CmdError::Msg("ERR at least 1 input key is needed for 'zintercard' command"));
+            }
+            let nk = nk as usize;
+            if n < 1 + nk {
+                return Err(CmdError::Syntax);
+            }
+            let mut keys = SmallVec::new();
+            for k in &args[1..1 + nk] {
+                keys.push(*k);
+            }
+            let limit = match &args[1 + nk..] {
+                [] => 0,
+                [l, v] if l.eq_ignore_ascii_case(b"limit") => {
+                    arg_i64(v).and_then(|v| u64::try_from(v).ok()).ok_or(CmdError::Msg("ERR LIMIT can't be negative"))?
+                }
+                _ => return Err(CmdError::Syntax),
+            };
+            Cmd::ZInterCard { keys, limit }
+        }
+        b"zscan" => {
+            at_least!(2);
+            let (mut pattern, mut count, mut noscores) = (None, None, false);
+            let mut i = 2;
+            while i < n {
+                let a = args[i];
+                if a.eq_ignore_ascii_case(b"noscores") {
+                    noscores = true;
+                    i += 1;
+                    continue;
+                }
+                let v = *args.get(i + 1).ok_or(CmdError::Syntax)?;
+                if a.eq_ignore_ascii_case(b"match") {
+                    pattern = Some(v);
+                } else if a.eq_ignore_ascii_case(b"count") {
+                    match int(v)? {
+                        c if c < 1 => return Err(CmdError::Syntax),
+                        c => count = Some(c as usize),
+                    }
+                } else {
+                    return Err(CmdError::Syntax);
+                }
+                i += 2;
+            }
+            Cmd::ZScan { key: args[0], cursor: args[1], pattern, count, noscores }
+        }
 
         // ── Pub/Sub ──────────────────────────────────────────────────────
         b"subscribe" => { at_least!(1); Cmd::Subscribe(owned!(0)) }
@@ -1421,6 +1567,7 @@ impl<'a> Cmd<'a> {
             Cmd::ZRem { members, .. } => members.len(),
             Cmd::ZPop { count, .. } => count.unwrap_or(1).max(1) as usize,
             Cmd::ZRemRange { .. } => 1,
+            Cmd::ZSetOp { dest: Some(_), .. } => 1,
             Cmd::LPush { vals, .. } => vals.len(),
             Cmd::LPop { count, .. } => count.unwrap_or(1).max(1) as usize,
             Cmd::LSet { .. }

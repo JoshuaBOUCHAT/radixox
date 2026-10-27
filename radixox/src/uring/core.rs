@@ -559,6 +559,7 @@ fn produced_key<'a>(cmd: &Cmd<'a>) -> Option<&'a [u8]> {
     match *cmd {
         Cmd::LPush { key, exists: false, .. } | Cmd::ZAdd { key, .. } | Cmd::ZIncrBy { key, .. } => Some(key),
         Cmd::LMove { dst, .. } | Cmd::BLMove { dst, .. } => Some(dst),
+        Cmd::ZSetOp { dest: Some(dest), .. } => Some(dest),
         _ => None,
     }
 }

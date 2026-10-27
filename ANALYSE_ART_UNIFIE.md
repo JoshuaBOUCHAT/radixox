@@ -663,7 +663,7 @@ Comme Redis (`struct zset { dict *dict; zskiplist *zsl; }`), l'index membre → 
 | ZSCORE, ZMSCORE, existence dans ZADD, ancien score dans ZREM / ZINCRBY, ZINTER / ZUNION / ZDIFF (appartenance) | index (valart, haché) |
 | ZRANGE (rang, BYSCORE, BYLEX), ZRANK, ZCOUNT, ZLEXCOUNT, ZPOPMIN/MAX, ZREMRANGEBY* | B+tree compté |
 | ZRANDMEMBER | B+tree : rang tiré au hasard puis sélection en O(log n) (uniforme) |
-| ZSCAN | index (ordre valart stable sous mutation, même garantie qu'un curseur de table) |
+| ZSCAN | B+tree : reprise strictement après le dernier (score, membre) rendu (curseur côté serveur, comme SCAN) ; petit ZSet ou COUNT ≥ cardinal : en entier |
 | ZCARD | compteur de l'en-tête |
 
 ### 13.2 Deux formes
@@ -967,7 +967,21 @@ Leviers restants (mémoire) : petite forme directement dans la valeur oxidart
 (`Tag::ZSetSmall`, spec §13.3 : −3,2 o/membre sur les petits), répertoires de l'index en
 64 o (~−1,5 o), remplissage des seaux.
 
-Reste : ZSCAN, ZUNION / ZINTER / ZDIFF (STORE), BZPOP* (service direct par `ZADD` / `ZINCRBY`, même mécanisme que les listes : §14.3).
+BZPOP* : service direct par `ZADD` / `ZINCRBY` / `Z*STORE` (même mécanisme que les listes :
+§14.3).
+
+**ZSCAN, ZUNION / ZINTER / ZDIFF (+STORE), ZINTERCARD (2026-10-27).** ZSCAN reprend par le
+curseur serveur de SCAN (`exec/scan.rs::with_cursor`, position = score en clé triable sur
+8 octets + membre) : une entrée présente tout le long de l'itération sort au moins une fois,
+dans l'ordre du ZSet ; MATCH filtré après la page, NOSCORES. Les opérations ensemblistes
+acceptent ZSet et Set (score 1) et suivent Redis jusque dans les cas limites : entrées
+traitées par taille croissante (avec des infinis, l'ordre de l'agrégation change le
+résultat : inf + −inf → 0), poids × score ramené à 0 s'il vaut NaN sauf pour les entrées
+sondées de ZINTER (SUM → 0, MIN / MAX → inchangé), −0 = 0 au tri. ZINTER part de la plus
+petite entrée et sonde les autres par l'index. Différentiel contre Valkey
+(`scripts/zset_vs_valkey.py`, contenu de la destination vérifié après chaque STORE) : 0
+écart sur 10 × 20 000 commandes. Calcul en une fois (pas de tranches) : à reprendre avec
+les lectures géantes si des entrées de plusieurs millions de membres apparaissent.
 
 ## 14. List — architecture retenue (2026-10-27, implémentée le même jour, §14.9)
 

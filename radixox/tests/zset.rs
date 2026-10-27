@@ -264,3 +264,83 @@ fn wrongtype_zcard_on_string() {
     let err = c.zcard::<_, i64>(k).unwrap_err();
     common::assert_wrongtype(&err);
 }
+
+// ── ZUNION / ZINTER / ZDIFF / ZINTERCARD / ZSCAN ────────────────────────────
+
+#[test]
+fn zset_ops_with_weights_and_set_input() {
+    let mut c = server();
+    let _: () = redis::cmd("DEL").arg(&["zop:a", "zop:b", "zop:s", "zop:d"][..]).query(&mut c).unwrap();
+    let _: () = redis::cmd("ZADD").arg("zop:a").arg(&["1", "x", "2", "y", "3", "z"][..]).query(&mut c).unwrap();
+    let _: () = redis::cmd("ZADD").arg("zop:b").arg(&["10", "y", "20", "w"][..]).query(&mut c).unwrap();
+    let _: () = redis::cmd("SADD").arg("zop:s").arg(&["y", "z"][..]).query(&mut c).unwrap();
+
+    let u: Vec<(String, f64)> = redis::cmd("ZUNION")
+        .arg(&["2", "zop:a", "zop:b", "WEIGHTS", "2", "1", "WITHSCORES"][..])
+        .query(&mut c)
+        .unwrap();
+    assert_eq!(u, vec![("x".into(), 2.0), ("z".into(), 6.0), ("y".into(), 14.0), ("w".into(), 20.0)]);
+
+    // un Set compte avec le score 1
+    let i: Vec<(String, f64)> =
+        redis::cmd("ZINTER").arg(&["2", "zop:a", "zop:s", "AGGREGATE", "MAX", "WITHSCORES"][..]).query(&mut c).unwrap();
+    assert_eq!(i, vec![("y".into(), 2.0), ("z".into(), 3.0)]);
+
+    let d: Vec<String> = redis::cmd("ZDIFF").arg(&["2", "zop:a", "zop:b"][..]).query(&mut c).unwrap();
+    assert_eq!(d, vec!["x", "z"]);
+
+    let n: i64 = redis::cmd("ZINTERSTORE").arg(&["zop:d", "2", "zop:a", "zop:b"][..]).query(&mut c).unwrap();
+    assert_eq!(n, 1);
+    let s: f64 = c.zscore("zop:d", "y").unwrap();
+    assert_eq!(s, 12.0);
+
+    let card: i64 = redis::cmd("ZINTERCARD").arg(&["2", "zop:a", "zop:s", "LIMIT", "1"][..]).query(&mut c).unwrap();
+    assert_eq!(card, 1);
+}
+
+#[test]
+fn zunionstore_wakes_bzpopmin() {
+    let mut c = server();
+    let _: () = redis::cmd("DEL").arg(&["zop:w", "zop:src"][..]).query(&mut c).unwrap();
+    let _: () = redis::cmd("ZADD").arg("zop:src").arg(&["5", "m"][..]).query(&mut c).unwrap();
+    let waiter = std::thread::spawn(|| {
+        let mut c = common::conn(PORT);
+        let r: Vec<String> = redis::cmd("BZPOPMIN").arg("zop:w").arg(5).query(&mut c).unwrap();
+        r
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let n: i64 = redis::cmd("ZUNIONSTORE").arg(&["zop:w", "1", "zop:src"][..]).query(&mut c).unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(waiter.join().unwrap(), vec!["zop:w", "m", "5"]);
+}
+
+#[test]
+fn zscan_large_form_returns_every_member() {
+    let mut c = server();
+    let k = "zop:scan";
+    let _: () = redis::cmd("DEL").arg(k).query(&mut c).unwrap();
+    let mut args = Vec::new();
+    for i in 0..2000 {
+        args.push(format!("{}", i % 50));
+        args.push(format!("m{i}"));
+    }
+    let _: () = redis::cmd("ZADD").arg(k).arg(&args).query(&mut c).unwrap();
+    let mut seen = std::collections::HashMap::new();
+    let mut cursor = "0".to_string();
+    let mut pages = 0;
+    loop {
+        let (next, items): (String, Vec<(String, f64)>) =
+            redis::cmd("ZSCAN").arg(k).arg(&cursor).arg("COUNT").arg(100).query(&mut c).unwrap();
+        for (m, s) in items {
+            seen.insert(m, s);
+        }
+        pages += 1;
+        if next == "0" {
+            break;
+        }
+        cursor = next;
+    }
+    assert!(pages > 10, "{pages} pages");
+    assert_eq!(seen.len(), 2000);
+    assert_eq!(seen["m123"], 23.0);
+}

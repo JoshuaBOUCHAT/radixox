@@ -152,6 +152,10 @@ pub fn execute_into<'a>(
             }
             return Executed::Done;
         }
+        Cmd::ZScan { key, cursor, pattern, count, noscores } => {
+            scan::cmd_zscan(art, client.id, key, cursor, pattern, count, noscores, out);
+            return Executed::Done;
+        }
         Cmd::Invalid { name, err } => Frame::Error(err.message(name)),
         cmd => execute_sync(cmd, art),
     };
@@ -380,6 +384,8 @@ pub fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         Cmd::ZScore { key, member } => cmd_zscore(art, key, member),
         Cmd::ZRem { key, members } => cmd_zrem(art, key, &members),
         Cmd::ZIncrBy { key, delta, member } => cmd_zincrby(art, key, delta, member),
+        Cmd::ZSetOp { op, dest, keys, weights, agg, with_scores } => zset::cmd_zsetop(art, op, dest, &keys, &weights, agg, with_scores),
+        Cmd::ZInterCard { keys, limit } => zset::cmd_zintercard(art, &keys, limit),
         // ── List ─────────────────────────────────────────────────────────────
         Cmd::LPush { key, vals, right, exists } => list::cmd_lpush(art, key, &vals, right, exists),
         Cmd::LPop { key, right, count } => list::cmd_lpop(art, key, right, count),
@@ -410,6 +416,7 @@ pub fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         | Cmd::Keys(_)
         | Cmd::KRange { .. }
         | Cmd::Scan { .. }
+        | Cmd::ZScan { .. }
         | Cmd::MGet(_)
         | Cmd::Unlink(_)
         | Cmd::BgSave

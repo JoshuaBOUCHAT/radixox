@@ -178,3 +178,40 @@ pub fn try_bzpop(art: &mut OxidArt, keys: &[&[u8]], max: bool) -> Option<Frame> 
     }
     None
 }
+
+pub fn cmd_zsetop(
+    art: &mut OxidArt,
+    op: radixox_lib::cmd::ZOp,
+    dest: Option<&[u8]>,
+    keys: &[&[u8]],
+    weights: &[f64],
+    agg: radixox_lib::cmd::ZAggregate,
+    with_scores: bool,
+) -> Frame {
+    if let Some(dest) = dest {
+        return match art.cmd_zsetop_store(dest, op, keys, weights, agg) {
+            Ok(n) => Frame::Integer(n as i64),
+            Err(e) => type_error(e),
+        };
+    }
+    match art.cmd_zsetop(op, keys, weights, agg) {
+        Ok(v) => {
+            let mut out = Vec::with_capacity(v.len() * if with_scores { 2 } else { 1 });
+            for (s, m) in v {
+                out.push(Frame::BulkString(m));
+                if with_scores {
+                    out.push(score_bulk(s));
+                }
+            }
+            Frame::Array(out)
+        }
+        Err(t) => wrongtype(t),
+    }
+}
+
+pub fn cmd_zintercard(art: &mut OxidArt, keys: &[&[u8]], limit: u64) -> Frame {
+    match art.cmd_zintercard(keys, limit) {
+        Ok(n) => Frame::Integer(n as i64),
+        Err(t) => wrongtype(t),
+    }
+}
