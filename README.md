@@ -678,6 +678,7 @@ Environment variables:
 | `RADIXOX_TIMEOUT` | `0` | close a client idle for this many seconds (`0` = never), like Redis's `timeout` |
 | `RADIXOX_BATCH_CMDS` | `2048` | commands per slice of a loop turn; replies ready between slices are sent |
 | `RADIXOX_CLIENT_OUTPUT_LIMIT_MB` | `1024` | a normal client whose pending output (replies not yet sent) exceeds this is disconnected; `0` = no limit. Subscribers keep their own limits (32 MB, or 8 MB for 60 s) |
+| `RADIXOX_INPUT_BUDGET_MB` | `1024` | received data waiting in all connections' buffers together; above it, the largest holders stop being read until it drops (TCP backpressure, nobody is disconnected); `0` = no budget |
 | `RADIXOX_OUTPUT_BUDGET_MB` | `1024` | pending output of all connections together; above it, a connection gets its next command only once its previous replies are sent (nobody is disconnected); `0` = no budget |
 | `RADIXOX_RING_BUFS` / `RADIXOX_RING_BUF_KB` | `64` / `32` | receive buffer ring shared by all connections |
 | `RADIXOX_SEND_ASYNC` | off | run sends on kernel io-wq workers (`IOSQE_ASYNC`): helps clients without pipelining when a second core is available |

@@ -590,8 +590,19 @@ bornait la **somme** des connexions (10 000 clients lents × une grosse réponse
 - Tests : `tests/output_limits.rs` (GET de 3 Mo sous limite de 1 Mo fermé, serveur intact ;
   20 GET de 512 Ko non lus sous budget de 1 Mo : pause, autres clients servis, toutes les
   réponses arrivent entières, budget retombé).
-- Reste : le **budget global d'entrée** du §5.3 (`rx` toutes connexions) n'est pas fait ;
-  `clients_input_bytes` le montre déjà.
+- **Budget global d'entrée** (§5.3, `RADIXOX_INPUT_BUDGET_MB`, 1024 par défaut, 0 = sans),
+  fait le même jour : total de `rx` tenu **par écart** (`ConnIn::rx_counted`, `account_rx`
+  aux points de passage : morceau reçu parqué, reconstitution d'une frame, avancée de la
+  fenêtre, parquage, fermeture), resynchronisé exactement au relevé de 100 ms. Au-delà, une
+  connexion qui tient ≥ 64 Kio a sa réception **suspendue** sur-le-champ (recv annulé, pas
+  réarmé : backpressure TCP vers le client, personne n'est fermé) ; reprise au relevé sous
+  90 % du budget. Dépassement borné par ce que l'anneau livre avant l'annulation
+  (64 × 32 Kio). Lien de réplication exclu (ses propres bornes). `INFO` :
+  `input_budget_throttled_clients`, `input_budget_throttle_events`. Test
+  `tests/input_budget.rs` : connexion parquée par BLPOP qui reçoit 16 Mo de SET sous un
+  budget de 1 Mo → suspendue, < 4 Mo tenus ; débloquée, les 16 000 SET passent tous.
+  Coût : aucun mesurable (memtier sans pipeline, passages alternés, 271–276 K contre
+  265–268 K).
 
 ### 6.3 Ce qui est zero-copy, et ce qui ne l'est pas
 

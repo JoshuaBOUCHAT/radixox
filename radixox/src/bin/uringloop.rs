@@ -976,6 +976,9 @@ fn main() -> io::Result<()> {
     if let Some(mb) = std::env::var("RADIXOX_CLIENT_OUTPUT_LIMIT_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
         cfg.client_output_limit = if mb == 0 { usize::MAX } else { mb << 20 };
     }
+    if let Some(mb) = std::env::var("RADIXOX_INPUT_BUDGET_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+        cfg.input_budget = if mb == 0 { usize::MAX } else { mb << 20 };
+    }
     if let Some(mb) = std::env::var("RADIXOX_OUTPUT_BUDGET_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
         cfg.output_budget = if mb == 0 { usize::MAX } else { mb << 20 };
     }

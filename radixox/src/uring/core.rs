@@ -67,6 +67,9 @@ pub struct Config {
     /// `out` au-delà duquel une connexion qui a déjà un send en vol n'est plus
     /// tirée (backpressure, §6.2).
     pub out_backpressure: usize,
+    /// Entrée recopiée (`rx`) de toutes les connexions au-delà de laquelle la réception
+    /// des plus grosses est suspendue (`RADIXOX_INPUT_BUDGET_MB`, 0 = sans).
+    pub input_budget: usize,
     /// Sortie en attente d'un client normal au-delà de laquelle il est fermé
     /// (`RADIXOX_CLIENT_OUTPUT_LIMIT_MB`, 0 = sans ; abonnés : leurs limites).
     pub client_output_limit: usize,
@@ -137,6 +140,7 @@ impl Default for Config {
             batch_cmds: 2048,
             flush_early: 64 << 10,
             out_backpressure: 1 << 20,
+            input_budget: 1 << 30,
             client_output_limit: 1 << 30,
             output_budget: 1 << 30,
             prefetch: oxidart::PREFETCH_BATCH,
@@ -591,6 +595,8 @@ struct OutStats {
     limit_closed: u64,
     /// Relevés en dépassement du budget, depuis le démarrage.
     over_checks: u64,
+    /// Réceptions suspendues par le budget d'entrée, depuis le démarrage.
+    throttle_events: u64,
 }
 
 pub struct Core {
@@ -609,6 +615,10 @@ pub struct Core {
     /// relevé (`out_check`) : celles qui en ont encore ne sont plus tirées.
     out_over: bool,
     out_stats: OutStats,
+    /// Total de `rx` compté par écart (`account_rx`), resynchronisé par `out_check`.
+    rx_total: usize,
+    /// Connexions dont la réception est suspendue par le budget d'entrée (slot, époque).
+    throttled: Vec<(Slot, u32)>,
     /// Recv arrêtés faute de tampon, réarmés quand un tampon revient.
     starved: Vec<Slot>,
     jobs: std::collections::VecDeque<FlushJob>,
@@ -705,6 +715,8 @@ impl Core {
             closing: Vec::new(),
             out_over: false,
             out_stats: OutStats::default(),
+            rx_total: 0,
+            throttled: Vec::new(),
             starved: Vec::new(),
             jobs: Default::default(),
             conn_jobs: Default::default(),
@@ -1436,6 +1448,7 @@ impl Core {
         o.stop_turn = u64::MAX;
         o.link = false;
         o.connecting = false;
+        self.forget_rx(slot as usize);
         self.ins[slot as usize] = ConnIn::default();
     }
 
@@ -1495,6 +1508,7 @@ impl Core {
             if i.rx.len() > self.cfg.query_limit {
                 self.drain(slot);
             }
+            self.account_rx(slot);
             return;
         }
         match i.spans.back_mut() {
@@ -1512,11 +1526,44 @@ impl Core {
     }
 
     fn arm_recv(&mut self, slot: Slot) {
+        if self.ins[slot as usize].throttled {
+            return; // réarmée par `out_check` quand le total d'entrée redescend
+        }
         let o = &mut self.outs[slot as usize];
         o.refs += 1;
         o.recv_armed = true;
         o.recv_cancelled = false;
         self.ops.push(Op::RecvMulti { slot });
+    }
+
+    /// Reporte dans `rx_total` l'écart de taille de `rx` depuis le dernier compte. Au-delà
+    /// du budget d'entrée, une connexion qui tient au moins `THROTTLE_MIN` voit sa
+    /// réception suspendue (recv annulé, pas réarmé) : backpressure TCP, pas de
+    /// fermeture ; reprise au relevé quand le total redescend (RUNTIME_ARCH.md §5.3).
+    fn account_rx(&mut self, slot: Slot) {
+        /// En dessous, une connexion ne pèse rien (frame coupée ordinaire).
+        const THROTTLE_MIN: usize = 64 << 10;
+        let s = slot as usize;
+        let i = &mut self.ins[s];
+        let n = i.rx.len();
+        self.rx_total = self.rx_total - i.rx_counted + n;
+        i.rx_counted = n;
+        if self.rx_total > self.cfg.input_budget
+            && n >= THROTTLE_MIN
+            && !i.throttled
+            && self.outs[s].mode == Mode::Normal
+            && !self.outs[s].link
+        {
+            i.throttled = true;
+            self.throttled.push((slot, self.outs[s].epoch));
+            self.out_stats.throttle_events += 1;
+            self.cancel_recv(slot);
+        }
+    }
+
+    /// Avant de remplacer `ins[s]` (accept, fermeture) : son `rx` sort du total.
+    fn forget_rx(&mut self, s: usize) {
+        self.rx_total -= self.ins[s].rx_counted;
     }
 
     fn try_recycle(&mut self, bid: Bid) {
@@ -1681,7 +1728,11 @@ impl Core {
     /// besoin d'être exact à l'octet.
     fn out_check(&mut self) {
         let (mut total, mut max, mut input, mut with_out) = (0, 0, 0, 0);
-        for (o, i) in self.outs.iter().zip(&self.ins) {
+        for (o, i) in self.outs.iter().zip(self.ins.iter_mut()) {
+            // resynchronise le compte par écart (une écriture dans `rx` pas suivie de
+            // `account_rx` ne fait qu'un écart d'au plus un relevé)
+            i.rx_counted = i.rx.len();
+            input += i.rx.len();
             if o.mode == Mode::Free {
                 continue;
             }
@@ -1689,7 +1740,21 @@ impl Core {
             total += n;
             max = max.max(n);
             with_out += (n > 0) as usize;
-            input += i.rx.len();
+        }
+        self.rx_total = input;
+        // Reprise des réceptions suspendues sous 90 % du budget (hystérésis).
+        if !self.throttled.is_empty() && input <= self.cfg.input_budget / 10 * 9 {
+            for (slot, epoch) in std::mem::take(&mut self.throttled) {
+                let s = slot as usize;
+                if self.outs[s].epoch != epoch || !self.ins[s].throttled {
+                    continue;
+                }
+                self.ins[s].throttled = false;
+                let o = &self.outs[s];
+                if o.mode == Mode::Normal && !o.recv_armed && !self.ins[s].broken {
+                    self.arm_recv(slot);
+                }
+            }
         }
         self.out_over = total > self.cfg.output_budget;
         let st = &mut self.out_stats;
@@ -1770,6 +1835,7 @@ impl Core {
             self.bufs.release(bid);
             self.try_recycle(bid);
         }
+        self.account_rx(slot);
         if too_big {
             self.drain(slot);
             return false;
@@ -2159,6 +2225,9 @@ impl Core {
                 self.try_recycle(bid);
             }
         }
+        for plan in plans.iter() {
+            self.account_rx(plan.slot);
+        }
         for (slot, after) in afters.drain() {
             self.finish_frame(slot, after);
         }
@@ -2250,8 +2319,9 @@ impl Core {
                     format_args!(
                         "clients_output_bytes:{}\r\nclients_output_max_bytes:{}\r\nclients_input_bytes:{}\r\n\
                          output_budget_exceeded:{}\r\noutput_budget_paused_clients:{}\r\noutput_budget_exceeded_checks:{}\r\n\
-                         client_output_limit_closed:{}\r\n",
-                        st.total, st.max, st.input, self.out_over as u8, st.paused, st.over_checks, st.limit_closed
+                         client_output_limit_closed:{}\r\ninput_budget_throttled_clients:{}\r\ninput_budget_throttle_events:{}\r\n",
+                        st.total, st.max, st.input, self.out_over as u8, st.paused, st.over_checks, st.limit_closed,
+                        self.throttled.len(), st.throttle_events
                     ),
                 );
                 let st = self.art.amac_stats;
@@ -2492,6 +2562,7 @@ impl Core {
             self.try_recycle(span.bid);
         }
         self.ins[s].rx_check = !self.ins[s].rx.is_empty();
+        self.account_rx(slot);
     }
 
     /// Une tranche de travail de fond : un job de connexion parquée (tour à
@@ -2913,6 +2984,7 @@ impl Core {
         self.outs[s].mode = Mode::Draining;
         self.unsubscribe_all(slot);
         self.release_queue(slot);
+        self.forget_rx(s);
         self.ins[s] = ConnIn { broken: true, ..ConnIn::default() };
         self.outs[s].out.clear();
         self.outs[s].holds.clear();
@@ -2947,6 +3019,7 @@ impl Core {
             self.bufs.release(span.bid);
             self.try_recycle(span.bid);
         }
+        self.account_rx(slot);
     }
 
     /// `Draining` et plus rien en vol : on ferme et le slot redevient libre.
@@ -2964,6 +3037,7 @@ impl Core {
         o.big_sending = false;
         o.link = false;
         o.connecting = false;
+        self.forget_rx(s);
         self.ins[s] = ConnIn::default();
         self.free.push(slot);
         self.ops.push(Op::Close { slot });

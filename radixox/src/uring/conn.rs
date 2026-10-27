@@ -35,6 +35,11 @@ pub struct ConnIn {
     pub proto_err: Option<&'static str>,
     /// La suite du flux est ignorée (fermeture en cours, erreur de protocole).
     pub broken: bool,
+    /// Taille de `rx` déjà comptée dans le total d'entrée du cœur (`account_rx`).
+    pub rx_counted: usize,
+    /// Réception suspendue par le budget global d'entrée (RUNTIME_ARCH.md §5.3) : pas
+    /// réarmée tant que le total n'est pas redescendu.
+    pub throttled: bool,
 }
 
 impl ConnIn {
