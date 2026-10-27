@@ -239,6 +239,15 @@ fn key_cmp(tie: &impl Tie, h: u32, e: u32) -> Ordering {
     if h == e { Ordering::Equal } else { tie.tie(h, e) }
 }
 
+/// Rang de l'entrée `(s, h)` dans la feuille, par égalité de poignée dans la plage des
+/// scores égaux : aucun membre lu (départager par `tie` coûtait deux défauts de cache par
+/// entrée de même score, la case de la poignée puis l'objet).
+#[inline(always)]
+fn leaf_pos(lf: &Leaf, s: u64, h: u32) -> Option<usize> {
+    let (lt, le) = count_scores(&lf.scores, lf.n as usize, s);
+    (lt..le).find(|&i| lf.handles[i] == h)
+}
+
 /// Position dans une feuille : `leaf`, rang `pos` dans la feuille.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cursor {
@@ -436,9 +445,8 @@ impl BTree {
             *slot = (idx, ci);
             idx = node.child[ci];
         }
-        let lf = leaf(idx);
-        let pos = search(&lf.scores, &lf.handles, lf.n as usize, s, false, |e| key_cmp(tie, h, e));
-        (pos < lf.n as usize && lf.scores[pos] == s && lf.handles[pos] == h).then_some(Cursor { leaf: idx, pos: pos as u16 })
+        // la descente exacte mène à la seule feuille qui peut la contenir
+        leaf_pos(leaf(idx), s, h).map(|pos| Cursor { leaf: idx, pos: pos as u16 })
     }
 
     /// Position de `(s, h)`.
@@ -672,7 +680,21 @@ impl BTree {
 
     /// Rang de `(s, h)` (présente).
     pub fn rank(&self, s: u64, h: u32, tie: &impl Tie) -> u32 {
-        self.lower_bound_key(s, |e| key_cmp(tie, h, e)).0
+        if self.root == NONE {
+            return 0;
+        }
+        let mut rank = 0;
+        let mut idx = self.root;
+        for _ in 0..self.height {
+            let node = internal(idx);
+            let ci = search(&node.sep_s, &node.sep_h, node.n as usize - 1, s, true, |e| key_cmp(tie, h, e));
+            rank += node.count[..ci].iter().sum::<u32>();
+            idx = node.child[ci];
+        }
+        let lf = leaf(idx);
+        let pos = leaf_pos(lf, s, h);
+        debug_assert!(pos.is_some(), "absente");
+        rank + pos.unwrap_or_else(|| search(&lf.scores, &lf.handles, lf.n as usize, s, false, |e| key_cmp(tie, h, e))) as u32
     }
 
     /// Position de l'entrée de rang `r` (`None` : `r ≥ len`).
