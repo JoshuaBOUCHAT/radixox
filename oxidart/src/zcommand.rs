@@ -383,7 +383,7 @@ impl OxidArt {
         let mut push = |(s, m): (u64, &[u8])| {
             emit(m);
             if with_scores {
-                emit(&crate::zset::format_score(decode_score(s)));
+                crate::zset::with_score_text(decode_score(s), &mut emit);
             }
             k += 1;
         };

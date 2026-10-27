@@ -333,11 +333,18 @@ pub fn decode_score(u: u64) -> f64 {
     f64::from_bits(if u >> 63 == 1 { u & !(1 << 63) } else { !u })
 }
 
-/// Texte d'un score, comme `f64::to_string` (même sortie), sans `String` pour les
-/// entiers (les plus fréquents : rangs, horodatages, compteurs).
+/// Texte d'un score, comme `f64::to_string` (même sortie), en `SharedByte` (réponses
+/// construites en `Frame`).
 #[inline]
 pub fn format_score(f: f64) -> radixox_lib::shared_byte::SharedByte {
-    use radixox_lib::shared_byte::SharedByte;
+    with_score_text(f, |t| radixox_lib::shared_byte::SharedByte::from_slice(t))
+}
+
+/// Texte d'un score, comme `f64::to_string` (même sortie), passé à `k` depuis un tampon
+/// sur la pile : ni `String` ni `SharedByte` sur le chemin des réponses encodées. Entiers
+/// (rangs, horodatages, compteurs, les plus fréquents) écrits à la main.
+#[inline]
+pub fn with_score_text<R>(f: f64, k: impl FnOnce(&[u8]) -> R) -> R {
     if f.fract() == 0.0 && f.abs() < 1e15 {
         let mut buf = [0u8; 20];
         let (neg, mut v) = (f < 0.0, f.abs() as u64);
@@ -354,9 +361,32 @@ pub fn format_score(f: f64) -> radixox_lib::shared_byte::SharedByte {
             i -= 1;
             buf[i] = b'-';
         }
-        return SharedByte::from_slice(&buf[i..]);
+        return k(&buf[i..]);
     }
-    SharedByte::from_slice(f.to_string())
+    float_text(f, k)
+}
+
+/// Flottant non entier : `Display` dans 64 octets sur la pile (forme la plus courte, ≤ 17
+/// chiffres significatifs) ; au-delà (exposants extrêmes écrits en entier), `to_string`.
+fn float_text<R>(f: f64, k: impl FnOnce(&[u8]) -> R) -> R {
+    use std::fmt::Write;
+    struct Stack {
+        buf: [u8; 64],
+        len: usize,
+    }
+    impl Write for Stack {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            let dst = self.buf.get_mut(self.len..self.len + s.len()).ok_or(std::fmt::Error)?;
+            dst.copy_from_slice(s.as_bytes());
+            self.len += s.len();
+            Ok(())
+        }
+    }
+    let mut st = Stack { buf: [0; 64], len: 0 };
+    match write!(st, "{f}") {
+        Ok(()) => k(&st.buf[..st.len]),
+        Err(_) => k(f.to_string().as_bytes()),
+    }
 }
 
 #[cfg(test)]
@@ -611,8 +641,16 @@ mod tests {
 
     #[test]
     fn score_format_matches_display() {
-        for f in [0.0, 1.0, -1.0, 42.0, -987654321.0, 1e14, 999999999999999.0, 1.5, -2.25, 1e15, 1e300, f64::INFINITY, f64::NEG_INFINITY, 1e-7] {
+        for f in [0.0, 1.0, -1.0, 42.0, -987654321.0, 1e14, 999999999999999.0, 1.5, -2.25, 1e15, 1e300, f64::INFINITY, f64::NEG_INFINITY, 1e-7, 0.1, 1.0 / 3.0, -2.0 / 3.0, 1e-20, 1e-300, 5e-324, f64::MAX, 1e16 + 0.5] {
             assert_eq!(format_score(f).as_slice(), f.to_string().as_bytes(), "{f}");
+        }
+        // bits tirés au hasard : tous les exposants, dont ceux qui débordent les 64 octets
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..100_000 {
+            let f = f64::from_bits(rng.next());
+            if !f.is_nan() {
+                assert_eq!(format_score(f).as_slice(), f.to_string().as_bytes(), "{f}");
+            }
         }
     }
 

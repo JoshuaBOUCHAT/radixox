@@ -1001,6 +1001,25 @@ Ce qui a compté, mesuré au profil :
   (membres à préfixe commun) ; profite aussi à ZSCORE & co.
 Reste visible : le formatage des scores (WITHSCORES −30 %).
 
+Puis (réponses ZRANGE et scores, 2026-10-27) : le coût de WITHSCORES sur les entiers
+n'était pas le formatage (`SharedByte` garde les petits textes en ligne) mais le passage
+par `Frame` : ZRANGE en petite plage copiait chaque membre et chaque score en `SharedByte`
+puis encodait le tableau (≈ 50 % du profil : `encode_frame`, `encode_len`, alloc/dealloc).
+Désormais `zrange_reply` encode directement depuis le ZSet (`zrange_part`, comme les jobs
+des grandes plages), et `with_score_text` écrit le score sur la pile (flottants : `Display`
+dans 64 octets, `to_string` au-delà ; même sortie, vérifiée sur 100 000 bits tirés au
+hasard). CPU serveur par requête, 1 000 ZSet de 100 membres, pipeline 16 :
+
+| commande | avant | après | débit vs Valkey (avant → après) |
+|---|---|---|---|
+| ZRANGE 0 -1 | 2,55 µs | 1,52 µs | ×1,29 → ×1,8 |
+| ZRANGE 0 -1 WITHSCORES (entiers) | 4,71 µs | 2,44 µs | ×1,17 → ×1,6–1,75 |
+| ZRANGE 0 -1 WITHSCORES (flottants) | 13,0 µs | 7,16 µs | ×0,79 → ×1,44 |
+| ZUNION WITHSCORES | 6,68 µs | 5,76 µs | ×3,9 → ×4,4 |
+
+Reste : un score flottant coûte ~47 ns (`core::fmt`, Grisu + mise en forme) contre ~2 pour
+un entier ; un ryu remis en forme décimale (pas d'exposant, comme `Display`) le réduirait.
+
 ## 14. List — architecture retenue (2026-10-27, implémentée le même jour, §14.9)
 
 ### 14.0 Pourquoi, et pour quels usages

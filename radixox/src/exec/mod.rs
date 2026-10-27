@@ -156,6 +156,10 @@ pub fn execute_into<'a>(
             zset::zsetop_reply(art, op, &keys, &weights, agg, with_scores, out);
             return Executed::Done;
         }
+        Cmd::ZRange { key, range, rev, limit, with_scores } => {
+            zset::zrange_reply(art, key, range, rev, limit, with_scores, out);
+            return Executed::Done;
+        }
         Cmd::ZScan { key, cursor, pattern, count, noscores } => {
             scan::cmd_zscan(art, client.id, key, cursor, pattern, count, noscores, out);
             return Executed::Done;
@@ -311,6 +315,10 @@ pub fn execute_hinted(cmd: Cmd<'_>, art: &mut OxidArt, keys: &[&[u8]], hints: &[
                     None => out.extend_from_slice(b"$-1\r\n"),
                 }
             }
+            return;
+        }
+        Cmd::ZRange { key, range, rev, limit, with_scores } => {
+            art.with_hint(key, h, |art| zset::zrange_reply(art, key, range, rev, limit, with_scores, out));
             return;
         }
         cmd => execute_with_hint(cmd, art, keys[0], h),

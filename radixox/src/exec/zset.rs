@@ -50,9 +50,37 @@ pub fn cmd_zrange(
     }
 }
 
+/// ZRANGE et variantes, réponse encodée dans `out` : membres lus sur place, scores écrits
+/// sur la pile (ni `SharedByte` ni `Frame` par entrée). Grande plage : rien d'écrit, job
+/// laissé au cœur comme [`cmd_zrange`].
+pub fn zrange_reply(
+    art: &mut OxidArt,
+    key: &[u8],
+    range: ZRangeBy<'_>,
+    rev: bool,
+    limit: Option<(i64, i64)>,
+    with_scores: bool,
+    out: &mut Vec<u8>,
+) {
+    use radixox_lib::shared_frame::{encode_array_len, encode_bulk, extend_encode};
+    let (lo, hi) = match art.zrange_ranks(key, range, rev, limit) {
+        Ok(Some(r)) => r,
+        Ok(None) => return encode_array_len(out, 0),
+        Err(t) => return extend_encode(out, &wrongtype(t)),
+    };
+    if hi - lo >= super::jobs::RANGE_JOB_MIN {
+        super::defer(super::jobs::RangeJob::zset(key, lo, hi, rev, with_scores));
+        return;
+    }
+    encode_array_len(out, (hi - lo) * if with_scores { 2 } else { 1 });
+    if hi > lo {
+        art.zrange_part(key, if rev { hi - 1 } else { lo }, hi - lo, rev, with_scores, |b| encode_bulk(out, b));
+    }
+}
+
 pub fn cmd_zscore(art: &mut OxidArt, key: &[u8], member: SharedByte) -> Frame {
     match art.cmd_zscore(key, member) {
-        Ok(Some(score)) => Frame::BulkString(SharedByte::from_slice(score.to_string().as_bytes())),
+        Ok(Some(score)) => score_bulk(score),
         Ok(None) => Frame::Null,
         Err(redis_type) => Frame::Error(format!(
             "WRONGTYPE Operation against a key holding the wrong kind of value (expected zset, got {})",
@@ -74,9 +102,7 @@ pub fn cmd_zrem(art: &mut OxidArt, key: &[u8], members: &[SharedByte]) -> Frame 
 pub fn cmd_zincrby(art: &mut OxidArt, key: &[u8], delta: f64, member: SharedByte) -> Frame {
     // cmd_zincrby peut créer le nœud zset : oxidart exige une clé possédée ici.
     match art.cmd_zincrby(SharedByte::from_slice(key), delta, member) {
-        Ok(new_score) => {
-            Frame::BulkString(SharedByte::from_slice(new_score.to_string().as_bytes()))
-        }
+        Ok(new_score) => score_bulk(new_score),
         Err(TypeError::NotAFloat) => Frame::Error("ERR resulting score is not a number (NaN)".into()),
         Err(e) => type_error(e),
     }
@@ -232,7 +258,7 @@ pub fn zsetop_reply(
         for &(s, m) in res {
             encode_bulk(out, m);
             if with_scores {
-                encode_bulk(out, &oxidart::zset::format_score(s));
+                oxidart::zset::with_score_text(s, |t| encode_bulk(out, t));
             }
         }
     });

@@ -409,7 +409,7 @@ pub fn cmd_zscan(
             for (m, s) in items {
                 encode_bulk(out, &m);
                 if !noscores {
-                    encode_bulk(out, &oxidart::zset::format_score(s));
+                    oxidart::zset::with_score_text(s, |t| encode_bulk(out, t));
                 }
             }
         }

@@ -316,7 +316,7 @@ impl Serve<'_> {
                             encode_array_len(out, 3);
                             encode_bulk(out, &k);
                             encode_bulk(out, &m);
-                            encode_bulk(out, &oxidart::zset::format_score(s));
+                            oxidart::zset::with_score_text(s, |t| encode_bulk(out, t));
                         });
                     }
                 }
