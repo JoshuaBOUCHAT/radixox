@@ -55,7 +55,7 @@ impl OxidArt {
         let popped: Vec<SharedByte> = (0..count)
             .map_while(|_| trees.set_pop(root, rand::random()))
             .collect();
-        if trees.set_card(root) == 0 {
+        if trees.set_count(root) == 0 {
             self.del(key);
         }
 
@@ -90,7 +90,7 @@ impl OxidArt {
             .iter()
             .filter(|member| trees.set_remove(root, member))
             .count() as u32;
-        if trees.set_card(root) == 0 {
+        if trees.set_count(root) == 0 {
             self.del(key);
         }
         Ok(count)
@@ -100,7 +100,7 @@ impl OxidArt {
             return Ok(Vec::new());
         };
         let trees = valart();
-        let mut res = Vec::with_capacity(trees.set_card(root) as usize);
+        let mut res = Vec::with_capacity(trees.set_count(root) as usize);
         trees.set_for_each(root, |m| res.push(m.clone()));
         Ok(res)
     }
@@ -114,7 +114,7 @@ impl OxidArt {
         let Some(root) = self.set_root(key)? else {
             return Ok(0);
         };
-        Ok(valart().set_card(root))
+        Ok(valart().set_count(root))
     }
 }
 

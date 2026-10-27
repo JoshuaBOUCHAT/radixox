@@ -372,6 +372,8 @@ const COMPACT_SLICE_UNITS: u32 = 512;
 /// Passe de compactage d'une slab autre que celle des nœuds.
 enum MorePass {
     List(oxidart::list::compact::ListCompaction),
+    /// Réparation des indices des racines valart (nœud oxidart où reprendre), puis la passe.
+    ValRepair(u32, oxidart::ValCompaction),
     Val(oxidart::ValCompaction),
     ZTree(oxidart::zset::btree::compact::ZCompaction),
 }
@@ -2481,7 +2483,7 @@ impl Core {
         if !self.compact_allowed() {
             match self.gc.compact_more.take() {
                 Some(MorePass::List(c)) => self.gc.compact_list_moved += c.moved,
-                Some(MorePass::Val(c)) => self.gc.compact_val_moved += c.moved,
+                Some(MorePass::Val(c) | MorePass::ValRepair(_, c)) => self.gc.compact_val_moved += c.moved,
                 Some(MorePass::ZTree(c)) => self.gc.compact_ztree_moved += c.moved,
                 None => {}
             }
@@ -2489,11 +2491,21 @@ impl Core {
         }
         let t0 = Instant::now();
         // 0 : List, 1 : valart, 2 : B+tree des ZSet
+        if let Some(MorePass::ValRepair(at, _)) = self.gc.compact_more.as_mut() {
+            match self.art.valart_hint_repair(*at, COMPACT_SLICE_UNITS) {
+                Some(next) => *at = next,
+                None => {
+                    let Some(MorePass::ValRepair(_, c)) = self.gc.compact_more.take() else { unreachable!() };
+                    self.gc.compact_more = Some(MorePass::Val(c));
+                }
+            }
+            return true;
+        }
         let (done, which) = match self.gc.compact_more.as_mut() {
             Some(MorePass::List(c)) => (oxidart::list::compact::step(c, COMPACT_SLICE_UNITS), 0),
             Some(MorePass::Val(c)) => (self.art.valart_compact_step(c, COMPACT_SLICE_UNITS), 1),
             Some(MorePass::ZTree(c)) => (oxidart::zset::btree::compact::step(c, COMPACT_SLICE_UNITS), 2),
-            None => return false,
+            Some(MorePass::ValRepair(..)) | None => return false,
         };
         let us = t0.elapsed().as_micros() as u64;
         self.gc.compact_max_slice_us = self.gc.compact_max_slice_us.max(us);
@@ -2549,7 +2561,7 @@ impl Core {
             if self.gc.log {
                 eprintln!("[compact] passe : {} Kio de trous dans la slab valart", self.art.valart_holes_bytes() >> 10);
             }
-            self.gc.compact_more = Some(MorePass::Val(c));
+            self.gc.compact_more = Some(MorePass::ValRepair(0, c));
             return;
         }
         if self.compact_allowed()

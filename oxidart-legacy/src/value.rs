@@ -101,7 +101,7 @@ fn hash_from_pairs(pairs: Vec<(SharedByte, SharedByte)>) -> u32 {
 
 fn hash_to_pairs(root: u32) -> Vec<(SharedByte, SharedByte)> {
     let trees = valart();
-    let mut pairs = Vec::with_capacity(trees.hash_len(root) as usize);
+    let mut pairs = Vec::with_capacity(trees.hash_count(root) as usize);
     trees.hash_for_each(root, |k, v| pairs.push((k.clone(), v.clone())));
     pairs
 }
@@ -117,7 +117,7 @@ fn set_from_members(members: Vec<SharedByte>) -> u32 {
 
 fn set_to_members(root: u32) -> Vec<SharedByte> {
     let trees = valart();
-    let mut members = Vec::with_capacity(trees.set_card(root) as usize);
+    let mut members = Vec::with_capacity(trees.set_count(root) as usize);
     trees.set_for_each(root, |m| members.push(m.clone()));
     members
 }

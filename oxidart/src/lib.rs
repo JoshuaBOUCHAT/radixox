@@ -430,9 +430,66 @@ impl OxidArt {
         valart().compact_want(force)
     }
 
-    /// Une tranche du compactage valart ; `Some((déplacés, octets rendus))` à la fin.
+    /// Indices des racines valart (Hash, Set) que tient le nœud `idx` (valeur propre et
+    /// feuilles) : le nœud vient d'être construit (chargement) ou déplacé (compactage).
+    pub(crate) fn hint_containers(&self, idx: u32) {
+        let node = unsafe { self.map.get_unchecked(idx) };
+        let hint = |tag: Tag, val: &ValUnion| match tag {
+            Tag::Hash => valart().set_hash_root_hint(unsafe { val.idx }, idx),
+            Tag::Set => valart().set_set_root_hint(unsafe { val.idx }, idx),
+            _ => {}
+        };
+        hint(node.tag, &node.val);
+        for (_, e) in node.iter() {
+            if let EntryRef::Leaf { tag, val, .. } = e {
+                hint(tag, val);
+            }
+        }
+    }
+
+    /// Réparation des indices des racines valart avant une passe de compactage valart : les
+    /// nœuds oxidart `from..`, au plus `budget`, reposent l'indice de chaque conteneur
+    /// qu'ils tiennent (une feuille a pu changer de nœud depuis la création de la racine).
+    /// Rend le nœud où reprendre, `None` à la fin. Jamais pendant une save (indice écrit
+    /// seulement s'il change ; une racine écrite pendant une save serait capturée).
+    pub fn valart_hint_repair(&self, from: u32, budget: u32) -> Option<u32> {
+        let mut at = from;
+        for _ in 0..budget {
+            let i = self.map.next_occupied(at)?;
+            self.hint_containers(i);
+            at = i + 1;
+        }
+        Some(at)
+    }
+
+    /// Une tranche du compactage valart ; `Some((déplacés, octets rendus))` à la fin. Une
+    /// racine ne bouge que si le nœud oxidart de son indice tient bien sa valeur (valeur
+    /// propre ou feuille) : l'idx y est réécrit.
     pub fn valart_compact_step(&mut self, c: &mut valart::ValCompaction, budget: u32) -> Option<(u64, usize)> {
-        valart().compact_step(c, budget)
+        let map = &mut self.map;
+        valart().compact_step(c, budget, |hint, src, dst| {
+            if hint == valart::NO_HINT || !map.is_occupied(hint) {
+                return false;
+            }
+            // Sans `node_mut` : jamais pendant une save ; réécrire l'idx d'une racine déplacée
+            // n'est pas une mutation logique.
+            let node = unsafe { map.get_unchecked_mut(hint) };
+            if matches!(node.tag, Tag::Hash | Tag::Set) && unsafe { node.val.idx } == src {
+                node.val.idx = dst;
+                return true;
+            }
+            let radix = node.iter().find_map(|(r, e)| match e {
+                EntryRef::Leaf { tag: Tag::Hash | Tag::Set, val, .. } if unsafe { val.idx } == src => Some(r),
+                _ => None,
+            });
+            match radix.and_then(|r| node.leaf_val_mut(r)) {
+                Some((_, val)) => {
+                    val.idx = dst;
+                    true
+                }
+                None => false,
+            }
+        })
     }
 
     /// Octets de trous sous la fin de la slab valart.
@@ -703,10 +760,10 @@ impl OxidArt {
     pub(crate) fn val_mut_at(&mut self, loc: Loc) -> NodeValMut<'_> {
         let node = self.node_mut(loc.node);
         match loc.slot {
-            Slot::SelfVal => NodeValMut { tag: &mut node.tag, val: &mut node.val },
+            Slot::SelfVal => NodeValMut { tag: &mut node.tag, val: &mut node.val, node: loc.node },
             Slot::Leaf(r) => {
                 let (tag, val) = node.leaf_val_mut(r).expect("feuille");
-                NodeValMut { tag, val }
+                NodeValMut { tag, val, node: loc.node }
             }
         }
     }

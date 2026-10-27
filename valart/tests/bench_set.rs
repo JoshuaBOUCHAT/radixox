@@ -209,7 +209,7 @@ fn bench_set_user_keys_1m() {
     };
     valart.root = valart.trees.set_create();
     let t = run(&mut valart, &keys);
-    assert_eq!(valart.trees.set_card(valart.root), 0);
+    assert_eq!(valart.trees.set_count(valart.root), 0);
     report("valart", &t);
 
     let t = run(&mut HashSet::<SharedByte>::new(), &keys);

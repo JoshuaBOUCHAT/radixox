@@ -461,8 +461,9 @@ enum PVal {
     /// pendant une tranche). Rendue possédée (clone) avant une pause.
     Bytes { sb: ManuallyDrop<SharedByte>, owned: bool },
     Int(i64),
-    Hash(u32),
-    Set(u32),
+    /// Racine, cardinal T0 (tenu dans la valeur de la clé).
+    Hash(u32, u32),
+    Set(u32, u32),
     /// List : idx de son en-tête (vue T0 lue à l'écriture, comme un ZSet).
     List(u32),
     /// ZSet : idx de son en-tête (vue T0 lue à l'écriture, comme une racine valart, I6).
@@ -502,7 +503,7 @@ struct Pending {
 #[inline(always)]
 fn warm(p: &Pending) {
     match p.val {
-        PVal::Hash(root) | PVal::Set(root) => valart().prefetch_root_entries(root),
+        PVal::Hash(root, _) | PVal::Set(root, _) => valart().prefetch_root_entries(root),
         _ => {}
     }
 }
@@ -788,8 +789,8 @@ impl SaveCursor {
                     owned: false,
                 },
                 Tag::Int => PVal::Int(val.integer),
-                Tag::Hash => PVal::Hash(val.idx),
-                Tag::Set => PVal::Set(val.idx),
+                Tag::Hash => PVal::Hash(val.idx, val.cont.card),
+                Tag::Set => PVal::Set(val.idx, val.cont.card),
                 Tag::HashSmall => {
                     let pairs = crate::small::entries::<2>(val.ptr);
                     let mut buf = Vec::new();
@@ -831,15 +832,15 @@ fn emit_oldest(cur: &mut SaveCursor, out: &mut Vec<u8>, budget: &mut u32) {
             sub(budget, 1 + (sb.len() >> 12) as u32);
         }
         PVal::Int(n) => put_varint(out, zigzag(*n)),
-        PVal::Hash(root) => {
+        PVal::Hash(root, card) => {
             let mark = out.len();
-            valart().hash_ser_begin(*root, &mut cur.ser, out);
+            valart().hash_ser_begin(*root, *card, &mut cur.ser, out);
             cur.begin_container_digest(p.key.take(), &out[mark..], format::T_HASH);
             cur.container = Container::Hash;
         }
-        PVal::Set(root) => {
+        PVal::Set(root, card) => {
             let mark = out.len();
-            valart().set_ser_begin(*root, &mut cur.ser, out);
+            valart().set_ser_begin(*root, *card, &mut cur.ser, out);
             cur.begin_container_digest(p.key.take(), &out[mark..], format::T_SET);
             cur.container = Container::Set;
         }

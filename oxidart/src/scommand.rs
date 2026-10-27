@@ -15,28 +15,29 @@ pub enum SPOPResult {
 /// Set vivant, en lecture : petit bloc ou arbre valart.
 enum SetView<'a> {
     Small(&'a [small::Member]),
-    Tree(u32),
+    /// Racine, cardinal.
+    Tree(u32, u32),
 }
 
 impl SetView<'_> {
     fn contains(&self, member: &[u8]) -> bool {
         match *self {
             SetView::Small(e) => e.iter().any(|[m]| m.as_slice() == member),
-            SetView::Tree(root) => valart().set_contains(root, member),
+            SetView::Tree(root, _) => valart().set_contains(root, member),
         }
     }
 
     fn len(&self) -> u32 {
         match *self {
             SetView::Small(e) => e.len() as u32,
-            SetView::Tree(root) => valart().set_card(root),
+            SetView::Tree(_, card) => card,
         }
     }
 
     fn for_each(&self, mut f: impl FnMut(&SharedByte)) {
         match *self {
             SetView::Small(e) => e.iter().for_each(|[m]| f(m)),
-            SetView::Tree(root) => valart().set_for_each(root, f),
+            SetView::Tree(root, _) => valart().set_for_each(root, f),
         }
     }
 }
@@ -47,6 +48,8 @@ impl SetView<'_> {
 struct SetMut<'a> {
     tag: &'a mut Tag,
     val: &'a mut ValUnion,
+    /// Nœud oxidart qui tient la valeur : indice de la racine valart (compactage).
+    node: u32,
 }
 
 impl SetMut<'_> {
@@ -54,14 +57,14 @@ impl SetMut<'_> {
     fn add(&mut self, member: SharedByte) -> bool {
         unsafe {
             match *self.tag {
-                Tag::Set => valart().set_add(self.val.idx, member),
+                Tag::Set => self.tree_add(member),
                 Tag::SetSmall => {
                     if small::find::<1>(self.val.ptr, &member).is_some() {
                         return false;
                     }
                     if let Err([member]) = small::push::<1>(&mut self.val.ptr, [member]) {
                         self.to_tree();
-                        return valart().set_add(self.val.idx, member);
+                        return self.tree_add(member);
                     }
                     true
                 }
@@ -73,7 +76,11 @@ impl SetMut<'_> {
     fn remove(&mut self, member: &[u8]) -> bool {
         unsafe {
             match *self.tag {
-                Tag::Set => valart().set_remove(self.val.idx, member),
+                Tag::Set => {
+                    let removed = valart().set_remove(self.val.idx, member);
+                    self.val.cont.card -= removed as u32;
+                    removed
+                }
                 Tag::SetSmall => match small::find::<1>(self.val.ptr, member) {
                     Some(i) => {
                         drop(small::remove_at::<1>(self.val.ptr, i));
@@ -90,7 +97,11 @@ impl SetMut<'_> {
     fn pop(&mut self, rnd: u64) -> Option<SharedByte> {
         unsafe {
             match *self.tag {
-                Tag::Set => valart().set_pop(self.val.idx, rnd),
+                Tag::Set => {
+                    let m = valart().set_pop(self.val.idx, rnd);
+                    self.val.cont.card -= m.is_some() as u32;
+                    m
+                }
                 Tag::SetSmall => {
                     let n = small::len(self.val.ptr);
                     (n > 0).then(|| {
@@ -106,20 +117,32 @@ impl SetMut<'_> {
     fn len(&self) -> u32 {
         unsafe {
             match *self.tag {
-                Tag::Set => valart().set_card(self.val.idx),
+                Tag::Set => self.val.cont.card,
                 _ => small::len(self.val.ptr) as u32,
             }
+        }
+    }
+
+    /// Membre posé dans l'arbre : cardinal et indice de la racine à jour.
+    fn tree_add(&mut self, member: SharedByte) -> bool {
+        unsafe {
+            let added = valart().set_add(self.val.idx, member);
+            self.val.cont.card += added as u32;
+            valart().set_set_root_hint(self.val.idx, self.node);
+            added
         }
     }
 
     /// Petit bloc → arbre valart (sans retour).
     fn to_tree(&mut self) {
         let root = valart().set_create();
+        let mut card = 0;
         for [m] in unsafe { small::into_entries::<1>(self.val.ptr) } {
-            valart().set_add(root, m);
+            card += valart().set_add(root, m) as u32;
         }
+        valart().set_set_root_hint(root, self.node);
         *self.tag = Tag::Set;
-        self.val.idx = root;
+        self.val.cont = crate::value::Cont { idx: root, card };
     }
 }
 
@@ -132,7 +155,7 @@ impl OxidArt {
         // SAFETY: le tag indique le champ actif de l'union.
         unsafe {
             match v.tag {
-                Tag::Set => Ok(Some(SetView::Tree(v.val.idx))),
+                Tag::Set => Ok(Some(SetView::Tree(v.val.idx, v.val.cont.card))),
                 Tag::SetSmall => Ok(Some(SetView::Small(small::entries::<1>(v.val.ptr)))),
                 t => Err(t.redis_type()),
             }
@@ -147,7 +170,7 @@ impl OxidArt {
             Some(t) => return Err(t.redis_type()),
         }
         let v = self.value_mut(key).expect("Set vivant");
-        Ok(Some(SetMut { tag: v.tag, val: v.val }))
+        Ok(Some(SetMut { tag: v.tag, val: v.val, node: v.node }))
     }
 
     /// SPOP - remove and return one or more random members from a set.
@@ -199,14 +222,20 @@ impl OxidArt {
                 let (tag, val) = set_into_raw(members.to_vec());
                 let added = match tag {
                     Tag::SetSmall => unsafe { small::len(val.ptr) as u32 },
-                    _ => valart().set_card(unsafe { val.idx }),
+                    _ => unsafe { val.cont.card },
                 };
+                let root = (tag == Tag::Set).then(|| unsafe { val.idx });
                 self.set_raw(key, RawVal::new(tag, val), ttl, None);
+                if let Some(root) = root
+                    && let Some(loc) = self.live_loc(key)
+                {
+                    valart().set_set_root_hint(root, loc.node);
+                }
                 return Ok(added);
             }
         }
         let v = self.value_mut(key).expect("Set vivant");
-        let mut set = SetMut { tag: v.tag, val: v.val };
+        let mut set = SetMut { tag: v.tag, val: v.val, node: v.node };
         Ok(members.iter().filter(|m| set.add((*m).clone())).count() as u32)
     }
 

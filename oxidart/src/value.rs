@@ -46,13 +46,27 @@ impl Tag {
 
 // ─── ValUnion ─────────────────────────────────────────────────────────────────
 
+#[repr(C)]
 pub(crate) union ValUnion {
     pub(crate) integer: i64,
     pub(crate) bytes: ManuallyDrop<SharedByte>,
     pub(crate) idx: u32,
+    /// Hash, Set (valart) : racine et cardinal (tenu ici, dans les 4 octets que l'idx
+    /// laisse libres : valart ne le tient pas). `idx` est le même champ que `cont.idx`.
+    pub(crate) cont: Cont,
     /// Bloc d'un petit conteneur (`Tag::HashSmall`, `Tag::SetSmall`).
     pub(crate) ptr: *mut u8,
 }
+
+/// Valeur d'un Hash ou d'un Set valart : racine, cardinal.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(crate) struct Cont {
+    pub(crate) idx: u32,
+    pub(crate) card: u32,
+}
+
+const _: () = assert!(size_of::<ValUnion>() == 8);
 
 // ─── Static slabs ─────────────────────────────────────────────────────────────
 
@@ -100,13 +114,14 @@ fn list_slab() -> &'static mut HiSlab<List> {
     }
 }
 
-fn hash_from_pairs(pairs: Vec<(SharedByte, SharedByte)>) -> u32 {
+fn hash_from_pairs(pairs: Vec<(SharedByte, SharedByte)>) -> Cont {
     let trees = valart();
     let root = trees.hash_create();
+    let mut card = 0;
     for (field, val) in pairs {
-        trees.hash_set(root, field, val);
+        card += trees.hash_set(root, field, val) as u32;
     }
-    root
+    Cont { idx: root, card }
 }
 
 /// Hash neuf : petit bloc jusqu'à `SMALL_MAX` champs distincts, valart au-delà.
@@ -121,7 +136,7 @@ pub(crate) fn hash_into_raw(pairs: Vec<(SharedByte, SharedByte)>) -> (Tag, ValUn
             }
             if let Err([f, v]) = small::push::<2>(&mut p, [f, v]) {
                 // trop de champs : tout part en valart
-                let root = hash_from_pairs(
+                let cont = hash_from_pairs(
                     small::into_entries::<2>(p)
                         .into_iter()
                         .map(|[f, v]| (f, v))
@@ -129,7 +144,7 @@ pub(crate) fn hash_into_raw(pairs: Vec<(SharedByte, SharedByte)>) -> (Tag, ValUn
                         .chain(rest)
                         .collect(),
                 );
-                return (Tag::Hash, ValUnion { idx: root });
+                return (Tag::Hash, ValUnion { cont });
             }
         }
     }
@@ -146,7 +161,7 @@ pub(crate) fn set_into_raw(members: Vec<SharedByte>) -> (Tag, ValUnion) {
                 continue;
             }
             if let Err([m]) = small::push::<1>(&mut p, [m]) {
-                let root = set_from_members(
+                let cont = set_from_members(
                     small::into_entries::<1>(p)
                         .into_iter()
                         .map(|[m]| m)
@@ -154,32 +169,33 @@ pub(crate) fn set_into_raw(members: Vec<SharedByte>) -> (Tag, ValUnion) {
                         .chain(rest)
                         .collect(),
                 );
-                return (Tag::Set, ValUnion { idx: root });
+                return (Tag::Set, ValUnion { cont });
             }
         }
     }
     (Tag::SetSmall, ValUnion { ptr: p })
 }
 
-fn hash_to_pairs(root: u32) -> Vec<(SharedByte, SharedByte)> {
+fn hash_to_pairs(root: u32, card: u32) -> Vec<(SharedByte, SharedByte)> {
     let trees = valart();
-    let mut pairs = Vec::with_capacity(trees.hash_len(root) as usize);
+    let mut pairs = Vec::with_capacity(card as usize);
     trees.hash_for_each(root, |k, v| pairs.push((k.clone(), v.clone())));
     pairs
 }
 
-fn set_from_members(members: Vec<SharedByte>) -> u32 {
+fn set_from_members(members: Vec<SharedByte>) -> Cont {
     let trees = valart();
     let root = trees.set_create();
+    let mut card = 0;
     for member in members {
-        trees.set_add(root, member);
+        card += trees.set_add(root, member) as u32;
     }
-    root
+    Cont { idx: root, card }
 }
 
-fn set_to_members(root: u32) -> Vec<SharedByte> {
+fn set_to_members(root: u32, card: u32) -> Vec<SharedByte> {
     let trees = valart();
-    let mut members = Vec::with_capacity(trees.set_card(root) as usize);
+    let mut members = Vec::with_capacity(card as usize);
     trees.set_for_each(root, |m| members.push(m.clone()));
     members
 }
@@ -302,8 +318,8 @@ pub(crate) unsafe fn value_from_raw_ref(tag: Tag, val: &ValUnion) -> Value {
             Tag::None => panic!("value_from_raw_ref: Tag::None"),
             Tag::Int => Value::Int(val.integer),
             Tag::Bytes => Value::String((*val.bytes).clone()),
-            Tag::Hash => Value::Hash(hash_to_pairs(val.idx)),
-            Tag::Set => Value::Set(set_to_members(val.idx)),
+            Tag::Hash => Value::Hash(hash_to_pairs(val.idx, val.cont.card)),
+            Tag::Set => Value::Set(set_to_members(val.idx, val.cont.card)),
             Tag::HashSmall => Value::Hash(
                 small::entries::<2>(val.ptr)
                     .iter()
@@ -328,12 +344,12 @@ pub(crate) unsafe fn value_take_raw(tag: Tag, val: ValUnion) -> Value {
             Tag::Int => Value::Int(val.integer),
             Tag::Bytes => Value::String(ManuallyDrop::into_inner(val.bytes)),
             Tag::Hash => {
-                let pairs = hash_to_pairs(val.idx);
+                let pairs = hash_to_pairs(val.idx, val.cont.card);
                 valart().hash_drop(val.idx);
                 Value::Hash(pairs)
             }
             Tag::Set => {
-                let members = set_to_members(val.idx);
+                let members = set_to_members(val.idx, val.cont.card);
                 valart().set_drop(val.idx);
                 Value::Set(members)
             }
@@ -434,6 +450,8 @@ impl Drop for RawVal {
 pub(crate) struct NodeValMut<'a> {
     pub(crate) tag: &'a mut Tag,
     pub(crate) val: &'a mut ValUnion,
+    /// Nœud oxidart qui tient la valeur (indice des racines valart).
+    pub(crate) node: u32,
 }
 
 impl<'a> NodeValMut<'a> {

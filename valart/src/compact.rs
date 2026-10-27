@@ -2,8 +2,9 @@
 //! §17.2) : les nœuds des slots les plus hauts descendent dans les trous les plus bas, puis
 //! la fin de la slab est rendue au système. Un nœud non racine connaît son parent et le
 //! radix de son slot (pointeur retour) : un déplacement corrige le parent et le pointeur
-//! retour de chaque enfant. Les racines restent en place (oxidart les désigne, sans
-//! pointeur retour).
+//! retour de chaque enfant. Une racine est désignée par la valeur de sa clé dans oxidart :
+//! elle porte un **indice** (le nœud oxidart qui tient cette valeur) ; l'appelant vérifie
+//! que ce nœud la désigne bien et réécrit l'idx, sinon elle reste en place.
 //!
 //! Interdit pendant une save, pendant la destruction différée d'un conteneur (elle garde
 //! des idx d'une tranche à l'autre) et en même temps qu'une passe du GC (il parcourt la
@@ -52,8 +53,15 @@ impl ValTrees {
     }
 
     /// Une tranche d'au plus `budget` unités. `Some((déplacés, octets rendus))` quand la
-    /// passe est finie (ou arrêtée : save, destruction différée).
-    pub fn compact_step(&mut self, c: &mut ValCompaction, budget: u32) -> Option<(u64, usize)> {
+    /// passe est finie (ou arrêtée : save, destruction différée). `owner(indice, src, dst)`
+    /// : pour une racine, vrai si la valeur désignée par l'indice tient bien `src` — et
+    /// l'appelant y a alors écrit `dst` ; faux : la racine ne bouge pas.
+    pub fn compact_step(
+        &mut self,
+        c: &mut ValCompaction,
+        budget: u32,
+        mut owner: impl FnMut(u32, u32, u32) -> bool,
+    ) -> Option<(u64, usize)> {
         if self.save.is_active() || self.draining.is_some() {
             return Some((c.moved, 0));
         }
@@ -63,21 +71,26 @@ impl ValTrees {
                 return Some(self.compact_finish(c));
             };
             c.scan = src;
-            let tag = unsafe { self.nodes.get_unchecked(src) }.tag();
-            let root = match tag {
-                NodeType::Hash => self.hash_is_root(src),
-                NodeType::Set => self.set_is_root(src),
-                NodeType::ZSet => unreachable!("nœud ZSet"),
+            let (tag, root) = {
+                let n = unsafe { self.nodes.get_unchecked(src) };
+                (n.tag(), n.is_root())
             };
-            if root {
-                spent += 1;
-                continue;
-            }
             // SAFETY: rempli par `move_to` tout de suite, ou rendu.
             let dst = unsafe { self.nodes.reserve_lowest() };
             if dst >= src || dst >= c.target {
                 unsafe { self.nodes.unreserve(dst) };
                 return Some(self.compact_finish(c));
+            }
+            if root {
+                let hint = match tag {
+                    NodeType::Hash => self.hash_root_hint(src),
+                    NodeType::Set => self.set_root_hint(src),
+                };
+                if !owner(hint, src, dst) {
+                    unsafe { self.nodes.unreserve(dst) };
+                    spent += 1;
+                    continue;
+                }
             }
             // SAFETY: `src` occupé, `dst` réservé, aucune référence vivante dans la slab.
             unsafe { self.nodes.move_to(src, dst) };
@@ -153,8 +166,32 @@ mod tests {
         }
         let span_before = t.nodes.last_occupied().unwrap() + 1;
         let before = t.nodes.len();
+        // propriétaire simulé (oxidart) : la racine `src` est désignée par l'entrée qui la
+        // tient ; l'indice vaut ici le rang de cette entrée
+        let mut owners: Vec<u32> = kh.iter().map(|(r, _)| *r).chain(ks.iter().map(|(r, _)| *r)).collect();
+        for (k, &r) in owners.iter().enumerate() {
+            if k < kh.len() { t.set_hash_root_hint(r, k as u32) } else { t.set_set_root_hint(r, k as u32) }
+        }
         let mut c = t.compact_want(true).expect("passe");
-        while t.compact_step(&mut c, 64).is_none() {}
+        let mut roots_moved = 0;
+        while t
+            .compact_step(&mut c, 64, |hint, src, dst| {
+                let ok = owners.get(hint as usize) == Some(&src);
+                if ok {
+                    owners[hint as usize] = dst;
+                    roots_moved += 1;
+                }
+                ok
+            })
+            .is_none()
+        {}
+        assert!(roots_moved > 0, "des racines ont bougé");
+        for (k, (root, _)) in kh.iter_mut().enumerate() {
+            *root = owners[k];
+        }
+        for (k, (root, _)) in ks.iter_mut().enumerate() {
+            *root = owners[kh.len() + k];
+        }
         assert_eq!(t.nodes.len(), before, "aucun nœud perdu");
         assert!(c.moved > 0);
         let span_after = t.nodes.last_occupied().unwrap() + 1;

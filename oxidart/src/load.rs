@@ -53,7 +53,7 @@ use crate::node::{Entry, Leaf, Node};
 use crate::digest::{Digest, value_terms};
 use crate::save::{DumpError, JournalPos, format};
 use crate::small::{self, SMALL_MAX};
-use crate::value::{RawVal, Tag, ValUnion, alloc_list, alloc_zset, valart};
+use crate::value::{Cont, RawVal, Tag, ValUnion, alloc_list, alloc_zset, valart};
 use crate::zset::{ZSet, encode_score};
 use crate::{OxidArt, Value};
 
@@ -429,10 +429,10 @@ impl<R: Read> DumpReader<R> {
                 } else {
                     let root = valart().hash_create();
                     // Possédée dès maintenant : libérée si la suite est illisible.
-                    let raw = RawVal::new(Tag::Hash, ValUnion { idx: root });
+                    let mut raw = RawVal::new(Tag::Hash, ValUnion { cont: Cont { idx: root, card: 0 } });
                     for _ in 0..n {
                         let (field, val) = (self.bytes()?, self.bytes()?);
-                        valart().hash_set(root, field, val);
+                        unsafe { raw.val.cont.card += valart().hash_set(root, field, val) as u32 };
                     }
                     raw
                 }
@@ -447,10 +447,10 @@ impl<R: Read> DumpReader<R> {
                     RawVal::new(Tag::SetSmall, ValUnion { ptr: small::from_entries::<1>(members.into_iter()) })
                 } else {
                     let root = valart().set_create();
-                    let raw = RawVal::new(Tag::Set, ValUnion { idx: root });
+                    let mut raw = RawVal::new(Tag::Set, ValUnion { cont: Cont { idx: root, card: 0 } });
                     for _ in 0..n {
                         let member = self.bytes()?;
-                        valart().set_add(root, member);
+                        unsafe { raw.val.cont.card += valart().set_add(root, member) as u32 };
                     }
                     raw
                 }
@@ -622,6 +622,7 @@ impl OxidArt {
         if self.node(root_idx).has_any_ttl() {
             self.map.tag(root_idx);
         }
+        self.hint_containers(root_idx);
         self.key_count += stats.keys as usize;
         stats.t0 = rd.t0;
         stats.pos = rd.jpos;
@@ -694,6 +695,7 @@ impl OxidArt {
         for (r, c) in kids {
             self.set_parent(c, idx, r);
         }
+        self.hint_containers(idx);
         idx
     }
 }

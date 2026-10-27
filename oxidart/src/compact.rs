@@ -232,6 +232,8 @@ impl OxidArt {
         for &(r, c) in children.iter() {
             self.set_parent(c, dst, r);
         }
+        // racines valart tenues par ce nœud : leur indice suit
+        self.hint_containers(dst);
         children.len() as u32
     }
 

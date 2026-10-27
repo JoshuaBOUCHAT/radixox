@@ -60,7 +60,7 @@ impl OxidArt {
             return Ok(Vec::new());
         };
         let trees = valart();
-        let mut result = Vec::with_capacity(2 * trees.hash_len(root) as usize);
+        let mut result = Vec::with_capacity(2 * trees.hash_count(root) as usize);
         trees.hash_for_each(root, |k, v| {
             result.push(k.clone());
             result.push(v.clone());
@@ -82,7 +82,7 @@ impl OxidArt {
             .iter()
             .filter(|field| trees.hash_remove(root, field))
             .count() as u32;
-        if trees.hash_len(root) == 0 {
+        if trees.hash_count(root) == 0 {
             self.del(key);
         }
         Ok(deleted)
@@ -101,7 +101,7 @@ impl OxidArt {
         let Some(root) = self.hash_root(key)? else {
             return Ok(0);
         };
-        Ok(valart().hash_len(root))
+        Ok(valart().hash_count(root))
     }
 
     /// HKEYS - get all field names in a hash.
@@ -110,7 +110,7 @@ impl OxidArt {
             return Ok(Vec::new());
         };
         let trees = valart();
-        let mut result = Vec::with_capacity(trees.hash_len(root) as usize);
+        let mut result = Vec::with_capacity(trees.hash_count(root) as usize);
         trees.hash_for_each(root, |k, _| result.push(k.clone()));
         Ok(result)
     }
@@ -121,7 +121,7 @@ impl OxidArt {
             return Ok(Vec::new());
         };
         let trees = valart();
-        let mut result = Vec::with_capacity(trees.hash_len(root) as usize);
+        let mut result = Vec::with_capacity(trees.hash_count(root) as usize);
         trees.hash_for_each(root, |_, v| result.push(v.clone()));
         Ok(result)
     }

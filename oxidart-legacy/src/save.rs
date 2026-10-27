@@ -592,11 +592,13 @@ fn emit_oldest(cur: &mut SaveCursor, out: &mut Vec<u8>, budget: &mut u32) {
         }
         PVal::Int(n) => put_varint(out, zigzag(*n)),
         PVal::Hash(root) => {
-            valart().hash_ser_begin(*root, &mut cur.ser, out);
+            let card = valart().hash_count(*root);
+            valart().hash_ser_begin(*root, card, &mut cur.ser, out);
             cur.container = Container::Hash;
         }
         PVal::Set(root) => {
-            valart().set_ser_begin(*root, &mut cur.ser, out);
+            let card = valart().set_count(*root);
+            valart().set_ser_begin(*root, card, &mut cur.ser, out);
             cur.container = Container::Set;
         }
         PVal::Idx(idx) => put_varint(out, *idx as u64),

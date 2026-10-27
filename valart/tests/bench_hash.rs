@@ -229,7 +229,7 @@ fn bench_hash_fields_1m() {
     };
     valart.root = valart.trees.hash_create();
     let t = run(&mut valart, &keys);
-    assert_eq!(valart.trees.hash_len(valart.root), 0);
+    assert_eq!(valart.trees.hash_count(valart.root), 0);
     report("valart", &t);
 
     let t = run(&mut HashMap::<SharedByte, SharedByte>::new(), &keys);

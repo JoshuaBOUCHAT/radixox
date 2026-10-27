@@ -14,7 +14,7 @@ use radixox_lib::save_barrier::{SaveBarrier, T0};
 use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::varint::{put_bytes, put_varint};
 
-use super::{List, NONE, block, is_end};
+use super::{List, block, is_end};
 use crate::digest;
 
 /// Image T0 d'un bloc.

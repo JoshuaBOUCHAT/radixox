@@ -10,28 +10,29 @@ use crate::{
 /// Hash vivant, en lecture : petit bloc ou arbre valart.
 enum HashView<'a> {
     Small(&'a [small::Pair]),
-    Tree(u32),
+    /// Racine, cardinal.
+    Tree(u32, u32),
 }
 
 impl<'a> HashView<'a> {
     fn get(&self, field: &[u8]) -> Option<&'a SharedByte> {
         match *self {
             HashView::Small(e) => e.iter().find(|[f, _]| f.as_slice() == field).map(|[_, v]| v),
-            HashView::Tree(root) => valart().hash_get(root, field),
+            HashView::Tree(root, _) => valart().hash_get(root, field),
         }
     }
 
     fn len(&self) -> u32 {
         match *self {
             HashView::Small(e) => e.len() as u32,
-            HashView::Tree(root) => valart().hash_len(root),
+            HashView::Tree(_, card) => card,
         }
     }
 
     fn for_each(&self, mut f: impl FnMut(&SharedByte, &SharedByte)) {
         match *self {
             HashView::Small(e) => e.iter().for_each(|[k, v]| f(k, v)),
-            HashView::Tree(root) => valart().hash_for_each(root, f),
+            HashView::Tree(root, _) => valart().hash_for_each(root, f),
         }
     }
 }
@@ -42,6 +43,8 @@ impl<'a> HashView<'a> {
 struct HashMut<'a> {
     tag: &'a mut Tag,
     val: &'a mut ValUnion,
+    /// Nœud oxidart qui tient la valeur : indice de la racine valart (compactage).
+    node: u32,
 }
 
 impl HashMut<'_> {
@@ -49,7 +52,7 @@ impl HashMut<'_> {
     fn set(&mut self, field: SharedByte, value: SharedByte) -> bool {
         unsafe {
             match *self.tag {
-                Tag::Hash => valart().hash_set(self.val.idx, field, value),
+                Tag::Hash => self.tree_set(field, value),
                 Tag::HashSmall => {
                     if let Some(i) = small::find::<2>(self.val.ptr, &field) {
                         // Écrasement sur place (MEMORY_ARCH.md §16.5) : l'image de save du
@@ -62,7 +65,7 @@ impl HashMut<'_> {
                     }
                     if let Err([field, value]) = small::push::<2>(&mut self.val.ptr, [field, value]) {
                         self.to_tree();
-                        return valart().hash_set(self.val.idx, field, value);
+                        return self.tree_set(field, value);
                     }
                     true
                 }
@@ -74,7 +77,11 @@ impl HashMut<'_> {
     fn remove(&mut self, field: &[u8]) -> bool {
         unsafe {
             match *self.tag {
-                Tag::Hash => valart().hash_remove(self.val.idx, field),
+                Tag::Hash => {
+                    let removed = valart().hash_remove(self.val.idx, field);
+                    self.val.cont.card -= removed as u32;
+                    removed
+                }
                 Tag::HashSmall => match small::find::<2>(self.val.ptr, field) {
                     Some(i) => {
                         drop(small::remove_at::<2>(self.val.ptr, i));
@@ -90,7 +97,7 @@ impl HashMut<'_> {
     fn len(&self) -> u32 {
         unsafe {
             match *self.tag {
-                Tag::Hash => valart().hash_len(self.val.idx),
+                Tag::Hash => self.val.cont.card,
                 _ => small::len(self.val.ptr) as u32,
             }
         }
@@ -108,14 +115,26 @@ impl HashMut<'_> {
         }
     }
 
+    /// Champ posé dans l'arbre : cardinal et indice de la racine à jour.
+    fn tree_set(&mut self, field: SharedByte, value: SharedByte) -> bool {
+        unsafe {
+            let added = valart().hash_set(self.val.idx, field, value);
+            self.val.cont.card += added as u32;
+            valart().set_hash_root_hint(self.val.idx, self.node);
+            added
+        }
+    }
+
     /// Petit bloc → arbre valart (sans retour).
     fn to_tree(&mut self) {
         let root = valart().hash_create();
+        let mut card = 0;
         for [f, v] in unsafe { small::into_entries::<2>(self.val.ptr) } {
-            valart().hash_set(root, f, v);
+            card += valart().hash_set(root, f, v) as u32;
         }
+        valart().set_hash_root_hint(root, self.node);
         *self.tag = Tag::Hash;
-        self.val.idx = root;
+        self.val.cont = crate::value::Cont { idx: root, card };
     }
 }
 
@@ -128,7 +147,7 @@ impl OxidArt {
         // SAFETY: le tag indique le champ actif de l'union.
         unsafe {
             match v.tag {
-                Tag::Hash => Ok(Some(HashView::Tree(v.val.idx))),
+                Tag::Hash => Ok(Some(HashView::Tree(v.val.idx, v.val.cont.card))),
                 Tag::HashSmall => Ok(Some(HashView::Small(small::entries::<2>(v.val.ptr)))),
                 t => Err(t.redis_type()),
             }
@@ -147,7 +166,7 @@ impl OxidArt {
             }
         }
         let v = self.value_mut(key).expect("Hash vivant");
-        Ok(HashMut { tag: v.tag, val: v.val })
+        Ok(HashMut { tag: v.tag, val: v.val, node: v.node })
     }
 
     /// HSET - set one or more field-value pairs in a hash.
@@ -167,14 +186,20 @@ impl OxidArt {
                 let (tag, val) = hash_into_raw(field_values.to_vec());
                 let added = match tag {
                     Tag::HashSmall => unsafe { small::len(val.ptr) as u32 },
-                    _ => valart().hash_len(unsafe { val.idx }),
+                    _ => unsafe { val.cont.card },
                 };
+                let root = (tag == Tag::Hash).then(|| unsafe { val.idx });
                 self.set_raw(key, RawVal::new(tag, val), ttl, None);
+                if let Some(root) = root
+                    && let Some(loc) = self.live_loc(key)
+                {
+                    valart().set_hash_root_hint(root, loc.node);
+                }
                 return Ok(added);
             }
         }
         let v = self.value_mut(key).expect("Hash vivant");
-        let mut h = HashMut { tag: v.tag, val: v.val };
+        let mut h = HashMut { tag: v.tag, val: v.val, node: v.node };
         Ok(field_values
             .iter()
             .filter(|(f, v)| h.set(f.clone(), v.clone()))
@@ -211,7 +236,7 @@ impl OxidArt {
             Some(t) => return Err(t.redis_type()),
         }
         let v = self.value_mut(key).expect("Hash vivant");
-        let mut h = HashMut { tag: v.tag, val: v.val };
+        let mut h = HashMut { tag: v.tag, val: v.val, node: v.node };
         let deleted = fields.iter().filter(|f| h.remove(f)).count() as u32;
         if h.len() == 0 {
             self.del(key);

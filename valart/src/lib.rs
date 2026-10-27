@@ -42,17 +42,27 @@ impl ValNode {
         unsafe { *(self as *const ValNode as *const u8).add(NODE_TYPE_OFFSET) }
     }
     fn tag(&self) -> NodeType {
-        unsafe { *(self as *const ValNode as *const NodeType).add(NODE_TYPE_OFFSET) }
+        if self.tag_u8() & !ROOT_BIT == NodeType::Hash as u8 { NodeType::Hash } else { NodeType::Set }
+    }
+    /// Racine d'un conteneur (bit [`ROOT_BIT`] de l'étiquette).
+    fn is_root(&self) -> bool {
+        self.tag_u8() & ROOT_BIT != 0
     }
 }
 
+/// Bit de l'étiquette d'un nœud : racine d'un conteneur. Une racine n'a pas de parent :
+/// son `parent_or_card` porte l'**indice** du nœud oxidart qui tient la valeur de la clé
+/// (compactage : vérifié par l'appelant avant de déplacer la racine) ; le cardinal du
+/// conteneur est tenu par l'appelant (la valeur de la clé), pas par valart.
+pub(crate) const ROOT_BIT: u8 = 0x80;
+/// Indice inconnu.
+pub const NO_HINT: u32 = u32::MAX;
+
 impl Drop for ValNode {
     fn drop(&mut self) {
-        match self.tag_u8() {
-            t if t == NodeType::Hash as u8 => unsafe { ManuallyDrop::drop(&mut self.hash) },
-            t if t == NodeType::Set as u8 => unsafe { ManuallyDrop::drop(&mut self.set) },
-            t if t == NodeType::ZSet as u8 => unreachable!("ZSet node not implemented yet"),
-            _ => unreachable!("invalid NodeType tag"),
+        match self.tag() {
+            NodeType::Hash => unsafe { ManuallyDrop::drop(&mut self.hash) },
+            NodeType::Set => unsafe { ManuallyDrop::drop(&mut self.set) },
         }
     }
 }
@@ -86,7 +96,6 @@ impl ValNodeImage {
         match node.tag() {
             NodeType::Hash => Self::Hash(unsafe { &node.hash }.image_copy()),
             NodeType::Set => Self::Set(unsafe { &node.set }.image_copy()),
-            NodeType::ZSet => unreachable!("ZSet node not implemented yet"),
         }
     }
 }
@@ -120,7 +129,6 @@ impl<F: FnMut(&mut SharedByte)> ValVisitor for F {
 enum NodeType {
     Hash,
     Set,
-    ZSet,
 }
 
 pub struct ValTrees {
@@ -220,8 +228,7 @@ impl ValTrees {
             match node.tag() {
                 NodeType::Hash => unsafe { &mut node.hash }.for_each_sb_mut(f),
                 NodeType::Set => unsafe { &mut node.set }.for_each_sb_mut(f),
-                NodeType::ZSet => unreachable!("ZSet node not implemented yet"),
-            }
+                }
             at = i + 1;
         }
         Some(at)
@@ -290,7 +297,6 @@ impl ValTrees {
             match kind {
                 NodeType::Hash => self.hash_drop_step(&mut stack, &mut budget),
                 NodeType::Set => self.set_drop_step(&mut stack, &mut budget),
-                NodeType::ZSet => unreachable!(),
             }
             if !stack.is_empty() {
                 self.draining = Some((kind, stack));
@@ -325,7 +331,6 @@ impl ValTrees {
                 match node.tag() {
                     NodeType::Hash => unsafe { &node.hash }.prefetch_entries(),
                     NodeType::Set => unsafe { &node.set }.prefetch_entries(),
-                    NodeType::ZSet => {}
                 }
             }
             Some(T0::Image(ValNodeImage::Hash(h))) => h.prefetch_entries(),

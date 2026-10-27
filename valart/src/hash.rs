@@ -41,11 +41,10 @@ pub struct HashNode {
     overflow: Option<HashOverflow>,
     count: u8,
     parent_radix: u8,
-    /// 1 : racine du conteneur (désignée par oxidart, sans pointeur retour : le compactage
-    /// ne la déplace pas).
-    root: u8,
+    _pad: u8,
     // Offset commun à toutes les variantes de `ValNode` (NODE_TYPE_OFFSET).
-    pub(crate) node_type: NodeType,
+    /// Type (`NodeType`) et bit racine (`ROOT_BIT`).
+    pub(crate) node_type: u8,
     parent_or_card: u32,
 }
 
@@ -93,8 +92,8 @@ impl HashNode {
             overflow: None,
             count: 0,
             parent_radix,
-            root: 0,
-            node_type: NodeType::Hash,
+            _pad: 0,
+            node_type: NodeType::Hash as u8,
             parent_or_card,
         }
     }
@@ -522,16 +521,12 @@ impl ValTrees {
         drop(self.nodes.remove(idx));
     }
 
-    #[inline]
-    fn hash_len_add(&mut self, root: u32, delta: i32) {
-        let len = &mut self.hash_node_mut(root).parent_or_card;
-        *len = len.wrapping_add_signed(delta);
-    }
 
     /// Crée un Hash vide, retourne l'idx de sa racine (à stocker côté oxidart).
     pub fn hash_create(&self) -> u32 {
         let mut n = HashNode::new(0, 0);
-        n.root = 1;
+        n.node_type |= crate::ROOT_BIT;
+        n.parent_or_card = crate::NO_HINT;
         self.nodes.insert(ValNode { hash: ManuallyDrop::new(n) })
     }
 
@@ -544,10 +539,14 @@ impl ValTrees {
             (n.parent_or_card, n.parent_radix)
         };
         let depth = self.hash_depth(dst);
-        let p = self.hash_node_mut(parent);
-        let slot = p.find(radix).expect("slot du nœud chez son parent");
-        p.set_child(slot, dst);
-        let mut fixed = 1;
+        let mut fixed = 0;
+        // racine : l'appelant a réécrit la valeur de sa clé
+        if depth > 0 {
+            let p = self.hash_node_mut(parent);
+            let slot = p.find(radix).expect("slot du nœud chez son parent");
+            p.set_child(slot, dst);
+            fixed += 1;
+        }
         if depth + 1 < DISPATCH_LEVELS {
             for k in 0..self.hash_node(dst).len() {
                 let n = self.hash_node(dst);
@@ -564,20 +563,41 @@ impl ValTrees {
     /// Profondeur d'un nœud (racine : 0), en remontant les pointeurs retour.
     fn hash_depth(&self, mut idx: u32) -> usize {
         let mut d = 0;
-        while self.hash_node(idx).root == 0 {
+        while self.hash_node(idx).node_type & crate::ROOT_BIT == 0 {
             idx = self.hash_node(idx).parent_or_card;
             d += 1;
         }
         d
     }
 
-    pub(crate) fn hash_is_root(&self, idx: u32) -> bool {
-        self.hash_node(idx).root != 0
+
+
+    /// Nombre d'entrées, recompté en O(n) (le cardinal est tenu par l'appelant, dans la
+    /// valeur de la clé ; ceci sert aux tests et à l'oracle `oxidart-legacy`).
+    pub fn hash_count(&self, root: u32) -> u32 {
+        let mut n = 0;
+        self.hash_for_each(root, |_k, _v| n += 1);
+        n
     }
 
-    /// HLEN, O(1).
+    #[cfg(test)]
     pub fn hash_len(&self, root: u32) -> u32 {
+        self.hash_count(root)
+    }
+
+    /// Indice de la racine `root` : le nœud oxidart qui tient la valeur de la clé
+    /// ([`crate::NO_HINT`] : inconnu).
+    pub fn hash_root_hint(&self, root: u32) -> u32 {
         self.hash_node(root).parent_or_card
+    }
+
+    /// Pose l'indice de la racine `root` (s'il a changé : une racine écrite pendant une
+    /// save est capturée).
+    #[inline]
+    pub fn set_hash_root_hint(&mut self, root: u32, hint: u32) {
+        if self.hash_node(root).parent_or_card != hint {
+            self.hash_node_mut(root).parent_or_card = hint;
+        }
     }
 
     fn hash_locate(&self, root: u32, field: &[u8]) -> Option<Loc> {
@@ -660,7 +680,6 @@ impl ValTrees {
             let node = self.hash_node(idx);
             let Some(slot) = node.find(radix) else {
                 self.hash_node_mut(idx).push(radix, ctrl, field, val, NO_CHILD);
-                self.hash_len_add(root, 1);
                 return true;
             };
             if node.ctrl_of(slot) == ctrl && node.key(slot).as_slice() == field.as_slice() {
@@ -689,7 +708,6 @@ impl ValTrees {
                 self.hash_collisions.alloc((field, val))
             };
             self.hash_node_mut(idx).set_child(slot, new_child);
-            self.hash_len_add(root, 1);
             return true;
         }
         let bucket = self.hash_collisions.get_mut(idx);
@@ -701,7 +719,6 @@ impl ValTrees {
             return false;
         }
         bucket.push((field, val));
-        self.hash_len_add(root, 1);
         true
     }
 
@@ -744,7 +761,6 @@ impl ValTrees {
             };
             self.dispose(idx, old_key);
             self.dispose(idx, old_val);
-            self.hash_len_add(root, -1);
             return true;
         }
 
@@ -756,14 +772,13 @@ impl ValTrees {
         if bucket.is_empty() {
             self.hash_release_bucket(idx, parent);
         }
-        self.hash_len_add(root, -1);
         true
     }
 
     /// HRANDFIELD : un champ pseudo-aléatoire (descente aléatoire jusqu'à une
     /// feuille, mêmes biais que `set_pop`), sans le retirer.
     pub fn hash_random(&self, root: u32, rnd: u64) -> Option<(&SharedByte, &SharedByte)> {
-        if self.hash_len(root) == 0 {
+        if self.hash_node(root).is_empty() {
             return None;
         }
         let mut rnd = rnd;
@@ -785,12 +800,9 @@ impl ValTrees {
 
     /// Démarre la sérialisation du conteneur `root` pendant une save : écrit
     /// sa cardinalité T0 et prépare `ser`. Format : `varint nb | (varint len | champ | varint len | valeur)*`.
-    pub fn hash_ser_begin(&mut self, root: u32, ser: &mut ValSer, out: &mut Vec<u8>) {
-        let card = match self.save.peek(root) {
-            Some(T0::Slab) => self.hash_node(root).parent_or_card,
-            Some(T0::Image(ValNodeImage::Hash(n))) => n.parent_or_card,
-            _ => panic!("racine valart {root} absente de la vue T0"),
-        };
+    /// `card` : cardinal T0 du conteneur (tenu par l'appelant, dans la valeur de la clé).
+    pub fn hash_ser_begin(&mut self, root: u32, card: u32, ser: &mut ValSer, out: &mut Vec<u8>) {
+        debug_assert!(self.save.peek(root).is_some(), "racine valart {root} absente de la vue T0");
         put_varint(out, card as u64);
         ser.stack.clear();
         ser.stack.push((root, 0));
@@ -1042,7 +1054,6 @@ impl ValTrees {
                 }
             }
         }
-        assert_eq!(total, self.hash_len(root) as usize, "HLEN incohérent");
         total
     }
 }
@@ -1090,7 +1101,8 @@ mod tests {
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
         use radixox_lib::varint::{get_bytes, get_varint};
         let (mut out, mut ser) = (Vec::new(), crate::ValSer::default());
-        t.hash_ser_begin(root, &mut ser, &mut out);
+        let card = t.hash_len(root);
+        t.hash_ser_begin(root, card, &mut ser, &mut out);
         loop {
             let mut b = budget;
             if t.hash_ser_step(&mut ser, &mut out, &mut b) {

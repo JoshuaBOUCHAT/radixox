@@ -61,12 +61,11 @@ pub struct SetNode {
     overflow: Option<SetOverflow>,
     count: u8,
     parent_radix: u8,
-    /// 1 : racine du conteneur (désignée par oxidart, sans pointeur retour : le compactage
-    /// ne la déplace pas).
-    root: u8,
+    _pad: u8,
     // Même offset que dans `HashNode` (voir NODE_TYPE_OFFSET) : nécessaire
     // pour lire le tag depuis l'union sans connaître la variante active.
-    pub(crate) node_type: NodeType,
+    /// Type (`NodeType`) et bit racine (`ROOT_BIT`).
+    pub(crate) node_type: u8,
     parent_or_card: u32,
 }
 
@@ -113,8 +112,8 @@ impl SetNode {
             overflow: None,
             count: 0,
             parent_radix,
-            root: 0,
-            node_type: NodeType::Set,
+            _pad: 0,
+            node_type: NodeType::Set as u8,
             parent_or_card,
         }
     }
@@ -488,16 +487,12 @@ impl ValTrees {
         drop(self.nodes.remove(idx));
     }
 
-    #[inline]
-    fn set_card_add(&mut self, root: u32, delta: i32) {
-        let card = &mut self.set_node_mut(root).parent_or_card;
-        *card = card.wrapping_add_signed(delta);
-    }
 
     /// Crée un Set vide, retourne l'idx de sa racine (à stocker côté oxidart).
     pub fn set_create(&self) -> u32 {
         let mut n = SetNode::new(0, 0);
-        n.root = 1;
+        n.node_type |= crate::ROOT_BIT;
+        n.parent_or_card = crate::NO_HINT;
         self.nodes.insert(ValNode { set: ManuallyDrop::new(n) })
     }
 
@@ -510,10 +505,14 @@ impl ValTrees {
             (n.parent_or_card, n.parent_radix)
         };
         let depth = self.set_depth(dst);
-        let p = self.set_node_mut(parent);
-        let slot = p.find(radix).expect("slot du nœud chez son parent");
-        p.set_child(slot, dst);
-        let mut fixed = 1;
+        let mut fixed = 0;
+        // racine : l'appelant a réécrit la valeur de sa clé
+        if depth > 0 {
+            let p = self.set_node_mut(parent);
+            let slot = p.find(radix).expect("slot du nœud chez son parent");
+            p.set_child(slot, dst);
+            fixed += 1;
+        }
         if depth + 1 < DISPATCH_LEVELS {
             for k in 0..self.set_node(dst).len() {
                 let n = self.set_node(dst);
@@ -530,20 +529,41 @@ impl ValTrees {
     /// Profondeur d'un nœud (racine : 0), en remontant les pointeurs retour.
     fn set_depth(&self, mut idx: u32) -> usize {
         let mut d = 0;
-        while self.set_node(idx).root == 0 {
+        while self.set_node(idx).node_type & crate::ROOT_BIT == 0 {
             idx = self.set_node(idx).parent_or_card;
             d += 1;
         }
         d
     }
 
-    pub(crate) fn set_is_root(&self, idx: u32) -> bool {
-        self.set_node(idx).root != 0
+
+
+    /// Nombre d'entrées, recompté en O(n) (le cardinal est tenu par l'appelant, dans la
+    /// valeur de la clé ; ceci sert aux tests et à l'oracle `oxidart-legacy`).
+    pub fn set_count(&self, root: u32) -> u32 {
+        let mut n = 0;
+        self.set_for_each(root, |_m| n += 1);
+        n
     }
 
-    /// SCARD, O(1).
+    #[cfg(test)]
     pub fn set_card(&self, root: u32) -> u32 {
+        self.set_count(root)
+    }
+
+    /// Indice de la racine `root` : le nœud oxidart qui tient la valeur de la clé
+    /// ([`crate::NO_HINT`] : inconnu).
+    pub fn set_root_hint(&self, root: u32) -> u32 {
         self.set_node(root).parent_or_card
+    }
+
+    /// Pose l'indice de la racine `root` (s'il a changé : une racine écrite pendant une
+    /// save est capturée).
+    #[inline]
+    pub fn set_set_root_hint(&mut self, root: u32, hint: u32) {
+        if self.set_node(root).parent_or_card != hint {
+            self.set_node_mut(root).parent_or_card = hint;
+        }
     }
 
     /// Un pas de [`ValTrees::probe_step`] dans un Set.
@@ -612,7 +632,6 @@ impl ValTrees {
             let node = self.set_node(idx);
             let Some(slot) = node.find(radix) else {
                 self.set_node_mut(idx).push(radix, ctrl, member, NO_CHILD);
-                self.set_card_add(root, 1);
                 return true;
             };
             if node.ctrl_of(slot) == ctrl && node.key(slot).as_slice() == member.as_slice() {
@@ -634,7 +653,6 @@ impl ValTrees {
                 self.set_collisions.alloc(member)
             };
             self.set_node_mut(idx).set_child(slot, new_child);
-            self.set_card_add(root, 1);
             return true;
         }
         let bucket = self.set_collisions.get_mut(idx);
@@ -642,7 +660,6 @@ impl ValTrees {
             return false;
         }
         bucket.push(member);
-        self.set_card_add(root, 1);
         true
     }
 
@@ -684,7 +701,6 @@ impl ValTrees {
                 old
             };
             self.dispose(idx, old);
-            self.set_card_add(root, -1);
             return true;
         }
 
@@ -696,7 +712,6 @@ impl ValTrees {
         if bucket.is_empty() {
             self.release_bucket(idx, parent);
         }
-        self.set_card_add(root, -1);
         true
     }
 
@@ -708,7 +723,7 @@ impl ValTrees {
     /// Retourne un clone du membre : l'original passe par `dispose` comme
     /// toute entrée sortie d'un nœud (SAVE_DESIGN.md §2.B).
     pub fn set_pop(&mut self, root: u32, rnd: u64) -> Option<SharedByte> {
-        if self.set_card(root) == 0 {
+        if self.set_node(root).is_empty() {
             return None;
         }
         let mut rnd = rnd;
@@ -723,7 +738,6 @@ impl ValTrees {
                 let key = self.remove_leaf(idx, slot, parent);
                 let out = key.clone();
                 self.dispose(idx, key);
-                self.set_card_add(root, -1);
                 return Some(out);
             }
             parent = Some((idx, slot));
@@ -734,18 +748,14 @@ impl ValTrees {
         if bucket.is_empty() {
             self.release_bucket(idx, parent);
         }
-        self.set_card_add(root, -1);
         Some(key)
     }
 
     /// Démarre la sérialisation du conteneur `root` pendant une save : écrit
     /// sa cardinalité T0 et prépare `ser`. Format : `varint nb | (varint len | membre)*`.
-    pub fn set_ser_begin(&mut self, root: u32, ser: &mut ValSer, out: &mut Vec<u8>) {
-        let card = match self.save.peek(root) {
-            Some(T0::Slab) => self.set_node(root).parent_or_card,
-            Some(T0::Image(ValNodeImage::Set(n))) => n.parent_or_card,
-            _ => panic!("racine valart {root} absente de la vue T0"),
-        };
+    /// `card` : cardinal T0 du conteneur (tenu par l'appelant, dans la valeur de la clé).
+    pub fn set_ser_begin(&mut self, root: u32, card: u32, ser: &mut ValSer, out: &mut Vec<u8>) {
+        debug_assert!(self.save.peek(root).is_some(), "racine valart {root} absente de la vue T0");
         put_varint(out, card as u64);
         ser.stack.clear();
         ser.stack.push((root, 0));
@@ -991,7 +1001,6 @@ impl ValTrees {
                 }
             }
         }
-        assert_eq!(total, self.set_card(root) as usize, "cardinal incohérent");
         total
     }
 }
