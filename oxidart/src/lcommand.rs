@@ -127,6 +127,29 @@ impl OxidArt {
         Ok(out)
     }
 
+    /// Rangs `[a, b]` d'un LRANGE ; `None` : clé absente ou plage vide.
+    pub fn lrange_span(&mut self, key: &[u8], start: i64, stop: i64) -> Result<Option<(u32, u32)>, RedisType> {
+        let Some(idx) = self.list_idx(key)? else { return Ok(None) };
+        Ok(span(start, stop, list_ref(idx).len()))
+    }
+
+    /// Morceau d'un LRANGE par tranches (non atomique) : au plus `n` éléments à partir du
+    /// rang `from`, passés à `emit`. Rend leur nombre ; moins que `n` : la clé a disparu,
+    /// changé de type, ou rétréci.
+    pub fn lrange_part(&mut self, key: &[u8], from: u32, n: u32, mut emit: impl FnMut(&[u8])) -> u32 {
+        let Ok(Some(idx)) = self.list_idx(key) else { return 0 };
+        let mut c = list_ref(idx).locate(from);
+        let mut k = 0;
+        while let Some(at) = c
+            && k < n
+        {
+            emit(list::value(at));
+            k += 1;
+            c = list::next(at);
+        }
+        k
+    }
+
     pub fn cmd_lindex(&mut self, key: &[u8], i: i64) -> Result<Option<SharedByte>, RedisType> {
         let Some(idx) = self.list_idx(key)? else { return Ok(None) };
         let l = list_ref(idx);

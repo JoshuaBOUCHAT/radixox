@@ -107,6 +107,83 @@ impl KeysJob {
     }
 }
 
+/// Au-delà, LRANGE / ZRANGE (et variantes) répondent par tranches (job).
+pub const RANGE_JOB_MIN: usize = 8192;
+/// Éléments écrits par tranche d'une lecture de plage.
+pub const RANGE_BUDGET: usize = 2048;
+
+/// Lecture de plage géante (LRANGE, ZRANGE et variantes) par tranches, **non atomique**
+/// (choix utilisateur, 2026-10-27) : reprise par rang ; une écriture entre deux tranches
+/// peut se voir. La clé disparue, changée de type ou trop rétrécie termine la réponse plus
+/// tôt (le nombre d'éléments de l'en-tête est celui écrit). Réponse encodée au fil du
+/// parcours, comme KEYS.
+pub struct RangeJob {
+    key: SharedByte,
+    zset: bool,
+    rev: bool,
+    with_scores: bool,
+    /// Rang de la prochaine entrée (vers le bas avec `rev`).
+    next: usize,
+    /// Entrées restant à écrire.
+    left: usize,
+    out: BigBuf,
+    count: usize,
+}
+
+impl RangeJob {
+    /// LRANGE des rangs `[a, b]`.
+    pub fn list(key: &[u8], a: u32, b: u32) -> Self {
+        Self::new(key, false, false, false, a as usize, (b - a + 1) as usize)
+    }
+
+    /// ZRANGE et variantes : rangs croissants `[lo, hi)`, parcourus à l'envers avec `rev`.
+    pub fn zset(key: &[u8], lo: usize, hi: usize, rev: bool, with_scores: bool) -> Self {
+        Self::new(key, true, rev, with_scores, if rev { hi - 1 } else { lo }, hi - lo)
+    }
+
+    fn new(key: &[u8], zset: bool, rev: bool, with_scores: bool, next: usize, left: usize) -> Self {
+        let mut out = BigBuf::new();
+        out.extend_from_slice(&[0; HEADER_ROOM]);
+        // externe : vit hors de l'arbre le temps du job (MEMORY_ARCH.md §16.9)
+        Self { key: SharedByte::from_slice_external(key), zset, rev, with_scores, next, left, out, count: 0 }
+    }
+
+    pub fn step(&mut self, art: &mut OxidArt, budget: usize) -> Step {
+        let n = self.left.min(budget.max(1));
+        let (out, count) = (&mut self.out, &mut self.count);
+        let mut emit = |b: &[u8]| {
+            out.push_bulk(b);
+            *count += 1;
+        };
+        let got = if self.zset {
+            art.zrange_part(&self.key, self.next, n, self.rev, self.with_scores, &mut emit)
+        } else {
+            art.lrange_part(&self.key, self.next as u32, n as u32, &mut emit) as usize
+        };
+        self.left -= got;
+        if self.rev {
+            self.next = self.next.wrapping_sub(got);
+        } else {
+            self.next += got;
+        }
+        // plus rien à lire (fin, ou la clé a rétréci / disparu)
+        if got < n {
+            self.left = 0;
+        }
+        Step::from_done(self.left == 0)
+    }
+
+    pub fn response(&mut self) -> &[u8] {
+        let start = write_header(self.out.as_mut_slice(), self.count);
+        &self.out.as_slice()[start..]
+    }
+
+    pub fn into_response(mut self) -> (BigBuf, usize) {
+        let start = write_header(self.out.as_mut_slice(), self.count);
+        (self.out, start)
+    }
+}
+
 /// Écrit `*count\r\n` calé à droite de la place réservée ; rend son début.
 fn write_header(out: &mut [u8], count: usize) -> usize {
     let mut head = Vec::with_capacity(HEADER_ROOM);

@@ -34,12 +34,19 @@ pub fn cmd_zrange(
     limit: Option<(i64, i64)>,
     with_scores: bool,
 ) -> Frame {
-    match art.cmd_zrange_by(key, range, rev, limit, with_scores) {
+    let (lo, hi) = match art.zrange_ranks(key, range, rev, limit) {
+        Ok(Some(r)) => r,
+        Ok(None) => return Frame::Array(Vec::new()),
+        Err(t) => return wrongtype(t),
+    };
+    // grande plage : par tranches (le cœur parque la connexion)
+    if hi - lo >= super::jobs::RANGE_JOB_MIN {
+        super::defer(super::jobs::RangeJob::zset(key, lo, hi, rev, with_scores));
+        return Frame::Null;
+    }
+    match art.zrange_at(key, lo, hi, rev, with_scores) {
         Ok(result) => Frame::Array(result.into_iter().map(Frame::BulkString).collect()),
-        Err(redis_type) => Frame::Error(format!(
-            "WRONGTYPE Operation against a key holding the wrong kind of value (expected zset, got {})",
-            redis_type.as_str()
-        )),
+        Err(t) => wrongtype(t),
     }
 }
 

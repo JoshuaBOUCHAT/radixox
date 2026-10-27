@@ -42,6 +42,13 @@ pub fn cmd_llen(art: &mut OxidArt, key: &[u8]) -> Frame {
 }
 
 pub fn cmd_lrange(art: &mut OxidArt, key: &[u8], start: i64, stop: i64) -> Frame {
+    // grande plage : par tranches (le cœur parque la connexion)
+    if let Ok(Some((a, b))) = art.lrange_span(key, start, stop)
+        && (b - a) as usize >= super::jobs::RANGE_JOB_MIN
+    {
+        super::defer(super::jobs::RangeJob::list(key, a, b));
+        return Frame::Null;
+    }
     match art.cmd_lrange(key, start, stop) {
         Ok(v) => Frame::Array(v.into_iter().map(Frame::BulkString).collect()),
         Err(t) => wrongtype(t),

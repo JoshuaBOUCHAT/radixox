@@ -23,7 +23,7 @@ use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::shared_frame::{SharedFrame as Frame, extend_encode};
 
 use crate::exec::client::Client;
-use crate::exec::jobs::{FREE_BUDGET, FlushJob, KEYS_BUDGET, KeysJob, Step, UnlinkJob};
+use crate::exec::jobs::{FREE_BUDGET, FlushJob, KEYS_BUDGET, KeysJob, RangeJob, Step, UnlinkJob};
 use crate::exec::autosave::{Persistence, Rule};
 use crate::exec::aof::{AofOp, AofWriter, ReplId, new_replid};
 use crate::exec::journal::{self, Cursor, Stream};
@@ -480,6 +480,8 @@ fn encode_sub_reply(out: &mut Vec<u8>, kind: &[u8], channel: Option<&[u8]>, coun
 enum ConnJob {
     Keys(KeysJob),
     Unlink(UnlinkJob),
+    /// LRANGE / ZRANGE géants, par tranches.
+    Range(Box<RangeJob>),
 }
 
 impl ConnJob {
@@ -487,6 +489,7 @@ impl ConnJob {
         match self {
             ConnJob::Keys(job) => job.step(art, budget),
             ConnJob::Unlink(job) => job.step(art, budget),
+            ConnJob::Range(job) => job.step(art, crate::exec::jobs::RANGE_BUDGET.max(budget)),
         }
     }
 
@@ -494,6 +497,7 @@ impl ConnJob {
         match self {
             ConnJob::Keys(job) => out.extend_from_slice(job.response()),
             ConnJob::Unlink(job) => extend_encode(out, &Frame::Integer(job.count() as i64)),
+            ConnJob::Range(job) => out.extend_from_slice(job.response()),
         }
     }
 }
@@ -1707,6 +1711,10 @@ impl Core {
         // Écrivains arrêtés par le plafond du flux : (connexion, début dans le
         // morceau de tête de la frame arrêtée ; `None` : la frame de `rx`).
         let mut aof_stops: Window<(Slot, Option<u32>)> = SmallVec::new();
+        // Connexions parquées en pleine fenêtre par une lecture de plage géante :
+        // (connexion, octets consommés du morceau de tête, frame comprise) ; leurs frames
+        // suivantes restent à lire.
+        let mut park_stops: Window<(Slot, u32)> = SmallVec::new();
         // Réplica avec AOF : la fin d'un `RXLOAD` refait les fichiers de l'AOF
         // (`rebase_aof`) ; elle attend qu'aucune suite de la file `Aof` ne soit
         // en cours (une rotation de l'ancien écrivain écrirait par-dessus).
@@ -1881,6 +1889,9 @@ impl Core {
                     }
                     art.begin_window();
                 }
+                if park_stops.iter().any(|&(s, _)| s == slot) {
+                    continue;
+                }
                 if k < run_end {
                     // préchargement en avance sur l'exécution (PF1 : nœud, PF2 :
                     // valeur), sur la première clé des frames suivantes
@@ -1898,14 +1909,22 @@ impl Core {
                         persist.note_writes(weight);
                     }
                     let plan = journal.is_some().then(|| (journal::plan(&cmd), o.out.len()));
+                    let range = matches!(cmd, Cmd::LRange { .. } | Cmd::ZRange { .. });
+                    let before = o.out.len();
                     crate::exec::execute_hinted(cmd, art, &flat[span(k)], &hints[span(k)], &mut o.out);
+                    if range && let Some(job) = crate::exec::take_deferred() {
+                        o.out.truncate(before);
+                        park_stops.push((slot, end.unwrap_or(0)));
+                        afters.push((slot, After::Park(ConnJob::Range(job))));
+                        continue;
+                    }
                     if let (Some(stream), Some((plan, start))) = (journal.as_mut(), plan) {
                         journal_finish(stream, plan, start, release_upto, held, slot, o, raw, art.now);
                     }
                     afters.push((slot, After::Continue));
                     continue;
                 }
-                if aof_stops.iter().any(|&(s, _)| s == slot) {
+                if aof_stops.iter().any(|&(s, _)| s == slot) || park_stops.iter().any(|&(s, _)| s == slot) {
                     continue;
                 }
                 let o = &mut outs[slot as usize];
@@ -1955,6 +1974,8 @@ impl Core {
                     }
                     _ => None,
                 };
+                let range = matches!(cmd, Cmd::LRange { .. } | Cmd::ZRange { .. });
+                let before = o.out.len();
                 let mut after = if let Some((_, _, vals)) = &hand_off {
                     // longueur après le push, avant le service (comme Redis)
                     extend_encode(&mut o.out, &Frame::Integer(vals.len() as i64));
@@ -1962,6 +1983,12 @@ impl Core {
                 } else {
                     run_cmd(cmd, art, o, job_budget)
                 };
+                if range && let Some(job) = crate::exec::take_deferred() {
+                    o.out.truncate(before);
+                    park_stops.push((slot, end.unwrap_or(0)));
+                    afters.push((slot, After::Park(ConnJob::Range(job))));
+                    continue;
+                }
                 if let After::Block(b) = after {
                     o.block_wait = Some(blocked.register(slot, o.epoch, b, now));
                     after = After::Blocked;
@@ -2002,6 +2029,13 @@ impl Core {
                 }
                 Some(start) => plan.consumed = start,
             }
+            plan.tail = false;
+            plan.err = None;
+        }
+        // Parquées par une lecture de plage : consommé jusqu'à la fin de cette frame.
+        for &(slot, upto) in &park_stops {
+            let plan = plans.iter_mut().find(|p| p.slot == slot).expect("plan de la connexion");
+            plan.consumed = upto;
             plan.tail = false;
             plan.err = None;
         }
@@ -2515,6 +2549,9 @@ impl Core {
             // si rien ne la précède ni ne la retient (sinon l'ordre passe par `out`).
             ConnJob::Keys(keys) if hold.is_none() && o.nothing_to_send() && o.holds.is_empty() => {
                 o.big = Some(keys.into_response());
+            }
+            ConnJob::Range(r) if hold.is_none() && o.nothing_to_send() && o.holds.is_empty() => {
+                o.big = Some(r.into_response());
             }
             mut job => job.respond(&mut o.out),
         }

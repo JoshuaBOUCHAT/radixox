@@ -42,6 +42,23 @@ use string::{
     cmd_type_hinted,
 };
 
+// ── Lectures de plage géantes : job (§ commandes bornées) ──────────────────
+
+thread_local! {
+    /// Lecture de plage trop grande pour une seule fois : le job préparé par l'exécution
+    /// (qui n'a rien répondu), repris par le cœur, qui parque la connexion.
+    static DEFERRED: std::cell::Cell<Option<Box<jobs::RangeJob>>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn defer(job: jobs::RangeJob) {
+    DEFERRED.with(|d| d.set(Some(Box::new(job))));
+}
+
+/// Job laissé par la dernière commande exécutée (LRANGE, ZRANGE et variantes).
+pub fn take_deferred() -> Option<Box<jobs::RangeJob>> {
+    DEFERRED.with(|d| d.take())
+}
+
 // ── Exécution vers le tampon de sortie ──────────────────────────────────────
 
 /// Commande dont l'exécution dépend du runtime réseau (fermeture, Pub/Sub,

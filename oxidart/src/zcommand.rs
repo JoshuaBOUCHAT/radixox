@@ -311,8 +311,28 @@ impl OxidArt {
         limit: Option<(i64, i64)>,
         with_scores: bool,
     ) -> Result<Vec<SharedByte>, RedisType> {
+        let Some((lo, hi)) = self.zrange_ranks(key, range, rev, limit)? else { return Ok(Vec::new()) };
+        let Some(val) = self.get_ref(key) else { return Ok(Vec::new()) };
+        Ok(zrange_out(val.as_zset()?, lo, hi, rev, with_scores))
+    }
+
+    /// Entrées des rangs `[lo, hi)` (à l'envers avec `rev`) de `key`.
+    pub fn zrange_at(&mut self, key: &[u8], lo: usize, hi: usize, rev: bool, with_scores: bool) -> Result<Vec<SharedByte>, RedisType> {
+        let Some(val) = self.get_ref(key) else { return Ok(Vec::new()) };
+        Ok(zrange_out(val.as_zset()?, lo, hi, rev, with_scores))
+    }
+
+    /// Rangs `[lo, hi)` (croissants) d'une lecture ZRANGE et variantes ; `None` : clé absente
+    /// ou LIMIT d'offset négatif (vide).
+    pub fn zrange_ranks(
+        &mut self,
+        key: &[u8],
+        range: ZRangeBy<'_>,
+        rev: bool,
+        limit: Option<(i64, i64)>,
+    ) -> Result<Option<(usize, usize)>, RedisType> {
         let Some(val) = self.get_ref(key) else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let zset = val.as_zset()?;
         let len = zset.len();
@@ -328,7 +348,7 @@ impl OxidArt {
             // Offset négatif : non documenté ; Valkey y rend vide ou le dernier élément
             // selon l'encodage du ZSet (listpack ou skiplist). Ici : toujours vide.
             if offset < 0 {
-                return Ok(Vec::new());
+                return Ok(None);
             }
             let n = hi - lo;
             let off = (offset as usize).min(n);
@@ -341,7 +361,33 @@ impl OxidArt {
                 hi = lo + take;
             }
         }
-        Ok(zrange_out(zset, lo, hi, rev, with_scores))
+        Ok(Some((lo, hi)))
+    }
+
+    /// Morceau d'une lecture de ZSet par tranches (non atomique) : au plus `n` entrées à
+    /// partir du rang `from` (vers le haut, ou vers le bas avec `rev`), passées à `emit`
+    /// (membre, puis score). Rend le nombre d'entrées ; moins que `n` : la clé a disparu,
+    /// changé de type, ou rétréci.
+    pub fn zrange_part(&mut self, key: &[u8], from: usize, n: usize, rev: bool, with_scores: bool, mut emit: impl FnMut(&[u8])) -> usize {
+        let Some(Ok(zset)) = self.get_ref(key).map(|v| v.as_zset()) else { return 0 };
+        if from >= zset.len() {
+            return 0;
+        }
+        let n = if rev { n.min(from + 1) } else { n };
+        let mut k = 0;
+        let mut push = |(s, m): (u64, &[u8])| {
+            emit(m);
+            if with_scores {
+                emit(&crate::zset::format_score(decode_score(s)));
+            }
+            k += 1;
+        };
+        if rev {
+            zset.iter_back_from(from).take(n).for_each(&mut push);
+        } else {
+            zset.iter_from(from).take(n).for_each(&mut push);
+        }
+        k
     }
 
     /// ZRANK / ZREVRANK : `(rang, score)`.
