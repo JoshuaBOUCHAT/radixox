@@ -14,7 +14,7 @@ use radixox_lib::save_barrier::{SaveBarrier, T0};
 use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::varint::{put_bytes, put_varint};
 
-use super::{List, NONE, block};
+use super::{List, NONE, block, is_end};
 use crate::digest;
 
 /// Image T0 d'un bloc.
@@ -154,7 +154,7 @@ impl LSer {
     /// Des blocs entiers jusqu'à épuiser `budget` (1 par bloc + 1 par élément). Vrai à la
     /// fin (terme du condensé ajouté à `d`).
     pub(crate) fn step(&mut self, out: &mut Vec<u8>, budget: &mut u32, d: &mut digest::Digest) -> bool {
-        while *budget > 0 && self.next != NONE {
+        while *budget > 0 && !is_end(self.next) {
             let b = self.next;
             let mut write = |v: &[u8]| {
                 put_bytes(out, v);
@@ -181,12 +181,12 @@ impl LSer {
             };
             self.left = self.left.checked_sub(n).expect("plus d'éléments T0 que le cardinal");
             self.next = next;
-            if next != NONE {
+            if !is_end(next) {
                 super::prefetch(next);
             }
             *budget = budget.saturating_sub(1 + n);
         }
-        if self.next != NONE {
+        if !is_end(self.next) {
             return false;
         }
         assert_eq!(self.left, 0, "chaînage T0 incomplet");

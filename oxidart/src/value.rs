@@ -233,20 +233,31 @@ pub(crate) fn zset_slab_mut() -> &'static mut HiSlab<ZSet> {
 }
 
 pub(crate) fn alloc_list(val: VecDeque<SharedByte>) -> u32 {
-    list_slab().insert(List::from_values(val))
+    alloc_list_raw(List::from_values(val))
 }
 pub(crate) fn alloc_list_raw(l: List) -> u32 {
-    list_slab().insert(l)
+    let idx = list_slab().insert(l);
+    // neuf : pas d'image T0 à prendre
+    list_slab().get_mut(idx).unwrap().set_id(idx);
+    idx
 }
 /// Libère la List `idx` : tout de suite si elle est petite, sinon par tranches
 /// (`list::lazy`) ; pendant une save, après (la vue T0 peut encore la lire).
 pub(crate) fn free_list(idx: u32) {
     crate::list::save::before_header_write(idx, || *list_ref(idx));
-    if let Some(l) = list_slab().remove(idx)
-        && let Some(l) = crate::list::save::defer_list(l)
+    if let Some(mut l) = list_slab().remove(idx)
+        && let Some(l) = crate::list::save::defer_list({
+            l.set_id(u32::MAX);
+            l
+        })
     {
         crate::list::lazy::release(l);
     }
+}
+/// En-tête de la List `idx`, sans barrière : compactage des blocs seulement (jamais
+/// pendant une save ; réécrire l'idx d'un bloc déplacé n'est pas une mutation logique).
+pub(crate) fn list_header_raw(idx: u32) -> &'static mut List {
+    list_slab().get_mut(idx).expect("en-tête de List")
 }
 /// Bitmap de présence de la slab des en-têtes de List (vue T0 de la save).
 pub(crate) fn list_slab_occupancy(buf: &mut Vec<u64>) {
@@ -337,6 +348,7 @@ pub(crate) unsafe fn value_take_raw(tag: Tag, val: ValUnion) -> Value {
             Tag::List => {
                 crate::list::save::before_header_write(val.idx, || *list_ref(val.idx));
                 let mut l = list_slab().remove(val.idx).expect("list slot");
+                l.set_id(u32::MAX);
                 let mut out = VecDeque::with_capacity(l.len() as usize);
                 while let Some(v) = l.pop_front() {
                     out.push_back(v);

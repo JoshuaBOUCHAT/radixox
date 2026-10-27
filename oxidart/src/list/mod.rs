@@ -17,6 +17,7 @@ use std::mem::MaybeUninit;
 use hislab::HiSlab;
 use radixox_lib::shared_byte::SharedByte;
 
+pub mod compact;
 pub mod lazy;
 pub mod save;
 
@@ -34,6 +35,16 @@ type Mask = u32;
 type Mask = u64;
 const _: () = assert!(CAP <= Mask::BITS as usize);
 const NONE: u32 = u32::MAX;
+/// Bout de chaîne (`prev` du premier bloc, `next` du dernier) : `HEAD | idx` désigne
+/// l'en-tête de la List dans sa slab (compactage : un bloc de bout déplacé corrige
+/// l'en-tête) ; `NONE` (qui a aussi le bit) : List hors de la slab (détachée, en cours de
+/// libération), dont les blocs de bout ne bougent pas.
+const HEAD: u32 = 1 << 31;
+
+#[inline(always)]
+fn is_end(x: u32) -> bool {
+    x & HEAD != 0
+}
 /// Sous ce nombre de vivants, un bloc tente une fusion avec un voisin.
 const MERGE_BELOW: u32 = (CAP / 4) as u32;
 
@@ -262,7 +273,7 @@ pub fn next(c: Cursor) -> Option<Cursor> {
     if above != 0 {
         return Some(Cursor { block: c.block, slot: above.trailing_zeros() as u8 });
     }
-    (b.next != NONE).then(|| Cursor { block: b.next, slot: block(b.next).lo })
+    (!is_end(b.next)).then(|| Cursor { block: b.next, slot: block(b.next).lo })
 }
 
 /// Élément précédent (vers le début).
@@ -273,7 +284,7 @@ pub fn prev(c: Cursor) -> Option<Cursor> {
     if below != 0 {
         return Some(Cursor { block: c.block, slot: (Mask::BITS - 1 - below.leading_zeros()) as u8 });
     }
-    (b.prev != NONE).then(|| Cursor { block: b.prev, slot: block(b.prev).hi - 1 })
+    (!is_end(b.prev)).then(|| Cursor { block: b.prev, slot: block(b.prev).hi - 1 })
 }
 
 /// Valeur en `c`.
@@ -288,9 +299,11 @@ pub fn value(c: Cursor) -> &'static SharedByte {
 /// part avec son dernier élément) mais l'en-tête la sait représenter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct List {
-    first: u32,
-    last: u32,
+    pub(crate) first: u32,
+    pub(crate) last: u32,
     len: u32,
+    /// Idx de l'en-tête dans la slab des List (`NONE` : hors de la slab).
+    id: u32,
 }
 
 impl Default for List {
@@ -301,7 +314,24 @@ impl Default for List {
 
 impl List {
     pub const fn new() -> Self {
-        Self { first: NONE, last: NONE, len: 0 }
+        Self { first: NONE, last: NONE, len: 0, id: NONE }
+    }
+
+    /// Marque des bouts de chaîne.
+    #[inline]
+    fn end(&self) -> u32 {
+        if self.id == NONE { NONE } else { HEAD | self.id }
+    }
+
+    /// L'en-tête est (`id`) ou n'est plus (`NONE`) à cet idx de la slab des List : bouts
+    /// remarqués.
+    pub(crate) fn set_id(&mut self, id: u32) {
+        self.id = id;
+        if self.first != NONE {
+            let e = self.end();
+            block_mut(self.first).prev = e;
+            block_mut(self.last).next = e;
+        }
     }
 
     #[inline]
@@ -336,7 +366,7 @@ impl List {
         self.len += 1;
         if self.last == NONE {
             // premier bloc : au milieu, de la place des deux côtés
-            let b = new_block(CAP as u8 / 2, NONE, NONE);
+            let b = new_block(CAP as u8 / 2, self.end(), self.end());
             (self.first, self.last) = (b, b);
         } else if block(self.last).hi as usize == CAP {
             let lb = block(self.last);
@@ -344,7 +374,7 @@ impl List {
             if lb.lo as usize + lb.dead.count_ones() as usize >= CAP / 4 {
                 block_mut(self.last).compact_to(0);
             } else {
-                let b = new_block(0, self.last, NONE);
+                let b = new_block(0, self.last, self.end());
                 block_mut(self.last).next = b;
                 self.last = b;
             }
@@ -357,7 +387,7 @@ impl List {
     pub fn push_front(&mut self, v: SharedByte) {
         self.len += 1;
         if self.first == NONE {
-            let b = new_block(CAP as u8 / 2, NONE, NONE);
+            let b = new_block(CAP as u8 / 2, self.end(), self.end());
             (self.first, self.last) = (b, b);
         } else if block(self.first).lo == 0 {
             let fb = block(self.first);
@@ -366,7 +396,7 @@ impl List {
                 let n = fb.live() as usize;
                 block_mut(self.first).compact_to(CAP - n);
             } else {
-                let b = new_block(CAP as u8, NONE, self.first);
+                let b = new_block(CAP as u8, self.end(), self.first);
                 block_mut(self.first).prev = b;
                 self.first = b;
             }
@@ -411,8 +441,16 @@ impl List {
     /// Décroche et libère le bloc `i`, vidé.
     fn unlink(&mut self, i: u32) {
         let (prev, next) = (block(i).prev, block(i).next);
-        if prev == NONE { self.first = next } else { block_mut(prev).next = next }
-        if next == NONE { self.last = prev } else { block_mut(next).prev = prev }
+        if is_end(prev) {
+            self.first = if is_end(next) { NONE } else { next };
+        } else {
+            block_mut(prev).next = next;
+        }
+        if is_end(next) {
+            self.last = if is_end(prev) { NONE } else { prev };
+        } else {
+            block_mut(next).prev = prev;
+        }
         free_block(i);
     }
 
@@ -514,9 +552,9 @@ impl List {
         }
         let b = block(i);
         let n = b.live();
-        if b.prev != NONE && block(b.prev).live() + n <= CAP as u32 {
+        if !is_end(b.prev) && block(b.prev).live() + n <= CAP as u32 {
             self.absorb(b.prev, i);
-        } else if b.next != NONE && block(b.next).live() + n <= CAP as u32 {
+        } else if !is_end(b.next) && block(b.next).live() + n <= CAP as u32 {
             self.absorb(i, b.next);
         }
     }
@@ -547,7 +585,7 @@ impl List {
         }
         l.hi = k as u8;
         l.next = next;
-        if next == NONE { self.last = left } else { block_mut(next).prev = left }
+        if is_end(next) { self.last = left } else { block_mut(next).prev = left }
         free_block(right);
     }
 
@@ -571,7 +609,7 @@ impl List {
             let next = b.next;
             let r = new_block(0, i, next);
             block_mut(i).next = r;
-            if next == NONE { self.last = r } else { block_mut(next).prev = r }
+            if is_end(next) { self.last = r } else { block_mut(next).prev = r }
             let rb = block_mut(r);
             for (j, v) in right.into_iter().take(CAP - half).enumerate() {
                 rb.slots[j] = v;
@@ -647,7 +685,11 @@ impl List {
             return List::new();
         }
         if n == self.len {
-            return std::mem::replace(self, List::new());
+            let id = self.id;
+            let mut out = std::mem::replace(self, List::new());
+            self.id = id;
+            out.set_id(NONE);
+            return out;
         }
         // rang du premier élément gardé (devant) ou du premier retiré (derrière)
         let c = self.locate(if front { n } else { self.len - n }).expect("coupe");
@@ -656,11 +698,12 @@ impl List {
         let mut out = List::new();
         if front {
             // blocs avant `c` : détachés ; `below` cases de `c` : retirées sur place
-            if b.prev != NONE {
+            if !is_end(b.prev) {
                 let last = b.prev;
                 (out.first, out.last, out.len) = (self.first, last, n - below);
+                block_mut(self.first).prev = NONE;
                 block_mut(last).next = NONE;
-                block_mut(c.block).prev = NONE;
+                block_mut(c.block).prev = self.end();
                 self.first = c.block;
             }
             self.len -= n - below;
@@ -669,11 +712,12 @@ impl List {
             }
         } else {
             let from = b.live() - below;
-            if b.next != NONE {
+            if !is_end(b.next) {
                 let first = b.next;
                 (out.first, out.last, out.len) = (first, self.last, n - from);
                 block_mut(first).prev = NONE;
-                block_mut(c.block).next = NONE;
+                block_mut(self.last).next = NONE;
+                block_mut(c.block).next = self.end();
                 self.last = c.block;
             }
             self.len -= n - from;
@@ -727,8 +771,11 @@ impl List {
 
     /// Vérifie les invariants (tests).
     pub fn verify(&self) -> Result<(), String> {
-        let (mut b, mut prev_b, mut n) = (self.first, NONE, 0u32);
-        while b != NONE {
+        if self.first == NONE {
+            return if self.last == NONE && self.len == 0 { Ok(()) } else { Err(format!("vide incohérente : {self:?}")) };
+        }
+        let (mut b, mut prev_b, mut n) = (self.first, self.end(), 0u32);
+        while !is_end(b) {
             let x = block(b);
             if x.prev != prev_b {
                 return Err(format!("bloc {b} : prev {} au lieu de {prev_b}", x.prev));
@@ -745,6 +792,9 @@ impl List {
         }
         if prev_b != self.last {
             return Err(format!("dernier {prev_b} au lieu de {}", self.last));
+        }
+        if b != self.end() {
+            return Err(format!("bout {b:x} au lieu de {:x}", self.end()));
         }
         if n != self.len {
             return Err(format!("{n} vivants au lieu de {}", self.len));
@@ -890,6 +940,53 @@ mod tests {
         }
     }
 
+    /// Compactage : List réelles (en-têtes dans leur slab), une sur deux supprimée, passe
+    /// forcée ; contenus et invariants gardés, slab rétrécie. Une List en cours de
+    /// libération (bouts `NONE`) ne bouge pas.
+    #[test]
+    fn compaction_keeps_lists() {
+        use crate::value::{alloc_list_raw, free_list, list_ref};
+        crate::value::init_slabs();
+        let mut r = Rng(0x5851_F42D_4C95_7F2D);
+        let mut lists: Vec<(u32, VecDeque<SharedByte>)> = Vec::new();
+        for i in 0..400u64 {
+            let n = 1 + r.below(300);
+            let vals: VecDeque<SharedByte> = (0..n).map(|j| sb(i * 1000 + j)).collect();
+            lists.push((alloc_list_raw(List::from_values(vals.iter().cloned())), vals));
+        }
+        // trous : une List sur deux part (tout de suite : petites)
+        let mut kept = Vec::new();
+        for (k, (idx, vals)) in lists.into_iter().enumerate() {
+            if k % 2 == 0 { free_list(idx) } else { kept.push((idx, vals)) }
+        }
+        // une grande en cours de libération : bouts `NONE`, ne doit pas bouger
+        let big = alloc_list_raw(List::from_values((0..2000).map(sb)));
+        free_list(big);
+        let before = slab().len();
+        let span_before = slab().last_occupied().unwrap() + 1;
+        let mut c = compact::want(true).expect("passe");
+        while compact::step(&mut c, 64).is_none() {}
+        assert_eq!(slab().len(), before, "aucun bloc perdu");
+        for (idx, vals) in &kept {
+            let l = list_ref(*idx);
+            l.verify().unwrap();
+            assert!(l.iter().map(|v| v.as_slice()).eq(vals.iter().map(|v| v.as_slice())));
+        }
+        while lazy::step(1 << 20) {}
+        let mut c = compact::want(true).expect("passe");
+        while compact::step(&mut c, 64).is_none() {}
+        let span_after = slab().last_occupied().unwrap() + 1;
+        assert!(span_after < span_before, "fin de slab {span_after} (avant {span_before})");
+        assert_eq!(span_after, slab().len(), "plus de trou sous la fin");
+        for (idx, vals) in kept {
+            let l = list_ref(idx);
+            l.verify().unwrap();
+            assert!(l.iter().map(|v| v.as_slice()).eq(vals.iter().map(|v| v.as_slice())));
+            free_list(idx);
+        }
+        while lazy::step(1 << 20) {}
+    }
+
     #[test]
     fn queue_stays_in_one_block() {
         let before = slab_blocks();
@@ -917,7 +1014,7 @@ mod tests {
         assert_eq!(l.len(), 300);
         let mut blocks = 0;
         let mut b = l.first_block();
-        while b != NONE {
+        while !is_end(b) {
             blocks += 1;
             b = block(b).next_block();
         }
