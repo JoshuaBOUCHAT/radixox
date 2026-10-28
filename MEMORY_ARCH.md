@@ -714,6 +714,42 @@ est résident après coup ; pour refuser avant, il faut compter avant que les pa
   `large` = `charged_bytes()` à chaque pas, tout rendu à la destruction),
   `tests/memory.rs` (registre ≥ mesuré, écart < 32 Mo, baisse après rognage).
 
+### 10.5 Total strict : décisions de l'utilisateur (2026-10-28), à implémenter
+
+- **`maxmemory` borne le total du processus** (« 2 Gio = 2 Gio »), contre le registre
+  (§10.4). Défaut `noeviction` ; message `-OOM` exact de Redis ; noms Redis dans `CONFIG`
+  (`maxmemory`, `maxmemory-policy`, `maxmemory-samples` ignoré), `RADIXOX_MAXMEMORY`,
+  `RADIXOX_MAXMEMORY_POLICY` ; `CONFIG SET maxmemory` à chaud (en dessous de l'usage :
+  éviction de fond, ou `-OOM` en `noeviction`).
+- **Réservation avant exécution** : coût borné calculé avant la commande ; `-OOM` sans
+  exécution partielle ; une borne haute peut refuser une commande qui aurait tenu (accepté).
+- **Démarrage** : save ou AOF plus gros que `maxmemory` → refus de démarrer, message clair.
+  **Réplica** : applique tout ce que pousse le maître, évince localement, le signale.
+- **Tampons fixes en alternance au lieu de budgets globaux** (remplace les budgets d'entrée
+  et de sortie de 1 Gio) :
+  - sortie d'un client : 2 tampons ; 64 Kio par défaut, doublés jusqu'à 2 Mio quand le
+    producteur les remplit, ramenés à 64 Kio au repos. Les deux pleins : le job est parqué
+    et la lecture du client suspendue (contre-pression, pas de fermeture). Les blocs au-delà
+    du petit tampon viennent d'une **réserve commune** plafonnée (part du total) ; vide →
+    attente. Une connexion à petites réponses ne prend jamais de bloc.
+  - réponses de taille inconnue d'avance (`KEYS motif`) : `*N` part avant le premier
+    élément en RESP2, compter puis émettre casserait le protocole (job non atomique) →
+    construites en entier (`BigBuf`) dans le plafond du client ; au-delà, rien n'est encore
+    parti : `-ERR reply exceeds output limit, use SCAN`.
+  - save : 2 tampons en alternance (aujourd'hui 10 Mo, `persist.rs:109`).
+  - AOF : taille selon le **débit d'écriture**, pas la taille de la base (une petite base
+    peut recevoir un flot massif) ; 64 Kio → 2 Mio ; disque trop lent → les écritures
+    attendent un tampon libre (au lieu du plafond de 64 Mio).
+  - réplicas : 3 tampons ; le 3e pas réutilisable (réplica pas à jour) → trop lent,
+    déconnecté, resynchronisation complète.
+- **Réserve CoW de la save** : `RADIXOX_SAVE_RESERVE` / `CONFIG` et `BGSAVE RESERVE
+  <octets>`, prise dans le total ; une save ne démarre que si la réserve est libre, donc ne
+  manque jamais de mémoire ; les copies de la barrière y comptent ; réserve épuisée →
+  `-OOM` aux écritures, pas d'éviction (évincer un nœud intact force une copie), la save
+  n'est jamais abandonnée.
+- **Ordre** : tampons fixes (sortie, save, AOF, réplicas) → `maxmemory` + `noeviction` +
+  réservation → politiques gratuites → éviction de fond → feature `eviction`.
+
 ### 10.3 Déclenchement
 
 - **Deux niveaux** : l'éviction de fond démarre à `maxmemory − réserve − marge` ; la
