@@ -14,7 +14,6 @@
 //! Sert aussi d'allocateur global du binaire ([`crate::raw_alloc::heap::RxAlloc`]).
 //! Les tests construisent leurs propres [`Large`], plus petits.
 
-use std::collections::VecDeque;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::{Duration, Instant};
@@ -111,6 +110,128 @@ fn map(len: usize) -> Option<*mut u8> {
     (p != libc::MAP_FAILED).then_some(p as *mut u8)
 }
 
+/// Tableau à capacité fixe sur un mapping à lui (`MAP_NORESERVE` : seules les pages
+/// écrites comptent). Les tables du tas ne passent jamais par l'allocateur global, qui est
+/// le tas lui-même : pas de réentrance, pas de repli.
+struct MapArr<T: Copy> {
+    ptr: *mut T,
+    cap: usize,
+    len: usize,
+    /// Plus haute longueur depuis le dernier rendu (pages peut-être résidentes).
+    touched: usize,
+}
+
+impl<T: Copy> MapArr<T> {
+    fn new(cap: usize) -> Option<Self> {
+        let p = map(Self::bytes_for(cap))?;
+        // Petites tables : sous THP `always`, la première écriture prendrait 2 Mio.
+        unsafe { libc::madvise(p as *mut _, Self::bytes_for(cap), libc::MADV_NOHUGEPAGE) };
+        Some(Self { ptr: p as *mut T, cap, len: 0, touched: 0 })
+    }
+
+    fn bytes_for(cap: usize) -> usize {
+        (cap * size_of::<T>()).max(1)
+    }
+
+    #[inline]
+    fn push(&mut self, v: T) {
+        assert!(self.len < self.cap, "table du tas pleine");
+        unsafe { self.ptr.add(self.len).write(v) };
+        self.len += 1;
+        self.touched = self.touched.max(self.len);
+    }
+
+    #[inline]
+    fn pop(&mut self) -> Option<T> {
+        (self.len > 0).then(|| {
+            self.len -= 1;
+            unsafe { self.ptr.add(self.len).read() }
+        })
+    }
+
+    /// Longueur ramenée à `len` ; les pages entières au-delà de `keep` éléments sont
+    /// rendues si plus de `2 × keep` ont été touchés.
+    fn truncate(&mut self, len: usize, keep: usize) {
+        debug_assert!(len <= self.len);
+        self.len = len;
+        let keep = keep.max(len);
+        if self.touched > 2 * keep {
+            let from = (keep * size_of::<T>()).next_multiple_of(4096);
+            let to = (self.touched * size_of::<T>()).next_multiple_of(4096);
+            if to > from {
+                unsafe { libc::madvise((self.ptr as *mut u8).add(from) as *mut _, to - from, libc::MADV_DONTNEED) };
+            }
+            self.touched = keep;
+        }
+    }
+
+    fn resident(&self) -> u64 {
+        crate::resident::region(self.ptr as usize, self.touched * size_of::<T>(), Self::bytes_for(self.cap))
+    }
+}
+
+impl<T: Copy> std::ops::Index<usize> for MapArr<T> {
+    type Output = T;
+    #[inline]
+    fn index(&self, i: usize) -> &T {
+        assert!(i < self.len);
+        unsafe { &*self.ptr.add(i) }
+    }
+}
+
+impl<T: Copy> std::ops::IndexMut<usize> for MapArr<T> {
+    #[inline]
+    fn index_mut(&mut self, i: usize) -> &mut T {
+        assert!(i < self.len);
+        unsafe { &mut *self.ptr.add(i) }
+    }
+}
+
+impl<T: Copy> Drop for MapArr<T> {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.ptr as *mut _, Self::bytes_for(self.cap)) };
+    }
+}
+
+/// File des suites sales : tableau linéaire, `head` avance au rendu, la compaction
+/// ramène les entrées vivantes au début.
+struct Fifo {
+    a: MapArr<(u32, Instant)>,
+    head: usize,
+}
+
+impl Fifo {
+    #[inline]
+    fn front(&self) -> Option<&(u32, Instant)> {
+        (self.head < self.a.len).then(|| &self.a[self.head])
+    }
+
+    #[inline]
+    fn pop_front(&mut self) {
+        self.head += 1;
+        if self.head == self.a.len {
+            self.head = 0;
+            self.a.len = 0;
+        }
+    }
+
+    #[inline]
+    fn push_back(&mut self, e: (u32, Instant)) {
+        self.a.push(e);
+    }
+
+    /// Fin de la partie écrite (déclenche la compaction).
+    #[inline]
+    fn tail(&self) -> usize {
+        self.a.len
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.a.len - self.head
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     /// Granules alloués (objets du tas et slabs), en octets.
@@ -138,13 +259,16 @@ pub struct Large {
     tag: *mut u32,
     next: *mut u32,
     prev: *mut u32,
-    /// Granule → slab qui le contient (granules de slab seulement).
+    /// Granule → slab qui le contient (granules de slab), `NONE` au début d'une suite du
+    /// tas : la route d'un bloc se retrouve depuis son adresse ([`Large::route_of_ptr`]).
     owner: *mut u32,
-    maps: [(*mut u8, usize); 5],
+    /// Granule → dernière position dans la file (compaction de la file seulement).
+    last: *mut u32,
+    maps: [(*mut u8, usize); 6],
     /// 0 : suites propres (rendues), 1 : sales.
     idx: [Index; 2],
     /// Suites sales à rendre : (début, libérée à).
-    fifo: VecDeque<(u32, Instant)>,
+    fifo: Fifo,
     /// Longueur de la file qui déclenche son nettoyage ([`Large::compact_fifo`]).
     fifo_compact_at: usize,
     decay: Duration,
@@ -159,17 +283,27 @@ impl Large {
     pub fn new(virt: usize, decay: Duration) -> Option<Self> {
         let nb = (virt / GRANULE).clamp(SLAB_GRANULES as usize, LEN as usize) as u32;
         let side = nb as usize * 4;
-        let lens = [nb as usize * GRANULE, side, side, side, side];
-        let mut maps = [(null_mut(), 0); 5];
+        let lens = [nb as usize * GRANULE, side, side, side, side, side];
+        let mut maps = [(null_mut(), 0); 6];
+        let unmap = |maps: &[(*mut u8, usize)]| {
+            for &(p, len) in maps {
+                unsafe { libc::munmap(p as *mut _, len) };
+            }
+        };
         for (i, &len) in lens.iter().enumerate() {
             let Some(p) = map(len) else {
-                for &(p, len) in &maps[..i] {
-                    unsafe { libc::munmap(p as *mut _, len) };
-                }
+                unmap(&maps[..i]);
                 return None;
             };
             maps[i] = (p, len);
         }
+        // Bornes : un slab par 16 granules ; la file est compactée à 2 × le nombre de suites
+        // libres (≤ nb / 2 + 1), et au moins à FIFO_MIN.
+        let slabs = nb as usize / SLAB_GRANULES as usize + 1;
+        let (Some(fifo), Some(slabs)) = (MapArr::new(nb as usize + FIFO_MIN + 2), Slabs::new(slabs)) else {
+            unmap(&maps);
+            return None;
+        };
         unsafe { libc::madvise(maps[0].0 as *mut _, lens[0], libc::MADV_NOHUGEPAGE) };
         Some(Self {
             base: maps[0].0 as usize,
@@ -179,15 +313,16 @@ impl Large {
             next: maps[2].0 as *mut u32,
             prev: maps[3].0 as *mut u32,
             owner: maps[4].0 as *mut u32,
+            last: maps[5].0 as *mut u32,
             maps,
             idx: [Index::EMPTY, Index::EMPTY],
-            fifo: VecDeque::new(),
+            fifo: Fifo { a: fifo, head: 0 },
             fifo_compact_at: FIFO_MIN,
             decay,
             held: 0,
             dirty: 0,
             released: 0,
-            slabs: Slabs::new(),
+            slabs,
         })
     }
 
@@ -210,7 +345,10 @@ impl Large {
             top_bytes: self.top as u64 * GRANULE as u64,
             slab_held_bytes: self.slabs.held_slabs * SLAB as u64,
             slab_live_bytes: self.slabs.live_bytes,
-            meta_bytes: self.maps[1..].iter().map(|&(p, len)| crate::resident::region(p as usize, self.top as usize * 4, len)).sum(),
+            meta_bytes: self.maps[1..].iter().map(|&(p, len)| crate::resident::region(p as usize, self.top as usize * 4, len)).sum::<u64>()
+                + self.fifo.a.resident()
+                + self.slabs.slabs.resident()
+                + self.slabs.free_ids.resident(),
         }
     }
 
@@ -277,6 +415,12 @@ impl Large {
 
     /// Suite de `n` granules (sale d'abord : déjà tenue, aucun défaut de page).
     fn alloc_granules(&mut self, n: u32) -> Option<u32> {
+        self.alloc_granules_z(n).map(|(g, _)| g)
+    }
+
+    /// Comme [`Large::alloc_granules`], et si la suite est déjà à zéro : propre (rendue par
+    /// `MADV_DONTNEED`) ou neuve (au-dessus de `top`, jamais écrite).
+    fn alloc_granules_z(&mut self, n: u32) -> Option<(u32, bool)> {
         debug_assert!(n > 0);
         for dirty in [true, false] {
             let Some(s) = self.idx[dirty as usize].find(n) else { continue };
@@ -293,7 +437,7 @@ impl Large {
             }
             self.set_run(a, n, 0);
             self.held += n as u64;
-            return Some(a);
+            return Some((a, !dirty));
         }
         if n > self.nb - self.top {
             return None;
@@ -302,7 +446,7 @@ impl Large {
         self.top += n;
         self.set_run(a, n, 0);
         self.held += n as u64;
-        Some(a)
+        Some((a, true))
     }
 
     /// Rend la suite `[s, s + n)` : sale, fusionnée avec ses voisines libres.
@@ -347,7 +491,7 @@ impl Large {
         }
         self.link(start, len, true);
         self.fifo.push_back((start, now));
-        if self.fifo.len() >= self.fifo_compact_at {
+        if self.fifo.tail() >= self.fifo_compact_at {
             self.compact_fifo();
         }
     }
@@ -357,30 +501,31 @@ impl Large {
     /// (mesuré : 390 K entrées, 6 Mo dans la libc, pour un chargement de 140 Mo). Quand
     /// elle double, on n'y garde que les suites encore libres et sales, une entrée par
     /// suite (la dernière : `decay` court depuis la dernière libération), dans l'ordre :
-    /// bornée par le nombre de suites libres. La capacité en trop est rendue. Amorti :
-    /// O(log n) par libération ; les tableaux temporaires vont à la libc (sous `BUSY`).
+    /// bornée par le nombre de suites libres. Les pages en trop sont rendues. Sur place,
+    /// en deux passes : la première note dans `last` la dernière position de chaque suite.
     fn compact_fifo(&mut self) {
-        let tag = self.tag;
-        // SAFETY: les entrées désignent des granules sous `top` (table de la plage).
+        let (tag, last) = (self.tag, self.last);
+        // SAFETY: les entrées désignent des granules sous `top` (tables de la plage).
         let valid = |s: u32| unsafe { *tag.add(s as usize) } & (FREE | DIRTY | START) == FREE | DIRTY | START;
-        let mut live: Vec<(u32, u32)> =
-            self.fifo.iter().enumerate().filter(|(_, (s, _))| valid(*s)).map(|(i, &(s, _))| (s, i as u32)).collect();
-        live.sort_unstable();
-        let mut keep = vec![false; self.fifo.len()];
-        for (j, &(s, i)) in live.iter().enumerate() {
-            if live.get(j + 1).is_none_or(|&(t, _)| t != s) {
-                keep[i as usize] = true;
+        let (h, t) = (self.fifo.head, self.fifo.tail());
+        let a = &mut self.fifo.a;
+        for i in h..t {
+            let s = a[i].0;
+            if valid(s) {
+                unsafe { *last.add(s as usize) = i as u32 };
             }
         }
-        let mut i = 0;
-        self.fifo.retain(|_| {
-            i += 1;
-            keep[i - 1]
-        });
-        self.fifo_compact_at = (self.fifo.len() * 2).max(FIFO_MIN);
-        if self.fifo.capacity() > 2 * self.fifo_compact_at {
-            self.fifo.shrink_to(self.fifo_compact_at);
+        let mut w = 0;
+        for i in h..t {
+            let e = a[i];
+            if valid(e.0) && unsafe { *last.add(e.0 as usize) } == i as u32 {
+                a[w] = e;
+                w += 1;
+            }
         }
+        self.fifo_compact_at = (w * 2).max(FIFO_MIN);
+        self.fifo.head = 0;
+        self.fifo.a.truncate(w, self.fifo_compact_at);
     }
 
     /// Rend au système les suites sales libérées depuis `decay`. Vrai s'il en reste à
@@ -440,9 +585,35 @@ impl Large {
     }
 
     fn alloc_route(&mut self, r: Route) -> *mut u8 {
+        self.alloc_route_z(r).0
+    }
+
+    /// Bloc et « déjà à zéro » (suite propre ou neuve ; jamais un emplacement de slab).
+    fn alloc_route_z(&mut self, r: Route) -> (*mut u8, bool) {
         match r {
-            Route::Heap(n) => self.alloc_granules(n).map_or(null_mut(), |g| self.addr(g)),
-            Route::Slab(c) => self.slab_alloc(c),
+            Route::Heap(n) => self.alloc_granules_z(n).map_or((null_mut(), false), |(g, zero)| {
+                unsafe { *self.owner.add(g as usize) = NONE };
+                (self.addr(g), zero)
+            }),
+            Route::Slab(c) => (self.slab_alloc(c), false),
+        }
+    }
+
+    /// Route d'un bloc servi, depuis son adresse : granule d'un slab (`owner`), sinon début
+    /// d'une suite du tas (`owner == NONE`, posé à l'allocation).
+    fn route_of_ptr(&self, p: *mut u8) -> Route {
+        let g = self.granule_of(p);
+        match unsafe { *self.owner.add(g as usize) } {
+            NONE => Route::Heap(self.tag(g) & LEN),
+            id => Route::Slab(self.slabs.slab(id).class as usize),
+        }
+    }
+
+    /// Octets utilisables d'un bloc servi (taille de classe, ou suite entière).
+    fn usable_of(&self, p: *mut u8) -> usize {
+        match self.route_of_ptr(p) {
+            Route::Heap(n) => n as usize * GRANULE,
+            Route::Slab(c) => CLASSES[c] as usize,
         }
     }
 
@@ -619,8 +790,8 @@ struct Slab {
 }
 
 struct Slabs {
-    slabs: Vec<Slab>,
-    free_ids: Vec<u32>,
+    slabs: MapArr<Slab>,
+    free_ids: MapArr<u32>,
     /// Slabs d'une classe avec de la place.
     partial: [u32; CLASSES.len()],
     held_slabs: u64,
@@ -628,8 +799,14 @@ struct Slabs {
 }
 
 impl Slabs {
-    fn new() -> Self {
-        Self { slabs: Vec::new(), free_ids: Vec::new(), partial: [NONE; CLASSES.len()], held_slabs: 0, live_bytes: 0 }
+    fn new(cap: usize) -> Option<Self> {
+        Some(Self {
+            slabs: MapArr::new(cap)?,
+            free_ids: MapArr::new(cap)?,
+            partial: [NONE; CLASSES.len()],
+            held_slabs: 0,
+            live_bytes: 0,
+        })
     }
 
     #[inline]
@@ -646,7 +823,7 @@ impl Slabs {
             }
             None => {
                 self.slabs.push(s);
-                (self.slabs.len() - 1) as u32
+                (self.slabs.len - 1) as u32
             }
         };
         self.held_slabs += 1;
@@ -731,8 +908,9 @@ impl Slabs {
 
 static mut LARGE: Option<Large> = None;
 static mut DISABLED: bool = false;
-/// Dans le tas (ou son initialisation) : une allocation qui y revient — ses tables (`Vec`,
-/// `VecDeque`), la lecture de l'environnement — part dans la libc ([`with`] rend `None`).
+/// Dans le tas : une allocation qui y reviendrait part en mapping direct ([`with`] rend
+/// `None`). Ne devrait plus arriver : les tables du tas sont des [`MapArr`], et
+/// l'initialisation lit l'environnement sans allouer.
 static mut BUSY: bool = false;
 /// La plage, lisible de tout thread ([`owns`]) : fixée une fois à l'initialisation.
 static RANGE_BASE: AtomicUsize = AtomicUsize::new(0);
@@ -758,26 +936,37 @@ fn with<R>(f: impl FnOnce(&mut Large) -> R) -> Option<R> {
     }
 }
 
-/// Sous [`BUSY`] : ses allocations (environnement, message) vont à la libc.
+/// Variable d'environnement entière, lue sans allouer (`getenv` : le tas n'existe pas encore).
+fn env_u64(name: &std::ffi::CStr, default: u64) -> u64 {
+    let v = unsafe { libc::getenv(name.as_ptr()) };
+    if v.is_null() {
+        return default;
+    }
+    let v = unsafe { std::ffi::CStr::from_ptr(v) }.to_bytes();
+    std::str::from_utf8(v).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Plage refusée (`vm.overcommit_memory = 2`, `ulimit -v`) : on retente en la divisant par
+/// deux jusqu'à 1 Gio ; au-delà, tout part en mapping direct (lent, mais compté).
 #[cold]
 #[allow(static_mut_refs)]
 unsafe fn init() -> Option<&'static mut Large> {
-    let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-    let gb = env("RADIXOX_LARGE_VIRT_GB", 64) as usize;
-    let decay = Duration::from_secs(env("RADIXOX_MEMORY_DECAY", 10));
+    let mut gb = env_u64(c"RADIXOX_LARGE_VIRT_GB", 64).max(1) as usize;
+    let decay = Duration::from_secs(env_u64(c"RADIXOX_MEMORY_DECAY", 10));
     unsafe {
-        match Large::new(gb << 30, decay) {
-            Some(l) => {
+        loop {
+            if let Some(l) = Large::new(gb << 30, decay) {
                 RANGE_BASE.store(l.base, Relaxed);
                 RANGE_LEN.store(l.nb as usize * GRANULE, Relaxed);
                 LARGE = Some(l);
-                LARGE.as_mut()
+                return LARGE.as_mut();
             }
-            None => {
-                eprintln!("radixox: mmap de la plage des grands objets ({gb} Gio) refusé, repli sur malloc");
+            if gb == 1 {
+                crate::raw_alloc::direct::message(b"radixox: plage des grands objets refusee, mappings directs\n");
                 DISABLED = true;
-                None
+                return None;
             }
+            gb /= 2;
         }
     }
 }
@@ -788,14 +977,14 @@ pub fn owns(a: usize) -> bool {
     a.wrapping_sub(RANGE_BASE.load(Relaxed)) < RANGE_LEN.load(Relaxed)
 }
 
-/// Objet de `size` octets (aligné sur 8) ; la libc si la plage est pleine ou absente.
+/// Objet de `size` octets (aligné sur 8) ; mapping direct si la plage est pleine ou absente.
 ///
 /// # Safety
 /// Mono-thread ; libérer par [`free`] avec la même taille.
 pub unsafe fn malloc(size: usize) -> *mut u8 {
     match with(|l| l.alloc(size)) {
         Some(p) if !p.is_null() => p,
-        _ => unsafe { libc::malloc(size) as *mut u8 },
+        _ => crate::raw_alloc::direct::alloc(size, 8),
     }
 }
 
@@ -805,7 +994,7 @@ pub unsafe fn free(ptr: *mut u8, size: usize) {
     if owns(ptr as usize) {
         with(|l| unsafe { l.free(ptr, size) }).expect("libération d'un objet du tas depuis le tas");
     } else {
-        unsafe { libc::free(ptr as *mut _) }
+        unsafe { crate::raw_alloc::direct::free(ptr) }
     }
 }
 
@@ -818,6 +1007,18 @@ pub fn global_alloc(size: usize, align: usize) -> *mut u8 {
     with(|l| l.alloc_route(r)).unwrap_or(null_mut())
 }
 
+/// Comme [`global_alloc`], mis à zéro. Une suite propre ou neuve l'est déjà : pas
+/// d'écriture, ses pages restent non résidentes (un gros `calloc` ne coûte que ce qu'on
+/// en écrit).
+pub fn global_alloc_zeroed(size: usize, align: usize) -> *mut u8 {
+    let Some(r) = Route::of(size, align) else { return null_mut() };
+    let (p, zero) = with(|l| l.alloc_route_z(r)).unwrap_or((null_mut(), false));
+    if !p.is_null() && !zero {
+        unsafe { std::ptr::write_bytes(p, 0, size) };
+    }
+    p
+}
+
 /// # Safety
 /// `ptr` vient de [`global_alloc`] avec ces `size` et `align` ([`owns`] vrai), pas encore
 /// rendu ; thread du tas.
@@ -825,6 +1026,24 @@ pub fn global_alloc(size: usize, align: usize) -> *mut u8 {
 pub unsafe fn global_free(ptr: *mut u8, size: usize, align: usize) {
     let r = Route::of(size, align).expect("route d'un bloc servi");
     with(|l| unsafe { l.free_route(ptr, r) }).expect("libération d'un bloc du tas depuis le tas");
+}
+
+/// Octets utilisables d'un bloc du tas ([`owns`] vrai), retrouvés depuis son adresse.
+pub fn usable_size(ptr: *mut u8) -> usize {
+    with(|l| l.usable_of(ptr)).expect("taille d'un bloc du tas depuis le tas")
+}
+
+/// Rend un bloc du tas sans connaître sa taille (`free` du C).
+///
+/// # Safety
+/// `ptr` vient de [`global_alloc`] ([`owns`] vrai), pas encore rendu ; thread du tas.
+pub unsafe fn free_ptr(ptr: *mut u8) {
+    with(|l| unsafe { l.free_route(ptr, l.route_of_ptr(ptr)) }).expect("libération d'un bloc du tas depuis le tas");
+}
+
+/// Le bloc du tas `ptr` sert aussi `new` (alignement `align`) sans bouger.
+pub fn ptr_fits(ptr: *mut u8, new: usize, align: usize) -> bool {
+    Route::of(new, align).is_some_and(|r| with(|l| l.route_of_ptr(ptr) == r).unwrap_or(false))
 }
 
 /// Un bloc servi pour `(old, align)` sert aussi `new` sans bouger.
@@ -1008,7 +1227,7 @@ mod tests {
             unsafe { l.free(p, size) };
         }
         assert!(l.fifo.len() < 2 * FIFO_MIN, "file : {} entrées", l.fifo.len());
-        assert!(l.fifo.capacity() <= 4 * FIFO_MIN, "capacité : {}", l.fifo.capacity());
+        assert!(l.fifo.a.touched <= 4 * FIFO_MIN, "touchées : {}", l.fifo.a.touched);
         l.check();
         for &p in &keep {
             unsafe { l.free(p, 64 << 10) };

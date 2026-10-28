@@ -50,7 +50,8 @@ fn rss_is_accounted_and_emptied_slabs_shrink() {
     // pile, binaire, libc pour elle-même : quelques Mo, qui ne grandissent pas avec les
     // données (une région oubliée en ferait des dizaines)
     assert!(untracked.abs() < 6 * MB && (untracked - empty).abs() < 4 * MB, "à vide {empty} o, chargé {untracked} o");
-    assert!(m["mem_libc_bytes"] < 2 * MB, "repli libc : {} o", m["mem_libc_bytes"]);
+    // plus rien chez la libc ; les mappings directs ne servent que les cas hors du tas
+    assert_eq!(m["mem_direct_bytes"], 0, "mappings directs");
     let zset = m["mem_hislab_zset_tree_bytes"] + m["mem_hislab_zset_index_bytes"];
     assert!(zset > 4 * MB, "slabs des ZSet : {zset} o");
 

@@ -16,6 +16,59 @@ compile_error!("RadixOx requires Linux to run (io_uring).");
 #[global_allocator]
 static HEAP: radixox_lib::raw_alloc::heap::RxAlloc = radixox_lib::raw_alloc::heap::RxAlloc;
 
+/// `malloc` & co. de tout le processus sur le même tas (MEMORY_ARCH.md §18.13) : la libc
+/// elle-même et le C lié (zstd) n'allouent plus chez la libc. Pas sous `radixox_sysalloc`.
+#[cfg(not(radixox_sysalloc))]
+mod c_malloc {
+    use radixox_lib::raw_alloc::heap::c;
+    use std::ffi::c_void;
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn malloc(size: usize) -> *mut c_void {
+        c::malloc(size) as _
+    }
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn free(p: *mut c_void) {
+        unsafe { c::free(p as _) }
+    }
+    #[unsafe(no_mangle)]
+    pub extern "C" fn calloc(n: usize, size: usize) -> *mut c_void {
+        c::calloc(n, size) as _
+    }
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn realloc(p: *mut c_void, size: usize) -> *mut c_void {
+        unsafe { c::realloc(p as _, size) as _ }
+    }
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn reallocarray(p: *mut c_void, n: usize, size: usize) -> *mut c_void {
+        unsafe { c::reallocarray(p as _, n, size) as _ }
+    }
+    #[unsafe(no_mangle)]
+    pub extern "C" fn aligned_alloc(align: usize, size: usize) -> *mut c_void {
+        c::aligned_alloc(align, size) as _
+    }
+    #[unsafe(no_mangle)]
+    pub extern "C" fn memalign(align: usize, size: usize) -> *mut c_void {
+        c::aligned_alloc(align, size) as _
+    }
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn posix_memalign(out: *mut *mut c_void, align: usize, size: usize) -> i32 {
+        unsafe { c::posix_memalign(out as _, align, size) }
+    }
+    #[unsafe(no_mangle)]
+    pub extern "C" fn valloc(size: usize) -> *mut c_void {
+        c::valloc(size) as _
+    }
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pvalloc(size: usize) -> *mut c_void {
+        c::pvalloc(size) as _
+    }
+    #[unsafe(no_mangle)]
+    pub extern "C" fn malloc_usable_size(p: *mut c_void) -> usize {
+        c::usable_size(p as _)
+    }
+}
+
 use std::io;
 use std::net::TcpListener;
 use std::os::fd::{AsRawFd, RawFd};

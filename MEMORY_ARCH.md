@@ -1802,6 +1802,41 @@ L'allocateur pèse ≤ 0,1 % des instructions d'un HSET : le serveur alloue rare
 chemins chauds. Les méthodes de `RxAlloc` ne sont pas `#[inline]` : sinon la LTO les recopie
 à chaque `push`.
 
+### 18.13 Plus rien chez la libc (2026-10-28)
+
+Avant : `RxAlloc` repliait sur la libc (réentrance du tas, autre thread, alignement au-delà
+de 4 Kio, plage pleine), et les `malloc` de la libc elle-même et du C lié (zstd) n'étaient
+comptés nulle part. Une borne stricte de la mémoire (« 2 Gio, pas un octet de plus ») en
+demande la fin.
+
+- **Le binaire exporte `malloc`** & co. (`free`, `calloc`, `realloc`, `reallocarray`,
+  `aligned_alloc`, `memalign`, `posix_memalign`, `valloc`, `pvalloc`,
+  `malloc_usable_size` : `src/bin/uringloop.rs`, `raw_alloc::heap::c`). Vérifié par
+  `nm -D` : ils sont dans la table dynamique, la glibc les prend à notre binaire. Seulement
+  dans le binaire : les tests des crates gardent la libc.
+- **`free` sans taille** : la route se retrouve depuis l'adresse. `owner[g]` vaut `NONE`
+  au début de chaque suite du tas (posé à l'allocation), l'indice du slab dans ses
+  granules : slab → taille de classe, sinon longueur de la suite dans l'étiquette.
+- **Les tables du tas ne passent plus par l'allocateur global** : la file des suites sales,
+  les slabs et leurs indices libres sont des `MapArr` (mapping `MAP_NORESERVE` à capacité
+  bornée, `MADV_NOHUGEPAGE` : sous THP `always`, chaque table prenait 2 Mio dès sa première
+  case, mesuré 12 Mo). La compaction de la file se fait sur place, en deux passes, avec une
+  table par granule (`last`). L'initialisation lit l'environnement par `getenv`, sans
+  allouer. Plus de réentrance.
+- **Ce que le tas ne sert pas part en mapping direct** (`raw_alloc::direct`) : un `mmap` par
+  bloc, en-tête `[MAGIC, base, len]` juste avant les données, de tout thread. Autre thread,
+  alignement au-delà de 4 Kio, plage pleine. Plage refusée au démarrage : on retente en la
+  divisant par deux jusqu'à 1 Gio, puis tout passe en direct. `INFO` :
+  `mem_direct_bytes` (remplace `mem_libc_bytes`), compté dans `mem_tracked_bytes`.
+- **`calloc` et `alloc_zeroed` n'écrivent pas les pages neuves** : une suite neuve
+  (au-dessus de `top`) ou propre (rendue par `MADV_DONTNEED`) est déjà à zéro ; seul un
+  emplacement de slab ou une suite sale est remis à zéro.
+- Mesuré (jeu de `redis-benchmark`, depuis un répertoire vide) : non compté 0,2 Mo à vide
+  et 3,05 Mo chargé, contre 0,2 et 3,16 Mo avant ; `mem_direct_bytes` = 0.
+  `tests/memory.rs` l'exige.
+- Test : `raw_alloc::tests::c_api_roundtrip` (toutes les fonctions, zéro après
+  réutilisation, alignements jusqu'à 1 Mio, autre thread, tout rendu).
+
 ## 19. Objets à poignée (2026-10-26 ; implémenté le 2026-10-27, `radixox-lib/src/handle.rs`)
 
 **But.** Un objet référencé par **plusieurs** structures (membre de ZSet : index + B+tree,

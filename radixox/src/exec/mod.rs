@@ -558,12 +558,12 @@ pub fn info_memory_total(out: &mut String, slabs: &[(&str, (u64, u64, u64))]) {
     let pool = radixox_lib::pool::resident();
     let large = radixox_lib::large::resident();
     let handles = radixox_lib::handle::table_resident();
-    let libc = if cfg!(radixox_sysalloc) { 0 } else { radixox_lib::raw_alloc::heap::libc_bytes() };
+    let direct = radixox_lib::raw_alloc::heap::direct_bytes();
     let _ = write!(
         out,
-        "mem_hislab_bytes:{slabs_total}\r\nmem_pool_resident_bytes:{pool}\r\nmem_large_resident_bytes:{large}\r\nmem_handles_table_resident_bytes:{handles}\r\nmem_libc_bytes:{libc}\r\n"
+        "mem_hislab_bytes:{slabs_total}\r\nmem_pool_resident_bytes:{pool}\r\nmem_large_resident_bytes:{large}\r\nmem_handles_table_resident_bytes:{handles}\r\nmem_direct_bytes:{direct}\r\n"
     );
-    let tracked = slabs_total + pool + large + handles + libc + radixox_lib::big_buf::bytes();
+    let tracked = slabs_total + pool + large + handles + direct + radixox_lib::big_buf::bytes();
     let (rss, anon) = proc_rss();
     let _ = write!(
         out,
