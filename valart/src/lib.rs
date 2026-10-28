@@ -6,7 +6,7 @@
 
 use std::mem::{ManuallyDrop, offset_of};
 
-use hislab::HiSlab;
+use radixox_lib::hislab::HiSlab;
 use radixox_lib::save_barrier::{SaveBarrier, T0};
 use radixox_lib::shared_byte::SharedByte;
 

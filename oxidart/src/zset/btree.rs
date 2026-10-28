@@ -21,7 +21,7 @@
 
 use std::cmp::Ordering;
 
-use hislab::HiSlab;
+use radixox_lib::hislab::HiSlab;
 
 /// Entrées par feuille.
 pub const L: usize = 41;

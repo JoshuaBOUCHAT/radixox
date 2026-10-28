@@ -98,7 +98,7 @@ mod test_diff;
 #[cfg(test)]
 mod test_detached;
 
-use hislab::TaggedHiSlab;
+use radixox_lib::hislab::TaggedHiSlab;
 use radixox_lib::shared_byte::SharedByte;
 use rand::rngs::ThreadRng;
 
@@ -1471,7 +1471,7 @@ impl OxidArt {
     fn evict_cycle(&mut self, rng: &mut ThreadRng) -> (usize, usize, usize) {
         let (mut evicted, mut hit_nodes, mut sampled) = (0, 0, 0);
         for _ in 0..Self::SAMPLE_SIZE {
-            let Some((idx, _)) = self.map.random_tagged(rng) else {
+            let Some((idx, _)) = self.map.random_tagged(|n| rand::Rng::gen_range(rng, 0..n)) else {
                 break;
             };
             sampled += 1;

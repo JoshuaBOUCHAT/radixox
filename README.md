@@ -878,6 +878,6 @@ Tests: `cargo test -p oxidart --features regex`, `cargo test -p radixox-lib`,
 MIT
 
 Built with [io-uring](https://github.com/tokio-rs/io-uring),
-[regex-automata](https://github.com/rust-lang/regex) and
-[hislab](https://github.com/JoshuaBOUCHAT/hislab). Benchmarked against
+[regex-automata](https://github.com/rust-lang/regex) and zstd; the slab of the
+tree started as [hislab](https://github.com/JoshuaBOUCHAT/hislab). Benchmarked against
 [Valkey](https://github.com/valkey-io/valkey).

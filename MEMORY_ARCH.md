@@ -1842,6 +1842,32 @@ demande la fin.
   interne `__simple_malloc` pour ses propres usages rares. Mesuré : non compté 0,1 Mo à
   vide, 2,97 Mo chargé ; save zstd OK.
 
+### 18.14 Huge pages à cheval et HiSlab intégré (2026-10-28)
+
+Après §18.13, il restait 3,05 Mo non comptés chargé (0,2 Mo à vide). Ce n'était pas une
+région oubliée :
+
+- **Cause** : les 7 HiSlab (`memmap2::map_anon`, tailles non multiples de 2 Mio) sont
+  collés par le noyau en une VMA. Sous THP `always`, la première écriture au début d'un
+  slab prend une page de 2 Mio **alignée**, qui commence donc avant lui, dans la fin
+  inutilisée du voisin. `resident_bytes` mesurait de `base` à la fin touchée : la part
+  avant `base` n'était à personne. Slab des en-têtes de ZSet : 40 o écrits, 716 Ko comptés,
+  ~1,3 Mo hors compte ; List : 16 o, 592 Ko, ~1,45 Mo. Vérifié par groupes de VMA :
+  `MAP_NORESERVE` (pool, `large`, poignées) exact à 16 Ko près, tout l'écart chez les
+  HiSlab.
+- **Correctif** : réservation des HiSlab alignée et dimensionnée sur 2 Mio (une page ne
+  chevauche plus deux slabs) ; `resident::region` mesure aussi la fin de chaque réservation
+  après sa dernière frontière de 2 Mio (défense pour les autres régions). Mesuré : non
+  compté 0,2 Mo à vide **et** chargé. `tests/memory.rs` exige < 1 Mo (avant : 6).
+- Coût visible : un slab d'en-têtes presque vide affiche sa huge page entière (2 Mio).
+  C'était déjà résident, désormais compté. Piste : `MADV_NOHUGEPAGE` tant qu'un slab est
+  petit.
+- **hislab intégré** dans `radixox-lib/src/hislab/` (seuls utilisateurs publiés : oxidart et
+  valart) et réduit : plus de `memmap2` ni de `rand`, plus de `BufferSlab`, de tirages
+  `random_occupied*`, d'itérateurs et `retain` de tags. `random_tagged(below)` prend une
+  fonction de tirage et ne fait plus d'allocation (avant : un `Vec` par tirage, sur le
+  chemin de l'évicteur TTL). Les versions publiées restent sur crates.io, sans suite.
+
 ## 19. Objets à poignée (2026-10-26 ; implémenté le 2026-10-27, `radixox-lib/src/handle.rs`)
 
 **But.** Un objet référencé par **plusieurs** structures (membre de ZSet : index + B+tree,

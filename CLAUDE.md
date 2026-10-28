@@ -32,7 +32,8 @@ radixox/        lib : `exec` (commandes, encodage, jobs, BGSAVE), `uring` (cœur
 scripts/        bench_vs_valkey.sh (référence du README), bench_zipf.sh (accès Zipf, CPU par cœur), stress_save.sh
 ```
 
-`hislab` (slab mmap + THP) est une crate séparée : `~/rust/hislab`.
+`HiSlab` (slab mmap + THP) vit dans `radixox-lib/src/hislab/` (ancien crate `hislab`, intégré
+le 2026-10-28 ; `~/rust/hislab` n'est plus utilisé par RadixOx).
 
 ## Commandes
 

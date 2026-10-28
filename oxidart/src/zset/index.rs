@@ -18,7 +18,7 @@
 //! L'index ne connaît pas les membres : la recherche prend `eq(poignée)` (octets comparés
 //! via la table des poignées), la coupe `rehash(poignée)` (hash recalculé du membre).
 
-use hislab::HiSlab;
+use radixox_lib::hislab::HiSlab;
 
 /// Entrées par seau.
 pub const B: usize = 9;

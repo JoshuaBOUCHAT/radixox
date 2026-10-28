@@ -47,9 +47,9 @@ fn rss_is_accounted_and_emptied_slabs_shrink() {
     let m = info(&mut c);
     let untracked = m["mem_untracked_bytes"];
     assert!(m["mem_rss_anon_bytes"] > 60 * MB, "jeu chargé : {} o", m["mem_rss_anon_bytes"]);
-    // pile, binaire, libc pour elle-même : quelques Mo, qui ne grandissent pas avec les
-    // données (une région oubliée en ferait des dizaines)
-    assert!(untracked.abs() < 6 * MB && (untracked - empty).abs() < 4 * MB, "à vide {empty} o, chargé {untracked} o");
+    // pile, binaire, données de la libc : ~0,2 Mo, fixes. Une huge page à cheval sur deux
+    // régions en faisait 2 à 3 Mo (MEMORY_ARCH.md §18.14), une région oubliée des dizaines.
+    assert!(untracked.abs() < MB && (untracked - empty).abs() < MB, "à vide {empty} o, chargé {untracked} o");
     // plus rien chez la libc ; les mappings directs ne servent que les cas hors du tas
     assert_eq!(m["mem_direct_bytes"], 0, "mappings directs");
     let zset = m["mem_hislab_zset_tree_bytes"] + m["mem_hislab_zset_index_bytes"];

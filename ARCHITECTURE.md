@@ -104,7 +104,8 @@ l'atomicité (RUNTIME_ARCH §8.1).
 ### 2.1 OxidArt — l'arbre des clés (`oxidart/`)
 
 - **Nœuds de 128 o** (`oxidart/src/node.rs`, assertion de taille) dans un `HiSlab`
-  (crate `hislab`, dépôt séparé `~/rust/hislab`) : `mmap` anonyme + `MADV_HUGEPAGE`,
+  (`radixox-lib/src/hislab/`, ancien crate `hislab` intégré le 2026-10-28) : `mmap`
+  anonyme aligné sur 2 Mio + `MADV_HUGEPAGE`,
   adresses stables, idx `u32` au lieu de pointeurs.
 - **Feuilles inline** : une clé sans descendant n'est pas un nœud, c'est une entrée de son
   parent (radix, suffixe, valeur, TTL). Le dernier étage coûte quelques octets par clé.

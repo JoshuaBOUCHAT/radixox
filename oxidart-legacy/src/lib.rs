@@ -80,7 +80,7 @@ mod test_binary;
 
 use std::mem::ManuallyDrop;
 
-use hislab::TaggedHiSlab;
+use radixox_lib::hislab::TaggedHiSlab;
 use radixox_lib::shared_byte::SharedByte;
 use rand::rngs::ThreadRng;
 
@@ -273,7 +273,7 @@ impl OxidArt {
         let mut evicted_this_round = 0;
         let mut sampled = 0;
         for _ in 0..Self::SAMPLE_SIZE {
-            let Some((idx, node)) = self.map.random_tagged(rng) else {
+            let Some((idx, node)) = self.map.random_tagged(|n| rand::Rng::gen_range(rng, 0..n)) else {
                 // No more tagged entries
                 break;
             };

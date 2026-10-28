@@ -10,21 +10,31 @@ const PAGE: usize = 4096;
 /// jusqu'à la frontière de 2 Mio suivante (dans la réservation virtuelle de la région).
 const HUGE: usize = 2 << 20;
 
-/// Octets résidents de `[base, base + touched)`, frontière de 2 Mio suivante comprise.
+/// Octets résidents de `[base, base + touched)`, frontière de 2 Mio suivante comprise, plus
+/// la fin de la réservation au-delà de la dernière frontière de 2 Mio : une huge page prise
+/// au début (non aligné) de la région voisine déborde en arrière jusque-là (mesuré :
+/// 2,75 Mo comptés par personne avec les anciens HiSlab collés les uns aux autres).
 /// `reserved` : taille de la réservation virtuelle qui commence à `base` (borne de la
 /// mesure).
 pub fn region(base: usize, touched: usize, reserved: usize) -> u64 {
-    if touched == 0 {
+    let start = base / PAGE * PAGE;
+    let res_end = (base + reserved).next_multiple_of(PAGE);
+    let end = if touched == 0 { start } else { (base + touched).next_multiple_of(HUGE).min(res_end) };
+    let tail = (res_end / HUGE * HUGE).max(end);
+    count(start, end, touched) + count(tail, res_end, 0)
+}
+
+/// Pages résidentes de `[start, end)` (alignés sur 4 Kio) ; repli : `fallback` octets.
+fn count(start: usize, end: usize, fallback: usize) -> u64 {
+    if end <= start {
         return 0;
     }
-    let start = base / PAGE * PAGE;
-    let end = (base + touched).next_multiple_of(HUGE).min((base + reserved).next_multiple_of(PAGE));
     let n = (end - start) / PAGE;
     let mut vec = vec![0u8; n];
     // SAFETY: `[start, end)` est dans la réservation de la région ; `vec` a une case par page.
     let r = unsafe { libc::mincore(start as *mut libc::c_void, end - start, vec.as_mut_ptr()) };
     if r != 0 {
-        return (base + touched).next_multiple_of(PAGE) as u64 - start as u64;
+        return fallback.next_multiple_of(PAGE) as u64;
     }
     vec.iter().filter(|&&v| v & 1 != 0).count() as u64 * PAGE as u64
 }

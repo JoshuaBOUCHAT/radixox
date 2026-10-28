@@ -14,7 +14,7 @@
 
 use std::mem::MaybeUninit;
 
-use hislab::HiSlab;
+use radixox_lib::hislab::HiSlab;
 use radixox_lib::shared_byte::SharedByte;
 
 pub mod compact;
