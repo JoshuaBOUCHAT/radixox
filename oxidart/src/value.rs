@@ -366,6 +366,22 @@ pub(crate) fn value_into_raw(val: Value) -> (Tag, ValUnion) {
 ///
 /// # Safety
 /// Tag must not be None.
+/// Un accès en lecture compté pour LRU / LFU (feature `eviction`) : le compteur de la
+/// valeur string. Les conteneurs et les entiers n'ont pas de compteur (v1 : froids).
+#[cfg(feature = "eviction")]
+#[inline]
+pub(crate) fn touch_raw(tag: Tag, val: &ValUnion) {
+    if tag == Tag::Bytes {
+        unsafe { val.bytes.touch() }
+    }
+}
+
+/// Compteur d'accès d'une valeur (0 : sans compteur, entier ou conteneur).
+#[inline]
+pub(crate) fn heat_raw(tag: Tag, val: &ValUnion) -> Option<&SharedByte> {
+    (tag == Tag::Bytes).then(|| unsafe { &*val.bytes })
+}
+
 pub(crate) unsafe fn value_from_raw_ref(tag: Tag, val: &ValUnion) -> Value {
     unsafe {
         match tag {

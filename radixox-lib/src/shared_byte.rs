@@ -76,7 +76,7 @@ impl SharedByte {
                 base.add(Self::LONG_HEADER)
             };
             data.sub(2).write(1); // rc
-            data.sub(1).write(0); // lfu
+            data.sub(1).write(LFU_INIT); // lfu
             Self { ptr: NonNull::new_unchecked(data) }
         }
     }
@@ -346,6 +346,57 @@ impl Drop for SharedByte {
                 self.dealloc();
             }
         }
+    }
+}
+
+/// Valeur initiale du compteur d'accès (comme Redis) : en LFU, une valeur neuve survit à
+/// quelques passages de l'aiguille ; en LRU (CLOCK), « lue depuis le dernier passage »
+/// veut dire au-dessus. 0 sans la feature `eviction` (rien ne le lit).
+pub const LFU_INIT: u8 = if cfg!(feature = "eviction") { 5 } else { 0 };
+
+impl SharedByte {
+    /// Compteur d'accès (octet `lfu` de l'en-tête, MEMORY_ARCH.md §10.2 bis).
+    #[inline]
+    pub fn lfu(&self) -> u8 {
+        unsafe { self.ptr.as_ptr().sub(1).read() }
+    }
+
+    /// Écrit le compteur (aiguille de l'éviction : décroissance, seconde chance).
+    #[inline]
+    pub fn set_lfu(&self, v: u8) {
+        unsafe { self.ptr.as_ptr().sub(1).write(v) }
+    }
+
+    /// Un accès en lecture (feature `eviction`) : compteur de Morris, incrémenté avec une
+    /// probabilité 1 / ((c − LFU_INIT) × 10 + 1) (le `lfu-log-factor` 10 de Redis), au moins
+    /// 1 après un accès (seconde chance du CLOCK).
+    #[cfg(feature = "eviction")]
+    #[inline]
+    pub fn touch(&self) {
+        let c = self.lfu();
+        if c == u8::MAX {
+            return;
+        }
+        let base = c.saturating_sub(LFU_INIT) as u32;
+        if c == 0 || base == 0 || morris_rand() % (base * 10 + 1) == 0 {
+            self.set_lfu(c + 1);
+        }
+    }
+}
+
+/// xorshift32, mono-thread comme le reste du serveur ; la qualité suffit à un compteur
+/// probabiliste.
+#[cfg(feature = "eviction")]
+#[inline]
+fn morris_rand() -> u32 {
+    static mut STATE: u32 = 0x9E37_79B9;
+    unsafe {
+        let mut x = STATE;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        STATE = x;
+        x
     }
 }
 

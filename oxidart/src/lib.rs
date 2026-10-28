@@ -834,6 +834,8 @@ impl OxidArt {
             self.drop_expired(loc, key);
             return None;
         }
+        #[cfg(feature = "eviction")]
+        value::touch_raw(tag, val);
         // SAFETY: tag != None (valeur trouvée).
         Some(unsafe { value_from_raw_ref(tag, val) })
     }
@@ -1597,6 +1599,7 @@ impl OxidArt {
         &mut self,
         volatile: bool,
         by_ttl: bool,
+        heat: Heat,
         scan: u32,
         max_keys: usize,
         on_key: &mut impl FnMut(&[u8]),
@@ -1635,7 +1638,7 @@ impl OxidArt {
                 }
             }
             if let Some((t, idx)) = best {
-                let n = self.evict_entries(idx, |ttl| ttl.is_some_and(|x| x <= t), on_key);
+                let n = self.evict_entries(idx, |ttl, _, _| ttl.is_some_and(|x| x <= t), on_key);
                 st.evicted += n;
                 st.hit += (n > 0) as u32;
             }
@@ -1648,7 +1651,7 @@ impl OxidArt {
                 };
                 at = idx + 1;
                 st.visited += 1;
-                let n = self.evict_entries(idx, |ttl| !volatile || ttl.is_some(), on_key);
+                let n = self.evict_entries(idx, |ttl, tag, val| (!volatile || ttl.is_some()) && heat.cold(tag, val), on_key);
                 st.evicted += n;
                 st.hit += (n > 0) as u32;
             }
@@ -1659,13 +1662,18 @@ impl OxidArt {
 
     /// Évince les clés du nœud `idx` dont l'échéance passe `pick`, chacune rendue d'abord à
     /// `on_key`. Même retrait que [`Self::evict_node`].
-    fn evict_entries(&mut self, idx: u32, pick: impl Fn(Option<u64>) -> bool, on_key: &mut impl FnMut(&[u8])) -> usize {
+    fn evict_entries(
+        &mut self,
+        idx: u32,
+        pick: impl Fn(Option<u64>, Tag, &ValUnion) -> bool,
+        on_key: &mut impl FnMut(&[u8]),
+    ) -> usize {
         let node = self.node(idx);
-        let own = node.has_val() && pick(node.exp_and_radix.exp());
+        let own = node.has_val() && pick(node.exp_and_radix.exp(), node.tag, &node.val);
         let mut leaves: smallvec::SmallVec<[(u8, smallvec::SmallVec<[u8; 16]>); 16]> = smallvec::SmallVec::new();
         for (r, e) in node.iter() {
-            if let EntryRef::Leaf { ttl, sfx, .. } = e
-                && pick(ttl)
+            if let EntryRef::Leaf { ttl, sfx, tag, val } = e
+                && pick(ttl, tag, val)
             {
                 leaves.push((r, sfx.map(|s| s.iter().copied().collect()).unwrap_or_default()));
             }
@@ -1734,6 +1742,43 @@ impl OxidArt {
         self.walk(self.root_idx, &mut path, |_, _, _, _| keys += 1);
         assert_eq!(self.key_count, keys, "compteur de clés");
         seen
+    }
+}
+
+/// Choix des victimes du balayage `maxmemory` ([`OxidArt::evict_for_memory`]), MEMORY_ARCH.md
+/// §10.2 bis. Les compteurs (octet `lfu` des valeurs string) ne sont incrémentés à la
+/// lecture qu'avec la feature `eviction` ; sans compteur (entier, conteneur), froid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Heat {
+    /// Toute clé visitée (`*-random`).
+    None,
+    /// CLOCK (`*-lru`) : lue depuis le dernier passage (compteur au-dessus de sa valeur
+    /// initiale) → épargnée, compteur ramené à la valeur initiale ; sinon évincée. Une
+    /// valeur neuve n'est pas « lue » : sinon un premier tour épargne tout, et le suivant
+    /// évince dans l'ordre des slots, chaudes comprises.
+    Lru,
+    /// `*-lfu` : le compteur de Morris perd 1 à chaque passage ; évincée à 0.
+    Lfu,
+}
+
+impl Heat {
+    /// L'aiguille passe sur une valeur : évincer ? (Fait décroître le compteur sinon.)
+    fn cold(self, tag: Tag, val: &ValUnion) -> bool {
+        let Some(sb) = (self != Heat::None).then(|| value::heat_raw(tag, val)).flatten() else {
+            return true;
+        };
+        const INIT: u8 = radixox_lib::shared_byte::LFU_INIT;
+        match (self, sb.lfu()) {
+            (Heat::Lru, c) if c > INIT => {
+                sb.set_lfu(INIT);
+                false
+            }
+            (Heat::Lru, _) | (_, 0) => true,
+            (_, c) => {
+                sb.set_lfu(c - 1);
+                false
+            }
+        }
     }
 }
 

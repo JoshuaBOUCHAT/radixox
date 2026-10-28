@@ -31,6 +31,8 @@ zstd-safe = { version = "8.1", default-features = false, features = ["experiment
 
 [features]
 regex = ["dep:regex-automata"]
+# Voir radixox-lib : compteurs d'accès pour LRU / LFU.
+eviction = ["radixox-lib/eviction"]
 
 [dev-dependencies]
 # Ancien arbre, oracle des tests différentiels (retiré à la publication).

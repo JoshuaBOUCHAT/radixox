@@ -732,6 +732,8 @@ impl OxidArt {
             self.drop_expired(loc, key);
             return None;
         }
+        #[cfg(feature = "eviction")]
+        crate::value::touch_raw(tag, val);
         // SAFETY: tag != None (valeur trouvée).
         Some(unsafe { value_from_raw_ref(tag, val) })
     }
@@ -745,6 +747,8 @@ impl OxidArt {
             return None;
         }
         let (tag, val, exp) = self.loc_value(loc);
+        #[cfg(feature = "eviction")]
+        crate::value::touch_raw(tag, val);
         str_val(tag, val, exp, self.now)
     }
 

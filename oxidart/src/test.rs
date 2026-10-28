@@ -1146,7 +1146,7 @@ fn evict_for_memory_reports_exact_keys() {
     // volatile : seules les clés avec TTL partent
     let mut gone = Vec::new();
     loop {
-        let st = art.evict_for_memory(true, false, 50, 100, &mut |k: &[u8]| gone.push(k.to_vec()));
+        let st = art.evict_for_memory(true, false, crate::Heat::None, 50, 100, &mut |k: &[u8]| gone.push(k.to_vec()));
         art.check();
         if st.lap_done {
             break;
@@ -1163,7 +1163,7 @@ fn evict_for_memory_reports_exact_keys() {
     // allkeys : par tranches, tout part, chaque clé rendue une fois
     let mut gone = Vec::new();
     for _ in 0..1000 {
-        art.evict_for_memory(false, false, 16, 40, &mut |k: &[u8]| gone.push(k.to_vec()));
+        art.evict_for_memory(false, false, crate::Heat::None, 16, 40, &mut |k: &[u8]| gone.push(k.to_vec()));
         art.check();
         if art.len() == 0 {
             break;
@@ -1177,6 +1177,67 @@ fn evict_for_memory_reports_exact_keys() {
         art.set_ttl(SharedByte::from_str(k), Duration::from_secs(t), Value::from_str("v"));
     }
     let mut first = Vec::new();
-    art.evict_for_memory(true, true, 64, 1, &mut |k: &[u8]| first.push(k.to_vec()));
+    art.evict_for_memory(true, true, crate::Heat::None, 64, 1, &mut |k: &[u8]| first.push(k.to_vec()));
     assert_eq!(first, vec![b"b:soon".to_vec()]);
+}
+
+/// Feature `eviction` : l'aiguille LRU (CLOCK) épargne pour un tour les clés lues depuis
+/// son dernier passage ; en LFU, une clé très lue résiste à plusieurs tours.
+#[cfg(feature = "eviction")]
+#[test]
+fn lru_and_lfu_spare_read_keys() {
+    use crate::Heat;
+    let mut art = OxidArt::new();
+    for i in 0..2000u32 {
+        art.set(SharedByte::from_slice(format!("k:{i}")), Value::from_str("v"));
+    }
+    // valeur neuve : compteur initial (5) → le premier tour LRU remet tout à 0 sans rien évincer
+    let lap = |art: &mut OxidArt, heat: Heat| {
+        let mut gone = Vec::new();
+        loop {
+            let st = art.evict_for_memory(false, false, heat, 256, usize::MAX, &mut |k: &[u8]| gone.push(k.to_vec()));
+            art.check();
+            if st.lap_done {
+                return gone;
+            }
+        }
+    };
+    // une valeur neuve n'est pas « lue » : seules les clés lues sont épargnées
+    for i in (0..2000u32).step_by(2) {
+        art.get(format!("k:{i}").as_bytes());
+    }
+    let gone = lap(&mut art, Heat::Lru);
+    assert_eq!(gone.len(), 1000, "les clés non lues partent");
+    assert!(gone.iter().all(|k| String::from_utf8_lossy(k)[2..].parse::<u32>().unwrap() % 2 == 1));
+    // LFU : une clé lue 200 fois survit à 5 tours de décroissance, une clé jamais lue non
+    art.set(SharedByte::from_str("hot"), Value::from_str("v"));
+    art.set(SharedByte::from_str("cold"), Value::from_str("v"));
+    for _ in 0..200 {
+        art.get(b"hot");
+    }
+    for _ in 0..6 {
+        lap(&mut art, Heat::Lfu);
+    }
+    assert!(art.get(b"hot").is_some());
+    assert!(art.get(b"cold").is_none());
+}
+
+/// LRU dans les conditions du serveur : insertions continues, une clé relue tous les 100
+/// ajouts, éviction par petites tranches dès qu'on dépasse 20 000 clés. La clé chaude reste.
+#[cfg(feature = "eviction")]
+#[test]
+fn lru_hot_key_survives_continuous_eviction() {
+    use crate::Heat;
+    let mut art = OxidArt::new();
+    art.set(SharedByte::from_str("hot"), Value::from_str("v"));
+    for i in 0..60_000u32 {
+        art.set(SharedByte::from_slice(format!("k{i}")), Value::String(SharedByte::from_slice(vec![b'v'; 100])));
+        if i % 100 == 0 {
+            assert!(art.get(b"hot").is_some(), "clé chaude perdue à {i}");
+        }
+        while art.len() > 20_000 {
+            art.evict_for_memory(false, false, Heat::Lru, 1024, 64, &mut |_: &[u8]| {});
+        }
+    }
+    art.check();
 }

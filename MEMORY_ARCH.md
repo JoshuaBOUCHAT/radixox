@@ -807,8 +807,18 @@ est résident après coup ; pour refuser avant, il faut compter avant que les pa
     197 963 acceptés (1 % de `-OOM`), 180 533 évincées, pic de RSS 39 Mo ; avec AOF 170 360
     acceptés (15 % de `-OOM` : les `DEL` passent aussi par l'AOF, et la place libérée attend
     le GC), pic 46,3 Mo ; redémarrage sur l'AOF : même contenu (digest identique).
-  - LRU / LFU (feature `eviction`) : pour l'instant le même balayage ; leurs compteurs
-    restent à faire (§10.2 bis).
+  - **LRU / LFU (feature `eviction`) faits** : compteur de Morris dans l'octet `lfu` des
+    valeurs string (`SharedByte::touch`, incrémenté par `get`, `get_hinted`, `str_hinted`
+    seulement avec la feature ; facteur 10 comme Redis ; valeur initiale `LFU_INIT` = 5).
+    Aiguille (`oxidart::Heat`) : LFU = −1 par passage, évincée à 0 ; LRU (CLOCK) = au-dessus
+    de `LFU_INIT` (lue depuis le dernier passage) → ramenée à `LFU_INIT` et épargnée, sinon
+    évincée. **Piège trouvé** : en comptant une valeur neuve comme « lue », le premier tour
+    épargnait tout et le suivant évinçait dans l'ordre des slots, la clé chaude (au début)
+    comprise — test `lru_hot_key_survives_continuous_eviction`. Entiers et conteneurs sans
+    compteur : froids (v1). Coût sur `GET` pipeliné 64 : non concluant (1 620–1 917 k/s
+    sans, 1 640–1 824 avec, dérive de ±8 % entre passages, gouverneur `powersave`) ; sans la
+    feature, rien n'est écrit à la lecture. Tests : `lru_and_lfu_spare_read_keys`,
+    `lru_keeps_hot_keys` (intégration, 900+ clés chaudes sur 1 000 gardées).
   - tests : `tests/maxmemory.rs` (`eviction_keeps_writes_going_under_the_limit`).
 
 ### 10.3 Déclenchement

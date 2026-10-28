@@ -3669,11 +3669,16 @@ fn evict_round(
             j.push(now, &del);
         }
     };
+    use oxidart::Heat;
+    let heat = match policy {
+        Policy::AllKeysLru | Policy::VolatileLru => Heat::Lru,
+        Policy::AllKeysLfu | Policy::VolatileLfu => Heat::Lfu,
+        _ => Heat::None,
+    };
     match policy {
         Policy::NoEviction => oxidart::EvictStep::default(),
-        Policy::VolatileTtl => art.evict_for_memory(true, true, scan, max_keys, &mut on_key),
-        // LRU / LFU (feature `eviction`) : par balayage en attendant leurs compteurs.
-        p => art.evict_for_memory(p.volatile(), false, scan, max_keys, &mut on_key),
+        Policy::VolatileTtl => art.evict_for_memory(true, true, heat, scan, max_keys, &mut on_key),
+        p => art.evict_for_memory(p.volatile(), false, heat, scan, max_keys, &mut on_key),
     }
 }
 

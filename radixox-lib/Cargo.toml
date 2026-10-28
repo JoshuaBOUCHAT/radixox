@@ -9,6 +9,11 @@ description = "RESP2/RESP3 protocol types and frame parsing for Redis-compatible
 keywords = ["redis", "resp", "protocol", "bytes", "server"]
 categories = ["network-programming", "parser-implementations"]
 
+[features]
+# Compteur d'accès dans l'octet `lfu` des valeurs (LRU / LFU de `maxmemory`, MEMORY_ARCH.md
+# §10.2 bis) : une écriture par lecture. Sans elle, rien n'est écrit à la lecture.
+eviction = []
+
 [dependencies]
 libc = "0.2"
 

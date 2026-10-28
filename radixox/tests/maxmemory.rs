@@ -163,3 +163,35 @@ fn eviction_keeps_writes_going_under_the_limit() {
     assert!(refused, "volatile-ttl sans TTL : -OOM attendu");
     let _ = redis::cmd("SHUTDOWN").arg("NOSAVE").query::<()>(&mut c);
 }
+
+/// Feature `eviction`, `allkeys-lru` : des clés relues pendant le remplissage survivent
+/// presque toutes, les autres partent.
+#[cfg(feature = "eviction")]
+#[test]
+fn lru_keeps_hot_keys() {
+    const PORT: u16 = 16434;
+    common::start_server_env(PORT, &[("RADIXOX_MAXMEMORY", "48mb"), ("RADIXOX_MAXMEMORY_POLICY", "allkeys-lru")]);
+    let mut c = common::conn(PORT);
+    let val = vec![b'v'; 1000];
+    for i in 0..1000 {
+        let _: () = redis::cmd("SET").arg(format!("hot{i}")).arg(&val).query(&mut c).unwrap();
+    }
+    for batch in 0..150 {
+        let mut p = redis::pipe();
+        for i in 0..1000 {
+            p.cmd("SET").arg(format!("k{}", batch * 1000 + i)).arg(&val).ignore();
+            if i % 2 == 0 {
+                p.cmd("GET").arg(format!("hot{}", (batch * 500 + i / 2) % 1000)).ignore();
+            }
+        }
+        let _ = p.query::<()>(&mut c);
+    }
+    let mut alive = 0;
+    for i in 0..1000 {
+        alive += redis::cmd("EXISTS").arg(format!("hot{i}")).query::<i64>(&mut c).unwrap();
+    }
+    let evicted: u64 = info(&mut c)["evicted_keys"].parse().unwrap();
+    assert!(evicted > 50_000, "{evicted}");
+    assert!(alive > 900, "{alive} clés chaudes sur 1000 survivent");
+    let _ = redis::cmd("SHUTDOWN").arg("NOSAVE").query::<()>(&mut c);
+}
