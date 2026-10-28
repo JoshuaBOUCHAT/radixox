@@ -566,6 +566,31 @@ après chaque commande :
 - L'autocorking TCP du noyau fusionne de petits sends rapprochés : un seuil un peu bas
   coûte moins cher que prévu.
 
+### 6.2 ter Plafond de sortie par commande (2026-10-28, MEMORY_ARCH.md §10.5)
+
+Avant, la limite n'était testée qu'au tirage, entre deux fenêtres : une fenêtre de 64 `GET`
+de 1 Mo empilait 64 Mo dans `out`. Et la capacité des tampons n'était jamais rendue (une
+connexion gardait la capacité de sa plus grosse réponse).
+
+- **Après chaque commande** (chemin AMAC et chemin normal) : `out ≥ out_backpressure`
+  (2 Mio) → les frames suivantes de la connexion restent à lire (même mécanisme que
+  `park_stops`, sans job). `out` + `sending` restent sous ~2 plafonds + une réponse.
+- **Pas tirée** (`waits_on_output`) tant que `out` est plein et que ce qui le videra est
+  en route : send en vol, fsync des réponses retenues, ou `big` (avant : send en vol
+  seulement — `out` grossissait pendant l'attente d'un fsync `always`).
+- **`quiet()`** ne compte plus une telle connexion comme du travail : le CQE réveille la
+  boucle (avant, un client qui ne lisait plus avec des frames en attente aurait fait
+  tourner la boucle à vide). **`flush`** ne retient plus l'envoi d'une connexion qui ne
+  sera pas tirée (sinon : sortie jamais envoyée, entrée jamais lue — vu au faux noyau).
+- **Capacité rendue** : après un send, un tampon de plus de 4 × `flush_early` repart à
+  `flush_early` (64 Kio).
+- Mesuré : client qui envoie 300 Mo de `GET` sans lire → RSS anonyme du serveur 18,7 Mo ;
+  `GET` pipeliné 64 : 2 268–2 291 k/s contre 2 227–2 270 avant (passages alternés).
+- Test : `output_is_capped_for_a_client_that_does_not_read` (faux noyau : 30 Mo de
+  réponses, sortie ≤ 2 plafonds + 2 réponses, tout arrive dans l'ordre à la reprise).
+- Reste (étape 1b) : une réponse unique plus grosse que le plafond (envoi direct depuis la
+  valeur) ; réserve commune des blocs ; budgets globaux de 1 Gio à remplacer.
+
 ### 6.2 bis Sortie bornée : limite par client, budget global (2026-10-27)
 
 La backpressure ci-dessus borne un client qui pipeline sans lire (~1 Mio + une réponse).

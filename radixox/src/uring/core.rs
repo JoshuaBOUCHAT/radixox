@@ -64,8 +64,11 @@ pub struct Config {
     pub batch_cmds: usize,
     /// `out` au-delà duquel on envoie sans attendre la fin du tour (§6.2).
     pub flush_early: usize,
-    /// `out` au-delà duquel une connexion qui a déjà un send en vol n'est plus
-    /// tirée (backpressure, §6.2).
+    /// Plafond de `out` (MEMORY_ARCH.md §10.5) : atteint, la connexion s'arrête après la
+    /// commande en cours (même au milieu d'une fenêtre), et n'est plus tirée tant qu'un
+    /// send est en vol, qu'une réponse attend le fsync ou qu'une grosse réponse attend
+    /// (backpressure, §6.2). `out` + `sending` restent sous ~2 × ce plafond, plus une
+    /// réponse.
     pub out_backpressure: usize,
     /// Entrée recopiée (`rx`) de toutes les connexions au-delà de laquelle la réception
     /// des plus grosses est suspendue (`RADIXOX_INPUT_BUDGET_MB`, 0 = sans).
@@ -139,7 +142,7 @@ impl Default for Config {
             // connexions qui ont fini partent (la boucle rappelle `run_batch`).
             batch_cmds: 2048,
             flush_early: 64 << 10,
-            out_backpressure: 1 << 20,
+            out_backpressure: 2 << 20,
             input_budget: 1 << 30,
             client_output_limit: 1 << 30,
             output_budget: 1 << 30,
@@ -1162,8 +1165,9 @@ impl Core {
     pub fn quiet(&self) -> bool {
         // Une connexion sale qui attend la fin de son send n'est pas du travail :
         // le CQE réveillera la boucle.
+        // De même pour une connexion prête arrêtée par son plafond de sortie.
         self.ops.is_empty()
-            && self.ready.is_empty()
+            && self.ready.iter().all(|&s| self.waits_on_output(s))
             && self.dirty.iter().all(|&s| self.outs[s as usize].send_in_flight())
     }
 
@@ -1633,7 +1637,17 @@ impl Core {
             self.ops.push(Op::Send { slot });
             return;
         }
-        o.sending.clear();
+        // Après un gros envoi, le tampon revient à sa petite taille (MEMORY_ARCH.md §10.5) :
+        // une connexion ne garde pas la capacité de sa plus grosse réponse.
+        let keep = self.cfg.flush_early;
+        if o.sending.capacity() > 4 * keep {
+            o.sending = Vec::with_capacity(keep);
+        } else {
+            o.sending.clear();
+        }
+        if o.out.is_empty() && o.out.capacity() > 4 * keep {
+            o.out = Vec::new();
+        }
         o.sent = 0;
         // Rien n'attend : on écrira dans le tampon qui vient d'être envoyé,
         // encore chaud en cache, plutôt que dans l'autre (+1,4 défaut L1 par
@@ -1723,13 +1737,42 @@ impl Core {
         more && !self.ready.is_empty()
     }
 
+    /// Sortie en attente de la connexion (`out` + en vol + grosse réponse), pour les tests.
+    #[cfg(test)]
+    pub fn pending_out_of(&self, slot: Slot) -> usize {
+        self.outs[slot as usize].pending_out()
+    }
+
+    /// Arrêtée par le plafond de sortie (MEMORY_ARCH.md §10.5) : `out` plein, et ce qui
+    /// le videra est en route — un send en vol, le fsync qui libère les réponses
+    /// retenues, ou la grosse réponse qui passe avant. Le CQE correspondant réveille la
+    /// boucle : ce n'est pas du travail en attente.
+    fn waits_on_output(&self, slot: Slot) -> bool {
+        let o = &self.outs[slot as usize];
+        o.out.len() >= self.cfg.out_backpressure && (o.send_in_flight() || !o.holds.is_empty() || o.big.is_some())
+    }
+
+    #[cfg(test)]
+    pub fn debug_dump(&self) {
+        for (s, o) in self.outs.iter().enumerate() {
+            if o.mode != Mode::Free {
+                let i = &self.ins[s];
+                eprintln!(
+                    "DBG slot {s} mode {:?} out {} sending {} sent {} refs {} holds {} big {} work {} rx {}/{} spans {} parked {} dirty {} ready {} drawable {}",
+                    o.mode, o.out.len(), o.sending.len(), o.sent, o.refs, o.holds.len(), o.big.is_some(), i.has_work(), i.rx_ready, i.rx.len(), i.spans.len(), o.parked(), o.dirty, o.ready, self.drawable(s as Slot)
+                );
+            }
+        }
+        eprintln!("DBG flush_early {} backpressure {}", self.cfg.flush_early, self.cfg.out_backpressure);
+    }
+
     /// La connexion peut donner des frames à ce tour-ci.
     fn drawable(&self, slot: Slot) -> bool {
         let o = &self.outs[slot as usize];
         o.stop_turn != self.turn
             && !o.parked()
             && matches!(o.mode, Mode::Normal | Mode::Closing)
-            && !(o.send_in_flight() && o.out.len() >= self.cfg.out_backpressure)
+            && !self.waits_on_output(slot)
             // budget global dépassé : une réponse à la fois, celle d'avant envoyée d'abord
             && !(self.out_over && o.pending_out() > 0)
     }
@@ -2087,6 +2130,10 @@ impl Core {
                     if let (Some(stream), Some((plan, start))) = (journal.as_mut(), plan) {
                         journal_finish(stream, plan, start, release_upto, held, slot, o, raw, art.now);
                     }
+                    // Plafond de sortie : les frames suivantes de la connexion attendent.
+                    if o.out.len() >= cfg.out_backpressure {
+                        park_stops.push((slot, end.unwrap_or(0)));
+                    }
                     afters.push((slot, After::Continue));
                     continue;
                 }
@@ -2159,9 +2206,14 @@ impl Core {
                     o.block_wait = Some(blocked.register(slot, o.epoch, b, now));
                     after = After::Blocked;
                 }
+                let cont = matches!(after, After::Continue);
                 afters.push((slot, after));
                 if let (Some(stream), Some((plan, start))) = (journal.as_mut(), plan) {
                     journal_finish(stream, plan, start, release_upto, held, slot, o, raw, art.now);
+                }
+                // Plafond de sortie : les frames suivantes de la connexion attendent.
+                if cont && o.out.len() >= cfg.out_backpressure {
+                    park_stops.push((slot, end.unwrap_or(0)));
                 }
                 if let Some(key) = produced {
                     let mut sv = block::Serve {
@@ -2892,13 +2944,14 @@ impl Core {
     pub fn flush(&mut self) {
         for slot in std::mem::take(&mut self.dirty) {
             let s = slot as usize;
+            // Parquée, ou arrêtée par le plafond de sortie : la suite attend, ce qui est
+            // prêt part (sinon personne ne l'enverrait).
+            let more_coming = self.outs[s].mode == Mode::Normal && self.ins[s].has_work() && self.drawable(slot);
             let o = &mut self.outs[s];
             if !matches!(o.mode, Mode::Normal | Mode::Closing) || o.nothing_to_send() {
                 o.dirty = false;
                 continue;
             }
-            // Parquée : la suite attend, ce qui est prêt part.
-            let more_coming = o.mode == Mode::Normal && self.ins[s].has_work() && !o.parked();
             if o.send_in_flight() || more_coming {
                 // Repart au CQE du send, ou au tour suivant.
                 self.dirty.push(slot);

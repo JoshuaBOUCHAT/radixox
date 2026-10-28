@@ -749,6 +749,8 @@ est résident après coup ; pour refuser avant, il faut compter avant que les pa
   n'est jamais abandonnée.
 - **Ordre** : tampons fixes (sortie, save, AOF, réplicas) → `maxmemory` + `noeviction` +
   réservation → politiques gratuites → éviction de fond → feature `eviction`.
+- **Avancement** : plafond de sortie par commande + capacité rendue faits (RUNTIME_ARCH
+  §6.2 ter, 2026-10-28).
 
 ### 10.3 Déclenchement
 

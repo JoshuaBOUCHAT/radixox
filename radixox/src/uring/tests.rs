@@ -314,6 +314,7 @@ impl Fake {
                 return;
             }
         }
+        self.core.debug_dump();
         panic!("pas de repos après 100 000 tours");
     }
 
@@ -2308,4 +2309,40 @@ fn chained_replicas_follow_the_primary() {
     }
     unsafe { std::env::remove_var("RADIXOX_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Plafond de sortie (MEMORY_ARCH.md §10.5) : un client qui ne lit plus et envoie un long
+/// pipeline de grosses réponses ne fait pas grossir sa sortie au-delà de ~2 plafonds ; la
+/// suite attend dans l'entrée, et tout arrive dans l'ordre quand il se remet à lire.
+#[test]
+fn output_is_capped_for_a_client_that_does_not_read() {
+    let mut f = Fake::new(Config { max_conn: 8, ..Config::default() });
+    let c = f.connect();
+    let val = "v".repeat(100_000);
+    f.send(c, format!("*3\r\n$3\r\nSET\r\n$3\r\nbig\r\n$100000\r\n{val}\r\n").as_bytes());
+    f.settle();
+    assert_eq!(f.take(c), "+OK\r\n");
+    f.peers.get_mut(&c).unwrap().stalled = true;
+    let n = 300; // 30 Mo de réponses
+    for _ in 0..n {
+        f.send(c, b"GET big\r\n");
+    }
+    f.settle();
+    let cap = Config::default().out_backpressure;
+    let pending = f.core.pending_out_of(c);
+    assert!(pending <= 2 * cap + 2 * 100_100, "sortie en attente : {pending} o (plafond {cap})");
+    // Le client relit : tout part, dans l'ordre.
+    let p = f.peers.get_mut(&c).unwrap();
+    p.stalled = false;
+    if std::mem::take(&mut p.send_pending) {
+        let bytes = f.core.pending_send(c).to_vec();
+        f.peers.get_mut(&c).unwrap().received.extend_from_slice(&bytes);
+        f.completions.push(Completion::Send { slot: c, res: bytes.len() as i32 });
+    }
+    f.settle();
+    let got = f.take(c);
+    let one = format!("$100000\r\n{val}\r\n");
+    assert_eq!(got.len(), n * one.len());
+    assert!(got.as_bytes().chunks(one.len()).all(|r| r == one.as_bytes()));
+    assert_eq!(f.core.pending_out_of(c), 0);
 }
