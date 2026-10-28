@@ -19,8 +19,15 @@ fn client_over_output_limit_is_closed() {
     let mut c = common::conn(PORT);
     let _: () = redis::cmd("SET").arg("big").arg(vec![b'x'; 3 << 20]).query(&mut c).unwrap();
     let _: () = redis::cmd("SET").arg("small").arg("ok").query(&mut c).unwrap();
-    // la réponse seule dépasse la limite : la connexion est fermée sans réponse
-    let r: redis::RedisResult<Vec<u8>> = redis::cmd("GET").arg("big").query(&mut c);
+    // Une grande valeur seule part depuis l'arbre sans tampon (RUNTIME_ARCH.md §6.2
+    // quater) : elle ne coûte pas de mémoire de sortie, la limite ne s'applique pas.
+    let v: Vec<u8> = redis::cmd("GET").arg("big").query(&mut c).unwrap();
+    assert_eq!(v.len(), 3 << 20);
+    for k in ["a", "b", "c"] {
+        let _: () = redis::cmd("SET").arg(k).arg(vec![b'y'; 600 << 10]).query(&mut c).unwrap();
+    }
+    // une réponse construite dans le tampon (1,8 Mo) dépasse la limite : fermée sans réponse
+    let r: redis::RedisResult<Vec<Vec<u8>>> = redis::cmd("MGET").arg("a").arg("b").arg("c").query(&mut c);
     assert!(r.is_err(), "connexion fermée attendue");
     // le serveur continue ; le reste passe
     let mut c = common::conn(PORT);

@@ -2346,3 +2346,37 @@ fn output_is_capped_for_a_client_that_does_not_read() {
     assert!(got.as_bytes().chunks(one.len()).all(|r| r == one.as_bytes()));
     assert_eq!(f.core.pending_out_of(c), 0);
 }
+
+/// Grande valeur (≥ `exec::BIG_REPLY`) : envoyée depuis l'arbre après tout ce qui précède,
+/// sans passer par `out` ; dans l'ordre au milieu d'un pipeline, même si la clé est
+/// supprimée pendant l'envoi ; la sortie en attente ne compte pas la valeur.
+#[test]
+fn big_value_is_sent_from_the_tree() {
+    let mut f = Fake::new(Config { max_conn: 8, ..Config::default() });
+    f.sends = Sends::Half;
+    let c = f.connect();
+    let d = f.connect();
+    let val = "x".repeat(3 << 20);
+    f.send(c, format!("*3\r\n$3\r\nSET\r\n$3\r\nbig\r\n${}\r\n{val}\r\n", val.len()).as_bytes());
+    f.settle();
+    assert_eq!(f.take(c), "+OK\r\n");
+    f.peers.get_mut(&c).unwrap().stalled = true;
+    f.send(c, b"PING\r\nGET big\r\nECHO after\r\nGET big\r\n");
+    f.settle();
+    // pendant l'envoi, un autre client supprime la clé : la valeur en vol reste valide
+    f.send(d, b"DEL big\r\n");
+    f.settle();
+    assert_eq!(f.take(d), ":1\r\n");
+    assert!(f.core.pending_out_of(c) < 1 << 20, "la valeur n'est pas recopiée : {}", f.core.pending_out_of(c));
+    let p = f.peers.get_mut(&c).unwrap();
+    p.stalled = false;
+    if std::mem::take(&mut p.send_pending) {
+        let bytes = f.core.pending_send(c).to_vec();
+        let n = bytes.len().div_ceil(2);
+        f.peers.get_mut(&c).unwrap().received.extend_from_slice(&bytes[..n]);
+        f.completions.push(Completion::Send { slot: c, res: n as i32 });
+    }
+    f.settle();
+    let one = format!("${}\r\n{val}\r\n", val.len());
+    assert_eq!(f.take(c), format!("+PONG\r\n{one}$5\r\nafter\r\n$-1\r\n"));
+}

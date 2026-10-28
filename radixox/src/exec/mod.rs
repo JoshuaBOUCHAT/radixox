@@ -59,6 +59,43 @@ pub fn take_deferred() -> Option<Box<jobs::RangeJob>> {
     DEFERRED.with(|d| d.take())
 }
 
+/// À partir de cette taille, une réponse faite d'une seule valeur ne passe pas par le tampon
+/// de sortie : seul son en-tête `$len\r\n` y est écrit, la valeur part ensuite directement
+/// depuis l'arbre (clone du `SharedByte`, sans copie), RUNTIME_ARCH.md §6.2 quater.
+pub const BIG_REPLY: usize = 1 << 20;
+
+thread_local! {
+    /// Grande valeur laissée par la dernière commande, à envoyer après `out`.
+    static BIG_TAIL: std::cell::Cell<Option<SharedByte>> = const { std::cell::Cell::new(None) };
+    /// Le dépôt n'est actif qu'autour des exécutions du cœur ([`with_big_tail`]) : les
+    /// autres appelants (rejeu du journal, oracle des tests) veulent la réponse entière.
+    static BIG_TAIL_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `f` avec le dépôt des grandes valeurs actif ; rend aussi la valeur déposée, à envoyer
+/// après ce que `f` a écrit.
+#[inline(always)]
+pub fn with_big_tail<R>(f: impl FnOnce() -> R) -> (R, Option<SharedByte>) {
+    BIG_TAIL_ON.with(|on| on.set(true));
+    let r = f();
+    BIG_TAIL_ON.with(|on| on.set(false));
+    (r, BIG_TAIL.with(|t| t.take()))
+}
+
+/// Encode la réponse ; une grande valeur seule est déposée au lieu d'être recopiée.
+#[inline(always)]
+fn encode_reply(out: &mut Vec<u8>, frame: Frame) {
+    match frame {
+        Frame::BulkString(b) if b.len() >= BIG_REPLY && BIG_TAIL_ON.with(|on| on.get()) => {
+            out.push(b'$');
+            out.extend_from_slice(b.len().to_string().as_bytes());
+            out.extend_from_slice(b"\r\n");
+            BIG_TAIL.with(|t| t.set(Some(b)));
+        }
+        frame => radixox_lib::shared_frame::extend_encode(out, &frame),
+    }
+}
+
 // ── Exécution vers le tampon de sortie ──────────────────────────────────────
 
 /// Commande dont l'exécution dépend du runtime réseau (fermeture, Pub/Sub,
@@ -167,7 +204,7 @@ pub fn execute_into<'a>(
         Cmd::Invalid { name, err } => Frame::Error(err.message(name)),
         cmd => execute_sync(cmd, art),
     };
-    extend_encode(out, &frame);
+    encode_reply(out, frame);
     Executed::Done
 }
 
@@ -323,7 +360,7 @@ pub fn execute_hinted(cmd: Cmd<'_>, art: &mut OxidArt, keys: &[&[u8]], hints: &[
         }
         cmd => execute_with_hint(cmd, art, keys[0], h),
     };
-    extend_encode(out, &frame);
+    encode_reply(out, frame);
 }
 
 /// Hash, Set, ZSet : la commande normale, sa clé partant de l'indice (hors du

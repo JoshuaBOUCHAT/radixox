@@ -588,8 +588,31 @@ connexion gardait la capacité de sa plus grosse réponse).
   `GET` pipeliné 64 : 2 268–2 291 k/s contre 2 227–2 270 avant (passages alternés).
 - Test : `output_is_capped_for_a_client_that_does_not_read` (faux noyau : 30 Mo de
   réponses, sortie ≤ 2 plafonds + 2 réponses, tout arrive dans l'ordre à la reprise).
-- Reste (étape 1b) : une réponse unique plus grosse que le plafond (envoi direct depuis la
-  valeur) ; réserve commune des blocs ; budgets globaux de 1 Gio à remplacer.
+- Reste : réserve commune des blocs ; budgets globaux de 1 Gio à remplacer.
+
+### 6.2 quater Grandes valeurs envoyées depuis l'arbre (2026-10-28)
+
+Une réponse faite d'une seule valeur d'au moins `exec::BIG_REPLY` (1 Mio) ne passe plus par
+`out` : `encode_reply` n'y écrit que `$len\r\n` et dépose la valeur (le `SharedByte`
+lui-même, sans copie) ; le cœur la met dans `ConnOut::tail`.
+
+- **Ordre** : `tail` part après tout `out` (son en-tête est le dernier octet de `out`),
+  puis son `\r\n` final est remis dans `out`. D'ici là la connexion n'exécute plus rien
+  (`waits_on_output`, arrêt en pleine fenêtre comme le plafond) : rien ne peut s'écrire
+  entre l'en-tête et la valeur.
+- **Sûr** : le clone tient la valeur vivante si la clé est supprimée ou écrasée pendant
+  l'envoi ; un objet tenu deux fois est épinglé (le GC ne le déplace pas) ; plus de 127
+  envois simultanés de la même valeur passent par la table de débordement de `rc`
+  (MEMORY_ARCH §10.2 ter).
+- **Activé seulement autour des deux appels du cœur** (`exec::with_big_tail`) : le rejeu du
+  journal et l'oracle des tests appellent aussi `execute_into` et veulent la réponse
+  entière.
+- **Limite de sortie par client** : ne compte pas `tail` (pas de mémoire) — une valeur de
+  3 Mo passe sous une limite de 1 Mo, un `MGET` qui construit 1,8 Mo dans `out` ferme.
+- Mesuré (50 valeurs de 2 Mo, `GET` pipeliné 4, 16 connexions, passages alternés) :
+  1 258–1 289 → 1 941–1 974 `GET`/s (2,5 → 3,9 Gio/s), pic de RSS 394–402 → 120 Mo.
+- Tests : `big_value_is_sent_from_the_tree` (faux noyau : envois partiels, clé supprimée
+  pendant l'envoi, ordre dans le pipeline), `output_limits.rs`.
 
 ### 6.2 bis Sortie bornée : limite par client, budget global (2026-10-27)
 

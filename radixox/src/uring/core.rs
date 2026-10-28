@@ -1149,8 +1149,9 @@ impl Core {
     /// Octets à envoyer pour `Op::Send { slot }` (le reste, après un envoi partiel).
     pub fn pending_send(&self, slot: Slot) -> &[u8] {
         let o = &self.outs[slot as usize];
-        match &o.big {
-            Some((b, start)) if o.big_sending => &b.as_slice()[start + o.sent..],
+        match (&o.big, &o.tail) {
+            (Some((b, start)), _) if o.big_sending => &b.as_slice()[start + o.sent..],
+            (_, Some(v)) if o.tail_sending => &v.as_slice()[o.sent..],
             _ => &o.sending[o.sent..],
         }
     }
@@ -1449,6 +1450,8 @@ impl Core {
         o.sending.clear();
         o.big = None;
         o.big_sending = false;
+        o.tail = None;
+        o.tail_sending = false;
         o.sent = 0;
         o.client = Client::new();
         o.last_active = self.now;
@@ -1605,6 +1608,8 @@ impl Core {
             o.sending.clear();
             o.big = None;
             o.big_sending = false;
+            o.tail = None;
+            o.tail_sending = false;
             o.sent = 0;
             if o.mode != Mode::Draining {
                 self.drain(slot);
@@ -1613,6 +1618,25 @@ impl Core {
             return;
         }
         o.sent += res as usize;
+        if o.tail_sending {
+            let left = o.tail.as_ref().map_or(0, |v| v.len() - o.sent);
+            if left > 0 && o.mode != Mode::Draining {
+                o.refs += 1;
+                self.ops.push(Op::Send { slot });
+                return;
+            }
+            // la valeur est partie : sa fin de frame, et la connexion reprend
+            o.tail = None;
+            o.tail_sending = false;
+            o.sent = 0;
+            o.out.extend_from_slice(b"\r\n");
+            if !o.dirty {
+                o.dirty = true;
+                self.dirty.push(slot);
+            }
+            self.maybe_close(slot);
+            return;
+        }
         if o.big_sending {
             let left = o.big.as_ref().map_or(0, |(b, start)| b.len() - start - o.sent);
             if left > 0 && o.mode != Mode::Draining {
@@ -1749,7 +1773,8 @@ impl Core {
     /// boucle : ce n'est pas du travail en attente.
     fn waits_on_output(&self, slot: Slot) -> bool {
         let o = &self.outs[slot as usize];
-        o.out.len() >= self.cfg.out_backpressure && (o.send_in_flight() || !o.holds.is_empty() || o.big.is_some())
+        o.tail.is_some()
+            || o.out.len() >= self.cfg.out_backpressure && (o.send_in_flight() || !o.holds.is_empty() || o.big.is_some())
     }
 
     #[cfg(test)]
@@ -2120,7 +2145,9 @@ impl Core {
                     let plan = journal.is_some().then(|| (journal::plan(&cmd), o.out.len()));
                     let range = matches!(cmd, Cmd::LRange { .. } | Cmd::ZRange { .. });
                     let before = o.out.len();
-                    crate::exec::execute_hinted(cmd, art, &flat[span(k)], &hints[span(k)], &mut o.out);
+                    let ((), tail) = crate::exec::with_big_tail(|| {
+                        crate::exec::execute_hinted(cmd, art, &flat[span(k)], &hints[span(k)], &mut o.out)
+                    });
                     if range && let Some(job) = crate::exec::take_deferred() {
                         o.out.truncate(before);
                         park_stops.push((slot, end.unwrap_or(0)));
@@ -2130,8 +2157,12 @@ impl Core {
                     if let (Some(stream), Some((plan, start))) = (journal.as_mut(), plan) {
                         journal_finish(stream, plan, start, release_upto, held, slot, o, raw, art.now);
                     }
-                    // Plafond de sortie : les frames suivantes de la connexion attendent.
-                    if o.out.len() >= cfg.out_backpressure {
+                    // Plafond de sortie, ou grande valeur à envoyer après `out` : les frames
+                    // suivantes de la connexion attendent.
+                    if tail.is_some() {
+                        o.tail = tail;
+                    }
+                    if o.tail.is_some() || o.out.len() >= cfg.out_backpressure {
                         park_stops.push((slot, end.unwrap_or(0)));
                     }
                     afters.push((slot, After::Continue));
@@ -2211,8 +2242,9 @@ impl Core {
                 if let (Some(stream), Some((plan, start))) = (journal.as_mut(), plan) {
                     journal_finish(stream, plan, start, release_upto, held, slot, o, raw, art.now);
                 }
-                // Plafond de sortie : les frames suivantes de la connexion attendent.
-                if cont && o.out.len() >= cfg.out_backpressure {
+                // Plafond de sortie, ou grande valeur à envoyer après `out` : les frames
+                // suivantes de la connexion attendent.
+                if cont && (o.tail.is_some() || o.out.len() >= cfg.out_backpressure) {
                     park_stops.push((slot, end.unwrap_or(0)));
                 }
                 if let Some(key) = produced {
@@ -3004,6 +3036,14 @@ impl Core {
         }
         let n = o.sendable(upto);
         if n == 0 {
+            if o.out.is_empty() && o.tail.is_some() {
+                // tout ce qui précède est parti : la grande valeur, depuis l'arbre
+                o.tail_sending = true;
+                o.sent = 0;
+                o.send_cancelled = false;
+                o.refs += 1;
+                self.ops.push(Op::Send { slot });
+            }
             return;
         }
         if n == o.out.len() {
@@ -3100,6 +3140,8 @@ impl Core {
         o.sending = Vec::new();
         o.big = None;
         o.big_sending = false;
+        o.tail = None;
+        o.tail_sending = false;
         o.link = false;
         o.connecting = false;
         self.forget_rx(s);
@@ -3158,11 +3200,15 @@ impl Core {
             if i.has_work() && !o.parked() && matches!(o.mode, Mode::Normal | Mode::Closing) {
                 assert!(o.ready && self.ready.contains(&(s as Slot)), "slot {s} a des frames hors de la liste prête");
             }
-            match &o.big {
-                Some((b, start)) if o.big_sending => assert!(start + o.sent <= b.len()),
+            match (&o.big, &o.tail) {
+                (Some((b, start)), _) if o.big_sending => assert!(start + o.sent <= b.len()),
+                (_, Some(v)) if o.tail_sending => assert!(o.sent <= v.len()),
                 _ => assert!(o.sent <= o.sending.len()),
             }
             assert!(!o.big_sending || o.big.is_some(), "slot {s} : send de big sans big");
+            assert!(!o.tail_sending || o.tail.is_some(), "slot {s} : send de tail sans tail");
+            assert!(!(o.big_sending && o.tail_sending), "slot {s} : deux sends en vol");
+            assert!(!o.tail_sending || o.out.is_empty() && o.sending.is_empty(), "slot {s} : tail avant la fin de out");
             if o.link {
                 assert!(!i.has_work() && !o.ready, "lien {s} : rien n'est exécuté");
                 assert!(
@@ -3271,7 +3317,11 @@ fn run_cmd(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) 
         }
     }
     let barrier = cmd.is_barrier();
-    let after = match execute_into(cmd, art, &mut o.client, &mut o.out) {
+    let (executed, tail) = crate::exec::with_big_tail(|| execute_into(cmd, art, &mut o.client, &mut o.out));
+    if tail.is_some() {
+        o.tail = tail;
+    }
+    let after = match executed {
         Executed::Done if barrier => After::Barrier,
         Executed::Done => After::Continue,
         Executed::Runtime(cmd) => runtime(cmd, art, o, job_budget),
