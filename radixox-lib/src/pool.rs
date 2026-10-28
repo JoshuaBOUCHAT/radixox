@@ -1200,6 +1200,13 @@ pub fn resident() -> u64 {
     })
 }
 
+/// Place libre dans les blocs pris (libérations dans des blocs entamés) : réutilisable
+/// seulement après évacuation par le GC. L'éviction `maxmemory` la compte comme rendue
+/// (sinon elle ne verrait jamais son effet), l'admission non. O(1).
+pub fn fragment_free_bytes() -> u64 {
+    global().map_or(0, |p| (p.held_blocks * BLOCK as u64).saturating_sub(p.live_bytes))
+}
+
 /// Octets comptés par le registre mais réutilisables sans nouvelle page : pages vides
 /// gardées (pas encore rendues), en O(1). MEMORY_ARCH.md §10.5.
 pub fn reusable_bytes() -> u64 {

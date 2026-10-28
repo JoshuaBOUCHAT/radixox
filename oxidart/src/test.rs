@@ -1117,3 +1117,66 @@ fn evict_step_sweeps_in_slices() {
     let st = art.evict_step(u32::MAX);
     assert!(st.lap_done && st.evicted == 0 && st.hit == 0);
 }
+
+/// Éviction `maxmemory` : les clés rendues à `on_key` sont exactement celles qui
+/// disparaissent (préfixes partagés, suffixes, valeur propre d'un nœud interne) ; `volatile`
+/// ne touche que les clés avec TTL ; `volatile-ttl` prend l'échéance la plus proche.
+#[test]
+fn evict_for_memory_reports_exact_keys() {
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+    let mut art = OxidArt::new();
+    art.set_now(0);
+    let mut all = BTreeSet::new();
+    for i in 0..3000u32 {
+        let k = format!("user:{}:{}", i % 37, i);
+        if i % 4 == 0 {
+            art.set_ttl(SharedByte::from_slice(&k), Duration::from_secs(100 + i as u64), Value::from_str("v"));
+        } else {
+            art.set(SharedByte::from_slice(&k), Value::from_str("v"));
+        }
+        all.insert(k.into_bytes());
+    }
+    // valeurs propres de nœuds internes
+    for p in ["user:1", "user:2:", "u"] {
+        art.set(SharedByte::from_slice(p), Value::from_str("p"));
+        all.insert(p.as_bytes().to_vec());
+    }
+    let present = |art: &mut OxidArt, k: &[u8]| art.get(k).is_some();
+    // volatile : seules les clés avec TTL partent
+    let mut gone = Vec::new();
+    loop {
+        let st = art.evict_for_memory(true, false, 50, 100, &mut |k: &[u8]| gone.push(k.to_vec()));
+        art.check();
+        if st.lap_done {
+            break;
+        }
+    }
+    assert_eq!(gone.len(), 750, "les 750 clés avec TTL");
+    for k in &gone {
+        assert!(!present(&mut art, k), "{} encore là", String::from_utf8_lossy(k));
+        assert!(all.remove(k), "clé inventée : {}", String::from_utf8_lossy(k));
+    }
+    for k in &all {
+        assert!(present(&mut art, k), "{} évincée sans être rendue", String::from_utf8_lossy(k));
+    }
+    // allkeys : par tranches, tout part, chaque clé rendue une fois
+    let mut gone = Vec::new();
+    for _ in 0..1000 {
+        art.evict_for_memory(false, false, 16, 40, &mut |k: &[u8]| gone.push(k.to_vec()));
+        art.check();
+        if art.len() == 0 {
+            break;
+        }
+    }
+    assert_eq!(art.len(), 0);
+    let gone: BTreeSet<_> = gone.into_iter().collect();
+    assert_eq!(gone, all);
+    // volatile-ttl : l'échéance la plus proche d'abord
+    for (k, t) in [("a:late", 900u64), ("b:soon", 10), ("c:mid", 500)] {
+        art.set_ttl(SharedByte::from_str(k), Duration::from_secs(t), Value::from_str("v"));
+    }
+    let mut first = Vec::new();
+    art.evict_for_memory(true, true, 64, 1, &mut |k: &[u8]| first.push(k.to_vec()));
+    assert_eq!(first, vec![b"b:soon".to_vec()]);
+}

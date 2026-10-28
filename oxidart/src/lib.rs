@@ -172,6 +172,8 @@ pub struct OxidArt {
     pub amac_stats: AmacStats,
     /// Curseur de l'évicteur TTL : prochain slot à examiner dans le bitmap tagué.
     evict_cursor: u32,
+    /// Curseur de l'éviction `maxmemory` (bitmap d'occupation ou tagué selon la politique).
+    mem_cursor: u32,
     _live: gc::LiveTree,
 }
 
@@ -346,6 +348,7 @@ impl OxidArt {
             window: None,
             amac_stats: AmacStats::default(),
             evict_cursor: 0,
+            mem_cursor: 0,
             _live: gc::LiveTree::new(),
         }
     }
@@ -1560,6 +1563,139 @@ impl OxidArt {
         self.retag(idx, before);
         self.normalize(idx);
         let n = self_exp as usize + radixes.len();
+        self.key_count -= n;
+        n
+    }
+
+    // ─── Éviction maxmemory (MEMORY_ARCH.md §10.2 quater) ───────────────────
+
+    /// Clé du nœud `idx` (sa valeur propre) dans `out` : radix et préfixes depuis la racine,
+    /// en remontant les parents (comme la descente de [`Self::walk`], à l'envers).
+    fn key_to_node(&self, idx: u32, out: &mut Vec<u8>) {
+        let mut chain: smallvec::SmallVec<[u32; 16]> = smallvec::SmallVec::new();
+        let mut i = idx;
+        while i != self.root_idx {
+            chain.push(i);
+            i = self.node(i).parent_idx;
+        }
+        out.clear();
+        for &i in chain.iter().rev() {
+            let n = self.node(i);
+            out.push(n.exp_and_radix.parent_radix());
+            out.extend_from_slice(&n.prefix);
+        }
+    }
+
+    /// Une tranche de l'éviction `maxmemory` : balayage **linéaire** des slots depuis le
+    /// curseur (bitmap tagué si `volatile`, d'occupation sinon), au plus `scan` nœuds ; dans
+    /// chaque nœud visité, ses clés (avec TTL si `volatile`) sont évincées, jusqu'à
+    /// `max_keys`. `by_ttl` (`volatile-ttl`) : sur la fenêtre des `scan` nœuds tagués, le nœud
+    /// qui porte l'échéance la plus proche. Chaque clé est rendue à `on_key` avant d'être
+    /// retirée (journal : `DEL`, l'éviction n'est pas déterministe). Rien pendant une save :
+    /// évincer une clé intacte forcerait une copie (MEMORY_ARCH.md §10.5).
+    pub fn evict_for_memory(
+        &mut self,
+        volatile: bool,
+        by_ttl: bool,
+        scan: u32,
+        max_keys: usize,
+        on_key: &mut impl FnMut(&[u8]),
+    ) -> EvictStep {
+        let mut st = EvictStep::default();
+        if self.is_saving() || self.window.is_some() {
+            return st;
+        }
+        let next = |a: &Self, at: u32| if volatile { a.map.next_tagged(at) } else { a.map.next_occupied(at) };
+        let mut at = self.mem_cursor;
+        if by_ttl {
+            // fenêtre : le nœud à l'échéance la plus proche
+            let mut best: Option<(u64, u32)> = None;
+            while st.visited < scan {
+                let Some(idx) = next(self, at) else {
+                    st.lap_done = true;
+                    at = 0;
+                    break;
+                };
+                at = idx + 1;
+                st.visited += 1;
+                let node = self.node(idx);
+                let own = node.has_val().then(|| node.exp_and_radix.exp()).flatten();
+                let min = node
+                    .iter()
+                    .filter_map(|(_, e)| match e {
+                        EntryRef::Leaf { ttl, .. } => ttl,
+                        _ => None,
+                    })
+                    .chain(own)
+                    .min();
+                if let Some(t) = min
+                    && best.is_none_or(|(b, _)| t < b)
+                {
+                    best = Some((t, idx));
+                }
+            }
+            if let Some((t, idx)) = best {
+                let n = self.evict_entries(idx, |ttl| ttl.is_some_and(|x| x <= t), on_key);
+                st.evicted += n;
+                st.hit += (n > 0) as u32;
+            }
+        } else {
+            while st.visited < scan && st.evicted < max_keys {
+                let Some(idx) = next(self, at) else {
+                    st.lap_done = true;
+                    at = 0;
+                    break;
+                };
+                at = idx + 1;
+                st.visited += 1;
+                let n = self.evict_entries(idx, |ttl| !volatile || ttl.is_some(), on_key);
+                st.evicted += n;
+                st.hit += (n > 0) as u32;
+            }
+        }
+        self.mem_cursor = at;
+        st
+    }
+
+    /// Évince les clés du nœud `idx` dont l'échéance passe `pick`, chacune rendue d'abord à
+    /// `on_key`. Même retrait que [`Self::evict_node`].
+    fn evict_entries(&mut self, idx: u32, pick: impl Fn(Option<u64>) -> bool, on_key: &mut impl FnMut(&[u8])) -> usize {
+        let node = self.node(idx);
+        let own = node.has_val() && pick(node.exp_and_radix.exp());
+        let mut leaves: smallvec::SmallVec<[(u8, smallvec::SmallVec<[u8; 16]>); 16]> = smallvec::SmallVec::new();
+        for (r, e) in node.iter() {
+            if let EntryRef::Leaf { ttl, sfx, .. } = e
+                && pick(ttl)
+            {
+                leaves.push((r, sfx.map(|s| s.iter().copied().collect()).unwrap_or_default()));
+            }
+        }
+        if !own && leaves.is_empty() || !self.attached(idx) {
+            return 0;
+        }
+        let mut key = Vec::new();
+        self.key_to_node(idx, &mut key);
+        let base = key.len();
+        if own {
+            on_key(&key);
+        }
+        for (r, sfx) in &leaves {
+            key.truncate(base);
+            key.push(*r);
+            key.extend_from_slice(sfx);
+            on_key(&key);
+        }
+        let before = self.node(idx).has_any_ttl();
+        let node = self.node_mut(idx);
+        if own {
+            drop(take_self(node));
+        }
+        for (r, _) in &leaves {
+            drop(node.remove(*r));
+        }
+        self.retag(idx, before);
+        self.normalize(idx);
+        let n = own as usize + leaves.len();
         self.key_count -= n;
         n
     }

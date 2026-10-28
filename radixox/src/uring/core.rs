@@ -394,6 +394,11 @@ const MEM_RELEASE_AGAIN: Duration = Duration::from_millis(10);
 /// Déclenchement du GC (MEMORY_ARCH.md §16.6) : par timer, comme le rendu des pages ;
 /// `run_jobs` et `idle_step` ne tournent que s'il y a déjà du travail.
 const GC_CHECK_EVERY: Duration = Duration::from_millis(100);
+/// Éviction de fond `maxmemory` : tranche suivante tant que la cible n'est pas atteinte.
+const MAXMEM_AGAIN: Duration = Duration::from_millis(1);
+/// Nœuds visités et clés évincées au plus par tranche (de l'ordre de 50 µs).
+const MAXMEM_SCAN: u32 = 1024;
+const MAXMEM_KEYS: usize = 256;
 /// Au repos : rien reçu depuis 10 ms.
 const GC_IDLE_AFTER: Duration = Duration::from_millis(10);
 /// Une tranche s'arrête au premier plafond atteint : slots visités ou octets recopiés.
@@ -478,6 +483,8 @@ enum Timer {
     Gc,
     /// Échéance d'une commande bloquante.
     Block,
+    /// Tranche de l'éviction de fond `maxmemory` (MEMORY_ARCH.md §10.3).
+    MaxMem,
 }
 
 /// Suite à donner après l'exécution d'une frame.
@@ -650,6 +657,10 @@ pub struct Core {
     out_over: bool,
     /// Écritures refusées en `-OOM` (`maxmemory`), depuis le démarrage.
     oom_rejected: u64,
+    /// Clés évincées (`evicted_keys`), depuis le démarrage.
+    evicted_keys: u64,
+    /// Une tranche d'éviction de fond est programmée.
+    maxmem_armed: bool,
     out_stats: OutStats,
     /// Total de `rx` compté par écart (`account_rx`), resynchronisé par `out_check`.
     rx_total: usize,
@@ -751,6 +762,8 @@ impl Core {
             closing: Vec::new(),
             out_over: false,
             oom_rejected: 0,
+            evicted_keys: 0,
+            maxmem_armed: false,
             out_stats: OutStats::default(),
             rx_total: 0,
             throttled: Vec::new(),
@@ -1084,8 +1097,13 @@ impl Core {
                     let next = if more { MEM_RELEASE_AGAIN } else { MEM_RELEASE_EVERY };
                     self.timers.push(Reverse((self.now + next, Timer::MemRelease)));
                 }
+                Timer::MaxMem => {
+                    self.maxmem_armed = false;
+                    self.maxmem_step();
+                }
                 Timer::Gc => {
                     self.out_check();
+                    self.maxmem_step();
                     self.gc_trigger();
                     self.timers.push(Reverse((self.now + GC_CHECK_EVERY, Timer::Gc)));
                 }
@@ -1823,7 +1841,22 @@ impl Core {
         let io_budget = (self.cfg.input_budget as u64).saturating_add(self.cfg.output_budget as u64);
         let io_used = (self.out_stats.total + self.rx_total) as u64;
         let reserve = if self.art.save_busy() { 0 } else { self.cfg.save_reserve };
-        Some((self.cfg.maxmemory + io_used.min(io_budget)).saturating_sub(io_budget.min(self.cfg.maxmemory) + reserve))
+        Some(
+            (self.cfg.maxmemory + io_used.min(io_budget))
+                .saturating_sub(io_budget.min(self.cfg.maxmemory) + reserve + self.system_budget()),
+        )
+    }
+
+    /// Mémoire « système » bornée par configuration, prise sur le total (MEMORY_ARCH.md
+    /// §10.5) : blocs de l'AOF pas encore écrits et en cours d'écriture, backlog de
+    /// réplication et retard toléré de chaque réplica branché. Mesuré sans : AOF actif,
+    /// pic de RSS 52,6 Mo pour `maxmemory 48mb`.
+    fn system_budget(&self) -> u64 {
+        let aof = if self.aof.is_some() { 2 * self.cfg.aof_max_pending } else { 0 };
+        let repl = self.src.as_ref().map_or(0, |src| {
+            self.cfg.repl_backlog + src.links.len() as u64 * self.cfg.repl_online_lag
+        });
+        aof + repl
     }
 
     /// Octets comptés par le registre mais réutilisables sans nouvelle page (pages vides du
@@ -1836,6 +1869,37 @@ impl Core {
     /// Mémoire utilisée au sens de `maxmemory` : le registre moins le réutilisable.
     pub fn used_memory(&self) -> u64 {
         radixox_lib::pages::charged().saturating_sub(self.mem_reusable())
+    }
+
+    /// Données vivantes estimées : l'usage moins la place libérée dans des blocs entamés du
+    /// pool (que le GC rendra). Ce que regarde l'éviction : sinon, évincer des valeurs dans
+    /// des blocs entamés ne ferait rien baisser et elle viderait la base.
+    fn live_estimate(&self) -> u64 {
+        self.used_memory().saturating_sub(radixox_lib::pool::fragment_free_bytes())
+    }
+
+    /// Éviction de fond (MEMORY_ARCH.md §10.3) : au-delà de `limite − 5 %` de données
+    /// vivantes estimées, une tranche, puis la suivante dans `MAXMEM_AGAIN` jusqu'à la
+    /// cible. Rien en `noeviction`, ni pendant une save (évincer une clé intacte forcerait
+    /// une copie).
+    fn maxmem_step(&mut self) {
+        use crate::exec::maxmem::Policy;
+        let Some(limit) = self.oom_limit() else { return };
+        if self.cfg.maxmemory_policy == Policy::NoEviction || self.art.save_busy() {
+            return;
+        }
+        let target = limit - limit / 20;
+        if self.live_estimate() <= target {
+            return;
+        }
+        let journal = self.journal.as_mut().filter(|_| self.follow.is_none());
+        let st = evict_round(&mut self.art, journal, self.cfg.maxmemory_policy, MAXMEM_SCAN, MAXMEM_KEYS);
+        self.evicted_keys += st.evicted as u64;
+        let progress = st.evicted > 0 || !st.lap_done;
+        if progress && self.live_estimate() > target && !self.maxmem_armed {
+            self.maxmem_armed = true;
+            self.timers.push(Reverse((self.now + MAXMEM_AGAIN, Timer::MaxMem)));
+        }
     }
 
     /// `n` octets libres sous `maxmemory`, en plus de ce qui est utilisé (toujours vrai sans
@@ -1862,15 +1926,17 @@ impl Core {
         let policies: Vec<&str> = crate::exec::maxmem::Policy::available().map(|p| p.name()).collect();
         let _ = write!(
             out,
-            "# Maxmemory\r\nmaxmemory:{}\r\nmaxmemory_policy:{}\r\nmaxmemory_policies_available:{}\r\nused_memory:{}\r\nmem_reusable_bytes:{}\r\nmaxmemory_data_limit:{}\r\nsave_reserve:{}\r\noom_rejected_commands:{}\r\n\r\n",
+            "# Maxmemory\r\nmaxmemory:{}\r\nmaxmemory_policy:{}\r\nmaxmemory_policies_available:{}\r\nused_memory:{}\r\nmem_reusable_bytes:{}\r\nmem_live_estimate:{}\r\nmaxmemory_data_limit:{}\r\nsave_reserve:{}\r\noom_rejected_commands:{}\r\nevicted_keys:{}\r\n\r\n",
             self.cfg.maxmemory,
             self.cfg.maxmemory_policy.name(),
             policies.join(","),
             self.used_memory(),
             self.mem_reusable(),
+            self.live_estimate(),
             self.oom_limit().unwrap_or(0),
             self.cfg.save_reserve,
             self.oom_rejected,
+            self.evicted_keys,
         );
     }
 
@@ -2134,11 +2200,11 @@ impl Core {
             // `maxmemory` : limite des données de cette fenêtre (None : sans), et ce que le
             // registre compte mais qu'une écriture réutilise sans nouvelle page.
             let oom = self.oom_limit();
-            let reusable = if oom.is_some() { self.mem_reusable() } else { 0 };
+            let mut reusable = if oom.is_some() { self.mem_reusable() } else { 0 };
             // Coût déjà admis dans la fenêtre : il a pu consommer du réutilisable sans faire
             // monter le registre (compté deux fois sinon : prudent).
             let mut admitted = 0u64;
-            let Core { art, ins, outs, bufs, persist, journal, aof, cfg, held, follow, blocked, ready, dirty, now, oom_rejected, .. } = self;
+            let Core { art, ins, outs, bufs, persist, journal, aof, cfg, held, follow, blocked, ready, dirty, now, oom_rejected, evicted_keys, .. } = self;
             let now = *now;
             // Réplica : les écritures des clients sont refusées (§10.1).
             let read_only = follow.is_some();
@@ -2400,7 +2466,15 @@ impl Core {
                         && cmd.may_grow()
                     {
                         let cost = write_cost(&cmd, raw.len()) + zset_store_cost(art, &cmd);
-                        if radixox_lib::pages::charged() + admitted + cost > limit + reusable {
+                        let mut fits = radixox_lib::pages::charged() + admitted + cost <= limit + reusable;
+                        if !fits && cfg.maxmemory_policy != crate::exec::maxmem::Policy::NoEviction {
+                            // Une petite tranche tout de suite, puis la même vérification stricte :
+                            // ce qu'elle libère dans des blocs entamés ne compte qu'après le GC.
+                            *evicted_keys += evict_round(art, journal.as_mut().filter(|_| follow.is_none()), cfg.maxmemory_policy, MAXMEM_SCAN, 64).evicted as u64;
+                            reusable = radixox_lib::pool::reusable_bytes() + radixox_lib::large::reusable_bytes() + art.slab_reusable_bytes();
+                            fits = radixox_lib::pages::charged() + admitted + cost <= limit + reusable;
+                        }
+                        if !fits {
                             extend_encode(&mut o.out, &Frame::Error(crate::exec::maxmem::OOM.into()));
                             *oom_rejected += 1;
                             afters.push((slot, After::Continue));
@@ -3574,6 +3648,35 @@ fn run_cmd(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) 
 
 /// Commandes qui dépendent du runtime. KEYS et UNLINK s'exécutent encore d'une
 /// traite (parquage + jobs : étape 4) ; Pub/Sub et saves : étapes 4–5.
+/// Une tranche d'éviction `maxmemory` selon `policy` ; chaque clé évincée part dans le
+/// journal comme un `DEL` (l'éviction n'est pas déterministe : l'AOF et les réplicas
+/// doivent la voir). `journal` : `None` sur un réplica (son flux est celui du maître).
+fn evict_round(
+    art: &mut OxidArt,
+    mut journal: Option<&mut journal::Stream>,
+    policy: crate::exec::maxmem::Policy,
+    scan: u32,
+    max_keys: usize,
+) -> oxidart::EvictStep {
+    use crate::exec::maxmem::Policy;
+    let now = art.now;
+    let mut del = Vec::new();
+    let mut on_key = |k: &[u8]| {
+        if let Some(j) = journal.as_deref_mut() {
+            del.clear();
+            del.extend_from_slice(b"*2\r\n$3\r\nDEL\r\n");
+            radixox_lib::shared_frame::encode_bulk(&mut del, k);
+            j.push(now, &del);
+        }
+    };
+    match policy {
+        Policy::NoEviction => oxidart::EvictStep::default(),
+        Policy::VolatileTtl => art.evict_for_memory(true, true, scan, max_keys, &mut on_key),
+        // LRU / LFU (feature `eviction`) : par balayage en attendant leurs compteurs.
+        p => art.evict_for_memory(p.volatile(), false, scan, max_keys, &mut on_key),
+    }
+}
+
 /// Borne haute de ce qu'une écriture peut ajouter (MEMORY_ARCH.md §10.5) : deux fois sa
 /// frame (valeurs, clés, en-têtes, chemins) plus 512 o par élément écrit (un à deux nœuds
 /// de 128 o, ou un nœud valart). Ce que la commande calcule depuis les données s'ajoute à

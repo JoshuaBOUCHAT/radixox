@@ -123,3 +123,43 @@ fn startup_is_refused_when_the_data_does_not_fit() {
     assert!(err.contains("maxmemory"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `allkeys-random` : au-delà de la limite, des clés sont évincées au lieu de refuser ; la
+/// mémoire reste sous `maxmemory`. `volatile-ttl` sans aucune clé avec TTL : rien
+/// d'évinçable, `-OOM`.
+#[test]
+fn eviction_keeps_writes_going_under_the_limit() {
+    const PORT: u16 = 16433;
+    common::start_server_env(PORT, &[("RADIXOX_MAXMEMORY", "48mb"), ("RADIXOX_MAXMEMORY_POLICY", "allkeys-random")]);
+    let mut c = common::conn(PORT);
+    let val = vec![b'v'; 1000];
+    for batch in 0..150 {
+        let mut p = redis::pipe();
+        for i in 0..1000 {
+            p.cmd("SET").arg(format!("k{}", batch * 1000 + i)).arg(&val).ignore();
+        }
+        // une réponse -OOM fait échouer le pipeline côté client : comptés par INFO
+        let _ = p.query::<()>(&mut c);
+    }
+    let m = info(&mut c);
+    let oom: u64 = m["oom_rejected_commands"].parse().unwrap();
+    let ok = 150_000 - oom;
+    let evicted: u64 = m["evicted_keys"].parse().unwrap();
+    let rss: u64 = m["mem_rss_anon_bytes"].parse().unwrap();
+    assert!(evicted > 50_000, "{evicted} clés évincées");
+    assert!(ok > 140_000, "{ok} acceptés, {oom} refusés");
+    assert!(rss <= 48 * MB, "RSS {rss} o pour 48 Mo");
+    let dbsize: u64 = redis::cmd("DBSIZE").query(&mut c).unwrap();
+    assert_eq!(dbsize, ok - evicted, "clés présentes = acceptées − évincées");
+    // volatile-ttl : aucune clé n'a de TTL, rien n'est évinçable
+    let _: () = redis::cmd("CONFIG").arg("SET").arg("maxmemory-policy").arg("volatile-ttl").query(&mut c).unwrap();
+    let mut refused = false;
+    for i in 0..50_000 {
+        if redis::cmd("SET").arg(format!("z{i}")).arg(&val).query::<()>(&mut c).is_err() {
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "volatile-ttl sans TTL : -OOM attendu");
+    let _ = redis::cmd("SHUTDOWN").arg("NOSAVE").query::<()>(&mut c);
+}

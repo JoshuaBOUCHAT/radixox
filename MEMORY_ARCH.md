@@ -786,6 +786,30 @@ est résident après coup ; pour refuser avant, il faut compter avant que les pa
     `maxmemory 48mb` : 22 657, 22 688, 22 695 acceptés, RSS 35,7 Mo. Le total reste borné :
     le réutilisable est déjà compté et repris avant toute nouvelle page. `INFO` :
     `used_memory` (effectif), `mem_reusable_bytes`.
+- **Politiques gratuites + éviction de fond faites** (2026-10-28) :
+  - `OxidArt::evict_for_memory` : curseur de slot sur le bitmap d'occupation
+    (`allkeys-random`) ou tagué (`volatile-random`), clés du nœud visité évincées sur
+    place ; `volatile-ttl` : sur une fenêtre de nœuds tagués, les entrées à l'échéance la
+    plus proche. Chaque clé est rendue avant retrait (`key_to_node` : remontée des
+    parents) et part dans le journal comme `DEL` (pas sur un réplica, dont le flux est
+    celui du maître). Rien pendant une save. Test : `evict_for_memory_reports_exact_keys`
+    (les clés rendues sont exactement celles qui disparaissent).
+  - **cible = données vivantes estimées** (`live_estimate` = usage − place libre des blocs
+    entamés du pool, que le GC rendra) : sinon l'éviction ne voit pas son effet et vide la
+    base. L'admission reste stricte (registre).
+  - **de fond** : au-delà de `limite − 5 %`, tranches de 1 024 nœuds / 256 clés toutes les
+    1 ms (`Timer::MaxMem`, relancé par le minuteur du GC) ; **synchrone** : une écriture qui
+    ne passe pas évince 64 clés puis revérifie strictement, sinon `-OOM`.
+  - **mémoire système dans le budget** (`system_budget`) : 2 × plafond de l'AOF, backlog de
+    réplication + retard toléré par réplica. Sans : AOF actif, pic de RSS 52,6 Mo pour
+    `maxmemory 48mb` ; avec : 46,3 Mo.
+  - mesuré (`maxmemory 48mb`, `allkeys-random`, 200 000 `SET` de 1 Ko en 0,6 s) : sans AOF
+    197 963 acceptés (1 % de `-OOM`), 180 533 évincées, pic de RSS 39 Mo ; avec AOF 170 360
+    acceptés (15 % de `-OOM` : les `DEL` passent aussi par l'AOF, et la place libérée attend
+    le GC), pic 46,3 Mo ; redémarrage sur l'AOF : même contenu (digest identique).
+  - LRU / LFU (feature `eviction`) : pour l'instant le même balayage ; leurs compteurs
+    restent à faire (§10.2 bis).
+  - tests : `tests/maxmemory.rs` (`eviction_keeps_writes_going_under_the_limit`).
 
 ### 10.3 Déclenchement
 
