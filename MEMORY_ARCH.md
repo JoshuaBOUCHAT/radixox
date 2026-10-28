@@ -840,6 +840,39 @@ est résident après coup ; pour refuser avant, il faut compter avant que les pa
   d'ensemble de ZSet sans `STORE` par un job ou une réservation sur le budget de sortie.
   Aucune éviction pour un temporaire (décision §10.5).
   - tests : `tests/maxmemory.rs` (`eviction_keeps_writes_going_under_the_limit`).
+- **Tests des cas limites et trois bugs corrigés** (2026-10-28) :
+  - **sur-éviction** : `pool::reusable_bytes` ne comptait que les pages entièrement vides ;
+    un bloc de 64 Kio vidé dans une page encore active n'était compté ni réutilisable ni
+    dans `fragment_free_bytes` (blocs tenus seulement), alors que `take_block` le sert avant
+    toute page neuve. L'éviction ne voyait son effet qu'aux pages vidées et continuait :
+    après un remplissage, l'estimation tombait jusqu'à 28,9 Mo pour une cible de 38,25 Mo
+    (11 000 à 14 000 clés de 1 Ko gardées sous `maxmemory 48mb`, 1 456 `-OOM` sur 150 000).
+    Maintenant : blocs libres de toutes les pages tenues, sauf ceux des pages en évacuation
+    (rendus en fin de passe) → 21 100 à 21 250 clés, estimation 38,1 Mo, ~110 `-OOM`.
+  - **`CONFIG SET maxmemory` sur un serveur lancé sans limite** : `io_budgets_auto` restait
+    faux, les budgets d'E/S gardaient 1 Gio chacun, limite des données = 0, et
+    `allkeys-random` évinçait **toute** la base. Les budgets sont maintenant dérivés dès
+    qu'ils ne sont pas fixés par l'environnement ; `CONFIG SET maxmemory` refuse une valeur
+    qui ne laisse rien aux données (même règle qu'au démarrage).
+  - **mémoire système comptée deux fois** : `oom_limit` retirait tout `system_budget` alors
+    que l'AOF en attente et le backlog sont déjà au registre. AOF + réplica sous 48 Mo :
+    chaque clé acceptée était évincée, 68 % de `-OOM`. Maintenant, comme pour l'E/S, ce que
+    le système tient déjà (le plus grand de l'AOF en attente et du backlog : ils peuvent
+    partager des blocs) est rendu à la limite → 3,6 % de `-OOM`.
+  - reste vu : **une frame plus grosse que le budget d'entrée** (10 % de `maxmemory`, 4,8 Mo
+    pour 48 Mo) ne reçoit jamais de réponse : la connexion est suspendue par le budget et
+    rien ne la fait repartir (frame incomplète). Décision à prendre (refus + fermeture
+    comme `proto-max-bulk-len`, ou exemption d'une frame seule). Aussi : le backlog par
+    défaut (64 Mo) dépasse à lui seul une petite `maxmemory`, sans avertissement.
+  - tests (`tests/maxmemory.rs`) : pic de mémoire anonyme (`VmHWM` − résident fichier) sous
+    la limite, pas seulement l'état final ; éviction arrêtée à au moins 90 % de la cible
+    (`assert_not_over_evicted`) ; Hash / Set / ZSet / List admis puis évincés entiers,
+    `ZUNIONSTORE` refusé sans exécution partielle ; AOF + réplica : même condensé sur le
+    réplica (qui n'évince rien) et après relance du primaire sur son AOF ;
+    `CONFIG SET maxmemory` sous l'usage (`noeviction` puis éviction de fond sans écriture,
+    puis rien d'évinçable : `PING` < 50 ms) ; `volatile-random` ne touche aucune clé sans
+    TTL, `volatile-ttl` évince des échéances moyennes plus proches ; `volatile-lru` avec la
+    feature. Course corrigée : `DBSIZE` lu pendant l'éviction de fond (test instable).
 
 ### 10.3 Déclenchement
 

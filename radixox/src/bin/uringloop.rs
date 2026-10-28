@@ -1050,16 +1050,17 @@ fn main() -> io::Result<()> {
         }
         cfg.save_reserve = size("RADIXOX_SAVE_RESERVE")?.unwrap_or(0);
         let max = size("RADIXOX_MAXMEMORY")?.unwrap_or(0);
+        let (input_set, output_set) =
+            (std::env::var("RADIXOX_INPUT_BUDGET_MB").is_ok(), std::env::var("RADIXOX_OUTPUT_BUDGET_MB").is_ok());
+        // même sans limite au démarrage : un `CONFIG SET maxmemory` plus tard les dérive
+        cfg.io_budgets_auto = !input_set && !output_set;
         if max > 0 {
-            let (input_set, output_set) =
-                (std::env::var("RADIXOX_INPUT_BUDGET_MB").is_ok(), std::env::var("RADIXOX_OUTPUT_BUDGET_MB").is_ok());
             if !input_set {
                 cfg.input_budget = (max / 10) as usize;
             }
             if !output_set {
                 cfg.output_budget = (max / 10) as usize;
             }
-            cfg.io_budgets_auto = !input_set && !output_set;
             let parts = cfg.input_budget as u64 + cfg.output_budget as u64 + cfg.save_reserve;
             if parts >= max {
                 return Err(io::Error::other(format!(

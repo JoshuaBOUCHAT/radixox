@@ -271,6 +271,18 @@ impl Pool {
         })
     }
 
+    /// Voir [`reusable_bytes`] : O(pages en évacuation), bornées par la réserve du GC.
+    fn reusable_bytes(&self) -> u64 {
+        let evac: u64 = self
+            .evacuating
+            .iter()
+            .map(|&p| &self.pages[p as usize])
+            .filter(|ps| ps.evacuating)
+            .map(|ps| ps.free_mask.count_ones() as u64)
+            .sum();
+        (self.charged_pages * BLOCKS_PER_PAGE as u64 - self.held_blocks - evac) * BLOCK as u64
+    }
+
     pub fn stats(&self) -> Stats {
         let (empty, released) = (self.empty_pages.len() as u64, self.released_pages.len() as u64);
         Stats {
@@ -1207,10 +1219,11 @@ pub fn fragment_free_bytes() -> u64 {
     global().map_or(0, |p| (p.held_blocks * BLOCK as u64).saturating_sub(p.live_bytes))
 }
 
-/// Octets comptés par le registre mais réutilisables sans nouvelle page : pages vides
-/// gardées (pas encore rendues), en O(1). MEMORY_ARCH.md §10.5.
+/// Octets comptés par le registre mais réutilisables sans nouvelle page : blocs libres des
+/// pages tenues, pages vides comprises (`take_block` les sert avant toute page neuve), sauf
+/// ceux des pages en évacuation, rendus à la fin de la passe. MEMORY_ARCH.md §10.5.
 pub fn reusable_bytes() -> u64 {
-    global().map_or(0, |p| p.empty_pages.len() as u64 * PAGE as u64)
+    global().map_or(0, |p| p.reusable_bytes())
 }
 
 pub fn gc_stats() -> Option<GcStats> {
@@ -1296,10 +1309,13 @@ mod tests {
         let next = p.alloc(MEDIUM); // ferme le bloc 0, ouvre le suivant
         assert_ne!(p.block_of(next), b0);
         assert_eq!(p.stats().held_blocks, 2);
+        assert_eq!(p.reusable_bytes(), (BLOCKS_PER_PAGE as u64 - 2) * BLOCK as u64);
         for &x in &first {
             unsafe { p.free(x, MEDIUM) };
         }
         assert_eq!(p.stats().held_blocks, 1, "bloc 0 libéré à 0");
+        // page encore active : le bloc rendu est réutilisable sans nouvelle page
+        assert_eq!(p.reusable_bytes(), (BLOCKS_PER_PAGE as u64 - 1) * BLOCK as u64);
         // Le curseur finit son bloc, puis reprend le bloc 0 (bit le plus bas).
         for _ in 1..per_block {
             p.alloc(MEDIUM);

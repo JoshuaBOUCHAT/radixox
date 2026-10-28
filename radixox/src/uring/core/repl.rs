@@ -160,6 +160,13 @@ pub(in super::super) struct Source {
     partial_syncs: u64,
 }
 
+impl Source {
+    /// Octets tenus par le backlog (`maxmemory` : déjà au registre).
+    pub fn backlog_bytes(&self) -> u64 {
+        self.backlog_bytes
+    }
+}
+
 // ── Cible ───────────────────────────────────────────────────────────────────
 
 /// Mode suivi : l'histoire suivie et la position du dernier bloc appliqué.

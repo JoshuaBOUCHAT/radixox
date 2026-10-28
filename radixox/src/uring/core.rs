@@ -1842,10 +1842,26 @@ impl Core {
         let io_budget = (self.cfg.input_budget as u64).saturating_add(self.cfg.output_budget as u64);
         let io_used = (self.out_stats.total + self.rx_total) as u64;
         let reserve = if self.art.save_busy() { 0 } else { self.cfg.save_reserve };
+        // comme l'E/S : ce que le système tient déjà est au registre, seul le reste du
+        // budget est retiré (sinon compté deux fois : avec AOF et réplica, plus rien ne
+        // tenait sous 48 Mo et l'éviction vidait la base)
+        let system = self.system_budget();
+        let system_used = self.system_used().min(system);
         Some(
-            (self.cfg.maxmemory + io_used.min(io_budget))
-                .saturating_sub(io_budget.min(self.cfg.maxmemory) + reserve + self.system_budget()),
+            (self.cfg.maxmemory + io_used.min(io_budget) + system_used)
+                .saturating_sub(io_budget.min(self.cfg.maxmemory) + reserve + system),
         )
+    }
+
+    /// Ce que tient la mémoire système, par défaut : le plus grand de l'AOF en attente et du
+    /// backlog (ils peuvent partager des blocs du journal ; les additionner surestimerait).
+    fn system_used(&self) -> u64 {
+        let aof = match (&self.aof, &self.journal) {
+            (Some(w), Some(j)) => w.pending(j),
+            _ => 0,
+        };
+        let backlog = self.src.as_ref().map_or(0, |src| src.backlog_bytes());
+        aof.max(backlog)
     }
 
     /// Mémoire « système » bornée par configuration, prise sur le total (MEMORY_ARCH.md
@@ -1950,6 +1966,26 @@ impl Core {
         }
     }
 
+    /// `maxmemory` à `max` laisse de la place aux données une fois les budgets d'entrée et
+    /// de sortie et la réserve de save retirés (même règle qu'au démarrage).
+    fn data_room(&self, max: u64) -> Result<(), String> {
+        if max == 0 {
+            return Ok(());
+        }
+        let io = if self.cfg.io_budgets_auto {
+            2 * (max / 10)
+        } else {
+            self.cfg.input_budget as u64 + self.cfg.output_budget as u64
+        };
+        let parts = io.saturating_add(self.cfg.save_reserve);
+        if parts >= max {
+            return Err(format!(
+                "maxmemory {max} : input and output budgets and save reserve ({parts} bytes) leave nothing for data"
+            ));
+        }
+        Ok(())
+    }
+
     /// CONFIG GET motif / CONFIG SET nom valeur [nom valeur…].
     fn config_cmd(&mut self, args: &[Vec<u8>], out: &mut Vec<u8>) {
         use crate::exec::maxmem::{Policy, glob, parse_size};
@@ -1980,7 +2016,10 @@ impl Core {
                     let v = String::from_utf8_lossy(&kv[1]).into_owned();
                     let name = String::from_utf8_lossy(&k).into_owned();
                     let checked = match k.as_slice() {
-                        b"maxmemory" | b"save-reserve" => parse_size(&v)
+                        b"maxmemory" => parse_size(&v)
+                            .ok_or_else(|| format!("Invalid argument '{v}' for CONFIG SET '{name}'"))
+                            .and_then(|max| self.data_room(max).map(|()| max.to_string())),
+                        b"save-reserve" => parse_size(&v)
                             .map(|n| n.to_string())
                             .ok_or_else(|| format!("Invalid argument '{v}' for CONFIG SET '{name}'")),
                         b"maxmemory-policy" => Policy::parse(&v).map(|p| p.name().to_string()),

@@ -45,6 +45,7 @@ cargo run --release --bin radixox         # écoute 127.0.0.1:6379 (RADIXOX_BIND
 cargo test -p oxidart --features regex    # arbre (dont tests différentiels contre oxidart-legacy)
 cargo test -p radixox-lib                 # parseur, SharedByte, barrière
 cargo test -p radixox                     # intégration : lance le binaire sur un port de test
+cargo test -p radixox --features eviction  # + LRU/LFU (tests sous cfg(feature = "eviction"))
 ```
 
 - Tests en mono-thread obligatoires (`RUST_TEST_THREADS=1` dans `.cargo/config.toml`) :
