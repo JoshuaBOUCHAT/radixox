@@ -12,6 +12,7 @@ pub mod client;
 pub mod jobs;
 pub mod journal;
 pub mod list;
+pub mod maxmem;
 pub mod persist;
 mod hash;
 pub mod scan;
@@ -132,6 +133,8 @@ pub fn execute_into<'a>(
         | Cmd::Unlink(_)
         | Cmd::FlushDb
         | Cmd::BgSave
+        | Cmd::BgSaveReserve(_)
+        | Cmd::Config(_)
         | Cmd::BgRewriteAof
         | Cmd::Save
         | Cmd::LastSave
@@ -469,6 +472,8 @@ pub fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         | Cmd::MGet(_)
         | Cmd::Unlink(_)
         | Cmd::BgSave
+        | Cmd::BgSaveReserve(_)
+        | Cmd::Config(_)
         | Cmd::BgRewriteAof
         | Cmd::Save
         | Cmd::LastSave

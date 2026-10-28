@@ -79,6 +79,16 @@ pub struct Config {
     /// Sortie en attente de toutes les connexions au-delà de laquelle celles qui en
     /// ont encore ne sont plus tirées (`RADIXOX_OUTPUT_BUDGET_MB`, 0 = sans).
     pub output_budget: usize,
+    /// Total du processus (registre des pages, MEMORY_ARCH.md §10.5) ; 0 = sans limite
+    /// (`RADIXOX_MAXMEMORY`, `CONFIG SET maxmemory`).
+    pub maxmemory: u64,
+    pub maxmemory_policy: crate::exec::maxmem::Policy,
+    /// Mémoire gardée libre hors save pour les copies d'une save (`RADIXOX_SAVE_RESERVE`,
+    /// `CONFIG SET save-reserve`) ; une save ne démarre que si elle est libre.
+    pub save_reserve: u64,
+    /// Budgets d'entrée et de sortie dérivés de `maxmemory` (10 % chacun) : recalculés à
+    /// chaque `CONFIG SET maxmemory`.
+    pub io_budgets_auto: bool,
     /// Largeur de la fenêtre d'exécution : commandes dont les clés descendent
     /// ensemble (`RADIXOX_PREFETCH`, défaut 64 = `PREFETCH_BATCH` ; 1 = une à une).
     pub prefetch: usize,
@@ -151,6 +161,10 @@ impl Default for Config {
             input_budget: 1 << 30,
             client_output_limit: 1 << 30,
             output_budget: 1 << 30,
+            maxmemory: 0,
+            maxmemory_policy: crate::exec::maxmem::Policy::NoEviction,
+            save_reserve: 0,
+            io_budgets_auto: false,
             prefetch: oxidart::PREFETCH_BATCH,
             amac: 16,
             amac_pf: 2,
@@ -479,6 +493,10 @@ enum After {
     /// BGSAVE / SAVE / LASTSAVE / INFO : dépendent de l'état du serveur (save
     /// en cours, dernière save).
     BgSave,
+    /// BGSAVE RESERVE <octets>.
+    BgSaveReserve(u64),
+    /// CONFIG GET / SET.
+    Config(Vec<Vec<u8>>),
     BgRewriteAof,
     Save,
     LastSave,
@@ -568,6 +586,7 @@ fn stops_window(cmd: &Cmd<'_>) -> bool {
             Cmd::Keys(_)
                 | Cmd::Unlink(_)
                 | Cmd::BgSave
+                | Cmd::BgSaveReserve(_)
                 | Cmd::BgRewriteAof
                 | Cmd::Save
                 | Cmd::Publish { .. }
@@ -629,6 +648,8 @@ pub struct Core {
     /// Sortie en attente de toutes les connexions au-delà de `output_budget`, au dernier
     /// relevé (`out_check`) : celles qui en ont encore ne sont plus tirées.
     out_over: bool,
+    /// Écritures refusées en `-OOM` (`maxmemory`), depuis le démarrage.
+    oom_rejected: u64,
     out_stats: OutStats,
     /// Total de `rx` compté par écart (`account_rx`), resynchronisé par `out_check`.
     rx_total: usize,
@@ -729,6 +750,7 @@ impl Core {
             dirty: Vec::new(),
             closing: Vec::new(),
             out_over: false,
+            oom_rejected: 0,
             out_stats: OutStats::default(),
             rx_total: 0,
             throttled: Vec::new(),
@@ -1528,8 +1550,15 @@ impl Core {
     /// une frame à cheval entre les deux n'a alors pas besoin d'être recopiée.
     fn push_span(&mut self, slot: Slot, span: Span) {
         let s = slot as usize;
+        // Arrêtée par son plafond de sortie (client qui ne lit pas) : comme parquée, sinon
+        // elle retiendrait les tampons partagés de l'anneau jusqu'à affamer les autres
+        // connexions ; le budget d'entrée suspend ensuite sa réception (§5.3).
+        let stalled = !self.outs[s].parked() && self.waits_on_output(slot);
+        if stalled {
+            self.spans_to_rx(slot);
+        }
         let i = &mut self.ins[s];
-        if self.outs[s].parked() {
+        if self.outs[s].parked() || stalled {
             // Parquée : copié tout de suite, l'anneau n'est jamais retenu (§7).
             i.rx.extend_from_slice(self.bufs.slice(span.bid, span.off, span.len));
             i.rx_check = true;
@@ -1537,6 +1566,12 @@ impl Core {
                 self.drain(slot);
             }
             self.account_rx(slot);
+            // une connexion arrêtée reprend quand sa sortie se vide : elle doit être prête
+            let o = &mut self.outs[s];
+            if stalled && !o.ready && o.mode == Mode::Normal {
+                o.ready = true;
+                self.ready.push(slot);
+            }
             return;
         }
         match i.spans.back_mut() {
@@ -1776,6 +1811,125 @@ impl Core {
         self.outs[slot as usize].pending_out()
     }
 
+    // ── maxmemory (MEMORY_ARCH.md §10.5) ─────────────────────────────────
+
+    /// Limite des données : `maxmemory` moins la part des budgets d'entrée et de sortie que
+    /// les tampons n'utilisent pas encore, moins la réserve de save hors save. Comparée au
+    /// registre des pages (qui compte aussi les tampons en usage). `None` : sans limite.
+    pub fn oom_limit(&self) -> Option<u64> {
+        if self.cfg.maxmemory == 0 {
+            return None;
+        }
+        let io_budget = (self.cfg.input_budget as u64).saturating_add(self.cfg.output_budget as u64);
+        let io_used = (self.out_stats.total + self.rx_total) as u64;
+        let reserve = if self.art.save_busy() { 0 } else { self.cfg.save_reserve };
+        Some((self.cfg.maxmemory + io_used.min(io_budget)).saturating_sub(io_budget.min(self.cfg.maxmemory) + reserve))
+    }
+
+    /// `n` octets libres sous `maxmemory`, en plus de ce qui est compté (toujours vrai sans
+    /// limite).
+    fn mem_free_for(&self, n: u64) -> bool {
+        self.oom_limit().is_none_or(|limit| radixox_lib::pages::charged() + n <= limit + self.cfg.save_reserve)
+    }
+
+    /// Au démarrage, après le chargement : les données tiennent dans `maxmemory`.
+    pub fn check_maxmemory(&self) -> Result<(), String> {
+        let Some(limit) = self.oom_limit() else { return Ok(()) };
+        let used = radixox_lib::pages::charged();
+        if used > limit {
+            return Err(format!(
+                "les données chargées occupent {used} octets, au-delà de la limite des données ({limit} octets : maxmemory {} moins budgets et réserve de save)",
+                self.cfg.maxmemory
+            ));
+        }
+        Ok(())
+    }
+
+    fn maxmemory_info(&self, out: &mut String) {
+        use std::fmt::Write as _;
+        let policies: Vec<&str> = crate::exec::maxmem::Policy::available().map(|p| p.name()).collect();
+        let _ = write!(
+            out,
+            "# Maxmemory\r\nmaxmemory:{}\r\nmaxmemory_policy:{}\r\nmaxmemory_policies_available:{}\r\nused_memory:{}\r\nmaxmemory_data_limit:{}\r\nsave_reserve:{}\r\noom_rejected_commands:{}\r\n\r\n",
+            self.cfg.maxmemory,
+            self.cfg.maxmemory_policy.name(),
+            policies.join(","),
+            radixox_lib::pages::charged(),
+            self.oom_limit().unwrap_or(0),
+            self.cfg.save_reserve,
+            self.oom_rejected,
+        );
+    }
+
+    /// `maxmemory` réglé (démarrage ou `CONFIG SET`) : budgets d'E/S dérivés, 10 % chacun.
+    pub fn set_maxmemory(&mut self, bytes: u64) {
+        self.cfg.maxmemory = bytes;
+        if self.cfg.io_budgets_auto {
+            let b = if bytes == 0 { 1 << 30 } else { (bytes / 10) as usize };
+            (self.cfg.input_budget, self.cfg.output_budget) = (b, b);
+        }
+    }
+
+    /// CONFIG GET motif / CONFIG SET nom valeur [nom valeur…].
+    fn config_cmd(&mut self, args: &[Vec<u8>], out: &mut Vec<u8>) {
+        use crate::exec::maxmem::{Policy, glob, parse_size};
+        let params = |c: &Config| -> Vec<(&'static str, String)> {
+            vec![
+                ("maxmemory", c.maxmemory.to_string()),
+                ("maxmemory-policy", c.maxmemory_policy.name().to_string()),
+                ("maxmemory-samples", "5".to_string()),
+                ("save-reserve", c.save_reserve.to_string()),
+            ]
+        };
+        let sub = args.first().map(|a| a.to_ascii_lowercase()).unwrap_or_default();
+        match (sub.as_slice(), args.len()) {
+            (b"get", n) if n >= 2 => {
+                let all = params(&self.cfg);
+                let hits: Vec<_> = all.iter().filter(|(k, _)| args[1..].iter().any(|p| glob(p, k.as_bytes()))).collect();
+                radixox_lib::shared_frame::encode_array_len(out, hits.len() * 2);
+                for (k, v) in hits {
+                    bulk(out, k.as_bytes());
+                    bulk(out, v.as_bytes());
+                }
+            }
+            (b"set", n) if n >= 3 && n % 2 == 1 => {
+                // tout est vérifié avant d'appliquer quoi que ce soit
+                let mut changes: Vec<(Vec<u8>, String)> = Vec::new();
+                for kv in args[1..].chunks(2) {
+                    let k = kv[0].to_ascii_lowercase();
+                    let v = String::from_utf8_lossy(&kv[1]).into_owned();
+                    let name = String::from_utf8_lossy(&k).into_owned();
+                    let checked = match k.as_slice() {
+                        b"maxmemory" | b"save-reserve" => parse_size(&v)
+                            .map(|n| n.to_string())
+                            .ok_or_else(|| format!("Invalid argument '{v}' for CONFIG SET '{name}'")),
+                        b"maxmemory-policy" => Policy::parse(&v).map(|p| p.name().to_string()),
+                        b"maxmemory-samples" => Ok(v),
+                        _ => Err(format!("Unknown option or number of arguments for CONFIG SET - '{name}'")),
+                    };
+                    match checked {
+                        Ok(v) => changes.push((k, v)),
+                        Err(e) => {
+                            extend_encode(out, &Frame::Error(format!("ERR {e}")));
+                            return;
+                        }
+                    }
+                }
+                for (k, v) in changes {
+                    match k.as_slice() {
+                        b"maxmemory" => self.set_maxmemory(v.parse().unwrap()),
+                        b"save-reserve" => self.cfg.save_reserve = v.parse().unwrap(),
+                        b"maxmemory-policy" => self.cfg.maxmemory_policy = Policy::parse(&v).unwrap(),
+                        _ => {}
+                    }
+                }
+                extend_encode(out, &resp_ok());
+            }
+            (b"get" | b"set", _) => extend_encode(out, &Frame::Error("ERR wrong number of arguments for 'config' command".into())),
+            _ => extend_encode(out, &Frame::Error("ERR CONFIG subcommand not supported (GET, SET)".into())),
+        }
+    }
+
     /// Arrêtée par le plafond de sortie (MEMORY_ARCH.md §10.5) : `out` plein, et ce qui
     /// le videra est en route — un send en vol, le fsync qui libère les réponses
     /// retenues, ou la grosse réponse qui passe avant. Le CQE correspondant réveille la
@@ -1964,7 +2118,9 @@ impl Core {
         let aof_files_busy = self.aof_files_busy();
         {
             let job_budget = self.cfg.job_budget;
-            let Core { art, ins, outs, bufs, persist, journal, aof, cfg, held, follow, blocked, ready, dirty, now, .. } = self;
+            // `maxmemory` : limite des données de cette fenêtre (None : sans).
+            let oom = self.oom_limit();
+            let Core { art, ins, outs, bufs, persist, journal, aof, cfg, held, follow, blocked, ready, dirty, now, oom_rejected, .. } = self;
             let now = *now;
             // Réplica : les écritures des clients sont refusées (§10.1).
             let read_only = follow.is_some();
@@ -2045,7 +2201,21 @@ impl Core {
             // descend d'abord en AMAC (lecture pure), puis s'exécute dans l'ordre
             // avec les indices, fenêtre d'oxidart ouverte. Les autres frames
             // coupent les séries et passent par le chemin normal, fenêtre fermée.
-            let amac = cfg.amac > 0 && !cfg!(radixox_gc_debug) && !read_only && refuse_writes.is_none() && !over_cap;
+            // Près de `maxmemory` : chaque écriture passe par la vérification du chemin normal.
+            let near_limit = oom.is_some_and(|limit| {
+                let worst: u64 = frames
+                    .iter()
+                    .filter(|(_, c, _, _)| c.may_grow())
+                    .map(|(_, c, raw, _)| write_cost(c, raw.len()))
+                    .sum();
+                radixox_lib::pages::charged() + worst > limit
+            });
+            let amac = cfg.amac > 0
+                && !cfg!(radixox_gc_debug)
+                && !read_only
+                && refuse_writes.is_none()
+                && !over_cap
+                && !near_limit;
             // Clés des frames avec indice, à la suite, au plus B par fenêtre (au-delà,
             // la frame passe par le chemin normal) : frame i = flat[start[i]..start[i + 1]].
             // La fenêtre est bornée par PREFETCH_BATCH = 64 (`width`) ; bit i de `has` :
@@ -2207,6 +2377,16 @@ impl Core {
                         continue;
                     }
                     // FLUSHDB : toutes les clés changent (le `dirty` de Redis).
+                    // `maxmemory` : coût borné avant d'exécuter, refus sans exécution partielle.
+                    if let Some(limit) = oom
+                        && cmd.may_grow()
+                        && radixox_lib::pages::charged() + write_cost(&cmd, raw.len()) + zset_store_cost(art, &cmd) > limit
+                    {
+                        extend_encode(&mut o.out, &Frame::Error(crate::exec::maxmem::OOM.into()));
+                        *oom_rejected += 1;
+                        afters.push((slot, After::Continue));
+                        continue;
+                    }
                     persist.note_writes(if matches!(cmd, Cmd::FlushDb) { art.len() as u64 } else { weight });
                 }
                 #[cfg(radixox_gc_debug)]
@@ -2364,12 +2544,32 @@ impl Core {
                 }
             }
             After::Park(job) => self.park(slot, job),
+            After::BgSaveReserve(n) => {
+                let frame = if self.bgsave.is_some() || self.art.save_busy() {
+                    Frame::Error("ERR Background save already in progress".into())
+                } else if !self.mem_free_for(n) {
+                    Frame::Error(format!("ERR not enough free memory for a save reserve of {n} bytes (maxmemory)"))
+                } else {
+                    match self.start_bgsave() {
+                        Ok(()) => Frame::SimpleString("Background saving started"),
+                        Err(e) => Frame::Error(format!("ERR {e}")),
+                    }
+                };
+                extend_encode(&mut self.outs[s].out, &frame);
+            }
+            After::Config(args) => {
+                let mut out = std::mem::take(&mut self.outs[s].out);
+                self.config_cmd(&args, &mut out);
+                self.outs[s].out = out;
+            }
             After::BgSave | After::BgRewriteAof => {
                 let rewrite = matches!(after, After::BgRewriteAof);
                 let frame = if rewrite && self.aof.is_none() {
                     Frame::Error("ERR AOF is disabled (RADIXOX_APPENDONLY=yes)".into())
-                } else if self.bgsave.is_some() || self.art.is_saving() {
+                } else if self.bgsave.is_some() || self.art.save_busy() {
                     Frame::Error("ERR Background save already in progress".into())
+                } else if !self.mem_free_for(self.cfg.save_reserve) {
+                    Frame::Error("ERR not enough free memory for the save reserve (maxmemory)".into())
                 } else {
                     match self.start_bgsave() {
                         Ok(()) if rewrite => {
@@ -2418,6 +2618,7 @@ impl Core {
                 self.repl_info(&mut info);
                 info.push_str("\r\n");
                 crate::exec::info_stats(&mut info);
+                self.maxmemory_info(&mut info);
                 let st = self.out_stats;
                 let _ = std::fmt::Write::write_fmt(
                     &mut info,
@@ -3352,6 +3553,24 @@ fn run_cmd(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) 
 
 /// Commandes qui dépendent du runtime. KEYS et UNLINK s'exécutent encore d'une
 /// traite (parquage + jobs : étape 4) ; Pub/Sub et saves : étapes 4–5.
+/// Borne haute de ce qu'une écriture peut ajouter (MEMORY_ARCH.md §10.5) : deux fois sa
+/// frame (valeurs, clés, en-têtes, chemins) plus 512 o par élément écrit (un à deux nœuds
+/// de 128 o, ou un nœud valart). Ce que la commande calcule depuis les données s'ajoute à
+/// part ([`zset_store_cost`]).
+fn write_cost(cmd: &Cmd<'_>, raw: usize) -> u64 {
+    2 * raw as u64 + 512 * cmd.write_weight().max(1)
+}
+
+/// `ZUNIONSTORE` / `ZINTERSTORE` / `ZDIFFSTORE` : la destination est bornée par la somme des
+/// cardinalités des sources, à 128 o par membre (estimation : la taille des membres n'est
+/// pas lue).
+fn zset_store_cost(art: &mut OxidArt, cmd: &Cmd<'_>) -> u64 {
+    match cmd {
+        Cmd::ZSetOp { dest: Some(_), keys, .. } => keys.iter().map(|k| art.cmd_zcard(k).unwrap_or(0) as u64 * 128).sum(),
+        _ => 0,
+    }
+}
+
 fn runtime(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) -> After {
     match cmd {
         Cmd::Quit => {
@@ -3383,6 +3602,8 @@ fn runtime(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) 
         }
         // Dépendent d'une save en cours : traitées par le cœur (`finish_frame`).
         Cmd::BgSave => After::BgSave,
+        Cmd::BgSaveReserve(n) => After::BgSaveReserve(n),
+        Cmd::Config(args) => After::Config(args.iter().map(|a| a.to_vec()).collect()),
         Cmd::BgRewriteAof => After::BgRewriteAof,
         Cmd::Save => After::Save,
         Cmd::LastSave => After::LastSave,

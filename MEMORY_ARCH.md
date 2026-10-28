@@ -756,6 +756,28 @@ est résident après coup ; pour refuser avant, il faut compter avant que les pa
   2 Mio (BGSAVE l'était déjà : `bgsave::CHUNK`, tampons en alternance).
   Réplicas en ligne : trop lent au-delà de 6 Mio (+ plus gros bloc), déconnecté
   (`RADIXOX_REPL_ONLINE_LAG_MB`, DURABILITY §10.5).
+- **`maxmemory` + `noeviction` fait** (2026-10-28) :
+  - limite des données = `maxmemory` − budgets d'E/S non utilisés − réserve de save (hors
+    save), comparée au registre (`Core::oom_limit`) ;
+  - admission avant exécution : `Cmd::may_grow` (le `denyoom` de Redis : les suppressions,
+    pops et TTL passent), coût = 2 × frame + 512 o par élément écrit
+    (`write_cost`), plus 128 o par membre des sources pour `Z*STORE` (seule estimation) ;
+    `-OOM` exact de Redis, compteur `oom_rejected_commands` ;
+  - AMAC coupé pour une fenêtre dont le pire cas dépasserait (chaque écriture passe alors
+    par la vérification) ;
+  - `CONFIG GET` (motifs `*` `?`) / `SET` (`maxmemory`, `maxmemory-policy`,
+    `maxmemory-samples` ignoré, `save-reserve`), `BGSAVE RESERVE <octets>`,
+    `RADIXOX_MAXMEMORY` / `_POLICY` / `RADIXOX_SAVE_RESERVE` ; budgets d'E/S = 10 % chacun
+    si non fixés ; refus de démarrer si les données chargées ne tiennent pas ;
+  - mesuré : `maxmemory 64mb`, `SET` de 1 Ko jusqu'au refus → 30 940 acceptés, RSS 44 Mo ;
+    le registre dépasse la limite des données d'au plus une tranche (granularité) ;
+  - **défaut trouvé en route** : une connexion arrêtée par son plafond de sortie (client
+    qui ne lit pas) retenait les tampons partagés de l'anneau de réception, jusqu'à les
+    épuiser — ce qu'elle reçoit est maintenant recopié dans son `rx` comme une connexion
+    parquée, et le budget d'entrée suspend sa réception (contre-pression TCP). Mesuré :
+    200 Mo envoyés sans lire sous `maxmemory 64mb` → client freiné, pas coupé, un autre
+    client servi, serveur à 51 Mo ;
+  - tests : `tests/maxmemory.rs`, `exec::maxmem::tests`.
 
 ### 10.3 Déclenchement
 

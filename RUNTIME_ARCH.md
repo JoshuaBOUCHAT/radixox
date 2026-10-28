@@ -588,7 +588,11 @@ connexion gardait la capacité de sa plus grosse réponse).
   `GET` pipeliné 64 : 2 268–2 291 k/s contre 2 227–2 270 avant (passages alternés).
 - Test : `output_is_capped_for_a_client_that_does_not_read` (faux noyau : 30 Mo de
   réponses, sortie ≤ 2 plafonds + 2 réponses, tout arrive dans l'ordre à la reprise).
-- Reste : réserve commune des blocs ; budgets globaux de 1 Gio à remplacer.
+- **Arrêtée par sa sortie, elle ne retient pas l'anneau** (2026-10-28) : ce qu'elle reçoit
+  est recopié dans `rx` comme pour une connexion parquée (`push_span`), le budget
+  d'entrée suspend ensuite sa réception. Avant, un client qui envoyait sans lire gardait
+  les tampons partagés jusqu'à `ENOBUFS` pour tous.
+- Budgets globaux : 10 % de `maxmemory` chacun quand il est fixé (MEMORY_ARCH §10.5).
 
 ### 6.2 quater Grandes valeurs envoyées depuis l'arbre (2026-10-28)
 

@@ -15,6 +15,11 @@ categories = ["database-implementations", "network-programming"]
 name = "radixox"
 path = "src/bin/uringloop.rs"
 
+[features]
+# Politiques d'éviction LRU / LFU : une écriture par accès (MEMORY_ARCH.md §10.2 quater).
+# Sans elle, le chemin de lecture n'écrit rien de plus.
+eviction = []
+
 [dependencies]
 oxidart = { workspace = true, features = ["regex"] }
 radixox-lib = { workspace = true }

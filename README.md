@@ -694,6 +694,9 @@ Environment variables:
 | `RADIXOX_BATCH_CMDS` | `2048` | commands per slice of a loop turn; replies ready between slices are sent |
 | `RADIXOX_CLIENT_OUTPUT_LIMIT_MB` | `1024` | a normal client whose pending output (replies not yet sent) exceeds this is disconnected; `0` = no limit. Subscribers keep their own limits (32 MB, or 8 MB for 60 s) |
 | `RADIXOX_INPUT_BUDGET_MB` | `1024` | received data waiting in all connections' buffers together; above it, the largest holders stop being read until it drops (TCP backpressure, nobody is disconnected); `0` = no budget |
+| `RADIXOX_MAXMEMORY` | `0` | bound on the **whole process** (`2gb`, `512mb`…, `0` = none), counted before memory is written; writes that may grow memory get Redis's `-OOM` error beyond it (reads, deletions, pops always go through). With it, the input and output budgets default to 10 % of it each. `CONFIG GET/SET maxmemory`. A dataset loaded at startup that does not fit: the server refuses to start |
+| `RADIXOX_MAXMEMORY_POLICY` | `noeviction` | `noeviction`, `allkeys-random`, `volatile-random`, `volatile-ttl` in every binary; `allkeys-lru`, `allkeys-lfu`, `volatile-lru`, `volatile-lfu` need a binary built with `--features eviction` (refused otherwise). `CONFIG GET/SET maxmemory-policy` |
+| `RADIXOX_SAVE_RESERVE` | `0` | memory kept free under `maxmemory` for a save's copies; a `BGSAVE` starts only when it is free. `BGSAVE RESERVE <bytes>` asks for a given amount for one save. `CONFIG GET/SET save-reserve` |
 | `RADIXOX_OUTPUT_BUDGET_MB` | `1024` | pending output of all connections together; above it, a connection gets its next command only once its previous replies are sent (nobody is disconnected); `0` = no budget |
 | `RADIXOX_RING_BUFS` / `RADIXOX_RING_BUF_KB` | `64` / `32` | receive buffer ring shared by all connections |
 | `RADIXOX_SEND_ASYNC` | off | run sends on kernel io-wq workers (`IOSQE_ASYNC`): helps clients without pipelining when a second core is available |

@@ -1035,6 +1035,40 @@ fn main() -> io::Result<()> {
     if let Some(mb) = std::env::var("RADIXOX_OUTPUT_BUDGET_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
         cfg.output_budget = if mb == 0 { usize::MAX } else { mb << 20 };
     }
+    // maxmemory (MEMORY_ARCH.md §10.5) : total du processus, découpé en budgets.
+    {
+        use radixox::exec::maxmem::{Policy, parse_size};
+        let size = |k: &str| -> io::Result<Option<u64>> {
+            match std::env::var(k) {
+                Ok(v) if v.trim().is_empty() => Ok(None),
+                Ok(v) => parse_size(&v).map(Some).ok_or_else(|| io::Error::other(format!("{k} : taille invalide '{v}'"))),
+                Err(_) => Ok(None),
+            }
+        };
+        if let Ok(p) = std::env::var("RADIXOX_MAXMEMORY_POLICY") {
+            cfg.maxmemory_policy = Policy::parse(&p).map_err(|e| io::Error::other(format!("RADIXOX_MAXMEMORY_POLICY : {e}")))?;
+        }
+        cfg.save_reserve = size("RADIXOX_SAVE_RESERVE")?.unwrap_or(0);
+        let max = size("RADIXOX_MAXMEMORY")?.unwrap_or(0);
+        if max > 0 {
+            let (input_set, output_set) =
+                (std::env::var("RADIXOX_INPUT_BUDGET_MB").is_ok(), std::env::var("RADIXOX_OUTPUT_BUDGET_MB").is_ok());
+            if !input_set {
+                cfg.input_budget = (max / 10) as usize;
+            }
+            if !output_set {
+                cfg.output_budget = (max / 10) as usize;
+            }
+            cfg.io_budgets_auto = !input_set && !output_set;
+            let parts = cfg.input_budget as u64 + cfg.output_budget as u64 + cfg.save_reserve;
+            if parts >= max {
+                return Err(io::Error::other(format!(
+                    "RADIXOX_MAXMEMORY ({max} o) : budgets d'entrée et de sortie et réserve de save ({parts} o) ne laissent rien aux données"
+                )));
+            }
+        }
+        cfg.maxmemory = max;
+    }
     // Commandes par tour au plus (RUNTIME_ARCH.md §2.1, §2.3).
     if let Some(n) = std::env::var("RADIXOX_BATCH_CMDS").ok().and_then(|v| v.parse::<usize>().ok()) {
         cfg.batch_cmds = n.max(1);
@@ -1082,6 +1116,7 @@ fn main() -> io::Result<()> {
     }
     let aof_on = aof.is_some();
     let mut core = Core::new(cfg, art);
+    core.check_maxmemory().map_err(|e| io::Error::other(format!("maxmemory : {e}")))?;
     if let Some((stream, writer)) = aof {
         core.set_aof(stream, writer);
     }
