@@ -94,6 +94,12 @@ pub(crate) fn slab_mem() -> (u64, u64, u64) {
     unsafe { SLAB.as_ref() }.map_or((0, 0, 0), crate::value::hislab_mem)
 }
 
+/// Voir [`crate::value::hislab_usage`].
+pub(crate) fn slab_usage() -> (u64, u64) {
+    #[allow(static_mut_refs)]
+    unsafe { SLAB.as_ref() }.map_or((0, 0), crate::value::hislab_usage)
+}
+
 /// Voir [`crate::value::trim_tail`] ; 0 tant que la slab n'existe pas.
 pub(crate) fn trim_tail() -> usize {
     #[allow(static_mut_refs)]

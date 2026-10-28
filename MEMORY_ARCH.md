@@ -778,6 +778,14 @@ est résident après coup ; pour refuser avant, il faut compter avant que les pa
     200 Mo envoyés sans lire sous `maxmemory 64mb` → client freiné, pas coupé, un autre
     client servi, serveur à 51 Mo ;
   - tests : `tests/maxmemory.rs`, `exec::maxmem::tests`.
+  - **usage effectif** (même jour) : le registre ne descend qu'au rendu des pages ; après un
+    `DEL` de tout, plus aucun `SET` ne passait (mesuré : 16 506 puis 0). L'usage =
+    registre − réutilisable sans nouvelle page (pages vides du pool, suites libres et
+    emplacements libres de `large`, trous des HiSlab : `Core::mem_reusable`, en O(1)) +
+    coût déjà admis dans la fenêtre. Trois cycles remplir / tout supprimer sous
+    `maxmemory 48mb` : 22 657, 22 688, 22 695 acceptés, RSS 35,7 Mo. Le total reste borné :
+    le réutilisable est déjà compté et repris avant toute nouvelle page. `INFO` :
+    `used_memory` (effectif), `mem_reusable_bytes`.
 
 ### 10.3 Déclenchement
 

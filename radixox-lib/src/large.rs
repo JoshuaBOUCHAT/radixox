@@ -1103,6 +1103,15 @@ pub fn stats() -> Option<Stats> {
     unsafe { LARGE.as_ref() }.map(Large::stats)
 }
 
+/// Octets comptés par le registre mais réutilisables sans nouvelle page : suites libres
+/// sales (tenues) et emplacements libres des slabs, en O(1). MEMORY_ARCH.md §10.5.
+pub fn reusable_bytes() -> u64 {
+    #[allow(static_mut_refs)]
+    unsafe { LARGE.as_ref() }.map_or(0, |l| {
+        l.dirty * GRANULE as u64 + (l.slabs.held_slabs * SLAB as u64).saturating_sub(l.slabs.live_bytes)
+    })
+}
+
 /// Voir [`Large::resident`] ; 0 sans tas.
 pub fn resident() -> u64 {
     #[allow(static_mut_refs)]

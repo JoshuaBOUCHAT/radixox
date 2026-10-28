@@ -384,6 +384,12 @@ impl ValTrees {
         (t as u64, self.nodes.len() as u64 * size_of::<ValNode>() as u64, self.nodes.resident_bytes() as u64)
     }
 
+    /// Comme [`slab_mem`](Self::slab_mem) sans la mesure de résidence (`mincore`) :
+    /// `(octets touchés, octets vivants)`, en O(1).
+    pub fn slab_usage(&self) -> (u64, u64) {
+        (self.nodes.touched_bytes() as u64, self.nodes.len() as u64 * size_of::<ValNode>() as u64)
+    }
+
     pub fn seed(&self) -> u64 {
         self.seed
     }

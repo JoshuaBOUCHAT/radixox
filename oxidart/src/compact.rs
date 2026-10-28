@@ -90,6 +90,17 @@ impl OxidArt {
     /// Tous les HiSlab du processus : `(nom, (octets touchés, octets vivants, octets
     /// résidents))`. Les pages d'un slab sont prises par le noyau à la première écriture,
     /// sans passer par l'allocateur : seul ce compte les voit (MEMORY_ARCH.md §10.1).
+    /// Octets comptés par les HiSlab mais réutilisables sans nouvelle page : trous et fin
+    /// de la dernière tranche (touché − vivant), en O(1) (MEMORY_ARCH.md §10.5).
+    pub fn slab_reusable_bytes(&self) -> u64 {
+        let nodes = (self.map.touched_bytes() as u64, self.map.len() as u64 * size_of::<crate::node::Node>() as u64);
+        let [zh, lh, va] = crate::value::value_slabs_usage();
+        [nodes, zh, lh, va, crate::zset::btree::slab_usage(), crate::zset::index::slab_usage(), crate::list::slab_usage()]
+            .iter()
+            .map(|&(t, l)| t.saturating_sub(l))
+            .sum()
+    }
+
     pub fn slab_mem(&self) -> [(&'static str, (u64, u64, u64)); 7] {
         let t = self.map.touched_bytes();
         let nodes = (

@@ -55,8 +55,23 @@ fn growth_is_refused_at_the_limit_reads_and_deletes_are_not() {
     // Lectures et suppressions passent toujours.
     let v: Vec<u8> = redis::cmd("GET").arg("k1").query(&mut c).unwrap();
     assert_eq!(v, val);
-    let n: i64 = redis::cmd("DEL").arg("k1").arg("k2").query(&mut c).unwrap();
-    assert_eq!(n, 2);
+    // Tout supprimer rend la place : un nouveau remplissage passe (le registre ne descend
+    // qu'au rendu des pages, l'usage compte le réutilisable).
+    for batch in 0..(ok / 1000 + 1) {
+        let mut p = redis::pipe();
+        for i in 0..1000 {
+            p.cmd("DEL").arg(format!("k{}", batch * 1000 + i)).ignore();
+        }
+        p.query::<()>(&mut c).unwrap();
+    }
+    let mut again = 0;
+    for i in 0..ok / 2 {
+        match redis::cmd("SET").arg(format!("n{i}")).arg(&val).query::<()>(&mut c) {
+            Ok(()) => again += 1,
+            Err(_) => break,
+        }
+    }
+    assert_eq!(again, ok / 2, "après suppression, la moitié du premier remplissage doit repasser");
     // CONFIG GET / SET.
     let got: Vec<String> = redis::cmd("CONFIG").arg("GET").arg("maxmemory").query(&mut c).unwrap();
     assert_eq!(got, vec!["maxmemory".to_string(), (48 * MB).to_string()]);

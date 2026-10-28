@@ -1200,6 +1200,12 @@ pub fn resident() -> u64 {
     })
 }
 
+/// Octets comptés par le registre mais réutilisables sans nouvelle page : pages vides
+/// gardées (pas encore rendues), en O(1). MEMORY_ARCH.md §10.5.
+pub fn reusable_bytes() -> u64 {
+    global().map_or(0, |p| p.empty_pages.len() as u64 * PAGE as u64)
+}
+
 pub fn gc_stats() -> Option<GcStats> {
     global().map(|p| p.gc_stats())
 }

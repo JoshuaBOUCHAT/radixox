@@ -125,6 +125,19 @@ pub(crate) fn trim_value_slabs() -> usize {
     trim_tail(zset_slab()) + trim_tail(list_slab()) + valart().trim_tail(TRIM_THRESHOLD)
 }
 
+/// `(octets touchés, octets vivants)` d'un HiSlab, en O(1) (sans `mincore`).
+pub(crate) fn hislab_usage<T>(s: &HiSlab<T>) -> (u64, u64) {
+    (s.touched_bytes() as u64, s.len() as u64 * size_of::<T>() as u64)
+}
+
+/// Comme [`value_slabs_mem`] sans la résidence.
+pub(crate) fn value_slabs_usage() -> [(u64, u64); 3] {
+    if !SLAB_INIT.is_completed() {
+        return [(0, 0); 3];
+    }
+    [hislab_usage(zset_slab()), hislab_usage(list_slab()), valart().slab_usage()]
+}
+
 /// `(octets touchés, octets vivants, octets résidents)` d'un HiSlab.
 pub(crate) fn hislab_mem<T>(s: &HiSlab<T>) -> (u64, u64, u64) {
     let t = s.touched_bytes();

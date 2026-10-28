@@ -1826,16 +1826,28 @@ impl Core {
         Some((self.cfg.maxmemory + io_used.min(io_budget)).saturating_sub(io_budget.min(self.cfg.maxmemory) + reserve))
     }
 
-    /// `n` octets libres sous `maxmemory`, en plus de ce qui est compté (toujours vrai sans
+    /// Octets comptés par le registre mais réutilisables sans nouvelle page (pages vides du
+    /// pool, suites libres de `large`, trous des HiSlab), en O(1). Après des suppressions,
+    /// le registre ne descend qu'au rendu des pages : sans ce terme, plus rien ne s'écrirait.
+    fn mem_reusable(&self) -> u64 {
+        radixox_lib::pool::reusable_bytes() + radixox_lib::large::reusable_bytes() + self.art.slab_reusable_bytes()
+    }
+
+    /// Mémoire utilisée au sens de `maxmemory` : le registre moins le réutilisable.
+    pub fn used_memory(&self) -> u64 {
+        radixox_lib::pages::charged().saturating_sub(self.mem_reusable())
+    }
+
+    /// `n` octets libres sous `maxmemory`, en plus de ce qui est utilisé (toujours vrai sans
     /// limite).
     fn mem_free_for(&self, n: u64) -> bool {
-        self.oom_limit().is_none_or(|limit| radixox_lib::pages::charged() + n <= limit + self.cfg.save_reserve)
+        self.oom_limit().is_none_or(|limit| self.used_memory() + n <= limit + self.cfg.save_reserve)
     }
 
     /// Au démarrage, après le chargement : les données tiennent dans `maxmemory`.
     pub fn check_maxmemory(&self) -> Result<(), String> {
         let Some(limit) = self.oom_limit() else { return Ok(()) };
-        let used = radixox_lib::pages::charged();
+        let used = self.used_memory();
         if used > limit {
             return Err(format!(
                 "les données chargées occupent {used} octets, au-delà de la limite des données ({limit} octets : maxmemory {} moins budgets et réserve de save)",
@@ -1850,11 +1862,12 @@ impl Core {
         let policies: Vec<&str> = crate::exec::maxmem::Policy::available().map(|p| p.name()).collect();
         let _ = write!(
             out,
-            "# Maxmemory\r\nmaxmemory:{}\r\nmaxmemory_policy:{}\r\nmaxmemory_policies_available:{}\r\nused_memory:{}\r\nmaxmemory_data_limit:{}\r\nsave_reserve:{}\r\noom_rejected_commands:{}\r\n\r\n",
+            "# Maxmemory\r\nmaxmemory:{}\r\nmaxmemory_policy:{}\r\nmaxmemory_policies_available:{}\r\nused_memory:{}\r\nmem_reusable_bytes:{}\r\nmaxmemory_data_limit:{}\r\nsave_reserve:{}\r\noom_rejected_commands:{}\r\n\r\n",
             self.cfg.maxmemory,
             self.cfg.maxmemory_policy.name(),
             policies.join(","),
-            radixox_lib::pages::charged(),
+            self.used_memory(),
+            self.mem_reusable(),
             self.oom_limit().unwrap_or(0),
             self.cfg.save_reserve,
             self.oom_rejected,
@@ -2118,8 +2131,13 @@ impl Core {
         let aof_files_busy = self.aof_files_busy();
         {
             let job_budget = self.cfg.job_budget;
-            // `maxmemory` : limite des données de cette fenêtre (None : sans).
+            // `maxmemory` : limite des données de cette fenêtre (None : sans), et ce que le
+            // registre compte mais qu'une écriture réutilise sans nouvelle page.
             let oom = self.oom_limit();
+            let reusable = if oom.is_some() { self.mem_reusable() } else { 0 };
+            // Coût déjà admis dans la fenêtre : il a pu consommer du réutilisable sans faire
+            // monter le registre (compté deux fois sinon : prudent).
+            let mut admitted = 0u64;
             let Core { art, ins, outs, bufs, persist, journal, aof, cfg, held, follow, blocked, ready, dirty, now, oom_rejected, .. } = self;
             let now = *now;
             // Réplica : les écritures des clients sont refusées (§10.1).
@@ -2208,7 +2226,7 @@ impl Core {
                     .filter(|(_, c, _, _)| c.may_grow())
                     .map(|(_, c, raw, _)| write_cost(c, raw.len()))
                     .sum();
-                radixox_lib::pages::charged() + worst > limit
+                radixox_lib::pages::charged() + worst > limit + reusable
             });
             let amac = cfg.amac > 0
                 && !cfg!(radixox_gc_debug)
@@ -2380,12 +2398,15 @@ impl Core {
                     // `maxmemory` : coût borné avant d'exécuter, refus sans exécution partielle.
                     if let Some(limit) = oom
                         && cmd.may_grow()
-                        && radixox_lib::pages::charged() + write_cost(&cmd, raw.len()) + zset_store_cost(art, &cmd) > limit
                     {
-                        extend_encode(&mut o.out, &Frame::Error(crate::exec::maxmem::OOM.into()));
-                        *oom_rejected += 1;
-                        afters.push((slot, After::Continue));
-                        continue;
+                        let cost = write_cost(&cmd, raw.len()) + zset_store_cost(art, &cmd);
+                        if radixox_lib::pages::charged() + admitted + cost > limit + reusable {
+                            extend_encode(&mut o.out, &Frame::Error(crate::exec::maxmem::OOM.into()));
+                            *oom_rejected += 1;
+                            afters.push((slot, After::Continue));
+                            continue;
+                        }
+                        admitted += cost;
                     }
                     persist.note_writes(if matches!(cmd, Cmd::FlushDb) { art.len() as u64 } else { weight });
                 }

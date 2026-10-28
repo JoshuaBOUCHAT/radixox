@@ -137,6 +137,9 @@ pub enum Cmd<'a> {
     Hello(SmallVec<4, &'a [u8]>),
     /// CLIENT subcommand [args…] — arguments bruts.
     Client(SmallVec<4, &'a [u8]>),
+    /// CONFIG GET / SET (maxmemory, maxmemory-policy… : MEMORY_ARCH.md §10.5), arguments
+    /// bruts, traités par le cœur.
+    Config(SmallVec<4, &'a [u8]>),
     /// COMMAND [subcommand …] — arguments bruts.
     Command(SmallVec<4, &'a [u8]>),
 
@@ -154,6 +157,9 @@ pub enum Cmd<'a> {
     FlushDb,
     /// BGSAVE
     BgSave,
+    /// BGSAVE RESERVE <octets> : la save ne démarre que si autant de mémoire est libre
+    /// pour ses copies (MEMORY_ARCH.md §10.5).
+    BgSaveReserve(u64),
     /// BGREWRITEAOF : réécriture de l'AOF (avec l'AOF, = BGSAVE).
     BgRewriteAof,
     /// SAVE (bloquante)
@@ -1372,6 +1378,7 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
         },
         b"hello" => Cmd::Hello(borrowed!(0)),
         b"client" => Cmd::Client(borrowed!(0)),
+        b"config" => Cmd::Config(borrowed!(0)),
         b"command" => Cmd::Command(borrowed!(0)),
         b"select" => { exact!(1); Cmd::Select(uint(args[0])?) }
         b"info" => Cmd::Info,
@@ -1385,7 +1392,11 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
                 _ => Cmd::FlushDb,
             }
         }
-        b"bgsave" => { at_most!(1); Cmd::BgSave }
+        b"bgsave" => match *args {
+            [m, n] if m.eq_ignore_ascii_case(b"reserve") => Cmd::BgSaveReserve(uint(n)?),
+            [] | [_] => Cmd::BgSave,
+            _ => return Err(CmdError::Syntax),
+        },
         b"bgrewriteaof" => { exact!(0); Cmd::BgRewriteAof }
         b"save" => { exact!(0); Cmd::Save }
         b"lastsave" => { exact!(0); Cmd::LastSave }
@@ -1543,6 +1554,33 @@ impl<'a> Cmd<'a> {
     /// `dirty` de Redis (MSET : ses paires, DEL : ses clés, HSET : ses champs) ;
     /// 0 pour une lecture. Majorant : une écriture sans effet compte aussi.
     /// FLUSHDB compte 1 ici, l'appelant ajoute la taille de la base.
+    /// L'écriture peut faire grossir la mémoire (le `denyoom` de Redis) : refusée en
+    /// `-OOM` au-delà de `maxmemory`. Les suppressions, pops et TTL passent toujours.
+    pub fn may_grow(&self) -> bool {
+        matches!(
+            self,
+            Cmd::Set { .. }
+                | Cmd::SetNx { .. }
+                | Cmd::MSet(_)
+                | Cmd::Incr(_)
+                | Cmd::Decr(_)
+                | Cmd::IncrBy { .. }
+                | Cmd::DecrBy { .. }
+                | Cmd::HSet { .. }
+                | Cmd::HMSet { .. }
+                | Cmd::HIncrBy { .. }
+                | Cmd::SAdd { .. }
+                | Cmd::ZAdd { .. }
+                | Cmd::ZIncrBy { .. }
+                | Cmd::ZSetOp { dest: Some(_), .. }
+                | Cmd::LPush { .. }
+                | Cmd::LSet { .. }
+                | Cmd::LInsert { .. }
+                | Cmd::LMove { .. }
+                | Cmd::BLMove { .. }
+        )
+    }
+
     pub fn write_weight(&self) -> u64 {
         let n = match self {
             Cmd::Set { .. }
