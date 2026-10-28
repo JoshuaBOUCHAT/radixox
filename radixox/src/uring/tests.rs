@@ -1459,7 +1459,9 @@ fn cfg_cycle() -> Duration {
 fn continuous_replies_never_wait_and_small_rests_wait_the_timer() {
     use crate::exec::aof::Fsync;
     let dir = test_dir("aof-continuous-min");
-    let mut f = fake_with_aof_fsync(&dir, Config { max_conn: 8, reserved: 0, ..Config::default() }, Fsync::Continuous);
+    // 6 Mio s'accumulent plus bas sans que les écrivains attendent : plafond au-dessus.
+    let cfg = Config { max_conn: 8, reserved: 0, aof_max_pending: 64 << 20, ..Config::default() };
+    let mut f = fake_with_aof_fsync(&dir, cfg, Fsync::Continuous);
     let c = f.connect();
     let start = f.core.aof().unwrap().durable;
     // Petit : rien n'est écrit avant le timer.

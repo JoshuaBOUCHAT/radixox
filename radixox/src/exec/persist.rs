@@ -73,7 +73,7 @@ pub fn load_at_startup(art: &mut OxidArt) -> io::Result<()> {
 
 /// Taille des écritures de `SAVE` : le DFS remplit un buffer, `write`
 /// le copie dans le cache du noyau, qui écrit sur disque en parallèle.
-const SYNC_CHUNK: usize = 8 << 20;
+const SYNC_CHUNK: usize = 2 << 20;
 /// Budget d'un pas de DFS pour `SAVE` (seulement pour borner le buffer).
 const SYNC_STEP_BUDGET: u32 = 1 << 16;
 

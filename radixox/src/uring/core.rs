@@ -154,7 +154,10 @@ impl Default for Config {
             save_rules: Vec::new(),
             stop_writes_on_bgsave_error: true,
             journal: false,
-            aof_max_pending: 64 << 20,
+            // Deux tampons de 2 Mio (MEMORY_ARCH.md §10.5) : l'un part sur le disque
+            // pendant que l'autre se remplit ; au-delà, les écrivains attendent. Mesuré
+            // contre 64 Mio : SET pipeliné + AOF −1 à −3 % (bruit), DURABILITY_DESIGN §7.6.
+            aof_max_pending: 4 << 20,
             aof_cycle: Duration::from_millis(10),
             aof_cycle_min: crate::exec::aof::CYCLE_MIN,
             aof_sync_bytes: crate::exec::aof::SYNC_BYTES,

@@ -522,7 +522,8 @@ plafond du §7.6 joue ce rôle sans bloquer la boucle.
 
 ### 7.6 Disque trop lent : plafond
 
-- Au-delà de `RADIXOX_AOF_MAX_PENDING_MB` (défaut 64) de blocs fermés non écrits, **les
+- Au-delà de `RADIXOX_AOF_MAX_PENDING_MB` (défaut 4 depuis le 2026-10-28 : deux tampons de
+  2 Mio, MEMORY_ARCH §10.5 ; SET pipeliné + AOF −1 à −3 % contre 64, dans le bruit) de blocs fermés non écrits, **les
   écritures des clients sont parquées** (la connexion attend, comme un job) ; les lectures
   continuent ; reprise quand le retard repasse sous la moitié.
 

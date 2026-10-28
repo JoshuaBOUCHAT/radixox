@@ -675,7 +675,7 @@ Environment variables:
 | `RADIXOX_APPENDONLY` | `no` | append-only file in `RADIXOX_DIR/appendonlydir/` (created from `dump.rxd` the first time) |
 | `RADIXOX_APPENDFSYNC` | `everysec` | `everysec` (one `fdatasync` per second, off the loop), `no` (left to the kernel), `always` (replies wait for the `fdatasync` covering them, group commit), or `continuous` (back-to-back write + `fdatasync` cycles, replies do not wait) |
 | `RADIXOX_AOF_LOAD_TRUNCATED` | `yes` | at startup, cut a block left incomplete by a crash at the end of the log instead of refusing to start |
-| `RADIXOX_AOF_MAX_PENDING_MB` | `64` | log bytes not yet written beyond which writers wait (reads go on) |
+| `RADIXOX_AOF_MAX_PENDING_MB` | `4` | log bytes not yet written beyond which writers wait (reads go on) |
 | `RADIXOX_AOF_SYNC_MB` | `32` | `everysec`: written but unsynced log bytes that trigger an `fdatasync` before the one-second timer |
 | `RADIXOX_AOF_CYCLE_MIN_KB` / `RADIXOX_AOF_CYCLE_MS` | `4` / `10` | `continuous`: a cycle starts as soon as this much is pending, or after this delay for less (limits SSD wear under light traffic) |
 | `RADIXOX_AUTO_AOF_REWRITE_PERCENTAGE` / `_MIN_SIZE` | `100` / `64mb` | rewrite the log when it has grown by this percentage of the base and at least this size (`0` = never) |

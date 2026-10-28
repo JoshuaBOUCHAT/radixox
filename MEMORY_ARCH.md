@@ -750,7 +750,10 @@ est résident après coup ; pour refuser avant, il faut compter avant que les pa
 - **Ordre** : tampons fixes (sortie, save, AOF, réplicas) → `maxmemory` + `noeviction` +
   réservation → politiques gratuites → éviction de fond → feature `eviction`.
 - **Avancement** : plafond de sortie par commande + capacité rendue faits (RUNTIME_ARCH
-  §6.2 ter, 2026-10-28) ; grandes valeurs envoyées depuis l'arbre sans copie (§6.2 quater).
+  §6.2 ter, 2026-10-28) ; grandes valeurs envoyées depuis l'arbre sans copie (§6.2 quater) ;
+  AOF : plafond des blocs non écrits 64 → 4 Mio (deux tampons de 2 Mio, écrivains en
+  attente au-delà ; SET pipeliné + AOF −1 à −3 %, bruit) ; save synchrone par tranches de
+  2 Mio (BGSAVE l'était déjà : `bgsave::CHUNK`, tampons en alternance).
 
 ### 10.3 Déclenchement
 
