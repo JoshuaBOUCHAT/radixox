@@ -775,6 +775,12 @@ tampon propre à l'envoi) puis le tampon partagé du bloc, puis `\r\n`.
   `RADIXOX_REPL_BACKLOG_MB` (défaut 64).
 - Un réplica qui retient des blocs au-delà de `RADIXOX_REPL_MAX_LAG_MB` (défaut 256, le
   `client-output-buffer-limit replica` de Valkey) est déconnecté ; il repassera par §10.3.
+  Depuis le 2026-10-28, ce plafond ne vaut plus que pendant une synchronisation complète
+  (file des blocs écrits pendant l'envoi du dump) ; **en ligne**, c'est
+  `RADIXOX_REPL_ONLINE_LAG_MB` (défaut 6 : trois tampons de 2 Mio, MEMORY_ARCH §10.5) plus
+  le plus gros bloc poussé (une seule grosse écriture ne déconnecte personne). Test :
+  `online_replica_too_slow_is_dropped`. Reste : pendant une synchronisation complète, lire
+  dans le backlog au lieu de dupliquer les blocs dans une file.
 
 ### 10.6 Acquittements, `WAIT`, réplication synchrone
 

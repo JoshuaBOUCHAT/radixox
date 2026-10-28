@@ -2382,3 +2382,43 @@ fn big_value_is_sent_from_the_tree() {
     let one = format!("${}\r\n{val}\r\n", val.len());
     assert_eq!(f.take(c), format!("+PONG\r\n{one}$5\r\nafter\r\n$-1\r\n"));
 }
+
+/// Réplica en ligne qui ne lit plus : au-delà de `repl_online_lag` (+ le plus gros bloc)
+/// en attente, il est déconnecté (trois tampons de 2 Mio par défaut, MEMORY_ARCH.md §10.5).
+#[test]
+fn online_replica_too_slow_is_dropped() {
+    let dir = test_dir("repl-slow");
+    unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
+    let mut pair = Net::new(Config { max_conn: 16, reserved: 1, repl_online_lag: 64 << 10, ..Config::default() }, 2);
+    pair.n[0].wall = Some(1_000);
+    let (c, admin) = (pair.n[0].connect(), pair.n[0].connect());
+    Net::cmd(&mut pair.n[0], c, b"SET a 1\r\n");
+    assert_eq!(Net::cmd(&mut pair.n[0], admin, format!("REPLICATE 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes()), "+OK\r\n");
+    pair.settle();
+    while pair.n[0].core.bgsave_running() {
+        pair.step();
+    }
+    pair.settle();
+    pair.assert_same("synchronisation");
+    let online = |pair: &mut Net| {
+        let info = Net::cmd(&mut pair.n[0], admin, b"INFO\r\n");
+        info_field(&info, "connected_replicas").unwrap()
+    };
+    assert_eq!(online(&mut pair), "1");
+    // Quelques écritures sous la limite : le réplica bloqué reste branché.
+    let link = pair.wires[0].link;
+    pair.n[0].peers.get_mut(&link).unwrap().stalled = true;
+    let val = "v".repeat(1000);
+    for i in 0..20 {
+        pair.n[0].send(c, format!("SET k{i} {val}\r\n").as_bytes());
+        pair.settle();
+    }
+    assert_eq!(online(&mut pair), "1", "20 Ko en attente : sous la limite");
+    // Au-delà : déconnecté.
+    for i in 20..200 {
+        pair.n[0].send(c, format!("SET k{i} {val}\r\n").as_bytes());
+        pair.settle();
+    }
+    assert_eq!(online(&mut pair), "0", "200 Ko en attente : trop lent");
+    let _ = std::fs::remove_dir_all(&dir);
+}

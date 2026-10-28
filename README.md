@@ -627,8 +627,10 @@ server: it follows the first source that connects, refuses writes from other cli
   **full sync**: a `BGSAVE` cut at an exact point in the stream (an AOF rewrite when the AOF is
   on), sent in 1 MiB chunks; the replica loads it (CRC and content digest checked) and the
   blocks written meanwhile follow.
-- A replica that falls behind by more than `RADIXOX_REPL_MAX_LAG_MB` is disconnected (and
-  resyncs).
+- An online replica that falls behind by more than `RADIXOX_REPL_ONLINE_LAG_MB` (6 MiB:
+  three 2 MiB buffers, plus the largest block just pushed) is too slow: disconnected, it
+  resyncs. During a full sync, the blocks queued for it are capped by
+  `RADIXOX_REPL_MAX_LAG_MB`.
 - A replica can have its own AOF (`RADIXOX_APPENDONLY=yes`): it writes the blocks it receives
   as is; restarted on its files, it comes back as a replica (read-only at once) and resumes
   from the primary's backlog without a new full sync. With `appendfsync always`, its
@@ -682,7 +684,8 @@ Environment variables:
 | `RADIXOX_REPLICATE` | unset | replicas to push to, `host:port,host:port` (IPv6 in brackets) |
 | `RADIXOX_REPLICATE_AUTH` | unset | password sent with `AUTH` to the replicas of `RADIXOX_REPLICATE` |
 | `RADIXOX_REPL_BACKLOG_MB` | `64` | recent blocks kept in memory for partial resyncs |
-| `RADIXOX_REPL_MAX_LAG_MB` | `256` | bytes waiting for a replica beyond which it is disconnected |
+| `RADIXOX_REPL_MAX_LAG_MB` | `256` | bytes queued for a replica during a full sync beyond which it is disconnected |
+| `RADIXOX_REPL_ONLINE_LAG_MB` | `6` | bytes waiting for an online replica (plus the largest block just pushed) beyond which it is disconnected |
 | `RADIXOX_SAVE_CPU_SHARE` | `0.1` | share of the server thread a `BGSAVE` is guaranteed while clients are active; whenever no client and no kernel completion is waiting, background work (save, `FLUSHDB` freeing, long `KEYS`) runs uncapped |
 | `RADIXOX_SCAN_IDLE_SECS` | `60` | idle time after which a `SCAN` cursor can be reclaimed |
 | `RADIXOX_SCAN_MAX_CURSORS` | `65536` | active `SCAN` cursors at most; beyond, a new `SCAN` gets an error |

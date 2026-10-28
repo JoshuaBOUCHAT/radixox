@@ -1077,6 +1077,9 @@ fn main() -> io::Result<()> {
     if let Some(mb) = std::env::var("RADIXOX_REPL_MAX_LAG_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
         cfg.repl_max_lag = mb.max(1) << 20;
     }
+    if let Some(mb) = std::env::var("RADIXOX_REPL_ONLINE_LAG_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
+        cfg.repl_online_lag = mb.max(1) << 20;
+    }
     let aof_on = aof.is_some();
     let mut core = Core::new(cfg, art);
     if let Some((stream, writer)) = aof {

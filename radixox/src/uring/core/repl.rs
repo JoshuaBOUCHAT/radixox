@@ -628,6 +628,8 @@ impl Core {
         }
         let blocks = std::mem::take(tap);
         let (backlog_max, max_lag) = (self.cfg.repl_backlog, self.cfg.repl_max_lag);
+        let biggest = blocks.iter().map(|b| b.len() as u64).max().unwrap_or(0);
+        let online_lag = self.cfg.repl_online_lag + biggest;
         let Core { src, outs, dirty, .. } = self;
         let src = src.as_mut().expect("flux branché sans source");
         let mut slow = Vec::new();
@@ -656,14 +658,15 @@ impl Core {
             }
         }
         for (i, l) in src.links.iter().enumerate() {
-            if let Some((slot, _)) = l.slot
-                && l.lag_bytes(&outs[slot as usize]) > max_lag
-            {
-                slow.push(i);
+            if let Some((slot, _)) = l.slot {
+                let limit = if matches!(l.state, State::Online) { online_lag } else { max_lag };
+                if l.lag_bytes(&outs[slot as usize]) > limit {
+                    slow.push((i, limit));
+                }
             }
         }
-        for i in slow {
-            self.link_drop(i, format!("réplica trop lent (plus de {} MB en attente)", max_lag >> 20));
+        for (i, limit) in slow.into_iter().rev() {
+            self.link_drop(i, format!("réplica trop lent (plus de {} Ko en attente)", limit >> 10));
         }
     }
 

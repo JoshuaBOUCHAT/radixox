@@ -754,6 +754,8 @@ est résident après coup ; pour refuser avant, il faut compter avant que les pa
   AOF : plafond des blocs non écrits 64 → 4 Mio (deux tampons de 2 Mio, écrivains en
   attente au-delà ; SET pipeliné + AOF −1 à −3 %, bruit) ; save synchrone par tranches de
   2 Mio (BGSAVE l'était déjà : `bgsave::CHUNK`, tampons en alternance).
+  Réplicas en ligne : trop lent au-delà de 6 Mio (+ plus gros bloc), déconnecté
+  (`RADIXOX_REPL_ONLINE_LAG_MB`, DURABILITY §10.5).
 
 ### 10.3 Déclenchement
 

@@ -119,8 +119,13 @@ pub struct Config {
     /// (`RADIXOX_REPL_BACKLOG_MB`, DURABILITY_DESIGN.md §10.5).
     pub repl_backlog: u64,
     /// Retard d'un réplica (octets à lui envoyer) au-delà duquel il est
-    /// déconnecté (`RADIXOX_REPL_MAX_LAG_MB`).
+    /// déconnecté (`RADIXOX_REPL_MAX_LAG_MB`) : file des blocs pendant une
+    /// synchronisation complète.
     pub repl_max_lag: u64,
+    /// Même chose pour un réplica en ligne (`RADIXOX_REPL_ONLINE_LAG_MB`, défaut 6 :
+    /// trois tampons de 2 Mio, MEMORY_ARCH.md §10.5), plus le plus gros bloc poussé (une
+    /// seule grosse écriture ne déconnecte personne).
+    pub repl_online_lag: u64,
     /// Dossier de `dump.rxd` et du dump reçu par un réplica (`None` :
     /// `RADIXOX_DIR`, lu à chaque save).
     pub dir: Option<std::path::PathBuf>,
@@ -165,6 +170,7 @@ impl Default for Config {
             aof_rewrite_min_size: 64 << 20,
             repl_backlog: 64 << 20,
             repl_max_lag: 256 << 20,
+            repl_online_lag: 6 << 20,
             dir: None,
         }
     }
