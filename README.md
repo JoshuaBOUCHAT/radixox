@@ -134,6 +134,18 @@ redis-cli BGSAVE                         # snapshot to ./dump.rxd, reloaded at n
 Requirements: **Linux 6.12 or newer** with io_uring (developed on 6.12 LTS and 7.2), **Rust 2024 edition**
 (stable).
 
+**Static binary** (no shared library, runs on any Linux ≥ 6.12, even with an empty environment):
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build --release -p radixox --target x86_64-unknown-linux-musl
+# target/x86_64-unknown-linux-musl/release/radixox : static-pie, ~2.6 MB
+```
+
+Every allocation of the process, the C library's own and the bundled zstd's included,
+goes through RadixOx's allocator (`malloc` is exported by the binary), so `INFO memory`
+accounts for all of it.
+
 ---
 
 ## Benchmarks

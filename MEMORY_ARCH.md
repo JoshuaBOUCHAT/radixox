@@ -1836,6 +1836,11 @@ demande la fin.
   `tests/memory.rs` l'exige.
 - Test : `raw_alloc::tests::c_api_roundtrip` (toutes les fonctions, zéro après
   réutilisation, alignements jusqu'à 1 Mio, autre thread, tout rendu).
+- **Binaire statique** (`--target x86_64-unknown-linux-musl`) : static-pie de 2,6 Mo,
+  aucune bibliothèque partagée, démarre sous `env -i`. Notre `malloc` remplace celui de
+  musl (vérifié par `nm` sur une build avec symboles) ; musl ne garde que son allocateur
+  interne `__simple_malloc` pour ses propres usages rares. Mesuré : non compté 0,1 Mo à
+  vide, 2,97 Mo chargé ; save zstd OK.
 
 ## 19. Objets à poignée (2026-10-26 ; implémenté le 2026-10-27, `radixox-lib/src/handle.rs`)
 

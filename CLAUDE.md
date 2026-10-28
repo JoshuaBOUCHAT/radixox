@@ -38,6 +38,7 @@ scripts/        bench_vs_valkey.sh (référence du README), bench_zipf.sh (accè
 
 ```bash
 cargo build --release -p radixox          # binaire target/release/radixox
+cargo build --release -p radixox --target x86_64-unknown-linux-musl   # binaire statique (static-pie)
 cargo run --release --bin radixox         # écoute 127.0.0.1:6379 (RADIXOX_BIND / RADIXOX_PORT)
 
 cargo test -p oxidart --features regex    # arbre (dont tests différentiels contre oxidart-legacy)
