@@ -316,6 +316,8 @@ fn next_occupied_walks_all_occupied_slots() {
 #[test]
 fn compaction_primitives() {
     // 128 o par slot, comme les nœuds d'oxidart : 100K slots = 12,8 Mo
+    const T: usize = 2 << 20;
+    let c0 = crate::pages::charged();
     let slab: TaggedHiSlab<[u64; 16]> = TaggedHiSlab::new(0, 1 << 20).unwrap();
     assert_eq!((slab.len(), slab.last_occupied()), (0, None));
     let idx: Vec<u32> = (0..100_000u64).map(|i| slab.insert([i; 16])).collect();
@@ -346,16 +348,19 @@ fn compaction_primitives() {
     let mut seen: Vec<u64> = (0..25_000).map(|i| unsafe { slab.get_unchecked(i)[0] }).collect();
     seen.sort_unstable();
     assert!(seen.iter().zip((0..100_000).step_by(4)).all(|(&a, b)| a == b), "valeurs intactes");
-    // Octets touchés : tout ce qui a été écrit, trous compris, jusqu'au rendu.
-    assert_eq!(slab.touched_bytes(), 100_000 * 128);
+    // Octets couverts : tranches de 2 Mio jusqu'au plus haut écrit, trous compris, jusqu'au
+    // rendu ; le registre en a autant.
+    let touched = (100_000 * 128usize).next_multiple_of(T);
+    assert_eq!(slab.touched_bytes(), touched);
+    assert_eq!(crate::pages::charged() - c0, touched as u64);
     let resident = slab.resident_bytes();
-    assert!(resident >= 100_000 * 128 && resident <= 100_000 * 128 + (2 << 20) + 4096, "{resident}");
+    assert!(resident >= 100_000 * 128 && resident <= touched, "{resident}");
     // Rendu de la fin : pages entières au-dessus du dernier occupé.
     let released = unsafe { slab.release_above(25_000) };
     assert_eq!(released % (2 << 20), 0);
-    // le rendu va jusqu'à la page qui suit le dernier écrit : au plus une page de plus
     let after = slab.touched_bytes();
-    assert!(after + released >= 100_000 * 128 && after + released < 100_000 * 128 + (2 << 20));
+    assert_eq!(after + released, touched);
+    assert_eq!(crate::pages::charged() - c0, after as u64, "le rendu revient au registre");
     assert!(slab.touched_bytes() >= 25_000 * 128, "les occupés restent comptés");
     assert!(slab.resident_bytes() <= slab.touched_bytes() + (2 << 20), "le rendu se voit au mincore");
     assert!(released >= 8 << 20, "12,8 Mo touchés, 3,2 Mo gardés : au moins 4 pages rendues");
@@ -366,7 +371,9 @@ fn compaction_primitives() {
     }
     assert_eq!(slab.len(), 105_000);
     assert_eq!(unsafe { *slab.get_unchecked(104_999) }, [79_999; 16]);
-    assert_eq!(slab.touched_bytes(), 105_000 * 128);
+    assert_eq!(slab.touched_bytes(), (105_000 * 128usize).next_multiple_of(T));
+    drop(slab);
+    assert_eq!(crate::pages::charged(), c0);
 }
 
 #[test]

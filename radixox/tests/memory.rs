@@ -50,6 +50,11 @@ fn rss_is_accounted_and_emptied_slabs_shrink() {
     // pile, binaire, données de la libc : ~0,2 Mo, fixes. Une huge page à cheval sur deux
     // régions en faisait 2 à 3 Mo (MEMORY_ARCH.md §18.14), une région oubliée des dizaines.
     assert!(untracked.abs() < MB && (untracked - empty).abs() < MB, "à vide {empty} o, chargé {untracked} o");
+    // Registre des pages (MEMORY_ARCH.md §10.4) : il couvre tout le résident mesuré, et ne
+    // le dépasse que de l'arrondi des régions par tranche (≈ 15 régions × 2 Mio au plus).
+    let (charged, tracked) = (m["mem_charged_bytes"], m["mem_tracked_bytes"]);
+    assert!(charged >= tracked, "registre {charged} o < résident mesuré {tracked} o");
+    assert!(charged - tracked < 32 * MB, "registre {charged} o, mesuré {tracked} o");
     // plus rien chez la libc ; les mappings directs ne servent que les cas hors du tas
     assert_eq!(m["mem_direct_bytes"], 0, "mappings directs");
     let zset = m["mem_hislab_zset_tree_bytes"] + m["mem_hislab_zset_index_bytes"];
@@ -76,5 +81,9 @@ fn rss_is_accounted_and_emptied_slabs_shrink() {
     }
     assert!(live == 0 && after <= 8 * MB, "slabs des ZSet après suppression : {after} o résidents, {live} o vivants (avant {zset})");
     assert!(after < zset, "rien rendu : {after} o (avant {zset})");
+    // Le rognage rend aussi au registre : il couvre encore le mesuré, et a baissé.
+    let m = info(&mut c);
+    assert!(m["mem_charged_bytes"] >= m["mem_tracked_bytes"], "registre sous le mesuré après rognage");
+    assert!(m["mem_charged_bytes"] < charged, "le registre n'a rien rendu : {} o (avant {charged})", m["mem_charged_bytes"]);
     let _ = redis::cmd("SHUTDOWN").arg("NOSAVE").query::<()>(&mut c);
 }

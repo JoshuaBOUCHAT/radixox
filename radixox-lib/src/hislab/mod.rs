@@ -91,7 +91,11 @@ pub struct HiSlab<T: 'static> {
     len: Cell<u32>,
     /// Au-delà de ce slot, rien n'a jamais été écrit (ou tout a été rendu) : borne de
     /// [`HiSlab::release_above`].
+    /// Fin (exclue) des slots couverts par le registre des pages : multiple de la tranche
+    /// de 2 Mio (la réservation est alignée). Écrire en dessous ne demande rien.
     touched_end: Cell<u32>,
+    /// Part de la réservation comptée dans le registre ([`crate::pages`]).
+    pages: crate::pages::Tranches,
 }
 
 impl<T> HiSlab<T> {
@@ -133,14 +137,19 @@ impl<T> HiSlab<T> {
             }
         }
 
-        Ok(Self {
+        let slab = Self {
             data: ptr,
             virtual_capacity,
             tree: UnsafeCell::new(BitmapTree::new()),
+            pages: crate::pages::Tranches::new(ptr as usize, HUGE),
             mmap,
             len: Cell::new(0),
-            touched_end: Cell::new(initial_capacity),
-        })
+            touched_end: Cell::new(0),
+        };
+        if initial_capacity > 0 {
+            slab.grow(initial_capacity - 1);
+        }
+        Ok(slab)
     }
 }
 
@@ -160,9 +169,20 @@ impl<T> HiSlab<T> {
         unsafe { std::ptr::write(self.data.add(idx as usize), val) };
         self.len.set(self.len.get() + 1);
         if idx >= self.touched_end.get() {
-            self.touched_end.set(idx + 1);
+            self.grow(idx);
         }
         idx
+    }
+
+    /// Le slot `idx` est au-delà de la partie comptée : une tranche de plus au registre
+    /// (une fois par 2 Mio de slots).
+    #[cold]
+    #[inline(never)]
+    fn grow(&self, idx: u32) {
+        let size = std::mem::size_of::<T>().max(1);
+        self.pages.ensure((idx as usize + 1) * size);
+        let end = (self.pages.covered() / size).min(self.virtual_capacity as usize);
+        self.touched_end.set(end as u32);
     }
 
     /// Removes the element at the given index and returns it, or `None` if the slot is empty.
@@ -270,7 +290,7 @@ impl<T> HiSlab<T> {
             (*self.tree.get()).clear_bit(src);
         }
         if dst >= self.touched_end.get() {
-            self.touched_end.set(dst + 1);
+            self.grow(dst);
         }
     }
 
@@ -297,6 +317,7 @@ impl<T> HiSlab<T> {
             return 0;
         }
         unsafe { libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_DONTNEED) };
+        self.pages.shrink(start - base);
         self.touched_end.set(((start - base) / size) as u32);
         end - start
     }
@@ -384,10 +405,9 @@ impl<T> HiSlab<T> {
         (unsafe { &*self.tree.get() }.lvl1.len() << 9) as u32
     }
 
-    /// Bytes of the slot range ever written and not handed back by
-    /// [`HiSlab::release_above`]: what the slab's data can hold resident (memory
-    /// accounting; the pages are committed by the kernel on first write, without any
-    /// allocator call). The bitmaps live on the heap and are not included.
+    /// Octets couverts par le registre des pages (tranches de 2 Mio jusqu'au plus haut slot
+    /// écrit, moins ce que [`HiSlab::release_above`] a rendu) : ce que les données du slab
+    /// peuvent tenir résident. Les bitmaps sont sur le tas, comptés ailleurs.
     #[inline]
     pub fn touched_bytes(&self) -> usize {
         self.touched_end.get() as usize * std::mem::size_of::<T>()

@@ -119,6 +119,8 @@ struct MapArr<T: Copy> {
     len: usize,
     /// Plus haute longueur depuis le dernier rendu (pages peut-être résidentes).
     touched: usize,
+    /// Registre des pages, par page de 4 Kio (`MADV_NOHUGEPAGE`).
+    pages: crate::pages::Tranches,
 }
 
 impl<T: Copy> MapArr<T> {
@@ -126,7 +128,7 @@ impl<T: Copy> MapArr<T> {
         let p = map(Self::bytes_for(cap))?;
         // Petites tables : sous THP `always`, la première écriture prendrait 2 Mio.
         unsafe { libc::madvise(p as *mut _, Self::bytes_for(cap), libc::MADV_NOHUGEPAGE) };
-        Some(Self { ptr: p as *mut T, cap, len: 0, touched: 0 })
+        Some(Self { ptr: p as *mut T, cap, len: 0, touched: 0, pages: crate::pages::Tranches::new(p as usize, crate::pages::PAGE) })
     }
 
     fn bytes_for(cap: usize) -> usize {
@@ -138,7 +140,10 @@ impl<T: Copy> MapArr<T> {
         assert!(self.len < self.cap, "table du tas pleine");
         unsafe { self.ptr.add(self.len).write(v) };
         self.len += 1;
-        self.touched = self.touched.max(self.len);
+        if self.len > self.touched {
+            self.touched = self.len;
+            self.pages.ensure(self.len * size_of::<T>());
+        }
     }
 
     #[inline]
@@ -162,6 +167,7 @@ impl<T: Copy> MapArr<T> {
                 unsafe { libc::madvise((self.ptr as *mut u8).add(from) as *mut _, to - from, libc::MADV_DONTNEED) };
             }
             self.touched = keep;
+            self.pages.shrink(from);
         }
     }
 
@@ -265,6 +271,10 @@ pub struct Large {
     /// Granule → dernière position dans la file (compaction de la file seulement).
     last: *mut u32,
     maps: [(*mut u8, usize); 6],
+    /// Registre des pages des tables par granule (`tag`, `next`, `prev`, `owner`, `last`),
+    /// jusqu'au sommet. Les données sont comptées à part, au granule près : `held + dirty`
+    /// (tout ce qui n'est pas propre sous `top`, MEMORY_ARCH.md §10.4).
+    meta_pages: [crate::pages::Tranches; 5],
     /// 0 : suites propres (rendues), 1 : sales.
     idx: [Index; 2],
     /// Suites sales à rendre : (début, libérée à).
@@ -304,7 +314,12 @@ impl Large {
             unmap(&maps);
             return None;
         };
-        unsafe { libc::madvise(maps[0].0 as *mut _, lens[0], libc::MADV_NOHUGEPAGE) };
+        // Données et tables en pages de 4 Kio : sous THP, chaque table par granule prenait
+        // 2 à 4 Mio pour quelques Ko écrits (mesuré : 21 Mo pour les 5). Elles ne servent que
+        // sur les chemins lents du tas.
+        for &(p, len) in &maps {
+            unsafe { libc::madvise(p as *mut _, len, libc::MADV_NOHUGEPAGE) };
+        }
         Some(Self {
             base: maps[0].0 as usize,
             nb,
@@ -314,6 +329,7 @@ impl Large {
             prev: maps[3].0 as *mut u32,
             owner: maps[4].0 as *mut u32,
             last: maps[5].0 as *mut u32,
+            meta_pages: std::array::from_fn(|i| crate::pages::Tranches::new(maps[i + 1].0 as usize, crate::pages::PAGE)),
             maps,
             idx: [Index::EMPTY, Index::EMPTY],
             fifo: Fifo { a: fifo, head: 0 },
@@ -350,6 +366,14 @@ impl Large {
                 + self.slabs.slabs.resident()
                 + self.slabs.free_ids.resident(),
         }
+    }
+
+    /// Part de ce tas dans le registre des pages : données (`held + dirty`), tables par
+    /// granule, file des suites sales et tables des slabs.
+    pub fn charged_bytes(&self) -> u64 {
+        (self.held + self.dirty) * GRANULE as u64
+            + self.meta_pages.iter().map(|t| t.bytes() as u64).sum::<u64>()
+            + (self.fifo.a.pages.bytes() + self.slabs.slabs.pages.bytes() + self.slabs.free_ids.pages.bytes()) as u64
     }
 
     // ─── Étiquettes et listes ────────────────────────────────────────────────
@@ -437,6 +461,9 @@ impl Large {
             }
             self.set_run(a, n, 0);
             self.held += n as u64;
+            if !dirty {
+                crate::pages::charge(n as usize * GRANULE);
+            }
             return Some((a, !dirty));
         }
         if n > self.nb - self.top {
@@ -444,8 +471,12 @@ impl Large {
         }
         let a = self.top;
         self.top += n;
+        for t in &self.meta_pages {
+            t.ensure(self.top as usize * 4);
+        }
         self.set_run(a, n, 0);
         self.held += n as u64;
+        crate::pages::charge(n as usize * GRANULE);
         Some((a, true))
     }
 
@@ -462,7 +493,9 @@ impl Large {
                 let d = t & DIRTY != 0;
                 self.unlink(s - ln, ln, d);
                 if !d {
+                    // propre fusionnée dans une sale : comptée sale, donc au registre
                     self.dirty += ln as u64;
+                    crate::pages::charge(ln as usize * GRANULE);
                 }
                 self.set_tag(s - 1, 0);
                 start = s - ln;
@@ -478,6 +511,7 @@ impl Large {
                 self.unlink(e, rn, d);
                 if !d {
                     self.dirty += rn as u64;
+                    crate::pages::charge(rn as usize * GRANULE);
                 }
                 self.set_tag(e, 0);
                 len += rn;
@@ -552,6 +586,7 @@ impl Large {
             };
             self.dirty -= len as u64;
             self.released += len as u64;
+            crate::pages::credit(len as usize * GRANULE);
             self.link(s, len, false);
             budget = budget.saturating_sub(len as u64 * GRANULE as u64);
         }
@@ -699,6 +734,7 @@ impl Large {
 
 impl Drop for Large {
     fn drop(&mut self) {
+        crate::pages::credit((self.held + self.dirty) as usize * GRANULE);
         for &(p, len) in &self.maps {
             unsafe { libc::munmap(p as *mut _, len) };
         }
@@ -1120,6 +1156,7 @@ mod tests {
     /// invariants du tas après chaque étape.
     #[test]
     fn random_against_model() {
+        let c0 = crate::pages::charged();
         let mut l = Large::new(32 << 30, Duration::ZERO).unwrap();
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         let mut live: Vec<(*mut u8, usize, u8)> = Vec::new();
@@ -1151,6 +1188,7 @@ mod tests {
             }
             if step % 64 == 0 {
                 l.check();
+                assert_eq!(crate::pages::charged() - c0, l.charged_bytes(), "registre, pas {step}");
             }
             if step % 997 == 0 {
                 l.release_step(Instant::now() + Duration::from_secs(1));
@@ -1169,6 +1207,13 @@ mod tests {
         while l.release_step(Instant::now() + Duration::from_secs(1)) {}
         l.check();
         assert_eq!(l.dirty, 0);
+        assert_eq!(crate::pages::charged() - c0, l.charged_bytes());
+        // Les données rendues ne comptent plus : il ne reste que les tables (4 o par granule
+        // jusqu'au sommet, chacune à une page près) et les petites tables des slabs.
+        let tables = 5 * (l.top as u64 * 4 + 2 * crate::pages::PAGE as u64);
+        assert!(l.charged_bytes() <= tables + (1 << 20), "{} > {tables}", l.charged_bytes());
+        drop(l);
+        assert_eq!(crate::pages::charged(), c0, "tout rendu à la destruction");
     }
 
     /// Sans objet vivant, tout est rendu : une seule suite propre.

@@ -6,6 +6,7 @@ pub mod handle;
 pub mod hislab;
 pub mod inline_childs;
 pub mod large;
+pub mod pages;
 pub mod pool;
 pub mod prefetch;
 pub mod raw_alloc;

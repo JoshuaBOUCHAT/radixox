@@ -158,6 +158,10 @@ pub struct Pool {
     /// Fin de remplissage d'un bloc à poignée, en granules, tenue à la fermeture du curseur.
     fill: *mut u16,
     maps: [(*mut u8, usize); 6],
+    /// Registre des pages (MEMORY_ARCH.md §10.4) : pages de données comptées (prises neuves
+    /// ou rendues, jusqu'à leur rendu), et tables par bloc.
+    charged_pages: u64,
+    meta_pages: [crate::pages::Tranches; 5],
     pages: Vec<PageState>,
     next_page: u32,
     /// Pages actives trouées (1 à 31 blocs libres), une liste chaînée par nombre de blocs
@@ -241,7 +245,9 @@ impl Pool {
             marked: maps[3].0 as *mut u64,
             handled: maps[4].0 as *mut u64,
             fill: maps[5].0 as *mut u16,
+            meta_pages: std::array::from_fn(|i| crate::pages::Tranches::new(maps[i + 1].0 as usize, crate::pages::TRANCHE)),
             maps,
+            charged_pages: 0,
             pages: Vec::new(),
             next_page: 0,
             by_free: [NONE; BLOCKS_PER_PAGE as usize],
@@ -674,6 +680,7 @@ impl Pool {
             self.page_fault();
             self.pages.push(PageState { free_mask: 0, state: PageKind::Active, prev: NONE, next: NONE, evacuating: false });
             self.next_page += 1;
+            self.charge_meta();
             self.next_page - 1
         } else {
             self.range_full += 1;
@@ -686,7 +693,20 @@ impl Pool {
         Some(self.open_block(p * BLOCKS_PER_PAGE))
     }
 
+    /// Tables par bloc (`live`, `open`, `marked`, `handled`, `fill`) jusqu'au dernier bloc
+    /// servi, au registre des pages.
+    fn charge_meta(&mut self) {
+        let blocks = self.next_page as usize * BLOCKS_PER_PAGE as usize;
+        let (u16s, bits) = (blocks * 2, blocks.div_ceil(64) * 8);
+        for (t, n) in self.meta_pages.iter().zip([u16s, bits, bits, bits, u16s]) {
+            t.ensure(n);
+        }
+    }
+
+    /// Une page de données va être écrite : neuve, ou rendue au système avant.
     fn page_fault(&mut self) {
+        crate::pages::charge(PAGE);
+        self.charged_pages += 1;
         self.sync_faults += 1;
         if self.gc.running {
             self.gc.fresh_pages += 1;
@@ -744,6 +764,8 @@ impl Pool {
             self.empty_pages.pop_front();
             let a = self.block_addr(p * BLOCKS_PER_PAGE);
             unsafe { libc::madvise(a as *mut _, PAGE, libc::MADV_DONTNEED) };
+            crate::pages::credit(PAGE);
+            self.charged_pages -= 1;
             self.pages[p as usize].state = PageKind::Released;
             self.released_pages.push(p);
             n += 1;
@@ -928,6 +950,7 @@ impl Pool {
 
 impl Drop for Pool {
     fn drop(&mut self) {
+        crate::pages::credit(self.charged_pages as usize * PAGE);
         for (p, len) in self.maps {
             unsafe { libc::munmap(p as *mut _, len) };
         }

@@ -567,8 +567,11 @@ pub fn info_memory_total(out: &mut String, slabs: &[(&str, (u64, u64, u64))]) {
     let (rss, anon) = proc_rss();
     let _ = write!(
         out,
-        "mem_tracked_bytes:{tracked}\r\nmem_rss_bytes:{rss}\r\nmem_rss_anon_bytes:{anon}\r\nmem_untracked_bytes:{}\r\n",
-        anon as i64 - tracked as i64
+        "mem_tracked_bytes:{tracked}\r\nmem_rss_bytes:{rss}\r\nmem_rss_anon_bytes:{anon}\r\nmem_untracked_bytes:{}\r\n\
+         mem_charged_bytes:{}\r\nmem_charged_peak_bytes:{}\r\n",
+        anon as i64 - tracked as i64,
+        radixox_lib::pages::charged(),
+        radixox_lib::pages::peak()
     );
 }
 

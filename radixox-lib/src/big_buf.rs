@@ -86,6 +86,9 @@ impl BigBuf {
         if self.cap == 0 {
             unsafe { libc::madvise(p, cap, libc::MADV_HUGEPAGE) };
         }
+        // Registre des pages : la capacité entière (au plus 2 × ce qui est écrit), comptée
+        // au `mremap` plutôt qu'à chaque écriture.
+        crate::pages::charge(cap - self.cap);
         self.ptr = p as *mut u8;
         self.cap = cap;
     }
@@ -132,6 +135,7 @@ impl Drop for BigBuf {
             unsafe {
                 BYTES -= self.len as u64;
                 libc::munmap(self.ptr as *mut _, self.cap);
+                crate::pages::credit(self.cap);
             }
         }
     }

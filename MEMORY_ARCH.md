@@ -643,6 +643,53 @@ clone avant la commande suivante, mais c'est un invariant global que rien ne vé
   `shared_byte_rc_overflow_table`, `shared_byte_rc_overflow_full_copies` (radixox-lib),
   objet de la table épinglé dans `gc_full_pass_moves_values_and_pins_shared` (oxidart).
 
+### 10.4 Registre des pages (fait le 2026-10-28, `radixox-lib/src/pages.rs`)
+
+But : une borne **stricte** (« `maxmemory` 2 Gio = 2 Gio »). `mincore` (§10.1 bis) dit ce qui
+est résident après coup ; pour refuser avant, il faut compter avant que les pages soient
+écrites. Le registre est ce compte ; `maxmemory` sera la politique qui le consulte.
+
+- **Principe** : chaque région déclare ce qu'elle peut rendre résident au moment où elle
+  grandit (`charge`), et le rend quand elle rend ses pages (`credit`). Par tranche de 2 Mio
+  sous THP, par page de 4 Kio en `MADV_NOHUGEPAGE`. Pessimiste : une tranche entière pour
+  un octet écrit, jamais l'inverse. `Tranches` part de la frontière sous `base`, pour qu'une
+  huge page à cheval (§18.14) soit toujours à quelqu'un.
+- **`charge` ne refuse jamais** : une région qui grandit est au milieu d'une écriture.
+  Refuser se fera avant la commande, par la réservation de `maxmemory` contre le registre.
+- **Le faulting reste paresseux** : compter ne remplit rien. Coût nul sur les chemins
+  chauds : HiSlab garde son seul test `idx >= touched_end`, mais `touched_end` est désormais
+  la fin de la tranche comptée (la fonction froide tourne une fois par 2 Mio, l'écriture
+  de `touched_end` à chaque insertion au sommet a disparu) ; les autres régions grandissent
+  déjà sur des chemins lents.
+- **Branchements** :
+
+  | région | compte | rend |
+  |---|---|---|
+  | HiSlab (7) | `grow`, une fois par tranche | `release_above` |
+  | pool, données | `page_fault` (page neuve ou rendue) | `release_step` |
+  | pool, 5 tables par bloc | avec `next_page` | — |
+  | `large`, données | `held + dirty` au granule : suite propre ou neuve prise, propre fusionnée dans une sale | `release_step` |
+  | `large`, 5 tables par granule | avec `top` | — |
+  | `MapArr` (file, slabs de `large`) | `push` au-delà du touché | `truncate` |
+  | table des poignées | `top` | — |
+  | `BigBuf` | capacité, à chaque `mremap` | `munmap` |
+  | mappings directs | `mmap` | `munmap` |
+
+- **Tables de `large` en 4 Kio** (`MADV_NOHUGEPAGE`) : sous THP, les 5 tables par granule
+  prenaient 2 à 4 Mio chacune pour quelques Ko écrits. RSS anonyme : 14,4 → 6,1 Mo à vide,
+  67 → 54,7 Mo chargé (jeu `redis-benchmark`). Elles ne servent que sur les chemins lents.
+- **Mesuré** (chargé) : registre 64 Mo pour 54,5 Mo résidents mesurés. L'écart (~9,5 Mo)
+  vient surtout des 5 tables du pool, comptées par tranche (elles restent sous THP : `live`
+  est touchée à chaque libération, pas de pages de 4 Kio sans mesure du TLB).
+- **Débit** : SET pipeliné 64 (memtier, 6 × 8 connexions, compté côté serveur, 3 passages
+  alternés, gouverneur `powersave`) : 2 354–2 394 k/s avant, 2 364–2 391 après ; CPU du
+  serveur 75 % dans les deux cas.
+- `INFO` : `mem_charged_bytes`, `mem_charged_peak_bytes`. Tests : `pages::tests`,
+  `hislab::test::compaction_primitives` (registre = tranches touchées, rendu au
+  `release_above` et à la destruction), `large::tests::random_against_model` (part de
+  `large` = `charged_bytes()` à chaque pas, tout rendu à la destruction),
+  `tests/memory.rs` (registre ≥ mesuré, écart < 32 Mo, baisse après rognage).
+
 ### 10.3 Déclenchement
 
 - **Deux niveaux** : l'éviction de fond démarre à `maxmemory − réserve − marge` ; la

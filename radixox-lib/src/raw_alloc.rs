@@ -168,6 +168,7 @@ pub mod direct {
         let data = (base + HEADER).next_multiple_of(align);
         unsafe { ((data - HEADER) as *mut [usize; 3]).write([MAGIC, base, len]) };
         BYTES.fetch_add(len as u64, Relaxed);
+        crate::pages::charge(len);
         data as *mut u8
     }
 
@@ -186,6 +187,7 @@ pub mod direct {
         let (base, len) = unsafe { header(p) };
         unsafe { libc::munmap(base as *mut _, len) };
         BYTES.fetch_sub(len as u64, Relaxed);
+        crate::pages::credit(len);
     }
 
     /// # Safety

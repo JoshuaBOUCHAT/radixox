@@ -42,6 +42,8 @@ pub struct Handles {
     top: u32,
     free: u32,
     live: u32,
+    /// Part comptée dans le registre des pages (THP permis : tranches de 2 Mio).
+    pages: crate::pages::Tranches,
 }
 
 impl Handles {
@@ -59,7 +61,15 @@ impl Handles {
                 0,
             )
         };
-        (p != libc::MAP_FAILED).then(|| Self { slots: p as *mut u64, map_len, cap, top: 0, free: NONE, live: 0 })
+        (p != libc::MAP_FAILED).then(|| Self {
+            slots: p as *mut u64,
+            map_len,
+            cap,
+            top: 0,
+            free: NONE,
+            live: 0,
+            pages: crate::pages::Tranches::new(p as usize, crate::pages::TRANCHE),
+        })
     }
 
     /// Nouvelle poignée vers `addr` (paire). `None` : table pleine.
@@ -72,6 +82,7 @@ impl Handles {
             h
         } else if self.top < self.cap {
             self.top += 1;
+            self.pages.ensure(self.top as usize * 8);
             self.top - 1
         } else {
             return None;
