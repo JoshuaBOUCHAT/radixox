@@ -1081,3 +1081,39 @@ mod regressions_2026_10_17 {
         assert_eq!(art.get(b"user2"), Some(Value::Int(2)));
     }
 }
+
+/// Évicteur à curseur : par petites tranches, un tour voit chaque nœud tagué une fois et
+/// retire toutes les expirées, sans toucher aux clés sans TTL ni aux TTL longs ; le tour
+/// suivant ne trouve plus rien.
+#[test]
+fn evict_step_sweeps_in_slices() {
+    use std::time::Duration;
+    let mut art = OxidArt::new();
+    art.set_now(0);
+    for i in 0..20_000u32 {
+        let key = SharedByte::from_slice(format!("user:{i}:session"));
+        let ttl = if i % 3 == 0 { 1000 } else { 1 };
+        art.set_ttl(key, Duration::from_secs(ttl), Value::from_str("v"));
+        art.set(SharedByte::from_slice(format!("plain:{i}")), Value::from_str("v"));
+    }
+    let expiring = (0..20_000u32).filter(|i| i % 3 != 0).count();
+    art.set_now(100);
+    let (mut evicted, mut steps) = (0, 0);
+    loop {
+        let st = art.evict_step(64);
+        assert!(st.visited <= 64);
+        evicted += st.evicted;
+        steps += 1;
+        art.check();
+        if st.lap_done {
+            break;
+        }
+    }
+    assert_eq!(evicted, expiring, "un tour retire toutes les expirées");
+    assert!(steps > 2, "plusieurs tranches : {steps}");
+    assert_eq!(art.len(), 40_000 - expiring);
+    assert!(art.get(b"user:0:session").is_some() && art.get(b"plain:1").is_some());
+    // Second tour : rien de plus.
+    let st = art.evict_step(u32::MAX);
+    assert!(st.lap_done && st.evicted == 0 && st.hit == 0);
+}

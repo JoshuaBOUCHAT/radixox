@@ -415,3 +415,18 @@ fn random_tagged_is_uniform_over_tagged() {
     }
     assert_eq!(seen, tagged);
 }
+
+#[test]
+fn next_tagged_walks_tagged_slots_only() {
+    let slab = TaggedHiSlab::<u32>::new(0, 1 << 16).unwrap();
+    let tagged: Vec<u32> = (0..5000u32).map(|i| if i % 13 == 0 { slab.insert_tagged(i) } else { slab.insert(i) }).filter(|&i| slab.is_tagged(i)).collect();
+    let (mut at, mut seen) = (0, Vec::new());
+    while let Some(i) = slab.next_tagged(at) {
+        seen.push(i);
+        at = i + 1;
+    }
+    assert_eq!(seen, tagged);
+    slab.untag(tagged[1]);
+    assert_eq!(slab.next_tagged(tagged[0] + 1), Some(tagged[2]));
+    assert_eq!(slab.next_tagged(1 << 20), None);
+}

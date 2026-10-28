@@ -585,6 +585,30 @@ les descentes entrelacées (à mesurer).
 Politiques v1 envisagées : `noeviction`, `allkeys-lru`, `volatile-lru` (CLOCK),
 `volatile-ttl` (bitmap TTL existant). LFU plus tard (compteur à 2 bits, ou CLOCK-Pro).
 
+### 10.2 quater Politiques et balayage (décisions de l'utilisateur, 2026-10-28)
+
+- **Par défaut, sans coût** (rien d'écrit à la lecture) : `noeviction`, `allkeys-random`,
+  `volatile-random`, `volatile-ttl`. **Feature cargo `eviction`** pour ce qui écrit à chaque
+  accès : `*-lru` (CLOCK), `*-lfu` (octet `lfu`, §10.2 ter). Politique demandée mais pas
+  compilée : refus au démarrage, pas de repli silencieux.
+- **Pas de tirage, un balayage** : curseur de slot sur le bitmap d'occupation
+  (`allkeys-*`) ou le bitmap tagué TTL (`volatile-*`) ; le nœud est lu par son indice,
+  l'éviction se fait sur place, la recompression par `parent_idx`. Jamais de parcours de
+  l'arbre pour choisir. « random » garde le nom Redis mais est un tour de slots : chaque clé
+  au plus une fois par tour, pas de biais par le nom (l'ordre lexicographique évincerait
+  toujours la même zone de noms), à peu près FIFO.
+- **Pas de fusion avec le GC** (« fausse bonne idée, alourdirait le GC ») : l'évicteur a
+  son curseur et son rythme, le GC le sien. `TaggedHiSlab` et le tag TTL gardés : l'évicteur
+  ne visite que les nœuds qui portent un TTL.
+- **Évicteur TTL à curseur fait** (`OxidArt::evict_step`, remplace le tirage à la Redis :
+  400 tirages par seconde, chacun recomptant tout le niveau 1 du bitmap) : tranches de
+  1 024 nœuds tagués, toutes les 1 ms pendant un tour (100 µs si plus d'un quart des
+  nœuds visités avaient des expirées), 1 s entre deux tours ; `attached()` (remontée
+  jusqu'à la racine) seulement si le nœud a quelque chose à retirer. Mesuré : 1 M de clés
+  `EX 2` toutes retirées moins de 0,5 s après l'échéance.
+- **Plus tard** : éviction par préfixes prioritaires (`maxmemory-evict-prefixes`),
+  détachement d'un sous-arbre d'un coup, propre à un radix.
+
 ### 10.2 bis Compteur dans la valeur (décisions de l'utilisateur, 2026-10-23)
 
 Remplace le tableau à part de §10.2 pour les chaînes et les conteneurs (le tableau reste

@@ -100,7 +100,6 @@ mod test_detached;
 
 use radixox_lib::hislab::TaggedHiSlab;
 use radixox_lib::shared_byte::SharedByte;
-use rand::rngs::ThreadRng;
 
 use crate::compact_path::CompactPath;
 use crate::node::{Entry, EntryRef, Leaf, Node};
@@ -171,6 +170,8 @@ pub struct OxidArt {
     pub(crate) window: Option<prefetch_batch::WindowState>,
     /// Compteurs du moteur AMAC (prototype).
     pub amac_stats: AmacStats,
+    /// Curseur de l'évicteur TTL : prochain slot à examiner dans le bitmap tagué.
+    evict_cursor: u32,
     _live: gc::LiveTree,
 }
 
@@ -331,6 +332,7 @@ impl OxidArt {
             flushes: 0,
             window: None,
             amac_stats: AmacStats::default(),
+            evict_cursor: 0,
             _live: gc::LiveTree::new(),
         }
     }
@@ -1442,44 +1444,45 @@ impl OxidArt {
 
     // ─── Éviction TTL ───────────────────────────────────────────────────────
 
-    const MAX_SAMPLE: usize = 20;
-    const SAMPLE_SIZE: usize = 20;
-    const THRESHOLD: usize = Self::SAMPLE_SIZE / 4; // 25% of 20
+    /// Nœuds tagués examinés par tranche de l'évicteur (≈ un défaut de cache chacun, de
+    /// l'ordre de 50 µs).
+    pub const EVICT_SLICE: u32 = 1024;
 
-    /// Evicts expired entries using Redis-style probabilistic sampling.
-    ///
-    /// Un tirage choisit un nœud tagué (qui porte au moins un TTL) et retire
-    /// toutes ses valeurs expirées. On recommence tant qu'au moins 25 % des
-    /// nœuds tirés avaient une valeur expirée. Returns the number of evicted
-    /// values.
+    /// Une tranche de l'évicteur TTL : balayage **linéaire** du bitmap tagué (nœuds qui
+    /// portent au moins un TTL) depuis le curseur, au plus `budget` nœuds ; chaque nœud
+    /// visité perd ses valeurs expirées. Pas de tirage : chaque nœud tagué est vu une fois
+    /// par tour, la mémoire d'une clé expirée revient en au plus un tour. Rien pendant une
+    /// save (SAVE_DESIGN.md §2.C), le curseur reste où il est.
+    pub fn evict_step(&mut self, budget: u32) -> EvictStep {
+        let mut st = EvictStep::default();
+        if self.is_saving() {
+            return st;
+        }
+        let mut at = self.evict_cursor;
+        while st.visited < budget {
+            let Some(idx) = self.map.next_tagged(at) else {
+                st.lap_done = true;
+                at = 0;
+                break;
+            };
+            at = idx + 1;
+            st.visited += 1;
+            let n = self.evict_node(idx);
+            st.evicted += n;
+            st.hit += (n > 0) as u32;
+        }
+        self.evict_cursor = at;
+        st
+    }
+
+    /// Un tour complet de l'évicteur TTL depuis le début (tests, appels forcés) ; rend le
+    /// nombre de valeurs retirées.
     pub fn evict_expired(&mut self) -> usize {
         if self.is_saving() {
             return 0;
         }
-        let mut rng = rand::thread_rng();
-        let mut total_evicted = 0;
-        for _ in 0..Self::MAX_SAMPLE {
-            let (evicted, hit_nodes, sampled) = self.evict_cycle(&mut rng);
-            total_evicted += evicted;
-            if sampled < Self::SAMPLE_SIZE || hit_nodes < Self::THRESHOLD {
-                break;
-            }
-        }
-        total_evicted
-    }
-
-    fn evict_cycle(&mut self, rng: &mut ThreadRng) -> (usize, usize, usize) {
-        let (mut evicted, mut hit_nodes, mut sampled) = (0, 0, 0);
-        for _ in 0..Self::SAMPLE_SIZE {
-            let Some((idx, _)) = self.map.random_tagged(|n| rand::Rng::gen_range(rng, 0..n)) else {
-                break;
-            };
-            sampled += 1;
-            let n = self.evict_node(idx);
-            evicted += n;
-            hit_nodes += (n > 0) as usize;
-        }
-        (evicted, hit_nodes, sampled)
+        self.evict_cursor = 0;
+        self.evict_step(u32::MAX).evicted
     }
 
     /// Racine d'un sous-arbre détaché (FLUSHDB, `UNLINK prefix*`) en attente
@@ -1503,9 +1506,6 @@ impl OxidArt {
 
     /// Retire les valeurs expirées du nœud `idx` ; renvoie leur nombre.
     fn evict_node(&mut self, idx: u32) -> usize {
-        if !self.attached(idx) {
-            return 0;
-        }
         let now = self.now;
         let node = self.node(idx);
         let self_exp = node.has_val() && expired(node.exp_and_radix.exp(), now);
@@ -1517,9 +1517,12 @@ impl OxidArt {
                 radixes.push(r);
             }
         }
-        if !self_exp && radixes.is_empty() {
+        // La remontée jusqu'à la racine seulement s'il y a quelque chose à retirer : la
+        // plupart des nœuds visités n'ont rien d'expiré.
+        if !self_exp && radixes.is_empty() || !self.attached(idx) {
             return 0;
         }
+        let node = self.node(idx);
         let before = node.has_any_ttl();
         let node = self.node_mut(idx);
         if self_exp {
@@ -1570,6 +1573,19 @@ impl OxidArt {
         assert_eq!(self.key_count, keys, "compteur de clés");
         seen
     }
+}
+
+/// Bilan d'une tranche de l'évicteur TTL ([`OxidArt::evict_step`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EvictStep {
+    /// Valeurs retirées.
+    pub evicted: usize,
+    /// Nœuds tagués examinés.
+    pub visited: u32,
+    /// Nœuds où au moins une valeur était expirée.
+    pub hit: u32,
+    /// Le curseur a atteint la fin du bitmap (et repart de 0).
+    pub lap_done: bool,
 }
 
 #[derive(Clone, Copy, Default)]

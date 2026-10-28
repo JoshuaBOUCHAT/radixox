@@ -868,6 +868,21 @@ impl<T: 'static> TaggedHiSlab<T> {
         self.inner.next_occupied(from)
     }
 
+    /// Premier slot tagué à `from` ou après, ou `None` : lit le bitmap des tags de niveau 1
+    /// mot par mot (balayage de l'évicteur TTL, sans tirage).
+    pub fn next_tagged(&self, from: u32) -> Option<u32> {
+        let lvl1 = &unsafe { &*self.tagged_tree.get() }.lvl1;
+        // SAFETY: comme `HiSlab::next_occupied`, un `Vec<BitBlock>` est une suite de u64.
+        let words = unsafe { std::slice::from_raw_parts(lvl1.as_ptr() as *const u64, lvl1.len() * 8) };
+        let mut w = from as usize / 64;
+        let mut word = *words.get(w)? & (!0u64 << (from % 64));
+        while word == 0 {
+            w += 1;
+            word = *words.get(w)?;
+        }
+        Some((w * 64) as u32 + word.trailing_zeros())
+    }
+
     /// Iterates over all occupied slots with maximum performance.
     pub fn for_each_occupied<F>(&self, f: F)
     where

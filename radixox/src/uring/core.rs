@@ -345,9 +345,12 @@ impl<T, const N: usize> Drop for FixedDrain<'_, T, N> {
     }
 }
 
-/// Évicteur TTL : une passe d'échantillonnage par seconde, comme l'ancien serveur monoio
-/// (l'évicteur à curseur est un chantier d'oxidart à part).
+/// Évicteur TTL (balayage du bitmap tagué, `OxidArt::evict_step`) : pause entre deux tours…
 const EVICT_EVERY: Duration = Duration::from_secs(1);
+/// …tranche suivante pendant un tour…
+const EVICT_AGAIN: Duration = Duration::from_millis(1);
+/// …ou plus vite si plus d'un quart des nœuds visités avaient des clés expirées.
+const EVICT_HOT: Duration = Duration::from_micros(100);
 /// Balayage d'inactivité : une tranche de connexions toutes les 100 ms.
 const SWEEP_EVERY: Duration = Duration::from_millis(100);
 /// Vérification des règles de save automatique (`serverCron` de Redis, hz 10).
@@ -1023,10 +1026,19 @@ impl Core {
             match timer {
                 Timer::Evict => {
                     // Pendant une save, l'évicteur est en pause (SAVE_DESIGN.md §2.C).
-                    if !self.art.is_saving() {
-                        self.art.evict_expired();
-                    }
-                    self.timers.push(Reverse((self.now + EVICT_EVERY, Timer::Evict)));
+                    let next = if self.art.is_saving() {
+                        EVICT_EVERY
+                    } else {
+                        let st = self.art.evict_step(OxidArt::EVICT_SLICE);
+                        if st.lap_done {
+                            EVICT_EVERY
+                        } else if st.hit * 4 >= st.visited {
+                            EVICT_HOT
+                        } else {
+                            EVICT_AGAIN
+                        }
+                    };
+                    self.timers.push(Reverse((self.now + next, Timer::Evict)));
                 }
                 Timer::Sweep => {
                     self.sweep_idle();
