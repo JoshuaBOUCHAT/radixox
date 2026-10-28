@@ -328,6 +328,58 @@ fn collections_are_bounded_and_evicted() {
     }
 }
 
+/// `SET` d'une valeur de `mb` Mo sur une connexion neuve, réponse lue pendant l'envoi
+/// (un client qui n'écrit qu'après ne verrait pas le refus, envoyé pendant qu'il écrit
+/// encore). `Err` : connexion fermée sans réponse lisible.
+fn set_big(port: u16, mb: usize) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut w = s.try_clone().unwrap();
+    let size = mb << 20;
+    let sender = std::thread::spawn(move || {
+        let _ = w.write_all(format!("*3\r\n$3\r\nSET\r\n$3\r\nbig\r\n${size}\r\n").as_bytes());
+        let _ = w.write_all(&vec![b'x'; size]);
+        let _ = w.write_all(b"\r\n");
+    });
+    let mut reply = vec![0u8; 256];
+    let r = s.read(&mut reply).map_err(|e| e.to_string());
+    drop(s);
+    sender.join().unwrap();
+    let n = r?;
+    reply.truncate(n);
+    Ok(reply)
+}
+
+/// Frame plus grosse que le budget d'entrée (10 % de `maxmemory`) : best effort. Admise si
+/// elle tient (2 × sa taille plus le budget d'entrée, sous la limite), sinon `-OOM` et
+/// fermeture ; jamais suspendue sans fin (avant : un `SET` de 20 Mo sous 48 Mo restait sans
+/// réponse).
+#[test]
+fn frames_larger_than_the_input_budget() {
+    const PORT: u16 = 16444;
+    let dir = test_dir("bigframe");
+    let server = spawn(PORT, &dir, &[("RADIXOX_MAXMEMORY", "48mb")]);
+    // 10 Mo > 4,8 Mo de budget : admise
+    assert_eq!(set_big(PORT, 10).unwrap(), b"+OK\r\n");
+    let mut c = common::conn(PORT);
+    let v: Vec<u8> = redis::cmd("GET").arg("big").query(&mut c).unwrap();
+    assert_eq!(v.len(), 10 << 20);
+    let _: u64 = redis::cmd("DEL").arg("big").query(&mut c).unwrap();
+    // 30 Mo : ne tient pas, refus rapide (ou fermeture avant que la réponse soit lue)
+    let t = Instant::now();
+    match set_big(PORT, 30) {
+        Ok(reply) => assert!(String::from_utf8_lossy(&reply).starts_with("-OOM"), "{reply:?}"),
+        Err(e) => assert!(!e.contains("timed out") && !e.contains("temporarily"), "pas de réponse : {e}"),
+    }
+    assert!(t.elapsed() < Duration::from_secs(5), "refus en {:?}", t.elapsed());
+    let _: String = redis::cmd("PING").query(&mut c).unwrap();
+    assert!(num(&info(&mut c), "oom_rejected_commands") >= 1);
+    assert!(server.peak_anon() <= 48 * MB, "pic {} o pour 48 Mo", server.peak_anon());
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
 }

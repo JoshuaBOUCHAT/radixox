@@ -40,6 +40,11 @@ pub struct ConnIn {
     /// Réception suspendue par le budget global d'entrée (RUNTIME_ARCH.md §5.3) : pas
     /// réarmée tant que le total n'est pas redescendu.
     pub throttled: bool,
+    /// Frame en cours plus grosse que ce que le budget d'entrée laisse attendre, admise
+    /// parce qu'elle tient dans la mémoire libre : pas suspendue jusqu'à sa fin.
+    pub oversize: bool,
+    /// Même cas, mais elle ne tient pas : `-OOM` puis fermeture au prochain relevé.
+    pub refused: bool,
 }
 
 impl ConnIn {

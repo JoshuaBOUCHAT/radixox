@@ -859,11 +859,11 @@ est résident après coup ; pour refuser avant, il faut compter avant que les pa
     chaque clé acceptée était évincée, 68 % de `-OOM`. Maintenant, comme pour l'E/S, ce que
     le système tient déjà (le plus grand de l'AOF en attente et du backlog : ils peuvent
     partager des blocs) est rendu à la limite → 3,6 % de `-OOM`.
-  - reste vu : **une frame plus grosse que le budget d'entrée** (10 % de `maxmemory`, 4,8 Mo
-    pour 48 Mo) ne reçoit jamais de réponse : la connexion est suspendue par le budget et
-    rien ne la fait repartir (frame incomplète). Décision à prendre (refus + fermeture
-    comme `proto-max-bulk-len`, ou exemption d'une frame seule). Aussi : le backlog par
-    défaut (64 Mo) dépasse à lui seul une petite `maxmemory`, sans avertissement.
+  - **une frame plus grosse que le budget d'entrée** (10 % de `maxmemory`, 4,8 Mo pour
+    48 Mo) ne recevait jamais de réponse : corrigé en best effort (RUNTIME_ARCH §6.2 bis,
+    budget global d'entrée) : admise si 2 × sa taille + le budget d'entrée tiennent, sinon
+    `-OOM` et fermeture. Reste : le backlog par défaut (64 Mo) dépasse à lui seul une
+    petite `maxmemory`, sans avertissement.
   - tests (`tests/maxmemory.rs`) : pic de mémoire anonyme (`VmHWM` − résident fichier) sous
     la limite, pas seulement l'état final ; éviction arrêtée à au moins 90 % de la cible
     (`assert_not_over_evicted`) ; Hash / Set / ZSet / List admis puis évincés entiers,

@@ -1633,9 +1633,33 @@ impl Core {
         if self.rx_total > self.cfg.input_budget
             && n >= THROTTLE_MIN
             && !i.throttled
+            && !i.oversize
             && self.outs[s].mode == Mode::Normal
             && !self.outs[s].link
         {
+            // Frame incomplète en tête qui dépasse à elle seule le seuil de reprise : la
+            // suspendre ne la ferait jamais repartir. Best effort : admise si elle tient
+            // dans la mémoire libre en laissant le budget d'entrée aux autres, sinon
+            // refusée (§5.3).
+            if let Some(need) = radixox_lib::cmd::frame_need(&i.rx)
+                && need > self.cfg.input_budget / 10 * 9
+            {
+                // Coût : 2 × la frame, comme l'admission (`write_cost`) : `rx`, puis la copie
+                // des arguments au découpage de la commande, avant son admission. `rx` est
+                // réservé à la taille exacte en une fois (sinon il double, ancien et nouveau
+                // tenus pendant la copie). Seul le réutilisable de `large` compte : une
+                // grosse allocation ne prend pas les pages libres du pool.
+                let held = radixox_lib::pages::charged().saturating_sub(radixox_lib::large::reusable_bytes());
+                if self.cfg.maxmemory == 0 || held + 2 * need as u64 + self.cfg.input_budget as u64 <= self.cfg.maxmemory
+                {
+                    let i = &mut self.ins[s];
+                    i.oversize = true;
+                    i.rx.reserve_exact(need - n);
+                    return;
+                }
+                self.ins[s].refused = true;
+            }
+            let i = &mut self.ins[s];
             i.throttled = true;
             self.throttled.push((slot, self.outs[s].epoch));
             self.out_stats.throttle_events += 1;
@@ -2104,6 +2128,29 @@ impl Core {
             with_out += (n > 0) as usize;
         }
         self.rx_total = input;
+        // Frames trop grosses pour la mémoire libre : `-OOM`, puis fin propre (la frame
+        // incomplète n'est jamais exécutée).
+        let refused: Vec<Slot> = self
+            .throttled
+            .iter()
+            .filter(|&&(slot, epoch)| {
+                let s = slot as usize;
+                self.outs[s].epoch == epoch && self.ins[s].refused && self.outs[s].mode == Mode::Normal
+            })
+            .map(|&(slot, _)| slot)
+            .collect();
+        for slot in refused {
+            let s = slot as usize;
+            self.ins[s].refused = false;
+            self.oom_rejected += 1;
+            let o = &mut self.outs[s];
+            extend_encode(&mut o.out, &Frame::Error(crate::exec::maxmem::OOM.into()));
+            if !o.dirty {
+                o.dirty = true;
+                self.dirty.push(slot);
+            }
+            self.begin_closing(slot, true);
+        }
         // Reprise des réceptions suspendues sous 90 % du budget (hystérésis).
         if !self.throttled.is_empty() && input <= self.cfg.input_budget / 10 * 9 {
             for (slot, epoch) in std::mem::take(&mut self.throttled) {
@@ -2149,6 +2196,7 @@ impl Core {
         loop {
             match frame_len(&i.rx) {
                 FrameLen::Done(n) => {
+                    i.oversize = false;
                     let give_back = ((i.rx.len() - n) as u32).min(last_piece);
                     if give_back > 0 {
                         let front = i.spans.front_mut().expect("excédent pris dans un morceau");

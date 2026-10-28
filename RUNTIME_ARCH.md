@@ -655,6 +655,21 @@ bornait la **somme** des connexions (10 000 clients lents × une grosse réponse
   budget de 1 Mo → suspendue, < 4 Mo tenus ; débloquée, les 16 000 SET passent tous.
   Coût : aucun mesurable (memtier sans pipeline, passages alternés, 271–276 K contre
   265–268 K).
+  - **Frame plus grosse que le budget** (2026-10-28) : suspendue, elle ne repartait jamais
+    (la reprise attend 90 % du budget, qu'elle dépasse seule) — un `SET` de 20 Mo sous
+    `maxmemory 48mb` (budget 4,8 Mo) restait sans réponse. Best effort (choix utilisateur) :
+    quand la suspension tomberait sur une frame `*N` incomplète en tête dont la taille
+    (`cmd::frame_need`, borne basse d'après les en-têtes reçus) dépasse 90 % du budget, elle
+    est **admise** si `registre − réutilisable de large + 2 × frame + budget d'entrée ≤
+    maxmemory` (2 × : `rx` puis la copie des arguments au découpage, avant l'admission ;
+    le budget reste aux autres) — `rx` réservé à la taille exacte d'un coup, la connexion
+    n'est plus suspendue jusqu'à la fin de la frame (`ConnIn::oversize`) ; sinon suspendue
+    et marquée `refused` : au relevé suivant, `-OOM` puis fin propre. Sans `maxmemory` :
+    toujours admise (la limite de 1 Go par connexion reste). Mesuré sous 48 Mo : 8, 10,
+    12 Mo passent (pic du registre 36–40 Mo) ; 14, 20, 60 Mo refusés en 0,1 s (pic 28 Mo).
+    Un client qui n'écrit qu'après avoir tout envoyé voit un reset, pas le `-OOM` (comme
+    Redis au-delà de `client-query-buffer-limit`). Tests `frames_larger_than_the_input_budget`,
+    `cmd::tests::frame_need_bounds_incomplete_frames`.
 
 ### 6.3 Ce qui est zero-copy, et ce qui ne l'est pas
 

@@ -662,6 +662,41 @@ pub fn frame_len(d: &[u8]) -> FrameLen {
     }
 }
 
+/// Frame RESP incomplète au début de `d` : borne basse de sa taille totale, d'après les
+/// en-têtes déjà reçus (les données des bulks ne sont pas lues). `None` : pas une frame
+/// `*N` incomplète. Sert au budget d'entrée (une frame plus grosse que lui ne peut pas
+/// attendre qu'il se libère).
+pub fn frame_need(d: &[u8]) -> Option<usize> {
+    let mut pos = 0;
+    while d[pos..].starts_with(b"\r\n") {
+        pos += 2;
+    }
+    if d.get(pos) != Some(&b'*') {
+        return None;
+    }
+    pos += 1;
+    let n = match header(d, &mut pos) {
+        Header::Num(n) if n > 0 && n <= MAX_MULTIBULK_LEN => n,
+        Header::Incomplete => return Some(d.len()),
+        _ => return None,
+    };
+    for _ in 0..n {
+        if pos >= d.len() {
+            return Some(pos.max(d.len()));
+        }
+        if d[pos] != b'$' {
+            return None;
+        }
+        pos += 1;
+        match header(d, &mut pos) {
+            Header::Num(len) if len <= MAX_BULK_LEN => pos += len + 2,
+            Header::Incomplete => return Some(d.len()),
+            _ => return None,
+        }
+    }
+    (pos > d.len()).then_some(pos)
+}
+
 // ---------------------------------------------------------------------------
 // Arguments
 // ---------------------------------------------------------------------------
@@ -1652,7 +1687,7 @@ impl<'a> Cmd<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cmd, CmdError, FrameLen, Parse, frame_len};
+    use super::{Cmd, CmdError, FrameLen, Parse, frame_len, frame_need};
 
     fn done(d: &[u8]) -> (Cmd<'_>, usize) {
         match Cmd::parse(d) {
@@ -1814,5 +1849,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Borne basse de la taille d'une frame incomplète : toujours ≤ la taille réelle,
+    /// exacte dès que le dernier en-tête est reçu ; `None` pour une frame complète.
+    #[test]
+    fn frame_need_bounds_incomplete_frames() {
+        let frame = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$10\r\n0123456789\r\n";
+        for cut in 0..frame.len() {
+            let part = &frame[..cut];
+            let need = frame_need(part);
+            if cut == 0 {
+                assert_eq!(need, None);
+                continue;
+            }
+            let need = need.unwrap_or_else(|| panic!("coupé à {cut}"));
+            assert!(need >= cut && need <= frame.len(), "coupé à {cut} : {need}");
+            if cut >= frame.len() - 12 {
+                assert_eq!(need, frame.len(), "dernier en-tête reçu à {cut}");
+            }
+        }
+        assert_eq!(frame_need(frame), None);
+        assert_eq!(frame_need(b"PING\r\n"), None);
+        assert_eq!(frame_need(b"*2\r\n$3\r\nSET\r\n$1048576\r\nxx"), Some(13 + 10 + 1048576 + 2));
     }
 }
