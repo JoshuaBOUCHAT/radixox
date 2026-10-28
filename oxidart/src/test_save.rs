@@ -898,6 +898,8 @@ fn gc_full_pass_moves_values_and_pins_shared() {
     let before: Vec<_> = (0..300).map(|i| str_ptr(&mut art, &format!("k:{i}"))).collect();
     let (hp, _) = hash_ptr(&mut art, "h", "f7");
     let held = art.get(b"k:5"); // rc == 2 pendant la passe
+    // rc == 201 : compte dans la table de débordement (MEMORY_ARCH.md §10.2 ter).
+    let held_many: Vec<_> = (0..200).map(|_| art.get(b"k:9")).collect();
     let stats0 = radixox_lib::pool::gc_stats().unwrap_or_default();
     art.gc_full_pass();
     let stats1 = radixox_lib::pool::gc_stats().unwrap_or_default();
@@ -905,7 +907,7 @@ fn gc_full_pass_moves_values_and_pins_shared() {
         let (q, w) = str_ptr(&mut art, &format!("k:{i}"));
         assert_eq!(&w, v, "k:{i} : octets");
         if cfg!(not(any(radixox_nopool, radixox_sysalloc))) {
-            assert_eq!(q == *p, i == 5, "k:{i} : déplacée sauf l'épinglée");
+            assert_eq!(q == *p, i == 5 || i == 9, "k:{i} : déplacée sauf les épinglées");
         }
     }
     assert_eq!(hash_ptr(&mut art, "h", "f7").1, b"v7");
@@ -916,6 +918,8 @@ fn gc_full_pass_moves_values_and_pins_shared() {
         assert_eq!(radixox_lib::pool::gc_stats().unwrap().marked_blocks, 0);
     }
     drop(held);
+    drop(held_many);
+    assert_eq!(radixox_lib::shared_byte::rc_overflow_stats().0, 0);
     assert!(radixox_lib::pool::verify_census(&art.gc_census()).is_ok());
 }
 

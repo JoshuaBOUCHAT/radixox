@@ -597,7 +597,8 @@ l'option des entiers, qui n'ont pas d'en-tête).
   ou la racine valart ; les champs et membres ne paient rien. Budget accepté : de l'ordre
   de 2 o par clé (« 10M clés = 20 Mio, largement respectable »).
 - **Niche de `rc`** : `rc` passe de 16 à 8 bits, les 8 bits libérés portent le compteur
-  (0 o de plus). Prérequis : **les lectures ne clonent plus** les `SharedByte`. `GET`,
+  (0 o de plus). Fait le 2026-10-28 avec une table de débordement (§10.2 ter) : plus
+  aucune hypothèse sur le nombre de détenteurs. Prérequis : **les lectures ne clonent plus** les `SharedByte`. `GET`,
   `HGET`, `MGET`, `HGETALL`… encodent depuis `&SharedByte` / `&[u8]` (on lit pour recopier
   dans la réponse puis on relâche : le clone n'apporte rien et coûte deux écritures dans
   l'en-tête par lecture — un gain en soi, éviction ou pas). Détenteurs légitimes restants :
@@ -616,6 +617,31 @@ l'option des entiers, qui n'ont pas d'en-tête).
   dans la `TaggedHiSlab` ; l'aiguille de `volatile-lfu` / `volatile-lru` / `volatile-ttl`
   ne parcourt **que les nœuds tagués**, jamais les clés sans TTL ; `volatile-ttl` lit
   l'échéance déjà dans la feuille.
+
+### 10.2 ter `rc` sur 8 bits et table de débordement (fait le 2026-10-28)
+
+Inquiétude de l'utilisateur : 8 bits de `rc` qui saturent à 255 (l'ancienne saturation à
+`u16::MAX` rendait l'objet immortel), c'est une fuite qu'on peut provoquer exprès dès qu'une
+fonction tient des valeurs (zéro copie vers la sortie ou le backlog, DURABILITY étape 8 :
+256 clients lents sur une même valeur suffisent). Aujourd'hui les lectures relâchent leur
+clone avant la commande suivante, mais c'est un invariant global que rien ne vérifie.
+
+- **En-tête à taille fixe** : `[len_lo u16][rc u8][lfu u8]`. `rc` = `0xxxxxxx` (0 à 127)
+  ou `1iiiiiii` = indice d'une case de la table, `[u32; 128]` en `static mut` (mono-thread
+  comme le pool ; `SharedByte` n'est pas `Send`). `lfu` est libre, jamais emprunté.
+- **Entrée et sortie au même seuil** : le 128e détenteur prend une case libre ; quand la
+  case redescend à 127, elle est rendue et le compte revient dans l'en-tête. Remplir la
+  table demande 128 objets tenus chacun plus de 127 fois en même temps (16 K détentions).
+- **Table pleine : `clone` copie** (objet neuf, `rc == 1`). Correct parce que les octets
+  d'un objet partagé ne changent jamais (`overwrite_from`, `to_uppercase` exigent
+  `rc == 1`) : jamais d'échec, jamais de fuite, seulement de la mémoire, déjà bornée par
+  le budget de sortie.
+- **GC** : un objet de la table a `rc > 1`, il est épinglé ; son adresse ne change pas.
+- **Chemin chaud** : un test (`< 127` au clone, bit 7 au drop), comme le `!= u16::MAX`
+  d'avant ; table et copie sur des fonctions `#[cold]`.
+- `INFO` : `mem_rc_overflow_slots`, `mem_rc_overflow_copies`. Tests :
+  `shared_byte_rc_overflow_table`, `shared_byte_rc_overflow_full_copies` (radixox-lib),
+  objet de la table épinglé dans `gc_full_pass_moves_values_and_pins_shared` (oxidart).
 
 ### 10.3 Déclenchement
 

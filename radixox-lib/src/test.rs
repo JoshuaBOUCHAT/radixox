@@ -598,14 +598,54 @@ fn cmd_invalid_returns_none() {
     assert!(matches!(Cmd::from_slice(&r), Some(Cmd::Invalid { err: CmdError::Unknown, .. })));
 }
 
-/// Au-delà de u16::MAX clones, le compteur sature : plus de libération
-/// prématurée (avant : retour à 0, use-after-free).
+/// Au-delà de 127 détenteurs, le compte passe dans la table de débordement et en
+/// revient : exact dans les deux sens, la case est rendue (MEMORY_ARCH.md §10.2 ter).
 #[test]
-fn shared_byte_rc_saturates() {
+fn shared_byte_rc_overflow_table() {
+    use crate::shared_byte::rc_overflow_stats;
+    let (used0, copies0) = rc_overflow_stats();
     let a = SharedByte::from_str("valeur partagée");
-    let clones: Vec<SharedByte> = (0..70_000).map(|_| a.clone()).collect();
-    assert_eq!(a.rc(), u16::MAX);
+    let mut clones: Vec<SharedByte> = (0..100_000).map(|_| a.clone()).collect();
+    assert_eq!(a.rc(), 100_001);
+    assert_eq!(rc_overflow_stats(), (used0 + 1, copies0));
+    assert!(clones.iter().all(|c| c.as_ptr() == a.as_ptr()), "partagé, pas copié");
+    // Va-et-vient autour du seuil.
+    clones.truncate(127);
+    assert_eq!(a.rc(), 128);
+    clones.pop();
+    assert_eq!((a.rc(), rc_overflow_stats().0), (127, used0));
+    clones.push(a.clone());
+    assert_eq!((a.rc(), rc_overflow_stats().0), (128, used0 + 1));
+    clones.pop();
+    clones.pop();
+    assert_eq!((a.rc(), rc_overflow_stats().0), (126, used0));
     drop(clones);
-    assert_eq!(a.rc(), u16::MAX);
+    assert_eq!(a.rc(), 1);
     assert_eq!(a.as_slice(), b"valeur partag\xc3\xa9e");
+}
+
+/// Table pleine (128 objets tenus chacun plus de 127 fois) : le clone suivant copie,
+/// et tout est rendu à la fin.
+#[test]
+fn shared_byte_rc_overflow_full_copies() {
+    use crate::shared_byte::rc_overflow_stats;
+    let (used0, copies0) = rc_overflow_stats();
+    assert_eq!(used0, 0);
+    let objs: Vec<SharedByte> = (0..129u32).map(|i| SharedByte::from_slice(i.to_le_bytes())).collect();
+    let mut held: Vec<SharedByte> = Vec::new();
+    for o in &objs[..128] {
+        held.extend((0..127).map(|_| o.clone()));
+    }
+    assert_eq!(rc_overflow_stats(), (128, copies0));
+    held.extend((0..126).map(|_| objs[128].clone()));
+    assert_eq!(objs[128].rc(), 127);
+    let c = objs[128].clone(); // 128e détenteur : plus de case
+    assert_eq!(rc_overflow_stats(), (128, copies0 + 1));
+    assert_ne!(c.as_ptr(), objs[128].as_ptr());
+    assert_eq!((c.rc(), objs[128].rc()), (1, 127));
+    assert_eq!(&c[..], &128u32.to_le_bytes());
+    drop(c);
+    drop(held);
+    assert_eq!(rc_overflow_stats().0, 0);
+    assert!(objs.iter().all(|o| o.rc() == 1));
 }

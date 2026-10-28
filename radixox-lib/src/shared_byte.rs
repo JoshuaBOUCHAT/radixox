@@ -10,9 +10,13 @@ use crate::prefetch::PreFetch;
 /// (l'adresse des données est toujours paire). MEMORY_ARCH.md §16.2 :
 ///
 /// ```text
-/// forme courte : [len_lo u16][rc u16][données…]              len ≤ POOL_MAX_LEN
-/// forme longue : [len_hi u16][len_lo u16][rc u16][données…]  bit 15 de len_lo = EXTERNE
+/// forme courte : [len_lo u16][rc u8][lfu u8][données…]              len ≤ POOL_MAX_LEN
+/// forme longue : [len_hi u16][len_lo u16][rc u8][lfu u8][données…]  bit 15 de len_lo = EXTERNE
 /// ```
+///
+/// `rc` (MEMORY_ARCH.md §10.2 ter) : `0xxxxxxx` = compte de 0 à 127 ; `1iiiiiii` = case
+/// `i` de la table de débordement ([`RcOverflow`]), qui tient le compte en `u32`. `lfu`
+/// est réservé au compteur d'éviction (§10.2 bis), à 0 tant que rien ne l'écrit.
 ///
 /// La forme longue est allouée par `external` (allocateur des grands objets, MEMORY_ARCH §18) ; la courte par le pool
 /// ([`crate::pool`]) par défaut, par la libc sous `--cfg radixox_nopool` ou
@@ -31,9 +35,10 @@ impl SharedByte {
     /// 2³¹ − 1 : `len_hi` porte 16 bits, `len_lo` 15.
     pub const MAX_LEN: usize = (1 << 31) - 1;
 
+    /// Octet `rc` (le premier du `u16` qui précède les données ; `lfu` est le second).
     #[inline]
-    fn rc_ptr(&self) -> *mut u16 {
-        unsafe { (self.ptr.as_ptr() as *mut u16).sub(1) }
+    fn rc_ptr(&self) -> *mut u8 {
+        unsafe { self.ptr.as_ptr().sub(2) }
     }
 
     #[inline]
@@ -70,7 +75,8 @@ impl SharedByte {
                 (base as *mut u16).add(1).write(Self::EXTERNAL | (len as u16 & 0x7FFF));
                 base.add(Self::LONG_HEADER)
             };
-            (data as *mut u16).sub(1).write(1);
+            data.sub(2).write(1); // rc
+            data.sub(1).write(0); // lfu
             Self { ptr: NonNull::new_unchecked(data) }
         }
     }
@@ -222,8 +228,54 @@ impl SharedByte {
         std::str::from_utf8(self.as_slice())
     }
 
-    pub fn rc(&self) -> u16 {
-        unsafe { self.rc_ptr().read() }
+    /// Nombre de détenteurs, table de débordement comprise.
+    pub fn rc(&self) -> u32 {
+        let b = unsafe { self.rc_ptr().read() };
+        if b & RC_TABLE == 0 { b as u32 } else { unsafe { RC_OVERFLOW.counts[(b & !RC_TABLE) as usize] } }
+    }
+
+    /// `clone` au-delà de 127 détenteurs : entrée dans la table, ou case déjà prise.
+    /// Table pleine : copie profonde, un objet neuf à `rc == 1` (les octets d'un objet
+    /// partagé ne changent jamais : `overwrite_from` et `to_uppercase` exigent `rc == 1`).
+    #[cold]
+    #[inline(never)]
+    fn clone_overflow(&self) -> Self {
+        unsafe {
+            let rc = self.rc_ptr();
+            let t = &mut *std::ptr::addr_of_mut!(RC_OVERFLOW);
+            let b = *rc;
+            if b & RC_TABLE != 0 {
+                // 2³² détenteurs = 32 Gio de pointeurs : pas atteignable.
+                t.counts[(b & !RC_TABLE) as usize] += 1;
+            } else {
+                let Some(i) = t.counts.iter().position(|&c| c == 0) else {
+                    t.copies += 1;
+                    return Self::copy_of(self, self.is_external());
+                };
+                t.counts[i] = RC_INLINE_MAX as u32 + 1;
+                t.used += 1;
+                *rc = RC_TABLE | i as u8;
+            }
+            Self { ptr: self.ptr }
+        }
+    }
+
+    /// `drop` d'un objet de la table : à 127 détenteurs, la case est rendue et le compte
+    /// revient dans l'en-tête (même seuil qu'à l'entrée).
+    #[cold]
+    #[inline(never)]
+    fn drop_overflow(&self) {
+        unsafe {
+            let rc = self.rc_ptr();
+            let t = &mut *std::ptr::addr_of_mut!(RC_OVERFLOW);
+            let i = (*rc & !RC_TABLE) as usize;
+            t.counts[i] -= 1;
+            if t.counts[i] == RC_INLINE_MAX as u32 {
+                t.counts[i] = 0;
+                t.used -= 1;
+                *rc = RC_INLINE_MAX;
+            }
+        }
     }
 
     /// Uppercases the bytes in-place if `rc == 1`, otherwise allocates a new
@@ -270,17 +322,14 @@ impl SharedByte {
 impl Clone for SharedByte {
     #[inline]
     fn clone(&self) -> Self {
-        // Saturation (comme les refcount du noyau) : à u16::MAX le compteur
-        // ne bouge plus et le bloc n'est jamais libéré. Une fuite plutôt
-        // qu'un use-after-free si une valeur est clonée plus de 65 535 fois.
         unsafe {
             let rc = self.rc_ptr();
-            if *rc != u16::MAX {
+            if *rc < RC_INLINE_MAX {
                 *rc += 1;
+                return Self { ptr: self.ptr };
             }
         }
-
-        Self { ptr: self.ptr }
+        self.clone_overflow()
     }
 }
 
@@ -289,14 +338,40 @@ impl Drop for SharedByte {
     fn drop(&mut self) {
         unsafe {
             let rc = self.rc_ptr();
-            if *rc == u16::MAX {
-                return; // saturé : immortel
+            if *rc & RC_TABLE != 0 {
+                return self.drop_overflow();
             }
             *rc -= 1;
             if *rc == 0 {
                 self.dealloc();
             }
         }
+    }
+}
+
+/// Bit de l'octet `rc` : les 7 autres sont l'indice d'une case de la table.
+const RC_TABLE: u8 = 0x80;
+/// Plus grand compte tenu dans l'en-tête.
+const RC_INLINE_MAX: u8 = 127;
+
+/// Table de débordement des compteurs (MEMORY_ARCH.md §10.2 ter) : 128 cases, une par
+/// objet tenu plus de 127 fois. La remplir demande 128 × 128 détentions simultanées ;
+/// pleine, `clone` copie au lieu de partager — jamais d'échec, jamais de fuite.
+/// Mono-thread comme le pool : `SharedByte` n'est pas `Send`.
+struct RcOverflow {
+    /// 0 = case libre.
+    counts: [u32; 128],
+    used: u32,
+    copies: u64,
+}
+
+static mut RC_OVERFLOW: RcOverflow = RcOverflow { counts: [0; 128], used: 0, copies: 0 };
+
+/// `INFO` : (cases occupées, copies faites faute de case).
+pub fn rc_overflow_stats() -> (u32, u64) {
+    unsafe {
+        let t = &*std::ptr::addr_of!(RC_OVERFLOW);
+        (t.used, t.copies)
     }
 }
 

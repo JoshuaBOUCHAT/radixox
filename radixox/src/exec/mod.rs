@@ -534,6 +534,9 @@ pub fn info_memory(out: &mut String, gc_enabled: bool, gc_running: bool, gc_max_
             g.marked_blocks,
         );
     }
+    // Compteurs au-delà de 127 détenteurs (MEMORY_ARCH.md §10.2 ter).
+    let (slots, copies) = radixox_lib::shared_byte::rc_overflow_stats();
+    let _ = write!(out, "mem_rc_overflow_slots:{slots}\r\nmem_rc_overflow_copies:{copies}\r\n");
 }
 
 /// Total résident compté, contre le RSS du processus (MEMORY_ARCH.md §10.1) : pages

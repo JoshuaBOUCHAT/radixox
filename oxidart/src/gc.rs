@@ -261,7 +261,7 @@ impl OxidArt {
 
     /// Audit d'unicité (MEMORY_ARCH.md §15, §16.9) : hors save, chaque `SharedByte` de
     /// l'arbre a `rc == 1`. Rend ceux qui ne l'ont pas (slab, octets, rc), pour le message.
-    pub fn gc_audit_unique(&mut self) -> Vec<(&'static str, Vec<u8>, u16)> {
+    pub fn gc_audit_unique(&mut self) -> Vec<(&'static str, Vec<u8>, u32)> {
         let mut shared = Vec::new();
         // Les images d'une save tiennent des clones, encore après `end_save` tant que
         // `drain_deferred` n'a pas vidé leurs feuilles : partage légitime, temporaire.
