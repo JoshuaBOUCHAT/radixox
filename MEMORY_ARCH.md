@@ -819,6 +819,26 @@ est résident après coup ; pour refuser avant, il faut compter avant que les pa
     sans, 1 640–1 824 avec, dérive de ±8 % entre passages, gouverneur `powersave`) ; sans la
     feature, rien n'est écrit à la lecture. Tests : `lru_and_lfu_spare_read_keys`,
     `lru_keeps_hot_keys` (intégration, 900+ clés chaudes sur 1 000 gardées).
+- **`KEYS` trop gros** (2026-10-28) : au-delà de la limite de sortie du client, le job
+  s'arrête pendant la construction, rend son `BigBuf` aussitôt et répond `-ERR reply
+  exceeds output limit, use SCAN` (rien n'était parti : `*N` est écrit à la fin) ; avant,
+  la réponse était construite en entier puis la connexion fermée. Test :
+  `keys_too_big_is_an_error_not_a_close`.
+- **Audit des temporaires et grosses réponses** (2026-10-28) :
+
+  | commande | aujourd'hui | borné ? |
+  |---|---|---|
+  | `GET` & co. d'une grande valeur | envoyée depuis l'arbre (§6.2 quater) | oui, sans mémoire |
+  | `LRANGE`, `ZRANGE` (et variantes) | job par tranches au-delà de 8 192 éléments | oui |
+  | `KEYS`, `SCAN`, `ZSCAN` | `BigBuf` sous la limite / pages | oui |
+  | écritures (`Z*STORE` compris) | réservation avant exécution | oui (estimation pour `Z*STORE`) |
+  | `HGETALL`, `HKEYS`, `HVALS`, `SMEMBERS` | réponse entière dans `out` en une commande | **non** : une grosse collection dépasse le plafond de sortie le temps d'une commande |
+  | `ZUNION` / `ZINTER` / `ZDIFF` (sans `STORE`), `MGET` de grosses valeurs | `Vec` temporaire / `out` | **non**, même raison |
+
+  Reste : faire passer les lectures de collection entières par le mécanisme des jobs de
+  plage (taille connue d'avance : `HLEN`, `SCARD` → `*N` puis tranches), et les opérations
+  d'ensemble de ZSet sans `STORE` par un job ou une réservation sur le budget de sortie.
+  Aucune éviction pour un temporaire (décision §10.5).
   - tests : `tests/maxmemory.rs` (`eviction_keeps_writes_going_under_the_limit`).
 
 ### 10.3 Déclenchement

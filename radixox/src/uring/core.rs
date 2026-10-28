@@ -737,6 +737,7 @@ pub struct Core {
 
 impl Core {
     pub fn new(cfg: Config, art: OxidArt) -> Self {
+        crate::exec::jobs::set_keys_limit(cfg.client_output_limit);
         let n = cfg.max_conn as usize;
         let now = Instant::now();
         let mut timers = BinaryHeap::new();

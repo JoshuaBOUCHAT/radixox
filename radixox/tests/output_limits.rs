@@ -83,3 +83,23 @@ fn output_budget_pauses_without_closing() {
     assert_eq!(info_field(&mut c, "client_output_limit_closed"), 0);
     let _ = redis::cmd("SHUTDOWN").arg("NOSAVE").query::<()>(&mut c);
 }
+
+/// KEYS dont la réponse dépasse la limite de sortie : une erreur, pas une fermeture
+/// (rien n'est encore parti), et la connexion reste utilisable.
+#[test]
+fn keys_too_big_is_an_error_not_a_close() {
+    const PORT: u16 = 16413;
+    common::start_server_env(PORT, &[("RADIXOX_CLIENT_OUTPUT_LIMIT_MB", "1")]);
+    let mut c = common::conn(PORT);
+    let mut p = redis::pipe();
+    for i in 0..40_000 {
+        p.cmd("SET").arg(format!("some:long:key:name:{i:08}")).arg("v").ignore();
+    }
+    p.query::<()>(&mut c).unwrap();
+    let r: redis::RedisResult<Vec<String>> = redis::cmd("KEYS").arg("*").query(&mut c);
+    let e = r.expect_err("réponse > 1 Mo : erreur attendue");
+    assert!(e.to_string().contains("use SCAN"), "{e}");
+    let small: Vec<String> = redis::cmd("KEYS").arg("some:long:key:name:0000000*").query(&mut c).unwrap();
+    assert_eq!(small.len(), 10);
+    let _ = redis::cmd("SHUTDOWN").arg("NOSAVE").query::<()>(&mut c);
+}

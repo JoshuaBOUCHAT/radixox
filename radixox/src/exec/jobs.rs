@@ -42,8 +42,22 @@ impl Step {
 /// motif, reprise sur la dernière clé examinée (une clé reste une question
 /// valide même si l'arbre a changé entre deux tranches, comme SCAN).
 /// Résultat « au mieux », comme le KEYS de Redis découpé.
+/// Taille au-delà de laquelle une réponse de KEYS est abandonnée (MEMORY_ARCH.md §10.5) :
+/// la limite de sortie d'un client, fixée par le cœur. En RESP2, `*N` part avant la première
+/// clé : la réponse est tenue en entier jusqu'au bout, rien n'est encore parti.
+static KEYS_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+pub fn set_keys_limit(bytes: usize) {
+    KEYS_LIMIT.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Réponse d'un KEYS trop gros.
+const KEYS_TOO_BIG: &[u8] = b"-ERR reply exceeds output limit, use SCAN\r\n";
+
 pub struct KeysJob {
     pattern: SharedByte,
+    /// Réponse abandonnée (au-delà de [`KEYS_LIMIT`]) : l'erreur à la place.
+    too_big: bool,
     /// Reprendre strictement après cette clé ; `None` au départ.
     from: Option<Vec<u8>>,
     /// Réponse : `HEADER_ROOM` octets réservés, puis les clés en bulk strings ;
@@ -57,7 +71,7 @@ impl KeysJob {
     pub fn new(pattern: SharedByte) -> Self {
         let mut out = BigBuf::new();
         out.extend_from_slice(&[0; HEADER_ROOM]);
-        Self { pattern, from: None, out, count: 0, done: false }
+        Self { pattern, too_big: false, from: None, out, count: 0, done: false }
     }
 
     pub fn step(&mut self, art: &mut OxidArt, budget: usize) -> Step {
@@ -90,11 +104,20 @@ impl KeysJob {
         self.count += page.len();
         self.from = page.next;
         self.done = self.from.is_none();
+        if self.out.len() > KEYS_LIMIT.load(std::sync::atomic::Ordering::Relaxed) {
+            // rendu tout de suite : la mémoire ne reste pas tenue jusqu'à l'envoi
+            self.out = BigBuf::new();
+            self.too_big = true;
+            self.done = true;
+        }
         Step::from_done(self.done)
     }
 
     /// Réponse complète (tableau RESP), à appeler une fois le job terminé.
     pub fn response(&mut self) -> &[u8] {
+        if self.too_big {
+            return KEYS_TOO_BIG;
+        }
         let start = write_header(self.out.as_mut_slice(), self.count);
         &self.out.as_slice()[start..]
     }
@@ -102,6 +125,11 @@ impl KeysJob {
     /// Réponse complète, sans copie : le tampon et le début de la réponse dedans
     /// (après la place non utilisée de l'en-tête).
     pub fn into_response(mut self) -> (BigBuf, usize) {
+        if self.too_big {
+            let mut b = BigBuf::new();
+            b.extend_from_slice(KEYS_TOO_BIG);
+            return (b, 0);
+        }
         let start = write_header(self.out.as_mut_slice(), self.count);
         (self.out, start)
     }
