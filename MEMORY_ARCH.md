@@ -1669,6 +1669,79 @@ au bout de 16 s, seul le pool baisse). Recensement des tailles (test temporaire)
 - Mesure (scénario uuid de §17) : arène mimalloc **< 1 Mo**, RSS chargé **118 Mo**, après
   suppression de la moitié **90 Mo** au bout de 16 s (pool 66 → 38 Mo).
 
+### 17.2 ter Débordements à taille fixe par forme (spec 2026-10-28, à valider, à implémenter sur `main`)
+
+**Constat.** Le modèle voulu par l'utilisateur depuis le nœud de 128 o (2026-10-16) : la
+capacité d'une forme se compte en **cellules de 8 o** (une cellule = un `ValUnion`, un TTL,
+un suffixe `CompactPath`, ou deux idx d'enfant de 4 o), comme le corps du nœud ; le bloc de
+débordement (`node.ptr`, appelé « page » dans le code) a **une taille fixe par forme** et
+**pas d'en-tête** : les métadonnées en plus (radix, tags) sont prises sur le corps du nœud.
+Le code a dérivé pendant v2 (`c99018f`, 2026-10-17), sans décision de l'utilisateur :
+`Overflow8` compté en *entrées* (8 de plus), en-tête de 16 o (radixs + tags des entrées
+9–16) **dans le bloc**, et bloc de taille `alloc_class(16 + enfants + feuilles)` réalloué à
+chaque classe franchie (`page_grow`, `page_trim` sous ¾). `Wide32` a déjà un bloc sans
+en-tête, mais de taille variable aussi.
+
+**Coût mesuré du modèle dérivé** (`main` c096419, serveur réel, 1M clés UUID, juste après le
+chargement) : pool vivant 78,1 Mo, tenu 93,5 Mo → **15,4 Mo de trous** (fragmentation
+0,16) ; le GC les rebouche en 3 passes (182 000 objets, 9,8 Mo déplacés). Pendant un
+chargement pur aucune valeur n'est libérée : les trous sont ceux des objets de structure,
+surtout des blocs de nœud qui grossissent (le pool est bump + compteur par bloc de 64 Kio,
+§6 : un trou n'est réutilisé qu'au bloc vide ou après évacuation).
+
+**Layout cible** (nœud de 128 o inchangé ; ligne 1 inchangée sauf `pg_block8`) :
+
+| forme | entrées | ligne 1 (métadonnées) | ligne 2 (64 o) | bloc externe |
+|---|---|---|---|---|
+| `Inline` | ≤ 8 | `radixs[8]`, `tags[8]`, maps u16 | 8 cellules (64 o) | aucun (`ptr` = `TRASH`) |
+| `Overflow8` | ≤ 16 | `radixs[0..8]`, `tags[0..8]`, maps u16 (16 entrées) | `[0..8]` radixs 8–15, `[8..16]` tags 8–15, puis **6 cellules** (48 o) | **64 o fixes, que des cellules** (8) |
+| `Wide32` | ≤ 32 | maps u32 ×3 (union `keys`) | bitmap 256 bits + `tags[32]` (comme aujourd'hui) | **256 o fixes, que des cellules** (32) |
+| `Wide256` | ≤ 256 | — | bitmap 256 bits | **à trancher** (voir plus bas) |
+
+- `Overflow8` : deux segments, nœud (≤ 8 entrées, cap 48 o) puis bloc (≤ 8 entrées, cap
+  64 o), placement canonique inchangé (`plan` : plus long préfixe d'entrées qui tient dans le
+  nœud, le reste dans le bloc). Capacité en feuilles à suffixe (16 o) : 3 + 4 = 7 (contre
+  4 + 8 aujourd'hui) ; en enfants (4 o) : 16 ; en feuilles nues (8 o) : 6 + 8 = 14.
+- **Recherche** : les radixs des entrées 9–16 sont en ligne 2, déjà préchargée avec le nœud
+  (`prefetch_body`) ; `search_needs_page` et l'étape AMAC `PageSearch` disparaissent, seule
+  la cellule d'une entrée du bloc demande un préchargement (`Entry`, 64 o = une ligne).
+- **Montées** : `Inline → Overflow8` à la 9ᵉ entrée ou au-delà de 64 o de cellules ;
+  `Overflow8 → Wide32` au-delà de 16 entrées ou si `plan(48, 64)` échoue ; `Wide32 → Wide256`
+  au-delà de 32 entrées ou de 256 o de cellules.
+- **Descentes** (hystérésis, comme aujourd'hui) : `Wide256 → Wide32` à ≤ 24 entrées si ça
+  tient en 256 o ; `Wide32 → Overflow8` à ≤ 12 entrées si `plan(48, 64)` tient ;
+  `Overflow8 → Inline` quand tout tient en 64 o avec une marge (à fixer, par ex. ≤ 6 entrées
+  et ≤ 48 o) pour ne pas osciller au bord.
+- **Allocation** : un bloc est alloué **une fois**, au changement de forme, et libéré à la
+  descente ; jamais réalloué pendant la croissance. `pg_block8` devient inutile pour
+  `Overflow8` / `Wide32` (taille donnée par la forme). Étape 1 : `pool::struct_alloc(64)` et
+  `(256)` (bump, alignés sur 8). Étape 2 (idée de l'utilisateur) : **slab dédié à deux classes**
+  (64 o et 256 o), blocs de 64 Kio pris dans les pages de 2 Mio du registre, **bitset
+  d'occupation hors bloc** (table indexée par numéro de bloc, comme `live` / `open` du pool),
+  recherche d'une case libre en 2 chargements AVX-512 (Zen 4 : avx512f/bw ; repli scalaire
+  BMI sur 16 mots), **libération typée O(1)** (bloc = `ptr & !0xFFFF`, case = `(ptr >> 6) &
+  1023`, le nœud sait que c'est un bloc de nœud et sa forme), blocs alignés sur 64 o
+  (une ligne pour `Overflow8`), octets libres comptés réutilisables pour `maxmemory` (O(1)).
+- **`Wide256`** (bitmap dans le nœud ; maps 3 × 256 bits + `tags[256]` ≈ 352 o + jusqu'à 256
+  entrées ne tiennent pas dans 128 o) : seul cas où un en-tête de bloc est inévitable. Options
+  à trancher par l'utilisateur : (a) bloc fixe (par ex. 4 Kio : 352 o d'en-tête + 468
+  cellules), (b) garder un bloc variable pour cette seule forme (rare : il faut > 32 entrées
+  dans un nœud ; jamais sous un alphabet hexadécimal ou décimal, seulement près de la racine
+  ou sur des clés binaires).
+- **Inchangé** : format des feuilles `[sfx?][ttl?][val]` et des cellules `[idx… | libre |
+  …feuilles]`, adressage par rang (popcount des maps), format du dump (la save ne parcourt
+  que `node.iter()`), visite du GC (`page_mut` : bloc de taille fixe, déplaçable tant qu'il
+  est dans le pool).
+- **Renommage proposé** : « page » → « débordement » (`ovf_*`) : « page » désigne aussi les
+  pages de 2 Mio de l'allocateur.
+- **À mesurer** (`tree_bench mem` avec octets vivants, serveur réel avec GC, comme §17.2 ter
+  constat) : o/clé (cellules vides des blocs fixes contre l'arrondi actuel), trous après
+  chargement, déplacements du GC, plus longue tranche de GC, débit de chargement et de lecture.
+- **Ordre** : (1) validation de ce layout (et de `Wide256`) par l'utilisateur ; (2) formes à
+  blocs fixes sur `main`, oracle `oxidart-legacy` + `test_diff` ; (3) slab à deux classes ;
+  (4) mesures ; (5) seulement ensuite, rebaser l'essai des groupes de collision
+  (branche `linear-small`).
+
 ### 17.4 Petits blocs Hash/Set et débordements valart (fait, branche `pool-structures`)
 
 - `small.rs` : `struct_alloc` / `struct_free` (taille `8 + cap × W × 8`, déjà multiple de
