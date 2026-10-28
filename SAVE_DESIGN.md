@@ -537,3 +537,22 @@ Calquées sur Valkey (`save`, `stop-writes-on-bgsave-error`, `LASTSAVE`, `INFO p
 - Pas fait : `CONFIG GET/SET save` (pas de commande CONFIG), `BGSAVE SCHEDULE`, `rdb_last_cow_size`
   (toujours 0 ici).
 
+
+
+## Une save à la fois par processus ; arbre détruit pendant une save (2026-10-28)
+
+Les slabs de valart, des ZSet et des List sont **globaux** : leur état de save est celui du
+processus, pas d'un arbre. Avec plusieurs arbres dans un processus (tests du faux noyau à
+plusieurs nœuds, `URING_SEEDS=3000`), trois défauts se cachaient :
+
+- **Arbre détruit pendant une save** : l'état « save en cours » des slabs globaux lui
+  survivait, et toutes les saves suivantes tombaient (« vidage pendant une save », 10 tests
+  en cascade). `impl Drop for OxidArt` termine sa save et vide une fois.
+- **Vidage des différés pendant la save d'un autre arbre** : `drain_deferred` attend
+  désormais qu'aucune save globale ne soit active (ses images peuvent encore lire ce qui
+  est différé).
+- **Deux saves simultanées** : `OxidArt::save_busy()` (cet arbre ou un slab global en save) ;
+  `BgSave::start` et la save synchrone refusent alors (« Background save already in
+  progress »), comme Redis. Pour un seul arbre (production), rien ne change.
+
+Passe longue `URING_SEEDS=3000 cargo test -p radixox --lib` : 75/75 (avant : 5 à 10 échecs).

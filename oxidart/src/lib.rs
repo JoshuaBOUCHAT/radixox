@@ -175,6 +175,19 @@ pub struct OxidArt {
     _live: gc::LiveTree,
 }
 
+/// Un arbre détruit pendant une save (tests ; jamais en production) la termine : les slabs
+/// de valart, des ZSet et des List sont globaux, leur état de save survivrait à l'arbre et
+/// ferait échouer la save suivante d'un autre arbre (« vidage pendant une save »).
+impl Drop for OxidArt {
+    fn drop(&mut self) {
+        if self.is_saving() {
+            self.end_save();
+        }
+        // une passe : ce qui reste (save d'un autre arbre en cours) sera vidé par lui
+        let _ = self.drain_deferred(u32::MAX);
+    }
+}
+
 impl Default for OxidArt {
     fn default() -> Self {
         Self::new()
@@ -372,6 +385,13 @@ impl OxidArt {
         self.save.barrier.is_active()
     }
 
+    /// Une save tient les slabs globaux (ZSet, List, valart) : celle de cet arbre, ou celle
+    /// d'un autre arbre du processus (tests à plusieurs nœuds). Une seule save à la fois
+    /// par processus, comme Redis : la suivante attend.
+    pub fn save_busy(&self) -> bool {
+        self.is_saving() || zset::save::is_saving() || list::save::is_saving() || valart().is_saving()
+    }
+
     /// Démarre une save : fige la vue T0 (bitmap de présence d'oxidart et
     /// de valart).
     pub fn begin_save(&mut self) {
@@ -412,6 +432,12 @@ impl OxidArt {
     pub fn drain_deferred(&mut self, budget: u32) -> bool {
         let rest = self.save.drain_leftover(budget);
         if !self.save.leftover.is_empty() {
+            return false;
+        }
+        // Slabs globaux (ZSet, List, valart) : une save active est celle d'un autre arbre du
+        // processus (tests à plusieurs nœuds) ; ses images peuvent encore lire ce qui est
+        // différé. On attend sa fin.
+        if zset::save::is_saving() || list::save::is_saving() || valart().is_saving() {
             return false;
         }
         let rest = zset::save::drain_step(rest);

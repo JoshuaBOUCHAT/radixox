@@ -97,7 +97,7 @@ pub fn save_sync(art: &mut OxidArt, level: Option<i32>) -> io::Result<SyncStats>
 /// [`save_sync`] vers `to`.
 pub fn save_sync_to(art: &mut OxidArt, level: Option<i32>, to: &Target) -> io::Result<SyncStats> {
     use std::io::Write;
-    if art.is_saving() {
+    if art.save_busy() {
         return Err(io::Error::other("Background save already in progress"));
     }
     let start = Instant::now();

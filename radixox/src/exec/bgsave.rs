@@ -155,6 +155,9 @@ impl BgSave {
     /// Ouvre la barrière de save ; le fichier temporaire de `target` est créé
     /// hors de la boucle ([`take_fs`](Self::take_fs)).
     pub fn start(art: &mut OxidArt, zstd: Option<ZstdConf>, target: Target) -> io::Result<Self> {
+        if art.save_busy() {
+            return Err(io::Error::other("Background save already in progress"));
+        }
         let t0 = Instant::now();
         let mut create = FsTask::new();
         create.open(&target.dir.join(&target.tmp), libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644);
