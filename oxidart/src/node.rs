@@ -68,6 +68,30 @@ pub(crate) fn alloc_class(size: usize) -> usize {
     words.div_ceil(step) * step * 8
 }
 
+/// Capacité de données d'une page de nœud (hors en-tête), en cellules de 8 o :
+/// 2, 4, 6, 8, 12, 16, 24, 32, 48… (deux classes par doublement après 4). Pas de
+/// classe 1 : une étape de réallocation de moins, pour ~11 Ko sur 1M UUID
+/// (MEMORY_ARCH.md §17.2 ter). Rend des octets.
+pub(crate) fn cell_class(bytes: usize) -> usize {
+    let cells = bytes.div_ceil(8);
+    if cells == 0 {
+        return 0;
+    }
+    if cells <= 2 {
+        return 16;
+    }
+    let cells = cells.max(4);
+    let b = usize::BITS - 1 - (cells - 1).leading_zeros();
+    let step = 1usize << (b - 1);
+    cells.div_ceil(step) * step * 8
+}
+
+/// Réduire une zone de données de `cap` octets pour un besoin `data` ? Seulement si
+/// le besoin, majoré d'un quart (hystérésis), tient dans une classe plus petite.
+fn cell_should_shrink(data: usize, cap: usize) -> bool {
+    cell_class(data + data / 4) < cap
+}
+
 #[inline]
 fn round8(n: usize) -> usize {
     n.div_ceil(8) * 8
@@ -1288,10 +1312,11 @@ impl Node {
         self.pg_block8 = (new_block / 8) as u16;
     }
 
-    /// Garantit un bloc d'au moins `need` octets (classe de taille).
-    fn page_grow(&mut self, need: usize) {
-        if need > self.block() {
-            self.page_resize(alloc_class(need));
+    /// Garantit un bloc d'au moins `header + data` octets : en-tête plus une classe
+    /// de cellules pour les données.
+    fn page_grow(&mut self, header: usize, data: usize) {
+        if header + data > self.block() {
+            self.page_resize(header + cell_class(data));
         }
     }
 
@@ -1307,9 +1332,9 @@ impl Node {
             self.kind = Kind::Inline;
             return;
         }
-        let need = alloc_class(self.page_header() + kids + leaves);
-        if need * 4 <= self.block() * 3 {
-            self.page_resize(need);
+        let header = self.page_header();
+        if cell_should_shrink(kids + leaves, self.block() - header) {
+            self.page_resize(header + cell_class(kids + leaves));
         }
     }
 
@@ -1402,7 +1427,7 @@ impl Node {
             return false;
         }
         let (kids, leaves) = self.page_usage();
-        self.page_grow(SMALL_PAGE_HEADER + kids + leaves + size);
+        self.page_grow(SMALL_PAGE_HEADER, kids + leaves + size);
         self.kind = Kind::Overflow8;
         true
     }
@@ -1437,7 +1462,7 @@ impl Node {
 
     fn wide32_insert_at(&mut self, e: usize, raw: &Raw) {
         let (kids, leaves) = self.page_usage();
-        self.page_grow(kids + leaves + raw.size());
+        self.page_grow(0, kids + leaves + raw.size());
         unsafe {
             let mut seg = Self::wide32_seg_raw(self);
             seg.insert(e, raw);
@@ -1466,7 +1491,7 @@ impl Node {
         let n = self.len();
         let (tags_old, tags_new) = (round8(n), round8(n + 1));
         let (kids, leaves) = self.page_usage();
-        self.page_grow(WIDE_MAPS + tags_new + kids + leaves + raw.size());
+        self.page_grow(WIDE_MAPS + tags_new, kids + leaves + raw.size());
         unsafe {
             if tags_new > tags_old {
                 // la zone de tags gagne 8 o : les enfants glissent à droite
@@ -1569,7 +1594,7 @@ impl Node {
                         tags: [Tag::None; WIDE32_MAX],
                     },
                 };
-                self.page_grow(cells);
+                self.page_grow(0, cells);
                 for (e, raw) in raws.iter().enumerate() {
                     self.wide32_insert_at(e, raw);
                 }
@@ -1583,7 +1608,7 @@ impl Node {
                         tags: [Tag::None; WIDE32_MAX],
                     },
                 };
-                self.page_grow(WIDE_MAPS + round8(raws.len()) + cells);
+                self.page_grow(WIDE_MAPS + round8(raws.len()), cells);
                 unsafe { ptr::write_bytes(self.ptr.as_ptr(), 0, WIDE_MAPS) };
                 for (e, raw) in raws.iter().enumerate() {
                     self.wide256_insert_at(e, raw);
@@ -1721,10 +1746,15 @@ impl Node {
         assert_eq!(self.ptr == trash(), self.pg_block8 == 0);
         let (kids, leaves) = self.page_usage();
         if self.pg_block8 > 0 {
-            let need = self.page_header() + kids + leaves;
-            assert!(need <= self.block(), "page trop petite");
-            assert_eq!(self.block(), alloc_class(self.block()), "bloc hors classe");
-            assert!(alloc_class(need) * 4 > self.block() * 3, "page non réduite");
+            let header = self.page_header();
+            let cap = self.block() - header;
+            assert!(kids + leaves <= cap, "page trop petite");
+            // en Wide256 l'en-tête suit le nombre d'entrées : la zone de données n'est
+            // une classe qu'à l'allocation
+            if self.kind != Kind::Wide256 {
+                assert_eq!(cap, cell_class(cap), "bloc hors classe");
+            }
+            assert!(!cell_should_shrink(kids + leaves, cap), "page non réduite");
         }
         let check_tags = |tags: *const Tag, c: &dyn Fn(usize) -> bool, i: usize| {
             let tag = unsafe { *tags.add(i) };
