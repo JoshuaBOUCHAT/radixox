@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["radixox", "oxidart", "oxidart-legacy", "radixox-lib", "valart"]
+# `cargo build` / `cargo test` sans `-p` : sans oxidart-legacy (oracle des tests différentiels,
+# tiré en dépendance de dev par oxidart ; `--workspace` pour l'inclure).
+default-members = ["radixox", "oxidart", "radixox-lib", "valart"]
 
 [workspace.package]
 version = "0.6.0"
