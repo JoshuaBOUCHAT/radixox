@@ -78,7 +78,20 @@ rustup target add x86_64-unknown-linux-musl
 RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -p radixox \
   --target x86_64-unknown-linux-musl --target-dir target/portable
 # → target/portable/x86_64-unknown-linux-musl/release/radixox
+
+# static without any libc (no glibc, no musl; non-PIE, ~2.3 MB), same CPU level
+RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -p radixox --no-default-features \
+  --features nostd-bin --bin radixox-nostd --target-dir target/portable
+# → target/portable/release/radixox-nostd
 ```
+
+`radixox-nostd` is the same server built `#![no_std]`: its own `_start`, system calls
+through `rustix`, its own `io_uring` ring, `memcpy` & co. in Rust (`radixox-mem`), zstd
+linked as C on RadixOx's allocator. It passes the whole integration suite
+(`RADIXOX_TEST_BIN=…/radixox-nostd cargo test -p radixox`). Differences: replication
+targets must be IP addresses or `localhost` (no DNS resolver), a second SIGINT / SIGTERM
+during the shutdown save kills the process by the signal's default action (instead of
+`_exit(130)`), and the binary is not position independent (no ASLR of the executable).
 
 `x86-64-v2` (SSE4.2) or plain `x86-64` also build, for older machines; the SIMD paths then
 fall back to scalar code. The static binary still uses RadixOx's own allocator (it
@@ -92,12 +105,16 @@ the server, 3 alternated runs, 2026-10-29):
 | `native`, glibc | 277 k ops/s | 3.10 M ops/s |
 | `x86-64-v3`, glibc | 279 k ops/s | **3.17 M ops/s** |
 | `x86-64-v3`, musl static | 278 k ops/s | 2.74 M ops/s (−13 %) |
+| `x86-64-v3`, no libc (`radixox-nostd`) | 286 k ops/s | 3.20 M ops/s |
 
 - `x86-64-v3` costs nothing here: the AVX-512 paths do not pay on these workloads.
 - musl costs 13 % under pipelining and nothing without: pipelining is where the server's
   own CPU work dominates, while without it the network round trip hides the difference.
   The likely cause is musl's slower `memcpy` / `memcmp` (the allocator is ours in both
   builds); not profiled yet.
+- Without any libc, nothing is lost (against `x86-64-v3` glibc measured the same day:
+  282 k / 3.25 M, within noise), and the resident memory is 2.3 MB lower (7.4 MB idle
+  instead of 9.7 MB).
 
 ## What Redis doesn't have
 

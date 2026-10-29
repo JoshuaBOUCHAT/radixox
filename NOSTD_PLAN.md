@@ -1,5 +1,9 @@
 # Binaire RadixOx sans `std` ni libc — plan de travail
 
+> **ÉTAT (2026-10-29) : FAIT.** Les quatre étapes sont faites, les cinq critères du §0 sont
+> remplis (§8). Le binaire glibc `radixox` reste construit à côté ; le retirer est une
+> décision de l'utilisateur.
+
 Document de passation (2026-10-29) : de quoi reprendre le chantier sans autre contexte.
 Lire d'abord `CLAUDE.md` et `ARCHITECTURE.md`, puis `RUNTIME_ARCH.md` (boucle io_uring)
 avant l'étape 2.
@@ -35,7 +39,8 @@ Tout est sur `main`, poussé :
 | `b234635` | étape 1, 1/3 : `sys::Instant` partout, environnement par `sys::env` (`persist::set_save_dir` pour les tests), `thread_local!` → statics `Mono<Cell / RefCell>` (`crate::mono`), `tsc` sur `sys::Once`, `hashbrown` |
 | `8b2a70c` | étape 1, 2/3 : `crate::fs` (rustix, chemins `&str` / `String`, `OwnedFd`) et `crate::Error` ; `sys::OsError` (textes glibc), `sys::exit`, `rx_println!` ; oxidart : `LoadError::Os`, `Source` exporté, `load_file` sur `Source`, `compress` sous la feature `zstd` (sans `std`) |
 | `4a40240` | étape 1, 3/3 : crate `radixox` (lib) `#![no_std]` + `alloc` : feature `std` par défaut (libc, `std` des dépendances) ; binaire en `required-features = ["std"]` ; faux noyau des tests sur rustix |
-| étape 2 | `radixox::ring` : anneau io_uring sur `rustix::io_uring` (SQE / CQE `repr(C)` à nous, `submit` comme la crate io-uring) ; `uringloop.rs` porté, crate `io-uring` retirée |
+| `f0f50a6` | étape 2 : `radixox::ring` : anneau io_uring sur `rustix::io_uring` (SQE / CQE `repr(C)` à nous, `submit` comme la crate io-uring) ; `uringloop.rs` porté, crate `io-uring` retirée |
+| étapes 3–4 | serveur déplacé dans `radixox::server` (sans std) ; binaire `radixox-nostd` (`_start`, `panic_handler`, build.rs) ; `RADIXOX_TEST_BIN` ; mesures, README |
 
 Vérification des bibliothèques (doit rester verte) :
 
@@ -319,3 +324,34 @@ temporaire.
   « corriger » au passage.
 - Avec 8 slots annoncés (`ulimit -n 40`), certaines des 8 premières connexions sont déjà
   refusées : antérieur au chantier, à part.
+
+## 8. État final (2026-10-29)
+
+- **Code** : le serveur (ex-`uringloop.rs`) est `radixox::server` (`radixox/src/server.rs`),
+  sans `std` : configuration par `sys::env`, écoute par `rustix::net` (`localhost` =
+  127.0.0.1, file de 128 comme `std`), signaux par `sc` (`rt_sigprocmask`, `signalfd4`,
+  SIGPIPE ignoré par `rt_sigaction` sans gestionnaire, second signal = action par défaut),
+  erreurs `crate::Error`. Binaires : `src/bin/uringloop.rs` (`radixox`, std : allocateur,
+  `c_malloc`, `main`) et `src/bin/nostd.rs` (`radixox-nostd` : `_start` en `global_asm!`,
+  `panic_handler` → message + abort, `_Unwind_Resume` / `rust_eh_personality` en abort car
+  `alloc` est précompilé avec unwind) ; `src/bin/shared/c_malloc.rs` commun. `build.rs` :
+  `-nostartfiles -nostdlib -static -no-pie` pour `radixox-nostd` seulement.
+  `.cargo/config.toml` : zstd en `-fno-stack-protector` (canari dans `%fs`, pas de TLS).
+  `radixox-mem` exporte aussi `strlen` (appelé par `CStr::from_ptr` de `core`, vDSO).
+  `libc` n'est plus qu'une dépendance de dev de radixox (tests : `kill`).
+- **Construire** : `cargo build --release -p radixox --no-default-features --features
+  nostd-bin --bin radixox-nostd` (release seulement : le profil dev déroule les panics).
+- **Critères** : (1) suite d'intégration verte contre `radixox-nostd`, avec et sans
+  `eviction` (`RADIXOX_TEST_BIN=…`) ; (2) `ldd` : « n'est pas un exécutable dynamique »,
+  `nm` (profil `profiling`) : aucun symbole glibc, seuls 4 indéfinis faibles
+  (`ZSTD_trace_*`, testés à `NULL`), ni `INTERP` ni `TLS`, `env -i` démarre ; (3) ABBA
+  glibc / sans libc / sans libc / glibc, `native` : p1 282 / 283 / 276 / 277 k, p32 3,15 /
+  3,17 / 3,06 / 3,06 M ; `x86-64-v3` : p1 283 / 284 / 287 / 281 k, p32 3,26 / 3,21 / 3,19 /
+  3,24 M : dans le bruit ; (4) `tests/memory.rs` vert ; RSS au repos 9,7 → 7,4 Mo, à 1 M de
+  clés 135,2 → 132,8 Mo ; (5) README à jour.
+- **Différences de comportement** du binaire sans libc : réplication vers une IP ou
+  `localhost` seulement (pas de DNS) ; second signal pendant la save d'arrêt = mort par le
+  signal (pas `_exit(130)`) ; binaire non PIE (pas d'ASLR de l'exécutable) ; messages de
+  `rx_eprintln!` tronqués à 512 o.
+- **Restes possibles** (non demandés) : static-pie (traiter les relocations au démarrage),
+  `memcmp` / `bcmp` AVX-512 au-delà de 1 Kio, retirer le binaire glibc.

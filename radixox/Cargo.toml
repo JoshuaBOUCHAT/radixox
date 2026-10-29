@@ -16,11 +16,20 @@ name = "radixox"
 path = "src/bin/uringloop.rs"
 required-features = ["std"]
 
+# Même serveur, sans std ni libc (NOSTD_PLAN.md) : `_start` à nous, lié statiquement
+# (build.rs). cargo build --release -p radixox --no-default-features --features nostd-bin
+[[bin]]
+name = "radixox-nostd"
+path = "src/bin/nostd.rs"
+required-features = ["nostd-bin"]
+
 [features]
-# Processus `std` (défaut) : binaire actuel (libc pour les signaux). Sans elle, la lib est
-# `no_std` + `alloc` (lib.rs), le binaire n'est pas construit.
+# Processus `std` (défaut) : binaire `radixox` (glibc). Sans elle, la lib est `no_std` +
+# `alloc` (lib.rs).
 default = ["std"]
-std = ["radixox-lib/std", "oxidart/std", "rustix/std", "crc32fast/std", "zstd-safe/std", "dep:libc"]
+std = ["radixox-lib/std", "oxidart/std", "rustix/std", "crc32fast/std", "zstd-safe/std"]
+# Binaire `radixox-nostd` (sans std ni libc) : avec --no-default-features.
+nostd-bin = ["dep:radixox-mem"]
 # Politiques d'éviction LRU / LFU : une écriture par accès (MEMORY_ARCH.md §10.2 quater).
 # Sans elle, le chemin de lecture n'écrit rien de plus.
 eviction = ["oxidart/eviction", "radixox-lib/eviction"]
@@ -30,8 +39,8 @@ oxidart = { workspace = true, features = ["regex", "zstd"] }
 radixox-lib = { workspace = true }
 hashbrown = "0.17.0"
 
-# Binaire std seulement : signaux (étape 3 de NOSTD_PLAN.md).
-libc = { version = "0.2", optional = true }
+# memcpy & co. sous leurs noms C, pour le binaire sans libc seulement.
+radixox-mem = { path = "../radixox-mem", version = "0.6.0", features = ["export"], optional = true }
 # signalfd4 en appel direct (absent de rustix).
 sc = "0.2"
 rustix = { version = "1.1", default-features = false, features = ["alloc", "fs", "time", "rand", "net", "process", "thread", "io_uring", "mm"] }
@@ -39,6 +48,7 @@ crc32fast = { version = "1.4", default-features = false }
 zstd-safe = { version = "8.1", default-features = false, features = ["experimental"] }
 
 [dev-dependencies]
+libc = "0.2"
 redis = "0.27"
 
 # Used by `cargo install radixox` (the workspace root profile is not published).

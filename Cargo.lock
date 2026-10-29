@@ -448,6 +448,7 @@ dependencies = [
  "libc",
  "oxidart",
  "radixox-lib",
+ "radixox-mem",
  "redis",
  "rustix",
  "sc",

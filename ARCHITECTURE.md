@@ -60,7 +60,9 @@ erreur, RUNTIME_ARCH §16).
 
 **La boucle io_uring maison** (RUNTIME_ARCH.md ; monoio a été retiré le 2026-10-19) :
 - `radixox::uring::Core` : cœur **sans I/O** (reçoit des `Completion`, émet des `Op`),
-  testé contre un faux noyau ; `src/bin/uringloop.rs` : traduction en SQE / CQE ;
+  testé contre un faux noyau ; `radixox::server` (`src/server.rs`, sans `std`) : traduction en SQE / CQE sur
+  l'anneau `radixox::ring` (rustix), lancé par les binaires `radixox` (std) et
+  `radixox-nostd` (sans libc, NOSTD_PLAN.md) ;
 - l'arbre appartient au cœur (`&mut OxidArt`, plus de `Rc<RefCell<>>`) ;
 - réception multishot dans un anneau partagé de petits tampons ; les morceaux reçus
   attendent tels quels dans la file de leur connexion ;

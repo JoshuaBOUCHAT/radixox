@@ -36,9 +36,13 @@ pub fn start_server_env(port: u16, envs: &[(&str, &str)]) {
     wait_for_port(port);
 }
 
-/// Binaire du serveur testé.
+/// Binaire du serveur testé : `RADIXOX_TEST_BIN` (le binaire sans libc, NOSTD_PLAN.md §5),
+/// sinon celui que cargo vient de construire.
 pub fn server_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_radixox")
+    match std::env::var("RADIXOX_TEST_BIN") {
+        Ok(p) if !p.is_empty() => Box::leak(p.into_boxed_str()),
+        _ => env!("CARGO_BIN_EXE_radixox"),
+    }
 }
 
 /// Open a fresh synchronous Redis connection to `port`.

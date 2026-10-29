@@ -16,6 +16,8 @@
 
 #![no_std]
 #![no_builtins]
+// `*mut u8` au lieu de `*mut c_void` dans les signatures C : même ABI (des pointeurs).
+#![allow(suspicious_runtime_symbol_definitions)]
 
 use core::ptr::{read_unaligned as ld, write_unaligned as st};
 
@@ -327,6 +329,21 @@ pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
         }
     }
     0
+}
+
+/// `strlen(3)` : `core` l'appelle (`CStr::from_ptr`) ; rare (noms du vDSO au démarrage),
+/// octet par octet.
+///
+/// # Safety
+/// `s` pointe sur une chaîne terminée par un octet nul.
+#[cfg_attr(feature = "export", unsafe(no_mangle))]
+pub unsafe extern "C" fn strlen(s: *const u8) -> usize {
+    let mut n = 0;
+    // SAFETY: lecture jusqu'au nul, qui existe (voir la fonction).
+    while unsafe { s.add(n).read_volatile() } != 0 {
+        n += 1;
+    }
+    n
 }
 
 /// `bcmp(3)` : 0 si égaux, autre chose sinon (Rust l'appelle pour `==` sur des tranches).

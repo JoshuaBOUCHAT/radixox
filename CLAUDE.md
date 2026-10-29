@@ -12,7 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 >   ZSet → [`ANALYSE_ART_UNIFIE.md`](ANALYSE_ART_UNIFIE.md) §13 ;
 > - AOF, réplication, journal des commandes → [`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md) ;
 > - allocation, GC, compactage des slabs, `maxmemory` → [`MEMORY_ARCH.md`](MEMORY_ARCH.md) ;
-> - binaire sans `std` ni libc (chantier en cours, bibliothèques et lib `radixox` déjà `no_std`) →
+> - binaire sans `std` ni libc (`radixox-nostd`, fait le 2026-10-29 ; serveur dans `radixox/src/server.rs`) →
 >   [`NOSTD_PLAN.md`](NOSTD_PLAN.md).
 
 ## Projet
@@ -28,9 +28,12 @@ oxidart/        arbre des clés : TTL, préfixe / glob / range, descentes entrel
 oxidart-legacy/ ancien arbre (nœuds 64 o), oracle des tests différentiels, non publié
 valart/         radix compacts pour les valeurs Hash et Set
 radixox-lib/    SharedByte, parseur RESP (cmd.rs) et encodeur, barrière de save
-radixox/        lib : `exec` (commandes, encodage, jobs, BGSAVE), `uring` (cœur sans I/O
-                de la boucle + faux noyau) ; binaire `radixox` (src/bin/uringloop.rs,
-                couche io_uring) ; tests d'intégration
+radixox/        lib no_std : `exec` (commandes, encodage, jobs, BGSAVE), `uring` (cœur sans
+                I/O de la boucle + faux noyau), `ring` (anneau io_uring sur rustix),
+                `server` (couche io_uring, configuration, signaux) ; binaires `radixox`
+                (std, src/bin/uringloop.rs) et `radixox-nostd` (sans libc, src/bin/nostd.rs) ;
+                tests d'intégration
+radixox-mem/    memcpy & co. en Rust pour le binaire sans libc
 scripts/        bench_vs_valkey.sh (référence du README), bench_zipf.sh (accès Zipf, CPU par cœur), stress_save.sh
 ```
 
@@ -47,7 +50,9 @@ cargo run --release --bin radixox         # écoute 127.0.0.1:6379 (RADIXOX_BIND
 cargo test -p oxidart --features regex    # arbre (dont tests différentiels contre oxidart-legacy)
 cargo test -p radixox-lib                 # parseur, SharedByte, barrière
 cargo build -p radixox-lib -p valart -p oxidart --no-default-features --features oxidart/regex   # #![no_std] + alloc : ne doit pas casser
-cargo build -p radixox --lib --no-default-features   # lib radixox no_std (le binaire exige la feature std)
+cargo build -p radixox --lib --no-default-features   # lib radixox no_std
+cargo build --release -p radixox --no-default-features --features nostd-bin --bin radixox-nostd   # binaire sans std ni libc (release seulement : panic = abort) ; README « Portable and static builds »
+RADIXOX_TEST_BIN=$PWD/target/release/radixox-nostd cargo test -p radixox --test '*'   # intégration contre ce binaire
 cargo test -p radixox                     # intégration : lance le binaire sur un port de test
 cargo test -p radixox --features eviction  # + LRU/LFU (tests sous cfg(feature = "eviction"))
 ```
