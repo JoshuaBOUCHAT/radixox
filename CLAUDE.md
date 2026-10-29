@@ -14,6 +14,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > - allocation, GC, compactage des slabs, `maxmemory` → [`MEMORY_ARCH.md`](MEMORY_ARCH.md) ;
 > - binaire sans `std` ni libc (`radixox-nostd`, fait le 2026-10-29 ; serveur dans `radixox/src/server.rs`) →
 >   [`NOSTD_PLAN.md`](NOSTD_PLAN.md).
+> - commandes Redis manquantes (lots 1–3, puis MULTI/EXEC et commandes custom en Rust) →
+>   [`COMMANDS_PLAN.md`](COMMANDS_PLAN.md).
 
 ## Projet
 
