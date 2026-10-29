@@ -484,7 +484,7 @@ impl OxidArt {
     /// `|count|` tirages avec répétition ; sans count, un seul. Tirage uniforme par rang
     /// (sélection O(log n)).
     pub fn cmd_zrandmember(&mut self, key: &[u8], count: Option<i64>) -> Result<Vec<(SharedByte, f64)>, RedisType> {
-        use rand::Rng;
+        use radixox_lib::rng;
         let Some(val) = self.get_ref(key) else {
             return Ok(Vec::new());
         };
@@ -497,16 +497,15 @@ impl OxidArt {
             let (s, m) = zset.iter_from(r).next().expect("rang dans le ZSet");
             (SharedByte::from_slice(m), decode_score(s))
         };
-        let mut rng = rand::thread_rng();
         Ok(match count {
-            None => vec![at(rng.gen_range(0..len))],
-            Some(c) if c < 0 => (0..c.unsigned_abs()).map(|_| at(rng.gen_range(0..len))).collect(),
+            None => vec![at(rng::below(len as u64) as usize)],
+            Some(c) if c < 0 => (0..c.unsigned_abs()).map(|_| at(rng::below(len as u64) as usize)).collect(),
             Some(c) if c as usize >= len => zset.iter().map(|(s, m)| (SharedByte::from_slice(m), decode_score(s))).collect(),
             Some(c) => {
                 // rangs distincts (Floyd) : c tirages, sans rejet
                 let mut picked = std::collections::BTreeSet::new();
                 for j in len - c as usize..len {
-                    let r = rng.gen_range(0..=j);
+                    let r = rng::below(j as u64 + 1) as usize;
                     if !picked.insert(r) {
                         picked.insert(j);
                     }

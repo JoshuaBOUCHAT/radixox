@@ -11,14 +11,12 @@ keywords = ["art", "radix-tree", "trie", "data-structure", "ttl"]
 categories = ["data-structures"]
 
 [dependencies]
-bytes.workspace = true
 smallvec.workspace = true
 ordered-float = "5.1.0"
 zmij = "1.0"
 radixox-lib = { workspace = true }
 valart = { workspace = true }
 
-rand = "0.8"
 crc32fast = "1.4"
 regex-automata = { version = "0.4", optional = true, default-features = false, features = [
     "dfa-build",
@@ -35,6 +33,7 @@ regex = ["dep:regex-automata"]
 eviction = ["radixox-lib/eviction"]
 
 [dev-dependencies]
+rand = "0.8"
 # Ancien arbre, oracle des tests différentiels (retiré à la publication).
 oxidart-legacy = { path = "../oxidart-legacy", features = ["regex"] }
 

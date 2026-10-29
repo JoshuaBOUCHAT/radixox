@@ -11,6 +11,7 @@ pub mod pool;
 pub mod prefetch;
 pub mod raw_alloc;
 pub mod resident;
+pub mod rng;
 pub mod save_barrier;
 pub mod shared_byte;
 pub mod shared_frame;

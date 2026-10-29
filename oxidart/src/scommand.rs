@@ -196,7 +196,7 @@ impl OxidArt {
                 SPOPResult::Multiple(Vec::new())
             });
         };
-        let popped: Vec<SharedByte> = (0..count).map_while(|_| set.pop(rand::random())).collect();
+        let popped: Vec<SharedByte> = (0..count).map_while(|_| set.pop(radixox_lib::rng::u64())).collect();
         if set.len() == 0 {
             self.del(key);
         }
