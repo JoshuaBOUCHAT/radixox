@@ -34,7 +34,8 @@ Tout est sur `main`, poussé :
 | `61148dc` | crate `radixox-mem` : `memcpy`/`memmove`/`memset`/`memcmp`/`bcmp` en Rust (`#![no_builtins]`, noms C sous la feature `export`) |
 | `b234635` | étape 1, 1/3 : `sys::Instant` partout, environnement par `sys::env` (`persist::set_save_dir` pour les tests), `thread_local!` → statics `Mono<Cell / RefCell>` (`crate::mono`), `tsc` sur `sys::Once`, `hashbrown` |
 | `8b2a70c` | étape 1, 2/3 : `crate::fs` (rustix, chemins `&str` / `String`, `OwnedFd`) et `crate::Error` ; `sys::OsError` (textes glibc), `sys::exit`, `rx_println!` ; oxidart : `LoadError::Os`, `Source` exporté, `load_file` sur `Source`, `compress` sous la feature `zstd` (sans `std`) |
-| étape 1, 3/3 | crate `radixox` (lib) `#![no_std]` + `alloc` : feature `std` par défaut (io-uring, libc, `std` des dépendances) ; binaire en `required-features = ["std"]` ; faux noyau des tests sur rustix |
+| `4a40240` | étape 1, 3/3 : crate `radixox` (lib) `#![no_std]` + `alloc` : feature `std` par défaut (libc, `std` des dépendances) ; binaire en `required-features = ["std"]` ; faux noyau des tests sur rustix |
+| étape 2 | `radixox::ring` : anneau io_uring sur `rustix::io_uring` (SQE / CQE `repr(C)` à nous, `submit` comme la crate io-uring) ; `uringloop.rs` porté, crate `io-uring` retirée |
 
 Vérification des bibliothèques (doit rester verte) :
 
@@ -191,7 +192,23 @@ Remplacements :
   `core::net` (stable) : garder le type, parser `RADIXOX_BIND` avec `core::net`.
 - **`HashMap`** → `hashbrown` (déjà en dépendance d'oxidart ; l'ajouter à radixox).
 
-### Étape 2 — notre anneau io_uring sur `rustix::io_uring`
+### Étape 2 — notre anneau io_uring sur `rustix::io_uring` — FAITE (2026-10-29)
+
+`radixox/src/ring.rs` (lib, sans `std`) : `Builder` (single issuer, cqsize, SQPOLL + CPU,
+DEFER_TASKRUN + TASKRUN_FLAG), `Ring` (`push`, `submit`, `submit_and_wait`, `enter` avec
+`WaitArgs` = délai + `min_wait_usec`, `harvest`, `need_wakeup` avec barrière SeqCst,
+`taskrun`, `register_*`), `Sqe` (un constructeur par opcode utilisé, champs de
+`io_uring.h`), `Cqe` (`more`, `buffer`, `buffer_more`), `BufRingEntry` + `buf_ring_tail`.
+Constantes absentes de rustix 1.1 écrites à la main (`NO_IOWAIT`, `FEAT_MIN_TIMEOUT`,
+`FEAT_NO_IOWAIT`, `IOU_PBUF_RING_INC`, `CQE_F_BUF_MORE`). Affinité io-wq par un masque
+`[u64; 16]` au lieu de `libc::cpu_set_t`. Test sur un vrai anneau (écriture + fsync liés,
+lecture, recv multishot sur slot enregistré puis cancel). Vérifié à la main : SQPOLL,
+recv / send async + `RADIXOX_IOWQ_CPUS`, `RADIXOX_FILE_CPUS`, `RADIXOX_MIN_WAIT_US`.
+Mesure ABBA contre `4a40240` : sans SQPOLL p1 283 / 281 / 271 / 282 k, p32 3,20 / 3,11 /
+3,16 / 3,12 M ; SQPOLL (CPU 1) p1 288 / 281 / 291 / 288 k, p32 4,58 / 4,54 / 4,49 /
+4,64 M. `perf stat` : instructions par commande identiques (utilisateur ~3 780 en p1,
+~2 852 en p32 ; noyau idem), les écarts sont des cycles, donc du bruit. Le plan d'origine
+suit, pour mémoire.
 
 Remplacer la crate `io-uring` dans `bin/uringloop.rs` (seul utilisateur) par un module à
 nous, de même forme d'API pour garder le diff de `uringloop.rs` lisible. Surface utilisée

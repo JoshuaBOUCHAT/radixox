@@ -9,7 +9,7 @@
 > déploiement). La version précédente de ce fichier (runtime à futures : `RawTask`,
 > `fn_poll`, `syscall_nb`) est **écartée**, voir §14. Historique : `git log -- RUNTIME_ARCH.md`.
 >
-> Base logicielle : **io-uring 0.7.15**, **noyau ≥ 6.12** (§11). monoio garde sa 0.6.4
+> Base logicielle : **anneau à nous sur `rustix::io_uring`** (`radixox/src/ring.rs`, depuis le 2026-10-29 ; io-uring 0.7.15 avant), **noyau ≥ 6.12** (§11). monoio garde sa 0.6.4
 > jusqu'à sa suppression (§13) : les deux versions coexistent dans le workspace.
 >
 > Démarche : *make it work, make it fast, make it adaptable*. Une seule boucle dans

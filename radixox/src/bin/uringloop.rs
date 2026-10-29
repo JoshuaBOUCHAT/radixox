@@ -72,15 +72,14 @@ mod c_malloc {
 use std::io;
 use std::net::TcpListener;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::Ordering;
 use core::time::Duration;
 use radixox_lib::sys::Instant;
 
-use io_uring::types::{BufRingEntry, Fd, Fixed, IOU_PBUF_RING_INC, SubmitArgs, Timespec};
-use io_uring::{EnterFlags, IoUring, cqueue, opcode, squeue};
 use oxidart::OxidArt;
 use radixox::exec::fs_task::StepRef;
 use radixox::exec::{aof, autosave};
+use radixox::ring::{self, BufRingEntry, Cqe, Ring, Sqe, Target, WaitArgs, flags as sqf};
 use radixox::tsc;
 use radixox::uring::{Bid, Completion, Config, Core, Op, Slot};
 use rustix::io::Errno;
@@ -123,7 +122,7 @@ struct BufRing {
 }
 
 impl BufRing {
-    fn new(ring: &IoUring, core: &mut Core) -> io::Result<Self> {
+    fn new(ring: &Ring, core: &mut Core) -> io::Result<Self> {
         let count = core.bufs_mut().count();
         let entries = (count as u32).next_power_of_two().max(1) as u16;
         let layout = std::alloc::Layout::from_size_align(entries as usize * size_of::<BufRingEntry>(), 4096)
@@ -132,10 +131,10 @@ impl BufRing {
         let base = unsafe { std::alloc::alloc_zeroed(layout) } as *mut BufRingEntry;
         assert!(!base.is_null(), "allocation de l'anneau de tampons");
         // SAFETY: `base` vit aussi longtemps que l'anneau io_uring (champ du serveur).
-        unsafe { ring.submitter().register_buf_ring_with_flags(base as u64, entries, BGID, IOU_PBUF_RING_INC as u16) }
+        unsafe { ring.register_buf_ring(base, entries, BGID, ring::PBUF_RING_INC) }
             .map_err(|e| {
                 io::Error::new(
-                    e.kind(),
+                    io::Error::from(e).kind(),
                     format!("anneau de tampons incrémental refusé ({e}) : noyau 6.12 ou plus récent requis"),
                 )
             })?;
@@ -153,16 +152,15 @@ impl BufRing {
         let addr = core.bufs_mut().ptr(bid) as u64;
         // SAFETY: index masqué dans l'anneau alloué.
         let e = unsafe { &mut *self.base.add((self.tail & self.mask) as usize) };
-        e.set_addr(addr);
-        e.set_len(size);
-        e.set_bid(bid);
+        e.addr = addr;
+        e.len = size;
+        e.bid = bid;
         self.tail = self.tail.wrapping_add(1);
     }
 
     fn publish(&self) {
-        // SAFETY: `tail` est le champ `resv` de la première entrée, partagé avec le noyau.
-        let tail = unsafe { &*(BufRingEntry::tail(self.base) as *const AtomicU16) };
-        tail.store(self.tail, Ordering::Release);
+        // SAFETY: anneau enregistré, vivant aussi longtemps que `self`.
+        unsafe { ring::buf_ring_tail(self.base) }.store(self.tail, Ordering::Release);
     }
 }
 
@@ -176,8 +174,10 @@ impl Drop for BufRing {
 // ── Serveur ─────────────────────────────────────────────────────────────────
 
 struct Server {
-    ring: IoUring,
+    ring: Ring,
     bufring: BufRing,
+    /// CQE récoltées (réutilisé d'un tour à l'autre).
+    cqes: Vec<Cqe>,
     core: Core,
     listener: TcpListener,
     ops: Vec<Op>,
@@ -252,9 +252,8 @@ impl Signals {
         Ok(Some(Self { fd, buf: Box::new(unsafe { std::mem::zeroed() }), save }))
     }
 
-    fn read_sqe(&mut self) -> squeue::Entry {
-        opcode::Read::new(Fd(self.fd), (&mut *self.buf as *mut libc::signalfd_siginfo).cast(), size_of::<libc::signalfd_siginfo>() as u32)
-            .build()
+    fn read_sqe(&mut self) -> Sqe {
+        Sqe::read(Target::Fd(self.fd), (&mut *self.buf as *mut libc::signalfd_siginfo).cast(), size_of::<libc::signalfd_siginfo>() as u32)
             .user_data(ud(K_SIGNAL, 0))
     }
 }
@@ -320,14 +319,12 @@ impl Server {
         let mut provided = false;
         for op in std::mem::take(&mut self.ops) {
             let sqe = match op {
-                Op::AcceptMulti => {
-                    opcode::AcceptMulti::new(Fd(self.listener.as_raw_fd())).build().user_data(ud(K_ACCEPT, 0))
-                }
+                Op::AcceptMulti => Sqe::accept_multi(Target::Fd(self.listener.as_raw_fd())).user_data(ud(K_ACCEPT, 0)),
                 Op::Install { slot, fd } => {
                     // Accept classique (§4.1) : réglages sur le fd, puis le socket
                     // passe dans la table des fichiers enregistrés et le fd est fermé.
                     tune_socket(fd);
-                    let res = self.ring.submitter().register_files_update(slot, &[fd]);
+                    let res = self.ring.register_files_update(slot, &[fd]);
                     close(fd);
                     if let Err(e) = res {
                         eprintln!("[uring] installation du slot {slot} : {e}");
@@ -348,66 +345,43 @@ impl Server {
                 Op::Send { slot } => {
                     // Le tampon reste intact jusqu'au CQE (invariant du cœur).
                     let buf = self.core.pending_send(slot);
-                    let sqe = opcode::Send::new(Fixed(slot), buf.as_ptr(), buf.len() as u32)
-                        .flags((RecvFlags::WAITALL.bits() | SendFlags::NOSIGNAL.bits()) as i32)
-                        .build()
+                    let sqe = Sqe::send(Target::Fixed(slot), buf.as_ptr(), buf.len() as u32, RecvFlags::WAITALL.bits() | SendFlags::NOSIGNAL.bits())
                         .user_data(ud(K_SEND, slot));
                     // Délégué : la pile TCP de l'envoi tourne sur un worker io-wq,
                     // pas pendant notre `enter`.
-                    if self.send_async { sqe.flags(squeue::Flags::ASYNC) } else { sqe }
+                    if self.send_async { sqe.flags(sqf::ASYNC) } else { sqe }
                 }
-                Op::CancelRecv { slot } => opcode::AsyncCancel::new(ud(K_RECV, slot))
-                    .build()
-                    .flags(squeue::Flags::SKIP_SUCCESS)
-                    .user_data(ud(K_CANCEL, slot)),
-                Op::CancelSend { slot } => opcode::AsyncCancel::new(ud(K_SEND, slot))
-                    .build()
-                    .flags(squeue::Flags::SKIP_SUCCESS)
-                    .user_data(ud(K_CANCEL, slot)),
-                Op::Close { slot } => opcode::Close::new(Fixed(slot))
-                    .build()
-                    .flags(squeue::Flags::SKIP_SUCCESS)
-                    .user_data(ud(K_CLOSE, slot)),
+                Op::CancelRecv { slot } => Sqe::cancel(ud(K_RECV, slot)).flags(sqf::SKIP_SUCCESS).user_data(ud(K_CANCEL, slot)),
+                Op::CancelSend { slot } => Sqe::cancel(ud(K_SEND, slot)).flags(sqf::SKIP_SUCCESS).user_data(ud(K_CANCEL, slot)),
+                Op::Close { slot } => Sqe::close(Target::Fixed(slot)).flags(sqf::SKIP_SUCCESS).user_data(ud(K_CLOSE, slot)),
                 // Numéro du BGSAVE dans le champ slot du user_data.
                 Op::FileWrite { fd, off, save } => {
                     // Le tampon reste intact jusqu'au CQE (invariant du BGSAVE).
                     let buf = self.core.pending_file_write(save);
-                    let sqe = opcode::Write::new(Fd(fd), buf.as_ptr(), buf.len() as u32)
-                        .offset(off)
-                        .build()
-                        .user_data(ud(K_FILE, save));
+                    let sqe = Sqe::write(Target::Fd(fd), buf.as_ptr(), buf.len() as u32, off).user_data(ud(K_FILE, save));
                     // Sinon la copie dans le cache de pages se fait dans notre `enter`.
-                    if self.file_async { sqe.flags(squeue::Flags::ASYNC) } else { sqe }
+                    if self.file_async { sqe.flags(sqf::ASYNC) } else { sqe }
                 }
-                Op::FileSync { fd, save } => opcode::Fsync::new(Fd(fd))
-                    .flags(io_uring::types::FsyncFlags::DATASYNC)
-                    .build()
-                    .user_data(ud(K_FILE, save)),
+                Op::FileSync { fd, save } => Sqe::fsync(Target::Fd(fd), ring::FSYNC_DATASYNC).user_data(ud(K_FILE, save)),
                 // Second canal de fichiers : le segment de l'AOF (DURABILITY_DESIGN.md §7.3).
                 // Génération de l'écrivain dans le champ slot du user_data.
                 Op::JournalWrite { fd, off, writer, link } => {
                     // Le tampon reste intact jusqu'au CQE (invariant de l'écrivain).
                     let buf = self.core.pending_journal_write(writer);
-                    let sqe = opcode::Write::new(Fd(fd), buf.as_ptr(), buf.len() as u32)
-                        .offset(off)
-                        .build()
-                        .user_data(ud(K_JWRITE, writer));
-                    let sqe = if self.file_async { sqe.flags(squeue::Flags::ASYNC) } else { sqe };
+                    let sqe = Sqe::write(Target::Fd(fd), buf.as_ptr(), buf.len() as u32, off).user_data(ud(K_JWRITE, writer));
+                    let sqe = if self.file_async { sqe.flags(sqf::ASYNC) } else { sqe };
                     if link {
                         // Le fsync lié suit dans la même soumission : une chaîne
                         // coupée par une SQ pleine laisserait le fsync partir seul.
                         self.reserve_sqes(2)?;
-                        sqe.flags(squeue::Flags::IO_LINK)
+                        sqe.flags(sqf::IO_LINK)
                     } else {
                         sqe
                     }
                 }
                 Op::JournalSync { fd, writer } => {
-                    let sqe = opcode::Fsync::new(Fd(fd))
-                        .flags(io_uring::types::FsyncFlags::DATASYNC)
-                        .build()
-                        .user_data(ud(K_JSYNC, writer));
-                    if self.file_async { sqe.flags(squeue::Flags::ASYNC) } else { sqe }
+                    let sqe = Sqe::fsync(Target::Fd(fd), ring::FSYNC_DATASYNC).user_data(ud(K_JSYNC, writer));
+                    if self.file_async { sqe.flags(sqf::ASYNC) } else { sqe }
                 }
                 Op::ProvideBuf { bid } => {
                     self.bufring.push(&mut self.core, bid);
@@ -427,15 +401,13 @@ impl Server {
                         }
                     };
                     tune_socket(fd);
-                    let res = self.ring.submitter().register_files_update(slot, &[fd]);
+                    let res = self.ring.register_files_update(slot, &[fd]);
                     close(fd);
                     if let Err(e) = res {
-                        self.core.complete(Completion::Connect { slot, res: -e.raw_os_error().unwrap_or(Errno::BADF.raw_os_error()) });
+                        self.core.complete(Completion::Connect { slot, res: -e.raw_os_error() });
                         continue;
                     }
-                    let sqe = opcode::Connect::new(Fixed(slot), sa.as_ptr().cast(), sa.addr_len())
-                        .build()
-                        .user_data(ud(K_CONNECT, slot));
+                    let sqe = Sqe::connect(Target::Fixed(slot), sa.as_ptr().cast(), sa.addr_len()).user_data(ud(K_CONNECT, slot));
                     self.connects.insert(slot, sa);
                     sqe
                 }
@@ -443,26 +415,21 @@ impl Server {
                 // worker io-wq (`IOSQE_ASYNC`), jamais dans notre `enter`.
                 Op::Fs { id } => {
                     let Some(step) = self.core.fs_step(id) else { continue };
-                    let cwd = Fd(std::os::fd::AsRawFd::as_raw_fd(&rustix::fs::CWD));
+                    let cwd = rustix::fs::CWD.as_raw_fd();
                     let sqe = match step {
-                        StepRef::Open { path, flags, mode } => {
-                            opcode::OpenAt::new(cwd, path.as_ptr()).flags(flags.bits() as i32).mode(mode.bits()).build()
-                        }
-                        StepRef::Fallocate { fd, off, len } => opcode::Fallocate::new(Fd(fd), len).offset(off).build(),
-                        StepRef::Fsync { fd, data } => {
-                            let f = if data { io_uring::types::FsyncFlags::DATASYNC } else { io_uring::types::FsyncFlags::empty() };
-                            opcode::Fsync::new(Fd(fd)).flags(f).build()
-                        }
+                        StepRef::Open { path, flags, mode } => Sqe::openat(cwd, path.as_ptr(), flags.bits(), mode.bits()),
+                        StepRef::Fallocate { fd, off, len } => Sqe::fallocate(Target::Fd(fd), off, len),
+                        StepRef::Fsync { fd, data } => Sqe::fsync(Target::Fd(fd), if data { ring::FSYNC_DATASYNC } else { 0 }),
                         StepRef::Write { fd, buf, off } => {
                             let len = buf.len().min(u32::MAX as usize) as u32;
-                            opcode::Write::new(Fd(fd), buf.as_ptr(), len).offset(off).build()
+                            Sqe::write(Target::Fd(fd), buf.as_ptr(), len, off)
                         }
-                        StepRef::Ftruncate { fd, len } => opcode::Ftruncate::new(Fd(fd), len).build(),
-                        StepRef::Rename { from, to } => opcode::RenameAt::new(cwd, from.as_ptr(), cwd, to.as_ptr()).build(),
-                        StepRef::Unlink { path } => opcode::UnlinkAt::new(cwd, path.as_ptr()).build(),
-                        StepRef::Close { fd } => opcode::Close::new(Fd(fd)).build(),
+                        StepRef::Ftruncate { fd, len } => Sqe::ftruncate(Target::Fd(fd), len),
+                        StepRef::Rename { from, to } => Sqe::renameat(cwd, from.as_ptr(), cwd, to.as_ptr()),
+                        StepRef::Unlink { path } => Sqe::unlinkat(cwd, path.as_ptr()),
+                        StepRef::Close { fd } => Sqe::close(Target::Fd(fd)),
                     };
-                    sqe.flags(squeue::Flags::ASYNC).user_data(ud(K_FS, id))
+                    sqe.flags(sqf::ASYNC).user_data(ud(K_FS, id))
                 }
             };
             self.push_sqe(&sqe)?;
@@ -477,24 +444,17 @@ impl Server {
     /// Recv d'une connexion : multishot (défaut), ou simple sur io-wq. Le recv
     /// simple rend `more = false` à chaque CQE : le cœur le réarme comme un
     /// multishot terminé. Les deux choisissent leur tampon dans notre anneau.
-    fn recv_sqe(&self, slot: Slot) -> squeue::Entry {
+    fn recv_sqe(&self, slot: Slot) -> Sqe {
         if self.recv_async {
-            opcode::Recv::new(Fixed(slot), std::ptr::null_mut(), 0)
-                .buf_group(BGID)
-                .build()
-                .flags(squeue::Flags::BUFFER_SELECT | squeue::Flags::ASYNC)
-                .user_data(ud(K_RECV, slot))
+            Sqe::recv_select(Target::Fixed(slot), BGID).flags(sqf::ASYNC).user_data(ud(K_RECV, slot))
         } else {
-            opcode::RecvMulti::new(Fixed(slot), BGID).build().user_data(ud(K_RECV, slot))
+            Sqe::recv_multi(Target::Fixed(slot), BGID).user_data(ud(K_RECV, slot))
         }
     }
 
     fn reserve_sqes(&mut self, n: usize) -> io::Result<()> {
         loop {
-            let free = {
-                let sq = self.ring.submission();
-                sq.capacity() - sq.len()
-            };
+            let free = self.ring.sq_capacity() - self.ring.sq_len();
             if free >= n {
                 return Ok(());
             }
@@ -502,9 +462,9 @@ impl Server {
         }
     }
 
-    fn push_sqe(&mut self, sqe: &squeue::Entry) -> io::Result<()> {
+    fn push_sqe(&mut self, sqe: &Sqe) -> io::Result<()> {
         // SAFETY: les tampons visés (envoi, fds) vivent jusqu'au CQE.
-        while unsafe { self.ring.submission().push(sqe) }.is_err() {
+        while unsafe { self.ring.push(sqe) }.is_err() {
             // SQ pleine en plein tour : on soumet et on continue (§16).
             self.ring.submit()?;
         }
@@ -514,24 +474,17 @@ impl Server {
     /// Récolte les CQE et les passe au cœur ; rend leur nombre.
     fn harvest(&mut self) -> u32 {
         let mut any = 0;
-        let mut cq = self.ring.completion();
-        cq.sync();
         // Recopiés d'abord : `complete` peut vouloir soumettre (rien ici, mais
         // le cœur ne doit pas dépendre de l'ordre des emprunts).
-        let cqes: Vec<cqueue::Entry> = cq.collect();
-        for cqe in cqes {
+        let mut cqes = std::mem::take(&mut self.cqes);
+        self.ring.harvest(&mut cqes);
+        for cqe in cqes.drain(..) {
             any += 1;
-            let (kind, slot) = (cqe.user_data() >> 32, cqe.user_data() as u32);
-            let (res, flags) = (cqe.result(), cqe.flags());
+            let (kind, slot) = (cqe.user_data >> 32, cqe.user_data as u32);
+            let res = cqe.res;
             let c = match kind {
-                K_ACCEPT => Completion::Accept { fd: res, more: cqueue::more(flags) },
-                K_RECV => Completion::Recv {
-                    slot,
-                    res,
-                    bid: cqueue::buffer_select(flags),
-                    buf_more: cqueue::buffer_more(flags),
-                    more: cqueue::more(flags),
-                },
+                K_ACCEPT => Completion::Accept { fd: res, more: cqe.more() },
+                K_RECV => Completion::Recv { slot, res, bid: cqe.buffer(), buf_more: cqe.buffer_more(), more: cqe.more() },
                 K_SEND => Completion::Send { slot, res },
                 K_SIGNAL => {
                     self.stop = Some(self.signals.as_ref().is_some_and(|s| s.save));
@@ -552,10 +505,11 @@ impl Server {
                     }
                     continue;
                 }
-                _ => unreachable!("user_data inconnu {:#x}", cqe.user_data()),
+                _ => unreachable!("user_data inconnu {:#x}", cqe.user_data),
             };
             self.core.complete(c);
         }
+        self.cqes = cqes;
         any
     }
 
@@ -628,7 +582,7 @@ impl Server {
             if self.core.quiet() && self.core.has_background() {
                 // Les réponses du tour partent avant : le travail de fond peut
                 // durer jusqu'à IDLE_WORK_MAX.
-                if !self.ring.submission().is_empty() {
+                if !self.ring.sq_is_empty() {
                     self.ring.submit()?;
                 }
                 self.idle_work();
@@ -641,13 +595,13 @@ impl Server {
                 self.wait()
             } else {
                 // Encore du travail : on soumet et on récolte sans attendre
-                // (GETEVENTS ajouté par le crate quand des complétions attendent).
+                // (GETEVENTS ajouté quand des complétions attendent, `Ring::submit`).
                 self.ring.submit()
             };
             if let Err(e) = res
-                && !matches!(e.raw_os_error(), Some(e) if [Errno::TIME, Errno::INTR, Errno::BUSY].contains(&Errno::from_raw_os_error(e)))
+                && ![Errno::TIME, Errno::INTR, Errno::BUSY].contains(&e)
             {
-                return Err(e);
+                return Err(e.into());
             }
         }
     }
@@ -671,17 +625,17 @@ impl Server {
     /// (les complétions n'existent qu'à notre `enter`) ; en SQPOLL, le thread
     /// noyau les écrit lui-même : la CQ n'est pas vide.
     fn work_waiting(&mut self) -> bool {
-        if self.sqpoll { !self.ring.completion().is_empty() } else { self.ring.submission().taskrun() }
+        if self.sqpoll { !self.ring.cq_is_empty() } else { self.ring.taskrun() }
     }
 
     /// Soumet et attend au moins une complétion, au plus jusqu'à la prochaine
     /// échéance de timer.
-    fn wait(&mut self) -> io::Result<usize> {
+    fn wait(&mut self) -> ring::Result<usize> {
         if self.sqpoll && !self.spin.is_zero() {
             let budget = self.core.next_deadline().map_or(self.spin, |t| t.saturating_duration_since(Instant::now()).min(self.spin));
             let end = tsc::Deadline::after(budget);
             while !end.passed() {
-                if !self.ring.completion().is_empty() {
+                if !self.ring.cq_is_empty() {
                     return Ok(0);
                 }
                 std::hint::spin_loop();
@@ -691,24 +645,19 @@ impl Server {
             .core
             .next_deadline()
             .map_or(Duration::from_secs(1), |t| t.saturating_duration_since(Instant::now()));
-        let ts = Timespec::from(timeout);
         let (want, usec) = self.min_wait.on_wait();
-        let args = SubmitArgs::new().timespec(&ts).min_wait_usec(usec);
-        let mut flags = EnterFlags::GETEVENTS | EnterFlags::EXT_ARG;
+        let mut args = WaitArgs::new(timeout, usec);
+        let mut flags = ring::enter::GETEVENTS | ring::enter::EXT_ARG;
         if self.no_iowait {
-            flags |= EnterFlags::NO_IOWAIT;
+            flags |= ring::enter::NO_IOWAIT;
         }
-        if self.sqpoll {
-            // Le thread noyau s'est endormi (`sq_thread_idle` sans SQE) : le réveiller
-            // pour qu'il prenne ce qu'on vient d'écrire.
-            std::sync::atomic::fence(Ordering::SeqCst);
-            if self.ring.submission().need_wakeup() {
-                flags |= EnterFlags::SQ_WAKEUP;
-            }
+        // Le thread noyau s'est endormi (`sq_thread_idle` sans SQE) : le réveiller
+        // pour qu'il prenne ce qu'on vient d'écrire (barrière dans `need_wakeup`).
+        if self.sqpoll && self.ring.need_wakeup() {
+            flags |= ring::enter::SQ_WAKEUP;
         }
-        let to_submit = self.ring.submission().len() as u32;
-        // SAFETY: `args` vit pendant l'appel.
-        unsafe { self.ring.submitter().enter(to_submit, want, flags.bits(), Some(&args)) }
+        let to_submit = self.ring.sq_len() as u32;
+        self.ring.enter(to_submit, want, flags, &mut args)
     }
 }
 
@@ -874,12 +823,12 @@ impl AutoWait {
 
 /// `RADIXOX_MIN_WAIT_US` : absent = automatique (10 µs), `0` = jamais, une valeur =
 /// toujours, ce délai. `RADIXOX_WAIT_NR` : complétions attendues (défaut 16).
-fn min_wait(ring: &IoUring) -> MinWait {
+fn min_wait(ring: &Ring) -> MinWait {
     let usec: Option<u32> = std::env::var("RADIXOX_MIN_WAIT_US").ok().and_then(|v| v.parse().ok());
     if usec == Some(0) {
         return MinWait::Off;
     }
-    if !ring.params().is_feature_min_timeout() {
+    if !ring.feature_min_timeout() {
         if usec.is_some() {
             eprintln!("[uring] RADIXOX_MIN_WAIT_US ignoré : noyau sans IORING_FEAT_MIN_TIMEOUT");
         }
@@ -904,7 +853,7 @@ fn min_wait(ring: &IoUring) -> MinWait {
 ///   cœur, §8.2).
 ///
 /// L'affinité vaut pour tous les workers du ring : c'est l'union des deux listes.
-fn setup_iowq(ring: &IoUring) -> io::Result<(bool, bool, bool)> {
+fn setup_iowq(ring: &Ring) -> io::Result<(bool, bool, bool)> {
     let send = env_yes("RADIXOX_SEND_ASYNC", false);
     let recv = env_yes("RADIXOX_RECV_ASYNC", false);
     let net = send || recv;
@@ -916,7 +865,7 @@ fn setup_iowq(ring: &IoUring) -> io::Result<(bool, bool, bool)> {
     // [bounded (disque), unbounded (réseau)] ; 0 = inchangé. Une écriture du
     // dump au plus en vol : un worker fichiers suffit.
     let mut max = [u32::from(file_cpus.is_some()), if net { workers.max(1) } else { 0 }];
-    ring.submitter().register_iowq_max_workers(&mut max)?;
+    ring.register_iowq_max_workers(&mut max)?;
     let mut parts = Vec::new();
     if net {
         let what = match (send, recv) {
@@ -934,12 +883,12 @@ fn setup_iowq(ring: &IoUring) -> io::Result<(bool, bool, bool)> {
         parts.push(format!("écritures du dump sur io-wq (CPU {f})"));
     }
     if !cpus.is_empty() {
-        // SAFETY: cpu_set_t initialisé à zéro puis rempli.
-        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-        for c in cpus.iter().flat_map(|l| l.split(',')).filter_map(|c| c.trim().parse::<usize>().ok()) {
-            unsafe { libc::CPU_SET(c, &mut set) };
+        // Masque de 1024 CPU, comme un `cpu_set_t`.
+        let mut set = [0u64; 16];
+        for c in cpus.iter().flat_map(|l| l.split(',')).filter_map(|c| c.trim().parse::<usize>().ok()).filter(|&c| c < 1024) {
+            set[c / 64] |= 1 << (c % 64);
         }
-        ring.submitter().register_iowq_aff(&set)?;
+        ring.register_iowq_aff(&set)?;
         parts.push(format!("affinité io-wq : CPU {}", cpus.join(",")));
     }
     println!("{}", parts.join(" ; "));
@@ -978,19 +927,19 @@ fn sqpoll_from_env() -> Option<(u32, u32)> {
     Some((cpu, idle))
 }
 
-fn build_ring(sqpoll: Option<(u32, u32)>) -> io::Result<IoUring> {
-    let mut b = IoUring::builder();
-    b.setup_single_issuer().setup_cqsize(CQ_ENTRIES);
+fn build_ring(sqpoll: Option<(u32, u32)>) -> io::Result<Ring> {
+    let mut b = ring::Builder::new();
+    b.single_issuer().cqsize(CQ_ENTRIES);
     match sqpoll {
         // Incompatible avec `DEFER_TASKRUN` et `TASKRUN_FLAG` : le travail des
         // complétions tourne dans le thread SQPOLL.
-        Some((cpu, idle)) => b.setup_sqpoll(idle).setup_sqpoll_cpu(cpu),
-        None => b.setup_defer_taskrun().setup_taskrun_flag(),
+        Some((cpu, idle)) => b.sqpoll(idle).sqpoll_cpu(cpu),
+        None => b.defer_taskrun().taskrun_flag(),
     };
     b.build(SQ_ENTRIES)
         .map_err(|e| {
             io::Error::new(
-                e.kind(),
+                io::Error::from(e).kind(),
                 format!(
                     "io_uring indisponible ({e}). Noyau 6.12 ou plus récent requis ; en conteneur, \
                      le profil seccomp par défaut de Docker bloque io_uring \
@@ -1137,8 +1086,8 @@ fn main() -> io::Result<()> {
     cfg.save_rules = autosave::rules_from_env().map_err(|e| io::Error::other(format!("RADIXOX_SAVE : {e}")))?;
     cfg.stop_writes_on_bgsave_error = autosave::stop_writes_from_env();
     cfg.max_conn = raise_nofile(cfg.max_conn);
-    ring.submitter().register_files_sparse(cfg.max_conn)?;
-    let no_iowait = ring.params().is_feature_no_iowait();
+    ring.register_files_sparse(cfg.max_conn)?;
+    let no_iowait = ring.feature_no_iowait();
     let (send_async, recv_async, file_async) = setup_iowq(&ring)?;
     let min_wait = min_wait(&ring);
     if let Some(mb) = std::env::var("RADIXOX_AOF_MAX_PENDING_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
@@ -1183,7 +1132,7 @@ fn main() -> io::Result<()> {
 
     // Avec l'AOF, le flux suffit à l'arrêt : pas de save par défaut.
     let signals = Signals::install(core.autosave_on() && !aof_on, aof_on)?;
-    let mut server = Server { ring, bufring, core, listener, ops: Vec::new(), no_iowait, send_async, recv_async, file_async, min_wait, sqpoll: sqpoll.is_some(),
+    let mut server = Server { ring, bufring, cqes: Vec::new(), core, listener, ops: Vec::new(), no_iowait, send_async, recv_async, file_async, min_wait, sqpoll: sqpoll.is_some(),
         spin: Duration::from_micros(std::env::var("RADIXOX_SQPOLL_SPIN_US").ok().and_then(|v| v.parse().ok()).unwrap_or(1000)),
         signals,
         connects: Default::default(),
