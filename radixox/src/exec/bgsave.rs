@@ -11,6 +11,9 @@
 //! dépasse `CHUNK` et qu'aucune écriture n'est en vol, il devient l'écriture
 //! en vol (double tampon : `fill` / `spare` / `writing`).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use core::time::Duration;
 use radixox_lib::rx_eprintln;
 use radixox_lib::sys::{self, Instant};
@@ -335,7 +338,7 @@ impl BgSave {
             self.footer = true;
         }
         if self.fill.len() >= CHUNK || (last && !self.fill.is_empty()) {
-            let buf = std::mem::replace(&mut self.fill, std::mem::take(&mut self.spare));
+            let buf = core::mem::replace(&mut self.fill, core::mem::take(&mut self.spare));
             self.crc.update(&buf);
             self.writing = buf;
             return Some(FileOp::Write { fd, off: self.pos });
@@ -366,7 +369,7 @@ impl BgSave {
             self.pos += len as u64;
         }
         self.writes += 1;
-        let mut buf = std::mem::take(&mut self.writing);
+        let mut buf = core::mem::take(&mut self.writing);
         buf.clear();
         self.spare = buf;
     }

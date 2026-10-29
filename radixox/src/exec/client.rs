@@ -2,7 +2,10 @@
 //! COMMAND. RESP2 seulement : `HELLO 3` répond `-NOPROTO`, ce qui fait
 //! retomber go-redis, Lettuce et redis-py en RESP2.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+#[allow(unused_imports)]
+use crate::prelude::*;
+
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use radixox_lib::shared_byte::SharedByte;
 
@@ -49,7 +52,7 @@ const BAD_NAME: &str = "ERR Client names cannot contain spaces, newlines or spec
 /// puis exigence d'authentification, puis SETNAME.
 pub fn cmd_hello(args: &[&[u8]], client: &mut Client) -> Frame {
     if let Some(v) = args.first() {
-        match std::str::from_utf8(v).ok().and_then(|s| s.parse::<i64>().ok()) {
+        match core::str::from_utf8(v).ok().and_then(|s| s.parse::<i64>().ok()) {
             Some(2) => {}
             Some(_) => return Frame::Error("NOPROTO unsupported protocol version".into()),
             None => return Frame::Error("ERR Protocol version is not an integer or out of range".into()),
@@ -170,6 +173,8 @@ pub fn cmd_command(args: &[&[u8]]) -> Frame {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::valid_name;
 
     #[test]

@@ -9,6 +9,9 @@
 //! s'arrête à la première erreur. Le faux noyau des tests et l'arrêt du serveur
 //! l'exécutent d'une traite ([`FsTask::run_blocking`]).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use alloc::ffi::CString;
 use core::ffi::CStr;
 
@@ -256,6 +259,8 @@ impl Drop for FsTask {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
 
     fn tmpdir(name: &str) -> std::path::PathBuf {
@@ -312,7 +317,7 @@ mod tests {
         t.done(res);
         let StepRef::Write { fd, .. } = t.step().unwrap() else { panic!() };
         // SAFETY: fd ouvert par la suite.
-        assert_eq!(rustix::io::pwrite(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }, b"abc", 0), Ok(3));
+        assert_eq!(rustix::io::pwrite(unsafe { rustix::fd::BorrowedFd::borrow_raw(fd) }, b"abc", 0), Ok(3));
         t.done(3);
         let StepRef::Write { buf, off, .. } = t.step().unwrap() else { panic!("écriture à reprendre") };
         assert_eq!((buf, off), (&b"def"[..], 3));

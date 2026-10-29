@@ -1,6 +1,9 @@
 //! Erreur de la crate, sans `std` : un code du noyau (`errno`), un message, ou les
 //! deux (le message cite alors le chemin ou l'opération).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use core::fmt;
 
 use radixox_lib::sys::OsError;

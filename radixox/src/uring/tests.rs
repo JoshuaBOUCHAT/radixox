@@ -1,6 +1,11 @@
 //! Tests du cœur sur un faux noyau (RUNTIME_ARCH.md §1.1 règle 3, §16) :
 //! séquences de complétions fabriquées, invariants vérifiés à chaque tour.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+#[allow(unused_imports)]
+use std::{dbg, eprintln, print, println};
+
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
@@ -187,13 +192,11 @@ impl Fake {
                 // Fichier du BGSAVE : écritures réelles (le dump est relu par le test).
                 Op::FileWrite { fd, off, save } => {
                     let buf = self.core.pending_file_write(save);
-                    // SAFETY: fd ouvert par le BGSAVE, tampon valide.
-                    let res = unsafe { libc::pwrite(fd, buf.as_ptr().cast(), buf.len(), off as i64) };
+                    let res = kpwrite(fd, buf, off);
                     self.completions.push(Completion::File { res: res as i32, save });
                 }
                 Op::FileSync { fd, save } => {
-                    // SAFETY: fd ouvert par le BGSAVE.
-                    let res = unsafe { libc::fdatasync(fd) };
+                    let res = kfdatasync(fd);
                     self.completions.push(Completion::File { res, save });
                 }
                 // Segment de l'AOF : écritures réelles (relues par le test).
@@ -204,7 +207,7 @@ impl Fake {
                 // Chaîne liée (IOSQE_IO_LINK) : le fsync suit son écriture.
                 Op::JournalSync { .. } if std::mem::take(&mut self.link_held) => self.journal_held.push(op),
                 Op::JournalSync { writer, .. } if std::mem::take(&mut self.cancel_sync) => {
-                    self.completions.push(Completion::JournalSync { res: -libc::ECANCELED, writer });
+                    self.completions.push(Completion::JournalSync { res: -ECANCELED, writer });
                 }
                 Op::JournalSync { .. } if self.sync_stalled => self.sync_held.push(op),
                 Op::JournalWrite { fd, off, writer, link } => {
@@ -214,14 +217,12 @@ impl Fake {
                         Some(max) => buf.len().min(max),
                         None => buf.len(),
                     };
-                    // SAFETY: fd ouvert par l'écrivain, tampon valide.
-                    let res = unsafe { libc::pwrite(fd, buf.as_ptr().cast(), n, off as i64) };
+                    let res = kpwrite(fd, &buf[..n], off);
                     self.cancel_sync = link && (res as usize) < buf.len();
                     self.completions.push(Completion::JournalWrite { res: res as i32, writer });
                 }
                 Op::JournalSync { fd, writer } => {
-                    // SAFETY: fd ouvert par l'écrivain.
-                    let res = unsafe { libc::fdatasync(fd) };
+                    let res = kfdatasync(fd);
                     self.completions.push(Completion::JournalSync { res, writer });
                 }
                 Op::Connect { slot, addr } => self.connecting.push((slot, addr)),
@@ -699,7 +700,7 @@ fn bgsave_writes_a_consistent_dump() {
     assert!(!f.core.bgsave_running());
     crate::exec::persist::set_save_dir(None);
     let mut art = OxidArt::new();
-    art.load_file(std::fs::File::open(dir.join("dump.rxd")).unwrap()).unwrap();
+    art.load_file(crate::fs::FdSource(crate::fs::open_read(p(&dir.join("dump.rxd"))).unwrap())).unwrap();
     assert_eq!(art.len(), 5000);
     assert_eq!(art.get(b"b0"), Some(oxidart::Value::from_str("v0")), "vue T0");
     let _ = std::fs::remove_dir_all(&dir);
@@ -1131,6 +1132,20 @@ fn expired_keys_are_absent_for_writes() {
 // ── Reprise depuis les fichiers de l'AOF (DURABILITY_DESIGN.md §9, test 4) ──
 
 /// Dossier de test neuf (supprimé s'il existe).
+/// `pwrite` du faux noyau : octets écrits ou `-errno`, comme un CQE.
+fn kpwrite(fd: i32, buf: &[u8], off: u64) -> i32 {
+    // SAFETY: fd ouvert par le cœur pendant toute l'opération.
+    let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(fd) };
+    rustix::io::pwrite(fd, buf, off).map_or_else(|e| -e.raw_os_error(), |n| n as i32)
+}
+
+/// `fdatasync` du faux noyau : 0 ou `-errno`.
+fn kfdatasync(fd: i32) -> i32 {
+    // SAFETY: comme `kpwrite`.
+    let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(fd) };
+    rustix::fs::fdatasync(fd).map_or_else(|e| -e.raw_os_error(), |()| 0)
+}
+
 /// Chemin d'un dossier de test, pour les API à `&str`.
 fn p(d: &std::path::Path) -> &str {
     d.to_str().unwrap()
@@ -1184,9 +1199,9 @@ fn write_aof(dir: &std::path::Path, parts: &[&[Vec<u8>]]) {
     m.write(p(dir)).unwrap();
 }
 
-fn recover_state(dir: &std::path::Path, now: u64, truncated: bool) -> std::io::Result<(Vec<String>, crate::exec::aof::Resume)> {
+fn recover_state(dir: &std::path::Path, now: u64, truncated: bool) -> crate::Result<(Vec<String>, crate::exec::aof::Resume)> {
     let mut art = OxidArt::new();
-    let res = crate::exec::aof::recover(&mut art, p(dir), truncated).map_err(std::io::Error::from)?.expect("manifeste");
+    let res = crate::exec::aof::recover(&mut art, p(dir), truncated)?.expect("manifeste");
     art.set_now(now);
     Ok((state(&mut art), res))
 }
@@ -1549,7 +1564,7 @@ fn rewrite_cut_is_exact_inside_a_pipeline() {
     assert_eq!(m.incrs, ["journal.2.rxj"]);
     // La base : a=1, au bloc CUT.
     let mut base = OxidArt::new();
-    let stats = base.load_file(std::fs::File::open(dir.join(&m.base)).unwrap()).unwrap();
+    let stats = base.load_file(crate::fs::FdSource(crate::fs::open_read(p(&dir.join(&m.base))).unwrap())).unwrap();
     assert_eq!((stats.pos.seq, stats.pos.offset), (m.base_seq, m.base_offset));
     assert!(matches!(base.get(b"a"), Some(oxidart::value::Value::String(v)) if v.as_slice() == b"1"));
     // Le segment suivant : SET a 2 seulement.

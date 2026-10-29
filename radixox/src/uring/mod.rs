@@ -4,6 +4,9 @@
 //! des [`Op`] ; la couche io_uring du binaire `radixox` les traduit en
 //! CQE / SQE, et les tests les fabriquent (faux noyau, `tests.rs`).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 pub mod bufs;
 pub mod conn;
 mod core;

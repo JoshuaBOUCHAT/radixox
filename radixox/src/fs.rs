@@ -2,6 +2,9 @@
 //! Seulement les quelques suites d'appels que la crate répète ; pas de couche
 //! `File` / `Path`.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
@@ -201,6 +204,8 @@ impl BufReader {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
 
     #[test]

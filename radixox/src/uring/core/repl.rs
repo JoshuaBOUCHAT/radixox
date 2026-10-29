@@ -11,7 +11,10 @@
 //! authentifiée. Le mode suivi ([`Follow`]) prend l'horloge des blocs
 //! (`Core::tick`) et refuse les écritures des clients (`exec_window`).
 
-use std::collections::VecDeque;
+#[allow(unused_imports)]
+use crate::prelude::*;
+
+use alloc::collections::VecDeque;
 use core::time::Duration;
 use radixox_lib::rx_eprintln;
 use radixox_lib::sys::{Instant, OsError};
@@ -28,7 +31,7 @@ use crate::fs::{self, FdSource};
 
 use super::super::conn::{ConnOut, Mode};
 use super::{After, Core, Op, REPL_EVERY, Slot, Timer};
-use std::cmp::Reverse;
+use core::cmp::Reverse;
 
 /// Morceau de dump par `RXLOAD DATA`.
 const LOAD_CHUNK: u64 = 1 << 20;
@@ -457,7 +460,7 @@ impl Core {
     /// Traite les réponses complètes reçues sur le lien.
     fn link_replies(&mut self, slot: Slot) {
         let s = slot as usize;
-        let data = std::mem::take(&mut self.ins[s].rx);
+        let data = core::mem::take(&mut self.ins[s].rx);
         let mut pos = 0;
         let mut res = Ok(());
         while let Some(n) = data[pos..].windows(2).position(|w| w == b"\r\n") {
@@ -489,7 +492,7 @@ impl Core {
             Some((b'+', _)) => Reply::Ok,
             Some((b'-', e)) => Reply::Err(e),
             Some((b':', n)) => Reply::Int(
-                std::str::from_utf8(n).ok().and_then(|n| n.parse().ok()).ok_or_else(|| format!("entier illisible {:?}", n.escape_ascii().to_string()))?,
+                core::str::from_utf8(n).ok().and_then(|n| n.parse().ok()).ok_or_else(|| format!("entier illisible {:?}", n.escape_ascii().to_string()))?,
             ),
             _ => return Err(format!("réponse inattendue {:?}", line.escape_ascii().to_string())),
         };
@@ -633,7 +636,7 @@ impl Core {
         if tap.is_empty() {
             return;
         }
-        let blocks = std::mem::take(tap);
+        let blocks = core::mem::take(tap);
         let (backlog_max, max_lag) = (self.cfg.repl_backlog, self.cfg.repl_max_lag);
         let biggest = blocks.iter().map(|b| b.len() as u64).max().unwrap_or(0);
         let online_lag = self.cfg.repl_online_lag + biggest;
@@ -710,7 +713,7 @@ impl Core {
                 let (base, base_offset) = l.base.expect("chargement sans base");
                 l.expect.push_back(Expect::LoadEnd { seq: base, end: base_offset });
                 l.next_seq = base + 1;
-                for b in std::mem::take(&mut l.queue) {
+                for b in core::mem::take(&mut l.queue) {
                     l.push_block(o, &b);
                 }
                 l.queue_bytes = 0;
@@ -790,7 +793,7 @@ impl Core {
             return;
         }
         let now = self.now;
-        for w in std::mem::take(&mut self.waiters) {
+        for w in core::mem::take(&mut self.waiters) {
             let n = self.acked_count(w.mark);
             let o = &self.outs[w.slot as usize];
             if o.epoch != w.epoch || !o.repl_wait {
@@ -847,7 +850,7 @@ impl Core {
                 reply(self, resp_ok());
             }
             After::RxHello(id) => {
-                let id = std::str::from_utf8(&id).ok().and_then(unhex).ok_or_else(|| refuse("ERR invalid replication id"))?;
+                let id = core::str::from_utf8(&id).ok().and_then(unhex).ok_or_else(|| refuse("ERR invalid replication id"))?;
                 if self.promoted {
                     return Err(refuse(
                         "ERR this server was promoted (REPLICAOF NO ONE): restart it to make it a replica again",
@@ -922,7 +925,7 @@ impl Core {
                 reply(self, Frame::Integer(blk.seq as i64));
                 // Réplica avec AOF ou qui chaîne : le bloc reçu, tel quel.
                 if let Some(j) = &mut self.journal {
-                    j.push_raw(std::rc::Rc::new(b), &blk);
+                    j.push_raw(alloc::rc::Rc::new(b), &blk);
                     // `always` : l'acquittement attend le fsync du bloc.
                     if let Some(durable) = self.aof.as_ref().and_then(|w| w.release_upto()) {
                         let mark = j.end_mark();
@@ -1081,7 +1084,7 @@ impl Core {
         self.replace_aof(w);
         self.fs_trash(trash);
         // Les marques des réponses retenues sont celles de l'ancienne histoire.
-        for slot in std::mem::take(&mut self.held) {
+        for slot in core::mem::take(&mut self.held) {
             let o = &mut self.outs[slot as usize];
             o.holds.clear();
             if !o.dirty && !o.out.is_empty() {
@@ -1107,7 +1110,7 @@ impl Core {
 
     /// Section `# Replication`.
     pub(super) fn repl_info(&self, out: &mut String) {
-        use std::fmt::Write as _;
+        use core::fmt::Write as _;
         out.push_str("# Replication\r\n");
         let cur = match &self.follow {
             Some(f) => {

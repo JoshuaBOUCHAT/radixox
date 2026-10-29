@@ -12,7 +12,10 @@
 //! 4. [`Core::flush`] : un send par connexion sale, fermetures terminées ;
 //! 5. [`Core::take_ops`] → SQE, puis `enter`.
 
-use std::cmp::Reverse;
+#[allow(unused_imports)]
+use crate::prelude::*;
+
+use core::cmp::Reverse;
 use alloc::collections::BinaryHeap;
 
 use hashbrown::HashMap;
@@ -245,7 +248,7 @@ pub enum Op {
     JournalSync { fd: i32, writer: u32 },
     /// Connexion sortante vers un réplica : socket installé dans `slot`
     /// (réglages comme `Install`), puis `connect`.
-    Connect { slot: Slot, addr: std::net::SocketAddr },
+    Connect { slot: Slot, addr: core::net::SocketAddr },
     /// Étape courante ([`Core::fs_step`]) de la suite de fichiers `id`, à
     /// exécuter hors de la boucle (worker io-wq).
     Fs { id: u32 },
@@ -292,12 +295,12 @@ type Batch<T> = SmallVec<{ oxidart::PREFETCH_BATCH }, T>;
 /// accès ne choisit entre inline et tas.
 struct Fixed<T, const N: usize = { oxidart::PREFETCH_BATCH }> {
     len: usize,
-    buf: [std::mem::MaybeUninit<T>; N],
+    buf: [core::mem::MaybeUninit<T>; N],
 }
 
 impl<T, const N: usize> Fixed<T, N> {
     fn new() -> Self {
-        Self { len: 0, buf: [const { std::mem::MaybeUninit::uninit() }; N] }
+        Self { len: 0, buf: [const { core::mem::MaybeUninit::uninit() }; N] }
     }
 
     /// La borne est structurelle (largeur de fenêtre), jamais une donnée client.
@@ -316,25 +319,25 @@ impl<T, const N: usize> Fixed<T, N> {
     /// Consomme les éléments dans l'ordre, sans déplacer le tableau.
     #[inline]
     fn drain(&mut self) -> FixedDrain<'_, T, N> {
-        let len = std::mem::replace(&mut self.len, 0);
+        let len = core::mem::replace(&mut self.len, 0);
         FixedDrain { arr: self, pos: 0, len }
     }
 }
 
-impl<T, const N: usize> std::ops::Deref for Fixed<T, N> {
+impl<T, const N: usize> core::ops::Deref for Fixed<T, N> {
     type Target = [T];
     #[inline]
     fn deref(&self) -> &[T] {
         // SAFETY: `len` premiers emplacements initialisés.
-        unsafe { std::slice::from_raw_parts(self.buf.as_ptr() as *const T, self.len) }
+        unsafe { core::slice::from_raw_parts(self.buf.as_ptr() as *const T, self.len) }
     }
 }
 
-impl<T, const N: usize> std::ops::DerefMut for Fixed<T, N> {
+impl<T, const N: usize> core::ops::DerefMut for Fixed<T, N> {
     #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
         // SAFETY: idem.
-        unsafe { std::slice::from_raw_parts_mut(self.buf.as_mut_ptr() as *mut T, self.len) }
+        unsafe { core::slice::from_raw_parts_mut(self.buf.as_mut_ptr() as *mut T, self.len) }
     }
 }
 
@@ -671,9 +674,9 @@ pub struct Core {
     throttled: Vec<(Slot, u32)>,
     /// Recv arrêtés faute de tampon, réarmés quand un tampon revient.
     starved: Vec<Slot>,
-    jobs: std::collections::VecDeque<FlushJob>,
+    jobs: alloc::collections::VecDeque<FlushJob>,
     /// Jobs des connexions parquées, avec l'époque de leur parquage.
-    conn_jobs: std::collections::VecDeque<(Slot, u32, ConnJob)>,
+    conn_jobs: alloc::collections::VecDeque<(Slot, u32, ConnJob)>,
     turn: u64,
     /// Commandes exécutées depuis le démarrage (`total_commands_processed`).
     cmds_total: u64,
@@ -1011,7 +1014,7 @@ impl Core {
             FsOwner::Save(save) => self.on_save_fs(save, job.task),
             FsOwner::Trash => {
                 if let Some(e) = job.task.error() {
-                    eprintln!("[aof] suppression d'un ancien fichier : {e}");
+                    radixox_lib::rx_eprintln!("[aof] suppression d'un ancien fichier : {e}");
                 }
             }
         }
@@ -1048,7 +1051,7 @@ impl Core {
         if w.pending(j) > self.cfg.aof_max_pending / 2 {
             return;
         }
-        for slot in std::mem::take(&mut self.aof_waiting) {
+        for slot in core::mem::take(&mut self.aof_waiting) {
             let s = slot as usize;
             let o = &mut self.outs[s];
             if !o.aof_wait {
@@ -1122,9 +1125,9 @@ impl Core {
                         w.rewrite_due(self.cfg.aof_rewrite_percentage, self.cfg.aof_rewrite_min_size)
                     });
                     if due && self.bgsave.is_none() && !self.art.is_saving() {
-                        eprintln!("[aof] journal au-delà du seuil de réécriture automatique : BGREWRITEAOF");
+                        radixox_lib::rx_eprintln!("[aof] journal au-delà du seuil de réécriture automatique : BGREWRITEAOF");
                         if let Err(e) = self.start_bgsave() {
-                            eprintln!("[aof] échec du démarrage de la réécriture : {e}");
+                            radixox_lib::rx_eprintln!("[aof] échec du démarrage de la réécriture : {e}");
                         }
                     }
                     self.timers.push(Reverse((self.now + self.aof_every(), Timer::Aof)));
@@ -1134,9 +1137,9 @@ impl Core {
                         && !self.art.is_saving()
                         && let Some(rule) = self.persist.due(self.now)
                     {
-                        eprintln!("[autosave] règle « save {} {} » atteinte : BGSAVE", rule.secs, rule.changes);
+                        radixox_lib::rx_eprintln!("[autosave] règle « save {} {} » atteinte : BGSAVE", rule.secs, rule.changes);
                         if let Err(e) = self.start_bgsave() {
-                            eprintln!("[autosave] échec du démarrage : {e}");
+                            radixox_lib::rx_eprintln!("[autosave] échec du démarrage : {e}");
                         }
                     }
                     self.timers.push(Reverse((self.now + AUTOSAVE_EVERY, Timer::AutoSave)));
@@ -1396,7 +1399,7 @@ impl Core {
         }
         if let Some(res) = bg.finished(&mut self.art) {
             if let Err(e) = &res {
-                eprintln!("[bgsave] échec : {e}");
+                radixox_lib::rx_eprintln!("[bgsave] échec : {e}");
             }
             self.persist.bgsave_finished(Instant::now(), res.is_ok());
             let target = bg.target().clone();
@@ -1688,7 +1691,7 @@ impl Core {
         }
         self.bufs.recycle(bid);
         self.ops.push(Op::ProvideBuf { bid });
-        for slot in std::mem::take(&mut self.starved) {
+        for slot in core::mem::take(&mut self.starved) {
             let o = &self.outs[slot as usize];
             if o.mode == Mode::Normal && !o.recv_armed && !self.ins[slot as usize].broken {
                 self.arm_recv(slot);
@@ -1774,7 +1777,7 @@ impl Core {
         // encore chaud en cache, plutôt que dans l'autre (+1,4 défaut L1 par
         // commande mesuré avec l'alternance).
         if o.out.is_empty() {
-            std::mem::swap(&mut o.out, &mut o.sending);
+            core::mem::swap(&mut o.out, &mut o.sending);
         }
         if !o.nothing_to_send() && !o.dirty {
             o.dirty = true;
@@ -1973,7 +1976,7 @@ impl Core {
     }
 
     fn maxmemory_info(&self, out: &mut String) {
-        use std::fmt::Write as _;
+        use core::fmt::Write as _;
         let policies: Vec<&str> = crate::exec::maxmem::Policy::available().map(|p| p.name()).collect();
         let _ = write!(
             out,
@@ -2098,13 +2101,13 @@ impl Core {
         for (s, o) in self.outs.iter().enumerate() {
             if o.mode != Mode::Free {
                 let i = &self.ins[s];
-                eprintln!(
+                radixox_lib::rx_eprintln!(
                     "DBG slot {s} mode {:?} out {} sending {} sent {} refs {} holds {} big {} work {} rx {}/{} spans {} parked {} dirty {} ready {} drawable {}",
                     o.mode, o.out.len(), o.sending.len(), o.sent, o.refs, o.holds.len(), o.big.is_some(), i.has_work(), i.rx_ready, i.rx.len(), i.spans.len(), o.parked(), o.dirty, o.ready, self.drawable(s as Slot)
                 );
             }
         }
-        eprintln!("DBG flush_early {} backpressure {}", self.cfg.flush_early, self.cfg.out_backpressure);
+        radixox_lib::rx_eprintln!("DBG flush_early {} backpressure {}", self.cfg.flush_early, self.cfg.out_backpressure);
     }
 
     /// La connexion peut donner des frames à ce tour-ci.
@@ -2163,7 +2166,7 @@ impl Core {
         }
         // Reprise des réceptions suspendues sous 90 % du budget (hystérésis).
         if !self.throttled.is_empty() && input <= self.cfg.input_budget / 10 * 9 {
-            for (slot, epoch) in std::mem::take(&mut self.throttled) {
+            for (slot, epoch) in core::mem::take(&mut self.throttled) {
                 let s = slot as usize;
                 if self.outs[s].epoch != epoch || !self.ins[s].throttled {
                     continue;
@@ -2476,7 +2479,7 @@ impl Core {
                             {
                                 // SAFETY: les frames de la série (k..run_end) ne sont pas
                                 // encore consommées ; leurs champs vivent dans leur `Cmd`.
-                                items[m] = (hints[start[j] as usize], unsafe { std::slice::from_raw_parts(p, n) }, z);
+                                items[m] = (hints[start[j] as usize], unsafe { core::slice::from_raw_parts(p, n) }, z);
                                 m += 1;
                             }
                         }
@@ -2766,7 +2769,7 @@ impl Core {
                 extend_encode(&mut self.outs[s].out, &frame);
             }
             After::Config(args) => {
-                let mut out = std::mem::take(&mut self.outs[s].out);
+                let mut out = core::mem::take(&mut self.outs[s].out);
                 self.config_cmd(&args, &mut out);
                 self.outs[s].out = out;
             }
@@ -2796,7 +2799,7 @@ impl Core {
                     let target = self.dump_target();
                     match save_sync_to(&mut self.art, sync_level(), &target) {
                         Ok(st) => {
-                            eprintln!(
+                            radixox_lib::rx_eprintln!(
                                 "[save] {:.1} MB ({:.1} MB bruts) en {:.2?} (DFS {:.2?})",
                                 st.written as f64 / 1e6,
                                 st.raw as f64 / 1e6,
@@ -2828,7 +2831,7 @@ impl Core {
                 crate::exec::info_stats(&mut info);
                 self.maxmemory_info(&mut info);
                 let st = self.out_stats;
-                let _ = std::fmt::Write::write_fmt(
+                let _ = core::fmt::Write::write_fmt(
                     &mut info,
                     format_args!(
                         "clients_output_bytes:{}\r\nclients_output_max_bytes:{}\r\nclients_input_bytes:{}\r\n\
@@ -2839,7 +2842,7 @@ impl Core {
                     ),
                 );
                 let st = self.art.amac_stats;
-                let _ = std::fmt::Write::write_fmt(
+                let _ = core::fmt::Write::write_fmt(
                     &mut info,
                     format_args!(
                         "total_commands_processed:{}\r\namac_cmds:{}\r\namac_redescents:{}\r\n",
@@ -2849,8 +2852,8 @@ impl Core {
                 info.push_str("\r\n");
                 crate::exec::info_memory(&mut info, self.gc.enabled, self.gc.pass.is_some(), self.gc.max_slice_us);
                 crate::exec::info_memory_total(&mut info, &self.art.slab_mem());
-                let _ = std::fmt::Write::write_fmt(&mut info, format_args!("mem_hislab_trimmed_bytes:{}\r\n", self.gc.trimmed_bytes));
-                let _ = std::fmt::Write::write_fmt(
+                let _ = core::fmt::Write::write_fmt(&mut info, format_args!("mem_hislab_trimmed_bytes:{}\r\n", self.gc.trimmed_bytes));
+                let _ = core::fmt::Write::write_fmt(
                     &mut info,
                     format_args!(
                         "compact_running:{}\r\ncompact_passes:{}\r\ncompact_moved_nodes:{}\r\ncompact_released_bytes:{}\r\ncompact_max_slice_us:{}\r\ncompact_total_us:{}\r\ncompact_slab_holes_bytes:{}\r\n",
@@ -2863,7 +2866,7 @@ impl Core {
                         self.art.slab_holes_bytes(),
                     ),
                 );
-                let _ = std::fmt::Write::write_fmt(
+                let _ = core::fmt::Write::write_fmt(
                     &mut info,
                     format_args!("compact_list_moved_blocks:{}\r\ncompact_list_released_bytes:{}\r\nlist_slab_holes_bytes:{}\r\ncompact_valart_moved_nodes:{}\r\ncompact_valart_released_bytes:{}\r\nvalart_slab_holes_bytes:{}\r\ncompact_zset_tree_moved_nodes:{}\r\ncompact_zset_tree_released_bytes:{}\r\nzset_tree_slab_holes_bytes:{}\r\ncompact_zset_index_moved_nodes:{}\r\ncompact_zset_index_released_bytes:{}\r\nzset_index_slab_holes_bytes:{}\r\n",
                     self.gc.compact_list_moved,
@@ -2969,7 +2972,7 @@ impl Core {
 
     /// Retire la connexion de tous ses canaux (fermeture).
     fn unsubscribe_all(&mut self, slot: Slot) {
-        for ch in std::mem::take(&mut self.outs[slot as usize].channels) {
+        for ch in core::mem::take(&mut self.outs[slot as usize].channels) {
             self.remove_sub(&ch, slot);
         }
     }
@@ -3009,7 +3012,7 @@ impl Core {
             }
         }
         for slot in over {
-            eprintln!("[pubsub] abonné {slot} trop lent : limite de sortie dépassée, connexion fermée");
+            radixox_lib::rx_eprintln!("[pubsub] abonné {slot} trop lent : limite de sortie dépassée, connexion fermée");
             self.drain(slot);
         }
         sent
@@ -3069,7 +3072,7 @@ impl Core {
     /// `rx`, l'anneau n'est pas retenu pendant l'attente.
     fn spans_to_rx(&mut self, slot: Slot) {
         let s = slot as usize;
-        let spans = std::mem::take(&mut self.ins[s].spans);
+        let spans = core::mem::take(&mut self.ins[s].spans);
         for span in spans {
             self.ins[s].rx.extend_from_slice(self.bufs.slice(span.bid, span.off, span.len));
             self.bufs.release(span.bid);
@@ -3116,7 +3119,7 @@ impl Core {
         let Some(c) = self.gc.compact.as_mut() else { return false };
         if !(!self.art.is_saving() && self.conn_jobs.is_empty() && self.jobs.is_empty()) {
             if self.gc.log {
-                eprintln!("[compact] arrêt : save ou job en cours ({} nœuds déplacés)", c.moved);
+                radixox_lib::rx_eprintln!("[compact] arrêt : save ou job en cours ({} nœuds déplacés)", c.moved);
             }
             self.gc.compact_moved += c.moved;
             self.gc.compact = None;
@@ -3133,7 +3136,7 @@ impl Core {
             self.gc.compact_moved += r.moved;
             self.gc.compact_released += r.released_bytes as u64;
             if self.gc.log {
-                eprintln!("[compact] fin : {} nœuds déplacés, {} Kio rendus", r.moved, r.released_bytes >> 10);
+                radixox_lib::rx_eprintln!("[compact] fin : {} nœuds déplacés, {} Kio rendus", r.moved, r.released_bytes >> 10);
             }
         }
         true
@@ -3190,7 +3193,7 @@ impl Core {
             *r += released as u64;
             self.gc.more_fruitless[which] = if released == 0 { holes } else { 0 };
             if self.gc.log {
-                eprintln!("[compact] fin : {moved} {what} déplacés, {} Kio rendus", released >> 10);
+                radixox_lib::rx_eprintln!("[compact] fin : {moved} {what} déplacés, {} Kio rendus", released >> 10);
             }
         }
         true
@@ -3207,7 +3210,7 @@ impl Core {
             if n > 0 {
                 self.gc.trimmed_bytes += n as u64;
                 if self.gc.log {
-                    eprintln!("[compact] fins de slabs rendues : {} Kio", n >> 10);
+                    radixox_lib::rx_eprintln!("[compact] fins de slabs rendues : {} Kio", n >> 10);
                 }
             }
         }
@@ -3218,7 +3221,7 @@ impl Core {
             && let Some(c) = self.art.compact_want(false)
         {
             if self.gc.log {
-                eprintln!("[compact] passe : {} Kio de trous dans la slab des nœuds", self.art.slab_holes_bytes() >> 10);
+                radixox_lib::rx_eprintln!("[compact] passe : {} Kio de trous dans la slab des nœuds", self.art.slab_holes_bytes() >> 10);
             }
             self.gc.compact = Some(c);
             return;
@@ -3228,7 +3231,7 @@ impl Core {
             && let Some(c) = oxidart::list::compact::want(false)
         {
             if self.gc.log {
-                eprintln!("[compact] passe : {} Kio de trous dans la slab des blocs de List", oxidart::list::compact::holes_bytes() >> 10);
+                radixox_lib::rx_eprintln!("[compact] passe : {} Kio de trous dans la slab des blocs de List", oxidart::list::compact::holes_bytes() >> 10);
             }
             self.gc.compact_more = Some(MorePass::List(c));
             return;
@@ -3238,7 +3241,7 @@ impl Core {
             && let Some(c) = self.art.valart_compact_want(false)
         {
             if self.gc.log {
-                eprintln!("[compact] passe : {} Kio de trous dans la slab valart", self.art.valart_holes_bytes() >> 10);
+                radixox_lib::rx_eprintln!("[compact] passe : {} Kio de trous dans la slab valart", self.art.valart_holes_bytes() >> 10);
             }
             self.gc.compact_more = Some(MorePass::ValRepair(0, c));
             return;
@@ -3248,7 +3251,7 @@ impl Core {
             && let Some(c) = oxidart::zset::btree::compact::want(false)
         {
             if self.gc.log {
-                eprintln!("[compact] passe : {} Kio de trous dans la slab du B+tree des ZSet", oxidart::zset::btree::compact::holes_bytes() >> 10);
+                radixox_lib::rx_eprintln!("[compact] passe : {} Kio de trous dans la slab du B+tree des ZSet", oxidart::zset::btree::compact::holes_bytes() >> 10);
             }
             self.gc.compact_more = Some(MorePass::ZTree(c));
             return;
@@ -3258,7 +3261,7 @@ impl Core {
             && let Some(c) = oxidart::zset::index::compact::want(false)
         {
             if self.gc.log {
-                eprintln!("[compact] passe : {} Kio de trous dans la slab de l'index des ZSet", oxidart::zset::index::compact::holes_bytes() >> 10);
+                radixox_lib::rx_eprintln!("[compact] passe : {} Kio de trous dans la slab de l'index des ZSet", oxidart::zset::index::compact::holes_bytes() >> 10);
             }
             self.gc.compact_more = Some(MorePass::ZIndex(c));
             return;
@@ -3274,7 +3277,7 @@ impl Core {
         self.gc.started = Some((now, pool::gc_stats().unwrap_or_default()));
         if self.gc.log {
             let how = if idle { "au repos" } else { "sous charge" };
-            eprintln!("[gc] passe : {n} blocs marqués ({mark:?}, {how})");
+            radixox_lib::rx_eprintln!("[gc] passe : {n} blocs marqués ({mark:?}, {how})");
         }
     }
 
@@ -3293,7 +3296,7 @@ impl Core {
         if self.gc.log
             && let (Some(r), Some((_, s0)), Some(s1)) = (r, self.gc.started.take(), pool::gc_stats())
         {
-            eprintln!(
+            radixox_lib::rx_eprintln!(
                 "[gc] fin : {} évacués ({} o), {} épinglés, {} Kio de blocs rendus, {} restent marqués, {} démarqués, {} ms",
                 s1.evacuated_objects - s0.evacuated_objects,
                 s1.evacuated_bytes - s0.evacuated_bytes,
@@ -3392,7 +3395,7 @@ impl Core {
     /// flush anticipé : sinon un pipeline de 256 commandes partait en ~20
     /// petits sends au lieu d'un (débit pipeliné divisé par deux, mesuré).
     pub fn flush(&mut self) {
-        for slot in std::mem::take(&mut self.dirty) {
+        for slot in core::mem::take(&mut self.dirty) {
             let s = slot as usize;
             // Parquée, ou arrêtée par le plafond de sortie : la suite attend, ce qui est
             // prêt part (sinon personne ne l'enverrait).
@@ -3410,7 +3413,7 @@ impl Core {
             o.dirty = false;
             self.send(slot);
         }
-        for slot in std::mem::take(&mut self.closing) {
+        for slot in core::mem::take(&mut self.closing) {
             let (i, o) = (&self.ins[slot as usize], &self.outs[slot as usize]);
             if o.mode != Mode::Closing {
                 continue;
@@ -3431,7 +3434,7 @@ impl Core {
         // Ici : tout envoi passe par `send` (fin de tour, envoi anticipé, suite d'un CQE).
         let o = &self.outs[slot as usize];
         if !o.link && o.channels.is_empty() && o.pending_out() > self.cfg.client_output_limit {
-            eprintln!(
+            radixox_lib::rx_eprintln!(
                 "[client] connexion {slot} : {} o de sortie en attente, au-delà de la limite ({} o) : fermée",
                 o.pending_out(),
                 self.cfg.client_output_limit
@@ -3465,7 +3468,7 @@ impl Core {
             return;
         }
         if n == o.out.len() {
-            std::mem::swap(&mut o.out, &mut o.sending);
+            core::mem::swap(&mut o.out, &mut o.sending);
         } else {
             o.sending.extend_from_slice(&o.out[..n]);
             o.out.drain(..n);
@@ -3535,7 +3538,7 @@ impl Core {
 
     fn release_queue(&mut self, slot: Slot) {
         let i = &mut self.ins[slot as usize];
-        let spans = std::mem::take(&mut i.spans);
+        let spans = core::mem::take(&mut i.spans);
         i.rx.clear();
         i.rx_ready = 0;
         for span in spans {
@@ -3750,7 +3753,7 @@ fn run_cmd(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) 
         let shared = art.gc_audit_unique();
         if !shared.is_empty() {
             let raw = GC_DEBUG_RAW.borrow().escape_ascii().to_string();
-            eprintln!("radixox_gc_debug : après {raw:.300} : SharedByte partagés : {:?}", &shared[..shared.len().min(5)]);
+            radixox_lib::rx_eprintln!("radixox_gc_debug : après {raw:.300} : SharedByte partagés : {:?}", &shared[..shared.len().min(5)]);
             panic!("audit d'unicité");
         }
     }
@@ -3904,7 +3907,7 @@ fn runtime(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) 
                     After::Continue
                 }
                 None => After::Block(block::Block {
-                    keys: std::iter::once(SharedByte::from_slice(src)).collect(),
+                    keys: core::iter::once(SharedByte::from_slice(src)).collect(),
                     kind: block::Kind::Move { dst: SharedByte::from_slice(dst), from_right, to_right },
                     timeout,
                 }),

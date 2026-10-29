@@ -12,7 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 >   ZSet → [`ANALYSE_ART_UNIFIE.md`](ANALYSE_ART_UNIFIE.md) §13 ;
 > - AOF, réplication, journal des commandes → [`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md) ;
 > - allocation, GC, compactage des slabs, `maxmemory` → [`MEMORY_ARCH.md`](MEMORY_ARCH.md) ;
-> - binaire sans `std` ni libc (chantier en cours, bibliothèques déjà `no_std`) →
+> - binaire sans `std` ni libc (chantier en cours, bibliothèques et lib `radixox` déjà `no_std`) →
 >   [`NOSTD_PLAN.md`](NOSTD_PLAN.md).
 
 ## Projet
@@ -47,6 +47,7 @@ cargo run --release --bin radixox         # écoute 127.0.0.1:6379 (RADIXOX_BIND
 cargo test -p oxidart --features regex    # arbre (dont tests différentiels contre oxidart-legacy)
 cargo test -p radixox-lib                 # parseur, SharedByte, barrière
 cargo build -p radixox-lib -p valart -p oxidart --no-default-features --features oxidart/regex   # #![no_std] + alloc : ne doit pas casser
+cargo build -p radixox --lib --no-default-features   # lib radixox no_std (le binaire exige la feature std)
 cargo test -p radixox                     # intégration : lance le binaire sur un port de test
 cargo test -p radixox --features eviction  # + LRU/LFU (tests sous cfg(feature = "eviction"))
 ```

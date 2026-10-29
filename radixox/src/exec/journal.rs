@@ -9,8 +9,11 @@
 //! - [`Block`] / [`read_block`] : format et validation d'un bloc ;
 //! - [`apply`] : rejeu d'une charge sur l'arbre (§9, réplica §10).
 
-use std::collections::VecDeque;
-use std::rc::Rc;
+#[allow(unused_imports)]
+use crate::prelude::*;
+
+use alloc::collections::VecDeque;
+use alloc::rc::Rc;
 
 use oxidart::OxidArt;
 use radixox_lib::cmd::{Cmd, Parse, SetCondition};
@@ -150,7 +153,7 @@ fn reply_bulks<'r>(reply: &'r [u8], into: &mut Vec<&'r [u8]>) -> bool {
 fn spop_members<'r>(reply: &'r [u8], into: &mut Vec<&'r [u8]>) -> bool {
     fn line(d: &[u8]) -> Option<(i64, usize)> {
         let end = d.windows(2).position(|w| w == b"\r\n")?;
-        let n = std::str::from_utf8(&d[1..end]).ok()?.parse().ok()?;
+        let n = core::str::from_utf8(&d[1..end]).ok()?.parse().ok()?;
         Some((n, end + 2))
     }
     fn bulk<'r>(d: &'r [u8], into: &mut Vec<&'r [u8]>) -> Option<usize> {
@@ -480,7 +483,7 @@ impl Stream {
             offset: self.offset,
             now: self.cur_now,
         };
-        let mut blk = std::mem::replace(&mut self.cur, vec![0; HEADER]);
+        let mut blk = core::mem::replace(&mut self.cur, vec![0; HEADER]);
         let (head, payload) = blk.split_at_mut(HEADER);
         write_header(head, &b, payload);
         let blk = Rc::new(blk);
@@ -562,6 +565,8 @@ pub fn apply_into(art: &mut OxidArt, payload: &[u8], pending: &mut Vec<FlushJob>
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
 
     fn stream_with(cmds: &[(u64, &[u8])]) -> Stream {

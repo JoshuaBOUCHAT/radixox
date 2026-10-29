@@ -6,6 +6,9 @@
 //! quand le noyau a fini d'y écrire (dernier morceau sans `F_BUF_MORE`) **et**
 //! qu'aucune frame en attente ne le vise plus (`refs == 0`).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 /// Identifiant d'un tampon dans l'anneau.
 pub type Bid = u16;
 

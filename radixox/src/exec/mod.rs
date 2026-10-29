@@ -3,6 +3,9 @@
 //! connexion cliente (AUTH, CLIENT, HELLO), curseurs SCAN, jobs, persistance.
 //! Utilisé par le cœur de la boucle io_uring (`radixox::uring`).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 pub mod aof;
 pub mod auth;
 pub mod autosave;
@@ -501,7 +504,7 @@ pub fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
 
 /// Sections `# Server` et `# Stats` d'`INFO` (la persistance vient du cœur).
 pub fn info_server(out: &mut String) {
-    use std::fmt::Write as _;
+    use core::fmt::Write as _;
     let _ = write!(
         out,
         "# Server\r\nredis_version:7.0.0\r\nradixox_version:{}\r\n\r\n",
@@ -510,14 +513,14 @@ pub fn info_server(out: &mut String) {
 }
 
 pub fn info_stats(out: &mut String) {
-    use std::fmt::Write as _;
+    use core::fmt::Write as _;
     let _ = write!(out, "# Stats\r\nscan_cursors:{}\r\n", scan::active_cursors());
 }
 
 /// Section `# Memory` d'`INFO` (MEMORY_ARCH.md §16.8) : objets externes, grands objets (§18), pool.
 pub fn info_memory(out: &mut String, gc_enabled: bool, gc_running: bool, gc_max_slice_us: u64) {
     use radixox_lib::raw_alloc::external;
-    use std::fmt::Write as _;
+    use core::fmt::Write as _;
     let _ = write!(
         out,
         "# Memory\r\nmem_external_bytes:{}\r\nmem_external_objects:{}\r\nmem_bigbuf_bytes:{}\r\n",
@@ -588,7 +591,7 @@ pub fn info_memory(out: &mut String, gc_enabled: bool, gc_running: bool, gc_max_
 /// pile, binaire, ce que la libc tient pour elle (~1–2 Mo, fixes) ; s'il grandit avec les
 /// données, une région manque.
 pub fn info_memory_total(out: &mut String, slabs: &[(&str, (u64, u64, u64))]) {
-    use std::fmt::Write as _;
+    use core::fmt::Write as _;
     let mut slabs_total = 0u64;
     for &(name, (touched, live, resident)) in slabs {
         let _ = write!(

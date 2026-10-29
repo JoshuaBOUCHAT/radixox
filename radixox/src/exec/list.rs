@@ -1,5 +1,8 @@
 //! Commandes List (ANALYSE_ART_UNIFIE.md §14) : réponses et erreurs de Redis.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use oxidart::OxidArt;
 use oxidart::lcommand::{End, LPosOpts, ListError};
 use oxidart::value::RedisType;

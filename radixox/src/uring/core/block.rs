@@ -10,6 +10,9 @@
 //! même fenêtre. Sémantique et journal de Redis : le push tel qu'envoyé, puis un pop par
 //! client servi.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use alloc::collections::VecDeque;
 
 use hashbrown::HashMap;
@@ -258,7 +261,7 @@ impl Serve<'_> {
                     if dst.as_slice() == key {
                         if *to_right { d.push_back(v.clone()) } else { d.push_front(v.clone()) }
                     } else {
-                        let _ = self.art.cmd_lpush(dst, end(*to_right), std::slice::from_ref(&v), false);
+                        let _ = self.art.cmd_lpush(dst, end(*to_right), core::slice::from_ref(&v), false);
                         if blocked.watched(dst) {
                             next_keys.push(dst.clone());
                         }
@@ -334,7 +337,7 @@ impl Core {
         let Some(id) = self.outs[slot as usize].block_wait else { return };
         self.spans_to_rx(slot);
         if let Some(d) = self.blocked.deadline(id) {
-            self.timers.push(std::cmp::Reverse((d, super::Timer::Block)));
+            self.timers.push(core::cmp::Reverse((d, super::Timer::Block)));
         }
     }
 

@@ -1,5 +1,8 @@
 //! État global du thread de la boucle, sans `thread_local!` (absent sous `no_std`).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use core::ops::Deref;
 
 /// Valeur d'un `static` touchée par un seul thread à la fois : le thread de la boucle

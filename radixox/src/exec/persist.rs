@@ -1,6 +1,9 @@
 //! Fichiers de persistance indépendants du runtime : emplacement du dump,
 //! rechargement au démarrage (SAVE_DESIGN.md §5bis), `SAVE` bloquante.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use core::time::Duration;
 use radixox_lib::sys::Instant;
 

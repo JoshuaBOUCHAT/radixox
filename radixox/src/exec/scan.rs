@@ -22,7 +22,10 @@
 //! `RADIXOX_SCAN_MAX_CURSORS_PER_CLIENT` actifs à la fois, pour qu'un client
 //! qui abandonne ses scans ne prive pas les autres.
 
-use std::cell::RefCell;
+#[allow(unused_imports)]
+use crate::prelude::*;
+
+use core::cell::RefCell;
 use hashbrown::HashMap;
 
 use crate::mono::Mono;
@@ -267,7 +270,7 @@ impl Cursors {
 }
 
 /// Variable d'environnement parsée et validée, sinon le défaut (avec message).
-fn env_or<T: std::str::FromStr + std::fmt::Display + Copy>(
+fn env_or<T: core::str::FromStr + core::fmt::Display + Copy>(
     name: &str,
     default: T,
     valid: impl Fn(&T) -> bool,
@@ -315,7 +318,7 @@ pub fn with_cursor<R>(
     now: u64,
     page: impl FnOnce(&[u8]) -> (R, Option<Vec<u8>>),
 ) -> Result<(u64, R), Frame> {
-    let cursor: u64 = std::str::from_utf8(cursor)
+    let cursor: u64 = core::str::from_utf8(cursor)
         .ok()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| Frame::Error("ERR invalid cursor".into()))?;
@@ -352,7 +355,7 @@ pub fn with_cursor<R>(
                 None => {
                     if !c.warned_full {
                         c.warned_full = true;
-                        eprintln!(
+                        radixox_lib::rx_eprintln!(
                             "[scan] {} curseurs actifs (RADIXOX_SCAN_MAX_CURSORS) : nouveaux SCAN refusés",
                             c.max
                         );
@@ -451,6 +454,8 @@ fn redis_type(name: &[u8]) -> Option<RedisType> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::{Cursors, NIL};
 
     /// Ordre de la liste, de la tête à la queue, vérifié dans les deux sens.

@@ -4,6 +4,9 @@
 //! l'horloge monotone ; sans TSC invariant (ou hors x86_64), repli sur
 //! `Instant`, en nanosecondes.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use core::mem::MaybeUninit;
 use core::time::Duration;
 
@@ -101,6 +104,8 @@ impl Deadline {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
 
     #[test]

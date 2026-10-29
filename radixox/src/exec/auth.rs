@@ -3,6 +3,9 @@
 //! commande sauf AUTH et QUIT reçoit `-NOAUTH`. Pas d'ACL : le seul
 //! utilisateur est `default`.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use radixox_lib::shared_frame::SharedFrame as Frame;
 
 /// Mot de passe configuré ; `None` (variable absente ou vide) : pas d'AUTH.
@@ -40,11 +43,13 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     for i in 0..a.len().max(b.len()) {
         diff |= (a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0)) as usize;
     }
-    std::hint::black_box(diff) == 0
+    core::hint::black_box(diff) == 0
 }
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::ct_eq;
 
     #[test]

@@ -14,27 +14,30 @@ categories = ["database-implementations", "network-programming"]
 [[bin]]
 name = "radixox"
 path = "src/bin/uringloop.rs"
+required-features = ["std"]
 
 [features]
-# Processus `std` (défaut) ; sans elle, la lib est `no_std` + `alloc` (lib.rs).
+# Processus `std` (défaut) : binaire actuel (crate io-uring, libc). Sans elle, la lib est
+# `no_std` + `alloc` (lib.rs), le binaire n'est pas construit.
 default = ["std"]
-std = []
+std = ["radixox-lib/std", "oxidart/std", "rustix/std", "crc32fast/std", "zstd-safe/std", "dep:io-uring", "dep:libc"]
 # Politiques d'éviction LRU / LFU : une écriture par accès (MEMORY_ARCH.md §10.2 quater).
 # Sans elle, le chemin de lecture n'écrit rien de plus.
 eviction = ["oxidart/eviction", "radixox-lib/eviction"]
 
 [dependencies]
-oxidart = { workspace = true, features = ["regex"] }
-radixox-lib = { workspace = true, features = ["std"] }
+oxidart = { workspace = true, features = ["regex", "zstd"] }
+radixox-lib = { workspace = true }
+hashbrown = "0.17.0"
 
-io-uring = "0.7.15"
-libc = "0.2"
+# Binaire std seulement (étape 2 de NOSTD_PLAN.md : notre anneau sur rustix::io_uring).
+io-uring = { version = "0.7.15", optional = true }
+libc = { version = "0.2", optional = true }
 # signalfd4 en appel direct (absent de rustix).
 sc = "0.2"
-rustix = { version = "1.1", default-features = false, features = ["std", "fs", "time", "rand", "net", "process", "thread"] }
-crc32fast = "1.4"
-hashbrown = "0.17.0"
-zstd-safe = { version = "8.1", default-features = false, features = ["experimental", "std"] }
+rustix = { version = "1.1", default-features = false, features = ["alloc", "fs", "time", "rand", "net", "process", "thread"] }
+crc32fast = { version = "1.4", default-features = false }
+zstd-safe = { version = "8.1", default-features = false, features = ["experimental"] }
 
 [dev-dependencies]
 redis = "0.27"

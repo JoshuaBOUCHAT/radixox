@@ -2,7 +2,10 @@
 //! [`ConnIn`] (frames reçues, empruntées en lecture pendant l'exécution) et
 //! [`ConnOut`] (réponses, envoi, mode, mutables pendant l'exécution).
 
-use std::collections::VecDeque;
+#[allow(unused_imports)]
+use crate::prelude::*;
+
+use alloc::collections::VecDeque;
 use radixox_lib::sys::Instant;
 
 use radixox_lib::shared_byte::SharedByte;
@@ -126,7 +129,7 @@ pub struct ConnOut {
     /// Réponses retenues jusqu'au fsync qui les couvre (`appendfsync always`,
     /// DURABILITY_DESIGN.md §7.5) : (début de la réponse dans `out`, marque).
     /// Rien à partir du premier début retenu ne part (ordre des réponses).
-    pub holds: std::collections::VecDeque<(usize, u64)>,
+    pub holds: alloc::collections::VecDeque<(usize, u64)>,
     /// Canaux abonnés (Pub/Sub) ; non vide = mode abonné.
     pub channels: Vec<SharedByte>,
     /// Depuis quand `out` dépasse la limite souple des abonnés.

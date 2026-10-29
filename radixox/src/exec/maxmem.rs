@@ -5,6 +5,9 @@
 //! Les politiques qui n'écrivent rien à la lecture sont dans tout binaire ; LRU et LFU
 //! (une écriture par accès) demandent la feature cargo `eviction`.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 /// Politique d'éviction (`maxmemory-policy`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Policy {
@@ -114,6 +117,8 @@ pub const OOM: &str = "OOM command not allowed when used memory > 'maxmemory'.";
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
 
     #[test]

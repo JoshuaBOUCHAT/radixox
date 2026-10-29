@@ -11,6 +11,9 @@
 //!   journal.<n>.rxj   blocs consécutifs, préalloués par paliers de 64 Mio
 //! ```
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use oxidart::{JournalPos, OxidArt};
 use radixox_lib::rx_eprintln;
 use rustix::fd::{AsFd, AsRawFd, OwnedFd};
@@ -686,7 +689,7 @@ impl AofWriter {
 
     /// Fichiers à supprimer hors de la boucle (file `Trash` du cœur).
     pub fn take_trash(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.trash)
+        core::mem::take(&mut self.trash)
     }
 
     fn fd(&self) -> i32 {
@@ -698,7 +701,7 @@ impl AofWriter {
     /// fermés du flux, jamais au-delà d'une frontière de rotation), fsync
     /// `everysec`. À rappeler tant qu'elle rend quelque chose.
     pub fn next_op(&mut self, stream: &mut super::journal::Stream, now: radixox_lib::sys::Instant) -> Option<AofOp> {
-        if std::mem::take(&mut self.link_next) {
+        if core::mem::take(&mut self.link_next) {
             // Couvre l'écriture liée, rendue juste avant.
             self.syncing = Some(self.written + (self.writing.len() - self.done) as u64);
             self.linked_sync = true;
@@ -867,7 +870,7 @@ impl AofWriter {
     /// base réussie.
     pub fn sync_done(&mut self, res: i32) {
         let Some(upto) = self.syncing.take() else { return };
-        if std::mem::take(&mut self.linked_sync) && res == -rustix::io::Errno::CANCELED.raw_os_error() {
+        if core::mem::take(&mut self.linked_sync) && res == -rustix::io::Errno::CANCELED.raw_os_error() {
             // Écriture liée partielle ou en échec : le cycle suivant reprend.
             return;
         }
@@ -963,7 +966,7 @@ impl AofWriter {
 
     /// Champs `aof_*` de la section `# Persistence`.
     pub fn info(&self, stream: &super::journal::Stream, out: &mut String) {
-        use std::fmt::Write as _;
+        use core::fmt::Write as _;
         let incr = self.written.saturating_sub(self.manifest.base_offset);
         let _ = write!(
             out,
@@ -1027,6 +1030,8 @@ impl AofWriter {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
 
     #[test]

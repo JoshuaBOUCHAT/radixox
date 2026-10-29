@@ -11,6 +11,9 @@
 //! fin depuis des `SharedByte` : la copie de chaque clé se superpose aux accès
 //! mémoire du parcours.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use oxidart::regex::{GlobKind, glob_kind, glob_literal_prefix, glob_match};
 use oxidart::{Detached, OxidArt};
 use radixox_lib::big_buf::BigBuf;
@@ -45,10 +48,10 @@ impl Step {
 /// Taille au-delà de laquelle une réponse de KEYS est abandonnée (MEMORY_ARCH.md §10.5) :
 /// la limite de sortie d'un client, fixée par le cœur. En RESP2, `*N` part avant la première
 /// clé : la réponse est tenue en entier jusqu'au bout, rien n'est encore parti.
-static KEYS_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+static KEYS_LIMIT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
 
 pub fn set_keys_limit(bytes: usize) {
-    KEYS_LIMIT.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    KEYS_LIMIT.store(bytes, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Réponse d'un KEYS trop gros.
@@ -104,7 +107,7 @@ impl KeysJob {
         self.count += page.len();
         self.from = page.next;
         self.done = self.from.is_none();
-        if self.out.len() > KEYS_LIMIT.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.out.len() > KEYS_LIMIT.load(core::sync::atomic::Ordering::Relaxed) {
             // rendu tout de suite : la mémoire ne reste pas tenue jusqu'à l'envoi
             self.out = BigBuf::new();
             self.too_big = true;
@@ -286,6 +289,8 @@ impl From<UnlinkJob> for FlushJob {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
     use oxidart::value::Value;
 

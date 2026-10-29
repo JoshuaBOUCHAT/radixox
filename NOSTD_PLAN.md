@@ -32,19 +32,26 @@ Tout est sur `main`, poussé :
 | `ec76677` | valart `#![no_std]` + `alloc` |
 | `7925f49` | oxidart `#![no_std]` + `alloc` ; trait `load::Source` ; `load_file` et `compress` (zstd) sous `std` |
 | `61148dc` | crate `radixox-mem` : `memcpy`/`memmove`/`memset`/`memcmp`/`bcmp` en Rust (`#![no_builtins]`, noms C sous la feature `export`) |
+| `b234635` | étape 1, 1/3 : `sys::Instant` partout, environnement par `sys::env` (`persist::set_save_dir` pour les tests), `thread_local!` → statics `Mono<Cell / RefCell>` (`crate::mono`), `tsc` sur `sys::Once`, `hashbrown` |
+| `8b2a70c` | étape 1, 2/3 : `crate::fs` (rustix, chemins `&str` / `String`, `OwnedFd`) et `crate::Error` ; `sys::OsError` (textes glibc), `sys::exit`, `rx_println!` ; oxidart : `LoadError::Os`, `Source` exporté, `load_file` sur `Source`, `compress` sous la feature `zstd` (sans `std`) |
+| étape 1, 3/3 | crate `radixox` (lib) `#![no_std]` + `alloc` : feature `std` par défaut (io-uring, libc, `std` des dépendances) ; binaire en `required-features = ["std"]` ; faux noyau des tests sur rustix |
 
 Vérification des bibliothèques (doit rester verte) :
 
 ```bash
 cargo build -p radixox-lib -p valart -p oxidart --no-default-features --features oxidart/regex
+cargo build -p radixox --lib --no-default-features            # lib radixox (oxidart avec zstd)
+cargo test -p radixox --lib --no-default-features             # ses tests, chemins sans std
+cargo tree -p radixox --no-default-features -e normal,features | grep -E 'feature "std"|libc|io-uring'   # vide
 cargo tree -p oxidart --no-default-features --features regex -e normal,features | grep -E 'feature "std"|libc|zstd'   # vide
 ```
 
 `radixox_lib::sys` fournit déjà, sans std ni libc ni allocation : `map_anon`, `unmap`,
 `advise`, `remap`, `stderr(&[u8])`, `eprint(fmt::Arguments)` + macro `rx_eprintln!`,
 `abort()`, `Instant` (API de `std::time::Instant`), `wall_secs()` (`CLOCK_REALTIME`),
-`Once` (`call_once`, `is_completed`), `env(name) -> Option<&'static str>` et
-`env_parse(name, default)` (lus une fois dans `/proc/self/environ`).
+`Once` (`call_once`, `is_completed`), `env(name) -> Option<&'static str>`, `env_bytes` et
+`env_parse(name, default)` (lus une fois dans `/proc/self/environ`), `OsError` (errno
+affiché comme `std::io::Error`), `exit(code)`, `stdout` / `print` + `rx_println!`.
 
 `radixox-mem`, mesuré contre la glibc (`taskset -c 2 cargo run --release -p radixox-mem
 --example vs_libc`, ns/appel, tailles aléatoires 1..=128) : memcpy 2,08 / 2,44, memset
@@ -95,7 +102,16 @@ règle.
 
 Chaque étape : tests verts, mesure si le chemin chaud est touché, commit + push.
 
-### Étape 1 — crate `radixox` (lib) en `#![no_std]` + `alloc`
+### Étape 1 — crate `radixox` (lib) en `#![no_std]` + `alloc` — FAITE (2026-10-29)
+
+Faite en trois commits (§1). Écarts au plan ci-dessous : `RADIXOX_DIR` par
+`persist::set_save_dir` (les tests), pas par un champ de `Config` ; la réplication résout
+la cible par `getaddrinfo` sous `std`, sans `std` seulement une IP littérale ou `localhost`
+(pas de DNS) ; `rx_eprintln!` tronque à 512 o (messages de debug du GC compris). Les
+messages d'erreur gardent le texte de la glibc (`sys::OsError`) et citent le chemin.
+Mesure ABBA contre `a0ebf9e` (débit compté serveur) : p1 285 / 282 / 283 / 279 k (avant,
+après, après, avant), p32 3,06 / 3,17 / 3,18 / 3,05 M : rien perdu (+4 % en p32, non
+expliqué, à ne pas compter). Le plan d'origine suit, pour mémoire.
 
 Même recette que les trois autres crates (voir leurs `lib.rs`) :
 

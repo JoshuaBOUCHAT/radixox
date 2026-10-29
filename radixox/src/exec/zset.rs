@@ -1,3 +1,6 @@
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use oxidart::OxidArt;
 use oxidart::error::TypeError;
 use oxidart::zcommand::ZAddReply;

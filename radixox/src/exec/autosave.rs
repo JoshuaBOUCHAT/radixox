@@ -3,7 +3,10 @@
 //! persistence` de Redis / Valkey. Sans I/O : le cœur lance le BGSAVE quand
 //! [`Persistence::due`] le demande et rapporte son issue.
 
-use std::fmt::Write as _;
+#[allow(unused_imports)]
+use crate::prelude::*;
+
+use core::fmt::Write as _;
 use core::time::Duration;
 
 use radixox_lib::sys::{self, Instant};
@@ -171,6 +174,8 @@ impl Persistence {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
 
     #[test]
