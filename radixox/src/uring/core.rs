@@ -2560,7 +2560,18 @@ impl Core {
                     {
                         let cost = write_cost(&cmd, raw.len()) + zset_store_cost(art, &cmd);
                         let mut fits = radixox_lib::pages::charged() + admitted + cost <= limit + reusable;
-                        if !fits && cfg.maxmemory_policy != crate::exec::maxmem::Policy::NoEviction {
+                        // Plancher : données vivantes estimées (comme `live_estimate`) au-dessus
+                        // de ¾ de la limite. Évincer rend souvent de la place réutilisable tout de
+                        // suite (nœuds valart, grands objets), mais celle des blocs entamés du pool
+                        // n'attend que le GC : sans plancher, pendant une pause du GC, chaque
+                        // écriture refusée évinçait encore et la base se vidait (MEMORY_ARCH.md §10.5).
+                        let over_floor = || {
+                            let used = radixox_lib::pages::charged().saturating_sub(
+                                radixox_lib::pool::reusable_bytes() + radixox_lib::large::reusable_bytes() + art.slab_reusable_bytes(),
+                            );
+                            used.saturating_sub(radixox_lib::pool::fragment_free_bytes()) > limit / 4 * 3
+                        };
+                        if !fits && cfg.maxmemory_policy != crate::exec::maxmem::Policy::NoEviction && over_floor() {
                             // Une petite tranche tout de suite, puis la même vérification stricte :
                             // ce qu'elle libère dans des blocs entamés ne compte qu'après le GC.
                             *evicted_keys += evict_round(art, journal.as_mut().filter(|_| follow.is_none()), cfg.maxmemory_policy, MAXMEM_SCAN, 64).evicted as u64;
@@ -2568,6 +2579,8 @@ impl Core {
                             fits = radixox_lib::pages::charged() + admitted + cost <= limit + reusable;
                         }
                         if !fits {
+                            // la place à récupérer doit l'être maintenant, pas après la pause
+                            radixox_lib::pool::gc_press();
                             extend_encode(&mut o.out, &Frame::Error(crate::exec::maxmem::OOM.into()));
                             *oom_rejected += 1;
                             afters.push((slot, After::Continue));

@@ -873,6 +873,18 @@ est résident après coup ; pour refuser avant, il faut compter avant que les pa
     puis rien d'évinçable : `PING` < 50 ms) ; `volatile-random` ne touche aucune clé sans
     TTL, `volatile-ttl` évince des échéances moyennes plus proches ; `volatile-lru` avec la
     feature. Course corrigée : `DBSIZE` lu pendant l'éviction de fond (test instable).
+  - **éviction à l'admission pendant une pause du GC** (2026-10-29, révélé par l'essai des
+    classes de page, branche `page-classes`) : une passe du GC qui rend moins de 2 Mio
+    suspend le déclenchement 10 s ; la place libérée par l'éviction reste dans des blocs
+    entamés, l'admission stricte (`charged − réutilisable`) reste fausse, et chaque écriture
+    refusée évinçait encore 64 clés : base vidée (`volatile-ttl`, 80 lots de 1 000 `SET` de
+    1 Ko sous 48 Mo : ~400 clés restantes sur 4 passages sur 4, une seule passe de GC).
+    Corrigé : l'admission n'évince que si les données vivantes estimées (`live_estimate`)
+    dépassent ¾ de la limite (plancher : évincer rend souvent de la place réutilisable tout
+    de suite — nœuds valart, grands objets —, une garde à la cible refusait 26 % des
+    écritures du test des collections) ; tout refus appelle `pool::gc_press` (si ≥ 2 Mio
+    sont à récupérer dans des blocs entamés : pause levée, passe suivante au seuil du repos,
+    5 %). Même scénario : 17,4 à 18 K clés restantes, 11 à 13 passes de GC, comme `main`.
 
 ### 10.3 Déclenchement
 

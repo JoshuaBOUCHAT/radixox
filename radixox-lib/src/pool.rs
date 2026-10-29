@@ -187,6 +187,9 @@ pub struct Pool {
     /// Blocs marqués libérés depuis le début de la passe.
     freed_in_pass: u64,
     suspended_until: Option<Instant>,
+    /// Une écriture a été refusée alors qu'il y a de quoi récupérer ([`gc_press`]) : la
+    /// prochaine passe démarre au seuil du repos, même sous charge.
+    pressed: bool,
     /// Pages vidées par la passe en cours (mode pages).
     evacuating: Vec<u32>,
 }
@@ -267,6 +270,7 @@ impl Pool {
             pass_started: None,
             freed_in_pass: 0,
             suspended_until: None,
+            pressed: false,
             evacuating: Vec::new(),
         })
     }
@@ -797,6 +801,9 @@ impl Pool {
         }
         let held = self.held_blocks * BLOCK as u64;
         let frag = 1.0 - self.live_bytes as f64 / held as f64;
+        if self.pressed && frag > 0.05 {
+            return Some(Mark::Blocks(0.90));
+        }
         if idle {
             if frag > 0.05 {
                 return Some(Mark::Blocks(0.90));
@@ -881,6 +888,7 @@ impl Pool {
             return 0;
         }
         self.gc.running = true;
+        self.pressed = false;
         self.freed_in_pass = 0;
         self.pass_started = Some(now);
         self.marked_list.len()
@@ -1180,6 +1188,19 @@ pub fn release_step(now: Instant) -> bool {
 /// Voir [`Pool::gc_want`] (`None` sans pool).
 pub fn gc_want(idle: bool, now: Instant) -> Option<Mark> {
     global().and_then(|p| p.gc_want(idle, now))
+}
+
+/// L'admission `maxmemory` refuse une écriture alors que des blocs entamés tiennent au
+/// moins [`WEAK_PASS`] octets libres : lève la pause d'après une passe faible et fait
+/// démarrer la suivante au seuil du repos. Sans ça, l'éviction à l'admission voit la
+/// mémoire comptée rester haute pendant la pause et vide la base (MEMORY_ARCH.md §10.5).
+pub fn gc_press() {
+    if let Some(p) = global()
+        && (p.held_blocks * BLOCK as u64).saturating_sub(p.live_bytes) >= WEAK_PASS
+    {
+        p.suspended_until = None;
+        p.pressed = true;
+    }
 }
 
 /// Voir [`Pool::gc_begin`] (0 sans pool).
