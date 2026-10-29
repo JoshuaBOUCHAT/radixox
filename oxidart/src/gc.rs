@@ -9,6 +9,8 @@
 //! Le visiteur reçoit `&mut SharedByte` et ne doit le réécrire que vers les mêmes octets
 //! (évacuation) : c'est pourquoi l'accès contourne la barrière de save (§8.5).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
 use radixox_lib::shared_byte::SharedByte;
 
 use crate::OxidArt;
@@ -87,11 +89,11 @@ impl GcPass {
     /// un slot coûte ~10–20 ns cache chaud mais un défaut de cache ou plus à froid (le petit
     /// bloc d'un Hash en plus) ; 10 000 slots froids ont pris 1,8 ms (YCSB 1M). Vrai quand
     /// la passe est finie.
-    pub fn step(&mut self, art: &mut OxidArt, max_slots: u32, max_bytes: usize, max_time: std::time::Duration) -> bool {
+    pub fn step(&mut self, art: &mut OxidArt, max_slots: u32, max_bytes: usize, max_time: core::time::Duration) -> bool {
         /// Slots par appel aux énumérateurs : octets et temps vérifiés entre deux (64 slots
         /// froids ≈ 10 µs).
         const CHUNK: u32 = 64;
-        let t0 = std::time::Instant::now();
+        let t0 = radixox_lib::sys::Instant::now();
         let mut v = Relocate { moved: 0 };
         let mut slots = 0;
         while slots < max_slots && v.moved < max_bytes && (slots == 0 || t0.elapsed() < max_time) {
@@ -327,7 +329,7 @@ impl OxidArt {
             return;
         }
         let mut pass = GcPass::new();
-        while !pass.step(self, u32::MAX, usize::MAX, std::time::Duration::MAX) {}
+        while !pass.step(self, u32::MAX, usize::MAX, core::time::Duration::MAX) {}
         pool::gc_unmark_all();
     }
 }

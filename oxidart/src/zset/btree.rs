@@ -19,7 +19,9 @@
 //! la suppression, pas d'emprunt : une feuille vide est rendue, deux feuilles voisines sous
 //! ¼ fusionnent, une racine à un seul enfant disparaît.
 
-use std::cmp::Ordering;
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::cmp::Ordering;
 
 use radixox_lib::hislab::HiSlab;
 
@@ -304,7 +306,7 @@ pub struct Cursor {
 }
 
 /// Parcours des entrées à partir d'un curseur, dans un sens.
-pub type Entries = std::iter::Map<std::iter::Successors<Cursor, fn(&Cursor) -> Option<Cursor>>, fn(Cursor) -> (u64, u32)>;
+pub type Entries = core::iter::Map<core::iter::Successors<Cursor, fn(&Cursor) -> Option<Cursor>>, fn(Cursor) -> (u64, u32)>;
 
 /// En-tête de l'arbre (dans l'en-tête du ZSet). `root == NONE` : vide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -817,13 +819,13 @@ impl BTree {
     /// Entrées dans l'ordre, à partir de `c`.
     pub fn iter_from(c: Option<Cursor>) -> Entries {
         let next: fn(&Cursor) -> Option<Cursor> = |&c| Self::next(c);
-        std::iter::successors(c, next).map(Self::entry as fn(Cursor) -> (u64, u32))
+        core::iter::successors(c, next).map(Self::entry as fn(Cursor) -> (u64, u32))
     }
 
     /// Entrées dans l'ordre inverse, à partir de `c`.
     pub fn iter_back_from(c: Option<Cursor>) -> Entries {
         let prev: fn(&Cursor) -> Option<Cursor> = |&c| Self::prev(c);
-        std::iter::successors(c, prev).map(Self::entry as fn(Cursor) -> (u64, u32))
+        core::iter::successors(c, prev).map(Self::entry as fn(Cursor) -> (u64, u32))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (u64, u32)> {
@@ -1143,12 +1145,16 @@ impl BTree {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
+    #[allow(unused_imports)]
+    use std::{dbg, eprintln, print, println, thread_local};
     use super::*;
-    use std::collections::BTreeSet;
+    use alloc::collections::BTreeSet;
 
     thread_local! {
         /// Poignées retirées : le départage ne doit jamais en voir une (séparateur périmé).
-        static DEAD: std::cell::RefCell<std::collections::HashSet<u32>> = Default::default();
+        static DEAD: core::cell::RefCell<std::collections::HashSet<u32>> = Default::default();
     }
 
     /// Ex-aequo départagés par la poignée elle-même, à l'envers (pour ne pas confondre
@@ -1160,8 +1166,8 @@ mod tests {
         }
     }
 
-    fn model_key((s, h): (u64, u32)) -> (u64, std::cmp::Reverse<u32>) {
-        (s, std::cmp::Reverse(h))
+    fn model_key((s, h): (u64, u32)) -> (u64, core::cmp::Reverse<u32>) {
+        (s, core::cmp::Reverse(h))
     }
 
     struct Rng(u64);
@@ -1177,7 +1183,7 @@ mod tests {
         }
     }
 
-    fn check(t: &BTree, model: &BTreeSet<(u64, std::cmp::Reverse<u32>)>) {
+    fn check(t: &BTree, model: &BTreeSet<(u64, core::cmp::Reverse<u32>)>) {
         let tie = tie();
         t.verify(&tie).unwrap();
         let got: Vec<_> = t.iter().map(model_key).collect();
@@ -1281,7 +1287,7 @@ mod tests {
                             break;
                         }
                         let r = rng.below(sorted.len() as u64) as usize;
-                        let (s, std::cmp::Reverse(h)) = sorted[r];
+                        let (s, core::cmp::Reverse(h)) = sorted[r];
                         assert_eq!(t.rank(s, h, &tie), r as u32);
                         let c = t.select(r as u32).unwrap();
                         assert_eq!(BTree::entry(c), (s, h));
@@ -1371,7 +1377,7 @@ mod tests {
 /// Interdit pendant une save et tant que des libérations de ZSet attendent (`lazy` : elles
 /// tiennent des idx de nœuds) : la passe s'arrête d'elle-même dans ce cas.
 pub mod compact {
-    use std::collections::HashMap;
+    use hashbrown::HashMap;
 
     use super::{BNode, INTERNAL, LEAF, NONE, internal, leaf, leaf_mut, parent, set_parent, slab};
     use crate::zset::ZSet;

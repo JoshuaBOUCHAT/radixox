@@ -1,4 +1,6 @@
-use std::{mem::ManuallyDrop, ptr::NonNull};
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::{mem::ManuallyDrop, ptr::NonNull};
 
 use crate::{
     ExpAndRadix,

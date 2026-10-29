@@ -1,6 +1,11 @@
 //! Clés binaires : tous les octets 0x00–0xFF (y compris `\0`, `\n`, octets non
 //! UTF-8), à chaque niveau, jusqu'au palier dense (256 enfants d'un nœud).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+#[allow(unused_imports)]
+use std::{dbg, eprintln, print, println, thread_local};
+
 use std::collections::BTreeMap;
 
 use radixox_lib::shared_byte::SharedByte;

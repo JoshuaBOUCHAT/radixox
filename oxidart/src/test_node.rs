@@ -1,5 +1,10 @@
 //! Fuzz du nœud v2 contre un `BTreeMap` de référence.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+#[allow(unused_imports)]
+use std::{dbg, eprintln, print, println, thread_local};
+
 use std::collections::BTreeMap;
 use std::mem::ManuallyDrop;
 

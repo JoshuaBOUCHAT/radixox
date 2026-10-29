@@ -1,7 +1,7 @@
-use std::{
-    collections::VecDeque,
-    mem::{ManuallyDrop, MaybeUninit},
-};
+#[allow(unused_imports)]
+use crate::prelude::*;
+use alloc::collections::VecDeque;
+use core::mem::{ManuallyDrop, MaybeUninit};
 
 use radixox_lib::hislab::HiSlab;
 use radixox_lib::shared_byte::SharedByte;
@@ -76,7 +76,7 @@ static mut VALART: MaybeUninit<ValTrees> = MaybeUninit::uninit();
 static mut ZSET_SLAB: MaybeUninit<HiSlab<ZSet>> = MaybeUninit::uninit();
 static mut LIST_SLAB: MaybeUninit<HiSlab<List>> = MaybeUninit::uninit();
 
-static SLAB_INIT: std::sync::Once = std::sync::Once::new();
+static SLAB_INIT: radixox_lib::sys::Once = radixox_lib::sys::Once::new();
 
 /// Initialize value slabs. Safe to call multiple times — only the first call takes effect.
 pub(crate) fn init_slabs() {
@@ -194,7 +194,7 @@ pub(crate) fn hash_into_raw(pairs: Vec<(SharedByte, SharedByte)>) -> (Tag, ValUn
                     small::into_entries::<2>(p)
                         .into_iter()
                         .map(|[f, v]| (f, v))
-                        .chain(std::iter::once((f, v)))
+                        .chain(core::iter::once((f, v)))
                         .chain(rest)
                         .collect(),
                 );
@@ -219,7 +219,7 @@ pub(crate) fn set_into_raw(members: Vec<SharedByte>) -> (Tag, ValUnion) {
                     small::into_entries::<1>(p)
                         .into_iter()
                         .map(|[m]| m)
-                        .chain(std::iter::once(m))
+                        .chain(core::iter::once(m))
                         .chain(rest)
                         .collect(),
                 );
@@ -496,7 +496,7 @@ impl RawVal {
     pub(crate) fn into_parts(self) -> (Tag, ValUnion) {
         let me = ManuallyDrop::new(self);
         // SAFETY: `me` n'est jamais droppé.
-        (me.tag, unsafe { std::ptr::read(&me.val) })
+        (me.tag, unsafe { core::ptr::read(&me.val) })
     }
 
     pub(crate) fn into_value(self) -> Value {
@@ -530,7 +530,7 @@ impl<'a> NodeValMut<'a> {
             match *self.tag {
                 Tag::Int => self.val.integer,
                 Tag::Bytes => {
-                    let s = std::str::from_utf8((*self.val.bytes).as_slice())
+                    let s = core::str::from_utf8((*self.val.bytes).as_slice())
                         .map_err(|_| IntError::NotAnInteger)?;
                     s.parse::<i64>().map_err(|_| IntError::NotAnInteger)?
                 }
@@ -635,7 +635,7 @@ impl Value {
         match self {
             Value::Int(n) => Ok(*n),
             Value::String(b) => {
-                let s = std::str::from_utf8(b).map_err(|_| IntError::NotAnInteger)?;
+                let s = core::str::from_utf8(b).map_err(|_| IntError::NotAnInteger)?;
                 s.parse::<i64>().map_err(|_| IntError::NotAnInteger)
             }
             _ => Err(IntError::NotAnInteger),

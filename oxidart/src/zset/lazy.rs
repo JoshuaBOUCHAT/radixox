@@ -7,7 +7,9 @@
 //! Pendant une save, rien n'avance : chaque feuille rendue serait capturée par la barrière
 //! (SAVE_DESIGN.md §2.F, même règle qu'UNLINK).
 
-use std::collections::VecDeque;
+#[allow(unused_imports)]
+use crate::prelude::*;
+use alloc::collections::VecDeque;
 
 use super::ZSet;
 use super::btree::BTree;

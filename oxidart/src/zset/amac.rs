@@ -10,6 +10,8 @@
 //! ```
 //! Membre absent : la descente du B+tree part de `(score, membre)` pour un ZADD, rien sinon.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
 use radixox_lib::handle;
 use radixox_lib::prefetch::prefetch_l1;
 

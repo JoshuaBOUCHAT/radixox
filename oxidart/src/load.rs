@@ -41,9 +41,11 @@
 //! construit (`kept`) ne contient que des clés gardées ; le lcp effectif avec
 //! la dernière clé gardée est le minimum des lcp lus depuis.
 
-use std::collections::{HashMap, VecDeque};
-use std::io::Read;
-use std::mem::ManuallyDrop;
+#[allow(unused_imports)]
+use crate::prelude::*;
+use alloc::collections::VecDeque;
+use hashbrown::HashMap;
+use core::mem::ManuallyDrop;
 
 use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::varint::{get_bytes, get_varint, unzigzag};
@@ -72,6 +74,7 @@ const MAX_LEN: u64 = 1 << 32;
 /// Erreur de reload : lecture de la source, ou dump invalide.
 #[derive(Debug)]
 pub enum LoadError {
+    #[cfg(feature = "std")]
     Io(std::io::Error),
     Dump(DumpError),
 }
@@ -81,20 +84,51 @@ impl From<DumpError> for LoadError {
         Self::Dump(e)
     }
 }
+#[cfg(feature = "std")]
 impl From<std::io::Error> for LoadError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
     }
 }
-impl std::fmt::Display for LoadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            #[cfg(feature = "std")]
             Self::Io(e) => write!(f, "lecture : {e}"),
             Self::Dump(e) => write!(f, "dump invalide : {}", e.0),
         }
     }
 }
-impl std::error::Error for LoadError {}
+impl core::error::Error for LoadError {}
+
+/// Source d'octets du rechargement : tout `std::io::Read` sous `std` (fichier,
+/// décompresseur zstd), une tranche en mémoire sans. `Interrupted` est réessayé ici.
+pub trait Source {
+    /// Comme `Read::read` : 0 à la fin de la source.
+    fn read_some(&mut self, buf: &mut [u8]) -> Result<usize, LoadError>;
+}
+
+#[cfg(feature = "std")]
+impl<R: std::io::Read> Source for R {
+    fn read_some(&mut self, buf: &mut [u8]) -> Result<usize, LoadError> {
+        loop {
+            match self.read(buf) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                r => return Ok(r?),
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl Source for &[u8] {
+    fn read_some(&mut self, buf: &mut [u8]) -> Result<usize, LoadError> {
+        let n = buf.len().min(self.len());
+        buf[..n].copy_from_slice(&self[..n]);
+        *self = &self[n..];
+        Ok(n)
+    }
+}
 
 /// Le flux se termine-t-il par le pied du fichier (crc32 + `RXDE`) ?
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -141,7 +175,7 @@ pub(crate) struct DumpReader<R> {
     key: Vec<u8>,
 }
 
-impl<R: Read> DumpReader<R> {
+impl<R: Source> DumpReader<R> {
     /// Lit l'en-tête et la section ZSet/List.
     pub(crate) fn new(src: R, footer: Footer) -> Result<Self, LoadError> {
         let mut rd = Self {
@@ -229,11 +263,9 @@ impl<R: Read> DumpReader<R> {
                 }
                 .into());
             }
-            match self.src.read(&mut self.buf[self.end..]) {
-                Ok(0) => self.eof = true,
-                Ok(k) => self.end += k,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e.into()),
+            match self.src.read_some(&mut self.buf[self.end..])? {
+                0 => self.eof = true,
+                k => self.end += k,
             }
         }
         Ok(())
@@ -350,11 +382,9 @@ impl<R: Read> DumpReader<R> {
         }
         while !self.eof {
             let mut probe = [0u8; 1];
-            match self.src.read(&mut probe) {
-                Ok(0) => self.eof = true,
-                Ok(_) => return Err(DumpError("octets après le marqueur de fin").into()),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e.into()),
+            match self.src.read_some(&mut probe)? {
+                0 => self.eof = true,
+                _ => return Err(DumpError("octets après le marqueur de fin").into()),
             }
         }
         Ok(())
@@ -402,7 +432,7 @@ impl<R: Read> DumpReader<R> {
         let mut err: Option<LoadError> = None;
         let mut prev: Option<(u64, u32)> = None;
         let mut left = n;
-        let entries = std::iter::from_fn(|| {
+        let entries = core::iter::from_fn(|| {
             if left == 0 || err.is_some() {
                 return None;
             }
@@ -570,7 +600,9 @@ impl OxidArt {
     ///
     /// Le fichier peut être brut ou compressé (une frame zstd, reconnue à son
     /// magic) : il est alors décompressé au fil de la lecture.
-    pub fn load_file<R: Read>(&mut self, mut src: R) -> Result<LoadStats, LoadError> {
+    #[cfg(feature = "std")]
+    pub fn load_file<R: std::io::Read>(&mut self, mut src: R) -> Result<LoadStats, LoadError> {
+        use std::io::Read;
         self.check_empty()?;
         let mut head = [0u8; 4];
         let mut got = 0;
@@ -609,7 +641,7 @@ impl OxidArt {
         Ok(())
     }
 
-    fn load_from<R: Read>(&mut self, mut rd: DumpReader<R>) -> Result<LoadStats, LoadError> {
+    fn load_from<R: Source>(&mut self, mut rd: DumpReader<R>) -> Result<LoadStats, LoadError> {
         let now = self.now;
         let mut stats = LoadStats::default();
         // Termes des clés sautées (expirées depuis la save), pour le condensé.

@@ -16,7 +16,7 @@ bytes.workspace = true
 smallvec = "1.15.1"
 ordered-float = "5.1.0"
 radixox-lib = { workspace = true, features = ["std"] }
-valart = { workspace = true }
+valart = { workspace = true, features = ["std"] }
 
 rand = "0.8"
 crc32fast = "1.4"

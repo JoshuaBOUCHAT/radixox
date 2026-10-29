@@ -1,3 +1,5 @@
+#[allow(unused_imports)]
+use crate::prelude::*;
 use radixox_lib::shared_byte::SharedByte;
 
 use crate::{
@@ -299,7 +301,7 @@ impl OxidArt {
         let mut h = self.hash_mut(key, None)?;
         let current = match h.get(&field) {
             Some(bytes) => {
-                let s = std::str::from_utf8(bytes).map_err(|_| TypeError::NotAInt)?;
+                let s = core::str::from_utf8(bytes).map_err(|_| TypeError::NotAInt)?;
                 s.parse::<i64>().map_err(|_| TypeError::NotAInt)?
             }
             None => 0,

@@ -23,8 +23,10 @@
 //! seulement avec hystérésis. Changements de forme avec hystérésis aussi
 //! (montée à 17 / 33 entrées, descente à 12 / 24).
 
-use std::mem::ManuallyDrop;
-use std::ptr::{self, NonNull};
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::mem::ManuallyDrop;
+use core::ptr::{self, NonNull};
 
 use radixox_lib::prefetch::prefetch_l1;
 use radixox_lib::pool;
@@ -181,7 +183,7 @@ pub(crate) struct Node {
 }
 
 const _: () = assert!(size_of::<Node>() == 128 && align_of::<Node>() == 128);
-const _: () = assert!(std::mem::offset_of!(Node, body) == 64);
+const _: () = assert!(core::mem::offset_of!(Node, body) == 64);
 
 // ─── Entrées ─────────────────────────────────────────────────────────────────
 
@@ -655,7 +657,7 @@ impl<M: Bits> Seg<M> {
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn cmp16(radixs: &[u8; SMALL_MAX], radix: u8) -> (u32, u32) {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
     // SAFETY: SSE2 fait partie de x86_64 ; chargement non aligné de 16 o.
     unsafe {
         let v = _mm_loadu_si128(radixs.as_ptr() as *const __m128i);

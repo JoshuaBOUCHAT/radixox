@@ -8,6 +8,8 @@
 //! Interdit pendant une save (son parcours et son occupation T0 sont indexés par `idx`) :
 //! c'est au pilote de ne pas l'avancer. Rien ne garde d'idx de bloc entre deux commandes.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
 use super::{Block, HEAD, NONE, block, block_mut, is_end, slab};
 
 /// Blocs par page de 2 Mio.

@@ -3,10 +3,12 @@
 //! `InnerZCommand` (l'ancien ZSet : `SmallVec` trié puis `BTreeSet` + `HashMap`) ne sert
 //! plus que d'oracle aux tests différentiels.
 
-use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
-use std::hash::BuildHasherDefault;
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::cmp::Ordering;
+use hashbrown::HashMap;
+use hashbrown::hash_map::Entry;
+use core::hash::BuildHasherDefault;
 
 use radixox_lib::cmd::{ZAddFlags, ZAggregate, ZOp, ZRangeBy};
 use radixox_lib::shared_byte::SharedByte;
@@ -23,13 +25,17 @@ pub(crate) use oracle::InnerZCommand;
 
 #[cfg(test)]
 mod oracle {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
+    #[allow(unused_imports)]
+    use std::{dbg, eprintln, print, println, thread_local};
     use crate::zset_inner::ZSetInner;
 
     use hashbrown::HashMap;
     use crate::zset_inner::OrdF64;
     use radixox_lib::shared_byte::SharedByte;
     use radixox_lib::small_vec::SmallVec;
-    use std::collections::BTreeSet;
+    use alloc::collections::BTreeSet;
 
 
     const THRESHOLD: usize = 16;
@@ -44,8 +50,8 @@ mod oracle {
     }
 
     enum ZIterInner<'a> {
-        Small(std::slice::Iter<'a, (OrdF64, SharedByte)>),
-        Large(std::collections::btree_set::Iter<'a, (OrdF64, SharedByte)>),
+        Small(core::slice::Iter<'a, (OrdF64, SharedByte)>),
+        Large(alloc::collections::btree_set::Iter<'a, (OrdF64, SharedByte)>),
     }
 
     impl<'a> Iterator for ZIter<'a> {
@@ -101,7 +107,7 @@ mod oracle {
                         let cap = vec.len() + 1;
                         let mut scores = HashMap::with_capacity(cap);
                         let mut sorted = BTreeSet::new();
-                        for (s, m) in std::mem::take(vec) {
+                        for (s, m) in core::mem::take(vec) {
                             scores.insert(m.clone(), s);
                             sorted.insert((s, m));
                         }
@@ -503,7 +509,7 @@ impl OxidArt {
             Some(c) if c as usize >= len => zset.iter().map(|(s, m)| (SharedByte::from_slice(m), decode_score(s))).collect(),
             Some(c) => {
                 // rangs distincts (Floyd) : c tirages, sans rejet
-                let mut picked = std::collections::BTreeSet::new();
+                let mut picked = alloc::collections::BTreeSet::new();
                 for j in len - c as usize..len {
                     let r = rng::below(j as u64 + 1) as usize;
                     if !picked.insert(r) {
@@ -677,7 +683,7 @@ impl<'a> Probe<'a> {
             let mut t = MemberTable::with_capacity_and_hasher(input.len(), Default::default());
             // SAFETY: comme dans `zsetop_with` : membres lus avant toute modification
             input.for_each(|m, s| {
-                t.insert(unsafe { std::mem::transmute::<&[u8], &'static [u8]>(m) }, s);
+                t.insert(unsafe { core::mem::transmute::<&[u8], &'static [u8]>(m) }, s);
             });
             t
         });
@@ -698,7 +704,7 @@ impl<'a> Probe<'a> {
 #[derive(Default)]
 struct MemberHasher(u64);
 
-impl std::hash::Hasher for MemberHasher {
+impl core::hash::Hasher for MemberHasher {
     #[inline]
     fn write(&mut self, b: &[u8]) {
         self.0 = crate::zset::large::member_hash(b);
@@ -770,7 +776,7 @@ impl OxidArt {
         // SAFETY: les membres restent dans les slabs (ZSet, valart, petites formes) tant
         // que la base ne change pas ; rien n'est modifié avant le retour de `f`, et les
         // tranches ne sortent pas de cette fonction.
-        let keep = |m: &[u8]| -> &'static [u8] { unsafe { std::mem::transmute::<&[u8], &'static [u8]>(m) } };
+        let keep = |m: &[u8]| -> &'static [u8] { unsafe { core::mem::transmute::<&[u8], &'static [u8]>(m) } };
         let mut out: Vec<(f64, &'static [u8])> = Vec::new();
         match op {
             ZOp::Union => {

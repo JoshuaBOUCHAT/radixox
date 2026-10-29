@@ -15,6 +15,8 @@
 //! Le GC peut déplacer membres et blocs pendant une save : les images gardent des poignées,
 //! et la save lit l'en-tête vivant d'un ZSet intact.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
 use radixox_lib::handle;
 use radixox_lib::save_barrier::{SaveBarrier, T0};
 use radixox_lib::varint::{put_bytes, put_varint};

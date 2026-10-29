@@ -1,9 +1,11 @@
+#[allow(unused_imports)]
+use crate::prelude::*;
 // Chemin d'un nœud ou suffixe d'une feuille : 7 octets inline, sinon un objet du pool des
 // `SharedByte` (MEMORY_ARCH.md §17), sans compteur de références (propriétaire unique).
 use radixox_lib::pool;
 use radixox_lib::raw_alloc::external;
 use radixox_lib::shared_byte::SharedByte;
-use std::ops::Deref;
+use core::ops::Deref;
 
 // Inline : inner[0] = (len << 1) | 1    len ∈ 0..=7
 //          inner[1..8] = data
@@ -73,7 +75,7 @@ impl CompactPath {
     unsafe fn alloc(len: usize) -> *mut u8 {
         assert!(len <= SharedByte::MAX_LEN);
         unsafe {
-            let short = if len > Self::POOL_MAX_LEN { std::ptr::null_mut() } else { pool::short_alloc(Self::slot(len)) };
+            let short = if len > Self::POOL_MAX_LEN { core::ptr::null_mut() } else { pool::short_alloc(Self::slot(len)) };
             if !short.is_null() {
                 (short as *mut u16).write(len as u16);
                 return short.add(Self::SHORT_HEADER);
@@ -90,7 +92,7 @@ impl CompactPath {
     fn heap_of(data: &[u8]) -> Self {
         unsafe {
             let p = Self::alloc(data.len());
-            std::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len());
+            core::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len());
             Self(Inner { heap: p })
         }
     }
@@ -110,9 +112,9 @@ impl CompactPath {
             } else {
                 unsafe {
                     let data = Self::alloc(new_len);
-                    std::ptr::copy_nonoverlapping(old.as_ptr(), data, old.len());
+                    core::ptr::copy_nonoverlapping(old.as_ptr(), data, old.len());
                     *data.add(old.len()) = radix;
-                    std::ptr::copy_nonoverlapping(suffix.as_ptr(), data.add(old.len() + 1), suffix.len());
+                    core::ptr::copy_nonoverlapping(suffix.as_ptr(), data.add(old.len() + 1), suffix.len());
                     Self(Inner { heap: data })
                 }
             }
@@ -138,7 +140,7 @@ impl CompactPath {
         }
         unsafe {
             let p = self.0.heap;
-            std::ptr::copy(p.add(k), p, new_len);
+            core::ptr::copy(p.add(k), p, new_len);
             (p as *mut u16).sub(1).write(new_len as u16);
             let (old, new) = (Self::slot(len), Self::slot(new_len));
             if new < old {
@@ -182,7 +184,7 @@ impl CompactPath {
             return 0; // plage pleine : l'objet reste
         }
         unsafe {
-            std::ptr::copy_nonoverlapping(base as *const u8, new, size);
+            core::ptr::copy_nonoverlapping(base as *const u8, new, size);
             self.0.heap = new.add(Self::SHORT_HEADER);
             pool::short_free(base as *mut u8, size);
         }
@@ -211,10 +213,10 @@ impl Deref for CompactPath {
             if tag & 1 == 1 {
                 let len = (tag >> 1) as usize;
                 // Aide le compilo: len ne peut pas dépasser 7 par construction
-                std::hint::assert_unchecked(len <= 7);
+                core::hint::assert_unchecked(len <= 7);
                 self.0.inline.get_unchecked(1..1 + len)
             } else {
-                std::slice::from_raw_parts(self.0.heap, self.heap_slice_len())
+                core::slice::from_raw_parts(self.0.heap, self.heap_slice_len())
             }
         }
     }
@@ -244,6 +246,10 @@ impl Drop for CompactPath {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
+    #[allow(unused_imports)]
+    use std::{dbg, eprintln, print, println, thread_local};
     use super::*;
 
     #[test]

@@ -18,6 +18,8 @@
 //! L'index ne connaît pas les membres : la recherche prend `eq(poignée)` (octets comparés
 //! via la table des poignées), la coupe `rehash(poignée)` (hash recalculé du membre).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
 use radixox_lib::hislab::HiSlab;
 
 /// Entrées par seau.
@@ -687,6 +689,10 @@ impl Index {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
+    #[allow(unused_imports)]
+    use std::{dbg, eprintln, print, println, thread_local};
     use super::*;
     use std::collections::HashMap;
 
@@ -806,7 +812,7 @@ mod tests {
 /// Interdit pendant une save et tant que des libérations de ZSet attendent : la passe
 /// s'arrête d'elle-même dans ce cas.
 pub mod compact {
-    use std::collections::HashMap;
+    use hashbrown::HashMap;
 
     use super::{FANOUT, INode, NONE, bucket, dir, is_dir, parent, set_parent, slab};
     use crate::zset::ZSet;

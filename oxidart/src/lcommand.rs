@@ -1,6 +1,8 @@
 //! Commandes List sur les blocs chaînés de `crate::list` (ANALYSE_ART_UNIFIE.md §14).
 //! Une List vide n'existe pas : la clé part avec son dernier élément.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
 use radixox_lib::shared_byte::SharedByte;
 
 use crate::{
@@ -266,7 +268,7 @@ impl OxidArt {
         if l.is_empty() {
             self.del(src);
         }
-        self.cmd_lpush(dst, to, std::slice::from_ref(&v), false)?;
+        self.cmd_lpush(dst, to, core::slice::from_ref(&v), false)?;
         Ok(Some(v))
     }
 }

@@ -1,6 +1,8 @@
 //! ZSet (ANALYSE_ART_UNIFIE.md §13) : petite forme en colonnes, grande forme = index
 //! valart + B+tree compté + membres à poignée (MEMORY_ARCH.md §19).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
 pub(crate) mod amac;
 pub mod btree;
 pub mod index;
@@ -9,7 +11,7 @@ pub(crate) mod lazy;
 pub(crate) mod save;
 pub mod small;
 
-use std::cmp::Ordering;
+use core::cmp::Ordering;
 
 use radixox_lib::cmd::{LexBound, ScoreBound, ZRangeBy};
 
@@ -107,7 +109,7 @@ impl ZSet {
             large.release();
             return None;
         }
-        drop(std::mem::replace(self, Self::Large(large)));
+        drop(core::mem::replace(self, Self::Large(large)));
         r
     }
 
@@ -222,7 +224,7 @@ impl ZSet {
     /// Retire le contenu d'une grande forme (le ZSet reste vide, sans rien à rendre).
     pub(crate) fn take_large(&mut self) -> Option<ZLarge> {
         match self {
-            Self::Large(z) => Some(std::mem::take(z)),
+            Self::Large(z) => Some(core::mem::take(z)),
             Self::Small(_) => None,
         }
     }
@@ -254,8 +256,8 @@ impl ZSet {
 }
 
 /// Le contenu, `(score, membre)` dans l'ordre (pas les adresses).
-impl std::fmt::Debug for ZSet {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for ZSet {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_list().entries(self.iter().map(|(s, m)| (decode_score(s), String::from_utf8_lossy(m)))).finish()
     }
 }
@@ -308,7 +310,7 @@ impl<'a> Iterator for ZIter<'a> {
 
 /// Parcours décroissant.
 pub enum ZIterBack<'a> {
-    Small(std::iter::Rev<std::iter::Take<small::Iter<'a>>>),
+    Small(core::iter::Rev<core::iter::Take<small::Iter<'a>>>),
     Large(large::Range),
 }
 
@@ -350,7 +352,8 @@ pub fn format_score(f: f64) -> radixox_lib::shared_byte::SharedByte {
 /// (rangs, horodatages, compteurs, les plus fréquents) écrits à la main.
 #[inline]
 pub fn with_score_text<R>(f: f64, k: impl FnOnce(&[u8]) -> R) -> R {
-    if f.fract() == 0.0 && f.abs() < 1e15 {
+    // entier exact (`f.fract() == 0`, absent de core)
+    if f.abs() < 1e15 && (f as i64) as f64 == f {
         let mut buf = [0u8; 20];
         let (neg, mut v) = (f < 0.0, f.abs() as u64);
         let mut i = buf.len();
@@ -391,7 +394,7 @@ fn float_text<R>(f: f64, k: impl FnOnce(&[u8]) -> R) -> R {
     };
     // `mantisse[e exposant]`, mantisse `d+[.d+]`
     let (mant, exp) = match s.iter().position(|&c| c == b'e') {
-        Some(e) => (&s[..e], std::str::from_utf8(&s[e + 1..]).unwrap().parse::<i32>().unwrap()),
+        Some(e) => (&s[..e], core::str::from_utf8(&s[e + 1..]).unwrap().parse::<i32>().unwrap()),
         None => (s, 0),
     };
     let mut digits = [0u8; 24];
@@ -451,6 +454,10 @@ fn float_text<R>(f: f64, k: impl FnOnce(&[u8]) -> R) -> R {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
+    #[allow(unused_imports)]
+    use std::{dbg, eprintln, print, println, thread_local};
     use super::*;
     use crate::zcommand::InnerZCommand;
     use radixox_lib::shared_byte::SharedByte;
@@ -481,7 +488,7 @@ mod tests {
     #[test]
     fn range_removal_with_stale_index() {
         use crate::value::{alloc_zset, free_zset, zset_mut, zset_ref};
-        use std::collections::BTreeMap;
+        use alloc::collections::BTreeMap;
         crate::value::init_slabs();
         for (seed, scores) in [(21u64, 1u64 << 30), (22, 50), (23, 1)] {
             let mut rng = Rng(0xD6E8_FEB8_6659_FD93 ^ seed);
@@ -541,7 +548,7 @@ mod tests {
     #[test]
     fn btree_compaction_keeps_zsets() {
         use crate::value::{alloc_zset, free_zset, zset_mut, zset_ref};
-        use std::collections::BTreeMap;
+        use alloc::collections::BTreeMap;
         crate::value::init_slabs();
         let mut rng = Rng(0x2F6B_1D4E_9A3C_7051);
         let member = |z: u64, i: u64| format!("z{z}-membre-{i}").into_bytes();
@@ -713,7 +720,7 @@ mod tests {
             let f = f64::from_bits(rng.next());
             if !f.is_nan() {
                 let (got, want) = (format_score(f), f.to_string());
-                let got = std::str::from_utf8(got.as_slice()).unwrap();
+                let got = core::str::from_utf8(got.as_slice()).unwrap();
                 assert_eq!(got.parse::<f64>().unwrap(), f, "{want}");
                 assert_eq!(got.len(), want.len(), "{want} : {got}");
                 assert!(!got.contains('e'), "{got}");
@@ -736,6 +743,10 @@ mod tests {
 
 #[cfg(test)]
 mod breakdown {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
+    #[allow(unused_imports)]
+    use std::{dbg, eprintln, print, println, thread_local};
     /// Décomposition mémoire (mesure, `--ignored`) : 1000 ZSet × 1000 membres de 15 o.
     #[test]
     #[ignore]

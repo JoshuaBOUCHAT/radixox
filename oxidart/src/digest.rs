@@ -21,6 +21,8 @@
 //! ZSet et List : un seul terme par clé, sur la somme de leurs éléments (ils
 //! sont sérialisés au T0 dans une section à part, avant les clés).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
 use crc32fast::Hasher;
 
 use crate::save::format;

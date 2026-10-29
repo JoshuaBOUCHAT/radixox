@@ -15,6 +15,8 @@
 //!   du refcount dans le bloc tas) et préchargées au moment où on les trouve :
 //!   l'encodage qui suit les trouve en cache.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
 use radixox_lib::shared_byte::SharedByte;
 
 use crate::node::{Ahead, Cursor, EntryRef};
@@ -118,7 +120,7 @@ impl RangeOut<'_> {
     /// (`&SharedByte` → `SharedByte` à refcount +1). Le bloc de l'entrée
     /// `i + 8` est préchargé pendant qu'on incrémente le refcount de `i`.
     pub fn into_owned(self) -> OwnedRange {
-        let mut entries = std::mem::ManuallyDrop::new(self.entries);
+        let mut entries = core::mem::ManuallyDrop::new(self.entries);
         let (ptr, len, cap) = (entries.as_mut_ptr(), entries.len(), entries.capacity());
         let dst = ptr as *mut (u32, OwnedVal);
         for i in 0..len {
@@ -187,7 +189,7 @@ unsafe fn copy_short(d: *mut u8, s: &[u8]) {
     let p = s.as_ptr();
     unsafe {
         if n > 32 {
-            std::ptr::copy_nonoverlapping(p, d, n);
+            core::ptr::copy_nonoverlapping(p, d, n);
         } else if n >= 16 {
             (d as *mut u128).write_unaligned((p as *const u128).read_unaligned());
             (d.add(n - 16) as *mut u128).write_unaligned((p.add(n - 16) as *const u128).read_unaligned());
@@ -239,9 +241,9 @@ struct Scratch {
     stack: Vec<Frame>,
 }
 
-thread_local! {
-    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::default();
-}
+/// Tampons réutilisés d'un parcours à l'autre : pris au début, remis à la fin (un parcours
+/// imbriqué en prend de vides). Mono-thread, comme les slabs de l'arbre.
+static mut SCRATCH: Scratch = Scratch { key: Vec::new(), stack: Vec::new() };
 
 /// Ce que le parcours fait des clés rencontrées (KRANGE : strings avec
 /// valeur ; SCAN : clés de tout type, filtrées, avec budget).
@@ -478,7 +480,8 @@ impl OxidArt {
         sink: S,
         on_stop: impl FnOnce(&[u8]) -> R,
     ) -> (S, Option<R>) {
-        let sc = SCRATCH.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        // SAFETY: mono-thread ; aucune référence à SCRATCH ne survit à cette ligne.
+        let sc = unsafe { core::mem::take(&mut *(&raw mut SCRATCH)) };
         let mut w = Walker {
             art: self,
             from,
@@ -507,7 +510,8 @@ impl OxidArt {
         let Walker { mut key, mut stack, sink, .. } = w;
         key.clear();
         stack.clear();
-        SCRATCH.with(|s| *s.borrow_mut() = Scratch { key, stack });
+        // SAFETY: comme à la prise.
+        unsafe { *(&raw mut SCRATCH) = Scratch { key, stack } };
         (sink, stopped)
     }
 
@@ -593,7 +597,11 @@ impl<'a, F: FnMut(&[u8], RedisType) -> bool> Sink<'a> for ScanSink<F> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    #[allow(unused_imports)]
+    use crate::prelude::*;
+    #[allow(unused_imports)]
+    use std::{dbg, eprintln, print, println, thread_local};
+    use alloc::collections::BTreeMap;
 
     use radixox_lib::shared_byte::SharedByte;
 
@@ -824,7 +832,7 @@ mod tests {
                 }
                 1 => {
                     // expirée au moment du scan : jamais rendue
-                    art.set_ttl(SharedByte::from_slice(&k), std::time::Duration::from_secs(5), Value::Int(1));
+                    art.set_ttl(SharedByte::from_slice(&k), core::time::Duration::from_secs(5), Value::Int(1));
                 }
                 2 => {
                     art.set(SharedByte::from_slice(&k), Value::Int(i));
@@ -880,14 +888,14 @@ mod tests {
             let len = 1 + rnd() as usize % 6;
             (0..len).map(|_| b"abc:01"[rnd() as usize % 6]).collect()
         };
-        let mut live = std::collections::BTreeSet::new();
+        let mut live = alloc::collections::BTreeSet::new();
         for _ in 0..2000 {
             let k = key(&mut rnd);
             art.set(SharedByte::from_slice(&k), Value::String(SharedByte::from_str("v")));
             live.insert(k);
         }
         let initial = live.clone();
-        let mut touched = std::collections::BTreeSet::new();
+        let mut touched = alloc::collections::BTreeSet::new();
         let mut seen = Vec::new();
         let mut from = Vec::new();
         loop {
@@ -940,7 +948,7 @@ mod tests {
                     model.insert(k, v);
                 }
             }
-            let mut kinds = std::collections::BTreeSet::new();
+            let mut kinds = alloc::collections::BTreeSet::new();
             let mut todo = vec![art.root_idx];
             while let Some(idx) = todo.pop() {
                 let node = art.node(idx);

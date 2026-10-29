@@ -15,8 +15,10 @@
 //! modifier le nœud (`value_mut` → barrière de save), et l'image de save en
 //! garde une copie profonde ([`deep_clone`]).
 
-use std::mem::ManuallyDrop;
-use std::ptr;
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::mem::ManuallyDrop;
+use core::ptr;
 
 use radixox_lib::pool;
 use radixox_lib::shared_byte::SharedByte;
@@ -100,7 +102,7 @@ pub(crate) fn from_entries<const W: usize>(entries: impl ExactSizeIterator<Item 
 /// `p` est un bloc vivant ; la tranche est invalidée par toute modification.
 #[inline]
 pub(crate) unsafe fn entries<'a, const W: usize>(p: *const u8) -> &'a [[SharedByte; W]] {
-    unsafe { std::slice::from_raw_parts(slots::<W>(p as *mut u8), len(p)) }
+    unsafe { core::slice::from_raw_parts(slots::<W>(p as *mut u8), len(p)) }
 }
 
 /// Entrées en écriture.
@@ -109,7 +111,7 @@ pub(crate) unsafe fn entries<'a, const W: usize>(p: *const u8) -> &'a [[SharedBy
 /// `p` est un bloc vivant, possédé ; aucune autre référence vers lui.
 #[inline]
 pub(crate) unsafe fn entries_mut<'a, const W: usize>(p: *mut u8) -> &'a mut [[SharedByte; W]] {
-    unsafe { std::slice::from_raw_parts_mut(slots::<W>(p), len(p)) }
+    unsafe { core::slice::from_raw_parts_mut(slots::<W>(p), len(p)) }
 }
 
 /// Position de l'entrée dont le premier élément vaut `key`.
@@ -200,6 +202,10 @@ pub(crate) unsafe fn peek(sb: &SharedByte) -> ManuallyDrop<SharedByte> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
+    #[allow(unused_imports)]
+    use std::{dbg, eprintln, print, println, thread_local};
     use super::*;
 
     fn sb(s: &str) -> SharedByte {

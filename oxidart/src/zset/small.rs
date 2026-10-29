@@ -16,8 +16,10 @@
 //!
 //! L'API prend et rend des scores encodés (`u64` ordonné).
 
-use std::cmp::Ordering;
-use std::ptr;
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::cmp::Ordering;
+use core::ptr;
 
 use radixox_lib::pool;
 
@@ -32,7 +34,8 @@ const HEADER: usize = 8;
 #[inline]
 fn width_for(s: u64) -> u8 {
     let f = decode_score(s);
-    if f.fract() != 0.0 || !f.is_finite() {
+    // pas un entier exact (`f.fract() != 0`, absent de core) ou infini / NaN
+    if !f.is_finite() || (f as i64) as f64 != f {
         8
     } else if (i16::MIN as f64..=i16::MAX as f64).contains(&f) {
         2
@@ -126,7 +129,7 @@ impl ZSmall {
 
     #[inline]
     fn lens(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.lens_ptr(), self.len()) }
+        unsafe { core::slice::from_raw_parts(self.lens_ptr(), self.len()) }
     }
 
     /// Score encodé du rang `i`.
@@ -147,7 +150,7 @@ impl ZSmall {
     pub fn member(&self, i: usize) -> &[u8] {
         let off = self.offset(i);
         let l = self.lens()[i] as usize;
-        unsafe { std::slice::from_raw_parts(self.bytes_ptr().add(off), l) }
+        unsafe { core::slice::from_raw_parts(self.bytes_ptr().add(off), l) }
     }
 
     /// `(score, membre)` dans l'ordre, à partir du rang `from`.
@@ -173,7 +176,7 @@ impl ZSmall {
             let l = l as usize;
             if l == m.len()
                 && tail.is_none_or(|t| unsafe { base.add(off + l - 8).cast::<u64>().read_unaligned() } == t)
-                && unsafe { std::slice::from_raw_parts(base.add(off), l) } == m
+                && unsafe { core::slice::from_raw_parts(base.add(off), l) } == m
             {
                 return Some(i);
             }
@@ -259,7 +262,7 @@ impl ZSmall {
             ptr::copy_nonoverlapping(m.as_ptr(), nb.add(off), m.len());
             ptr::copy_nonoverlapping(ob.add(off), nb.add(off + m.len()), used - off);
         }
-        std::mem::replace(self, new).free();
+        core::mem::replace(self, new).free();
         true
     }
 
@@ -284,7 +287,7 @@ impl ZSmall {
             ptr::copy_nonoverlapping(self.lens_ptr(), new.lens_ptr(), n);
             ptr::copy_nonoverlapping(self.bytes_ptr(), new.bytes_ptr(), used);
         }
-        std::mem::replace(self, new).free();
+        core::mem::replace(self, new).free();
     }
 
     /// Retire le rang `i` (le bloc garde sa place).
@@ -360,7 +363,7 @@ impl<'a> Iterator for Iter<'a> {
             return None;
         }
         let l = self.z.lens()[self.i] as usize;
-        let m = unsafe { std::slice::from_raw_parts(self.z.bytes_ptr().add(self.off), l) };
+        let m = unsafe { core::slice::from_raw_parts(self.z.bytes_ptr().add(self.off), l) };
         let s = self.z.score(self.i);
         self.i += 1;
         self.off += l;
@@ -381,7 +384,7 @@ impl DoubleEndedIterator for Iter<'_> {
         self.j -= 1;
         let l = self.z.lens()[self.j] as usize;
         self.end -= l;
-        let m = unsafe { std::slice::from_raw_parts(self.z.bytes_ptr().add(self.end), l) };
+        let m = unsafe { core::slice::from_raw_parts(self.z.bytes_ptr().add(self.end), l) };
         Some((self.z.score(self.j), m))
     }
 }
@@ -418,6 +421,10 @@ unsafe fn write_score(sc: *mut u8, w: usize, i: usize, s: u64) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
+    #[allow(unused_imports)]
+    use std::{dbg, eprintln, print, println, thread_local};
     use super::*;
 
     struct Rng(u64);

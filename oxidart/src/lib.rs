@@ -15,7 +15,7 @@
 //! ```rust,ignore
 //! use oxidart::OxidArt;
 //! use bytes::Bytes;
-//! use std::time::Duration;
+//! use core::time::Duration;
 //!
 //! let mut tree = OxidArt::new();
 //!
@@ -45,8 +45,27 @@
 //! Ordered operations (`krange`, prefix scans) use unsigned byte order (`memcmp`), like Redis.
 
 
+#![no_std]
+
+extern crate alloc;
+#[cfg(any(feature = "std", test))]
+extern crate std;
+
+/// Ce que le prélude de `std` donnait, pour un module `no_std`.
+#[allow(unused_imports)]
+pub(crate) mod prelude {
+    pub use alloc::borrow::ToOwned;
+    pub use alloc::boxed::Box;
+    pub use alloc::string::{String, ToString};
+    pub use alloc::vec::Vec;
+    pub use alloc::{format, vec};
+}
+#[allow(unused_imports)]
+use prelude::*;
+
 pub mod compact;
 pub mod compact_path;
+#[cfg(feature = "std")]
 pub mod compress;
 pub mod digest;
 pub mod gc;
@@ -314,7 +333,7 @@ fn overwrite_self(node: &mut Node, raw: &RawVal, exp: Option<u64>) -> bool {
 /// Retire la self-val (propriété à l'appelant).
 fn take_self(node: &mut Node) -> (RawVal, Option<u64>) {
     debug_assert!(node.has_val());
-    let raw = RawVal::new(node.tag, std::mem::replace(&mut node.val, ValUnion { integer: 0 }));
+    let raw = RawVal::new(node.tag, core::mem::replace(&mut node.val, ValUnion { integer: 0 }));
     let exp = node.exp_and_radix.exp();
     node.tag = Tag::None;
     node.exp_and_radix.set_no_expiracy();
@@ -383,10 +402,7 @@ impl OxidArt {
     /// La boucle du serveur l'appelle une fois par tour.
     #[inline]
     pub fn tick(&mut self) {
-        self.now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time before UNIX epoch")
-            .as_secs();
+        self.now = radixox_lib::sys::wall_secs();
     }
 
     /// Indique si une save est en cours. Pendant une save, les lectures ne
@@ -869,7 +885,7 @@ impl OxidArt {
 
     /// Inserts or updates a key-value pair with a time-to-live duration
     /// (from the current timestamp `self.now`).
-    pub fn set_ttl(&mut self, key: SharedByte, ttl: std::time::Duration, val: Value) {
+    pub fn set_ttl(&mut self, key: SharedByte, ttl: core::time::Duration, val: Value) {
         let exp = self.now.saturating_add(ttl.as_secs());
         self.set_raw(&key, RawVal::from_value(val), Some(exp), None);
     }
@@ -885,7 +901,7 @@ impl OxidArt {
     pub fn set_cond(
         &mut self,
         key: &[u8],
-        ttl: Option<std::time::Duration>,
+        ttl: Option<core::time::Duration>,
         val: Value,
         if_exists: Option<bool>,
     ) -> bool {
@@ -1077,7 +1093,7 @@ impl OxidArt {
     ///
     /// Returns `true` if the key exists and the TTL was set (also when it
     /// replaces a previous TTL, like Redis), `false` otherwise.
-    pub fn expire(&mut self, key: SharedByte, ttl: std::time::Duration) -> bool {
+    pub fn expire(&mut self, key: SharedByte, ttl: core::time::Duration) -> bool {
         let Some(loc) = self.locate(&key) else {
             return false;
         };
@@ -1294,7 +1310,7 @@ impl OxidArt {
         while let Some((idx, depth, radix)) = stack.pop() {
             path.truncate(depth as usize);
             let node = self.node(idx);
-            if !std::mem::take(&mut first) {
+            if !core::mem::take(&mut first) {
                 path.push(radix);
                 path.extend_from_slice(&node.prefix);
             }

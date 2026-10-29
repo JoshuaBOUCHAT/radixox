@@ -14,6 +14,8 @@
 //! directement le nœud trouvé par la descente entrelacée (`descend_batch`) :
 //! pas de seconde descente.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
 use radixox_lib::prefetch::prefetch_l1;
 
 use crate::krange::{OwnedVal, RangeVal, str_val};
@@ -693,7 +695,7 @@ impl OxidArt {
         let (ptr, len, hint) = self.window.as_ref()?.scoped?;
         // SAFETY: `with_hint` emprunte la clé pendant tout `f`, seul moment où
         // `scoped` est posé.
-        (len == key.len() && unsafe { std::slice::from_raw_parts(ptr, len) } == key).then_some(hint)
+        (len == key.len() && unsafe { core::slice::from_raw_parts(ptr, len) } == key).then_some(hint)
     }
 
     // Les commandes avec l'indice de `amac_descend`, dans une fenêtre ouverte :
@@ -746,7 +748,7 @@ impl OxidArt {
     }
 
     /// [`expire`](Self::expire) : l'échéance change sur place.
-    pub fn expire_hinted(&mut self, key: &[u8], ttl: std::time::Duration, hint: Hint) -> bool {
+    pub fn expire_hinted(&mut self, key: &[u8], ttl: core::time::Duration, hint: Hint) -> bool {
         let Some(loc) = self.hinted_loc(key, hint) else {
             return false;
         };
@@ -796,7 +798,7 @@ impl OxidArt {
     pub fn set_cond_hinted(
         &mut self,
         key: &[u8],
-        ttl: Option<std::time::Duration>,
+        ttl: Option<core::time::Duration>,
         val: Value,
         if_exists: Option<bool>,
         hint: Hint,
@@ -882,7 +884,7 @@ impl OxidArt {
     }
 
     fn to_owned_vals(v: Vec<Option<RangeVal<'_>>>) -> Vec<Option<OwnedVal>> {
-        let v = std::mem::ManuallyDrop::new(v);
+        let v = core::mem::ManuallyDrop::new(v);
         let (ptr, len, cap) = (v.as_ptr() as *mut Option<RangeVal<'_>>, v.len(), v.capacity());
         let dst = ptr as *mut Option<OwnedVal>;
         for i in 0..len {
@@ -934,6 +936,10 @@ fn expired_push(expired: &mut Vec<u32>, chunk: usize, i: usize) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
+    #[allow(unused_imports)]
+    use std::{dbg, eprintln, print, println, thread_local};
     use radixox_lib::shared_byte::SharedByte;
 
     use crate::OxidArt;
@@ -987,7 +993,7 @@ mod tests {
                 1 => {
                     let _ = art.cmd_hset(k.as_bytes(), &[(SharedByte::from_str("f"), SharedByte::from_str("v"))], None);
                 }
-                2 => art.set_ttl(SharedByte::from_str(&k), std::time::Duration::from_secs(5), val(&k)),
+                2 => art.set_ttl(SharedByte::from_str(&k), core::time::Duration::from_secs(5), val(&k)),
                 _ => art.set(SharedByte::from_str(&k), val(&k)),
             }
         }
@@ -1051,7 +1057,7 @@ mod tests {
     fn amac_matches_plain_tree() {
         use rand::{Rng, SeedableRng, rngs::StdRng};
         use radixox_lib::shared_byte::SharedByte;
-        use std::time::Duration;
+        use core::time::Duration;
         // chaque commande avec indice, et sa version sans indice
         // 15..=18 : Hash / Set sous `with_hint`, champ préchargé par la phase 1
         // 19..=22 : ZSet (ZADD, ZSCORE, ZREM, ZINCRBY), chaînes de `zset::amac`
@@ -1186,7 +1192,11 @@ mod tests {
 
 #[cfg(test)]
 mod purge_tests {
-    use std::collections::BTreeMap;
+    #[allow(unused_imports)]
+    use crate::prelude::*;
+    #[allow(unused_imports)]
+    use std::{dbg, eprintln, print, println, thread_local};
+    use alloc::collections::BTreeMap;
 
     use radixox_lib::shared_byte::SharedByte;
 
@@ -1273,7 +1283,7 @@ mod purge_tests {
                     Value::String(SharedByte::from_slice(k))
                 };
                 if expiring {
-                    art.set_ttl(SharedByte::from_slice(k), std::time::Duration::from_secs(5), val);
+                    art.set_ttl(SharedByte::from_slice(k), core::time::Duration::from_secs(5), val);
                 } else {
                     art.set(SharedByte::from_slice(k), val.clone());
                     live.insert(k.clone(), val);

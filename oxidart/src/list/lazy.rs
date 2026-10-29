@@ -2,7 +2,9 @@
 //! les grands ZSet (`zset::lazy`) : la clé disparaît tout de suite, les blocs attendent
 //! dans une file. Pendant une save, rien n'avance.
 
-use std::collections::VecDeque;
+#[allow(unused_imports)]
+use crate::prelude::*;
+use alloc::collections::VecDeque;
 
 use super::{CAP, List};
 

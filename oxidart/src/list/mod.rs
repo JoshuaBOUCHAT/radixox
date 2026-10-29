@@ -12,7 +12,9 @@
 //! sont nuls. Un pop n'a donc jamais de morte à sauter, et `first` / `last` ne sont jamais
 //! vides.
 
-use std::mem::MaybeUninit;
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::mem::MaybeUninit;
 
 use radixox_lib::hislab::HiSlab;
 use radixox_lib::shared_byte::SharedByte;
@@ -518,7 +520,7 @@ impl List {
     /// Remplace la valeur en `c` ; rend l'ancienne.
     pub fn replace(&mut self, c: Cursor, v: SharedByte) -> SharedByte {
         let b = block_mut(c.block);
-        std::mem::replace(unsafe { b.slots[c.slot as usize].assume_init_mut() }, v)
+        core::mem::replace(unsafe { b.slots[c.slot as usize].assume_init_mut() }, v)
     }
 
     pub fn first_cursor(&self) -> Option<Cursor> {
@@ -531,12 +533,12 @@ impl List {
 
     /// Valeurs du début à la fin.
     pub fn iter(&self) -> impl Iterator<Item = &'static SharedByte> {
-        std::iter::successors(self.first_cursor(), |&c| next(c)).map(value)
+        core::iter::successors(self.first_cursor(), |&c| next(c)).map(value)
     }
 
     /// Valeurs de la fin au début.
     pub fn iter_rev(&self) -> impl Iterator<Item = &'static SharedByte> {
-        std::iter::successors(self.last_cursor(), |&c| prev(c)).map(value)
+        core::iter::successors(self.last_cursor(), |&c| prev(c)).map(value)
     }
 
     // ─── Milieu ──────────────────────────────────────────────────────────────
@@ -705,7 +707,7 @@ impl List {
         }
         if n == self.len {
             let id = self.id;
-            let mut out = std::mem::replace(self, List::new());
+            let mut out = core::mem::replace(self, List::new());
             self.id = id;
             out.set_id(NONE);
             return out;
@@ -824,8 +826,12 @@ impl List {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
+    #[allow(unused_imports)]
+    use std::{dbg, eprintln, print, println, thread_local};
     use super::*;
-    use std::collections::VecDeque;
+    use alloc::collections::VecDeque;
 
     struct Rng(u64);
     impl Rng {

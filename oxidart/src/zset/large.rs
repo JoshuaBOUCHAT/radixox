@@ -1,7 +1,9 @@
 //! Grande forme du ZSet (ANALYSE_ART_UNIFIE.md §13.4) : index (membre → score) + B+tree
 //! compté (ordre, rangs), membres = objets à poignée (une seule copie des octets).
 
-use std::cmp::Ordering;
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::cmp::Ordering;
 
 use radixox_lib::handle;
 

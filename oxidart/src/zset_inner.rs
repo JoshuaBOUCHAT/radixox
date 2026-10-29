@@ -1,6 +1,8 @@
+#[allow(unused_imports)]
+use crate::prelude::*;
 use hashbrown::HashMap;
 use radixox_lib::shared_byte::SharedByte;
-use std::collections::BTreeSet;
+use alloc::collections::BTreeSet;
 
 /// Score ordonné, comme `ordered_float::OrderedFloat` : `-0.0 == 0.0`, NaN égal à lui-même
 /// et plus grand que tout.
@@ -20,13 +22,13 @@ impl PartialEq for OrdF64 {
 }
 impl Eq for OrdF64 {}
 impl PartialOrd for OrdF64 {
-    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, o: &Self) -> Option<core::cmp::Ordering> {
         Some(self.cmp(o))
     }
 }
 impl Ord for OrdF64 {
-    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
-        use std::cmp::Ordering::*;
+    fn cmp(&self, o: &Self) -> core::cmp::Ordering {
+        use core::cmp::Ordering::*;
         match (self.0.is_nan(), o.0.is_nan()) {
             (true, true) => Equal,
             (true, false) => Greater,

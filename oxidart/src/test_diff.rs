@@ -4,6 +4,11 @@
 //! (mutations entre les tranches) et comparée à l'état T0 de l'oracle ; en fin
 //! de graine, aller-retour save/reload dans les deux sens (format commun).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+#[allow(unused_imports)]
+use std::{dbg, eprintln, print, println, thread_local};
+
 use std::time::Duration;
 
 use oxidart_legacy::OxidArt as Old;

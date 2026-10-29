@@ -152,6 +152,47 @@ impl Sub<Instant> for Instant {
     }
 }
 
+/// Secondes depuis l'époque Unix (`CLOCK_REALTIME`, vDSO), 0 avant elle.
+#[inline]
+pub fn wall_secs() -> u64 {
+    rustix::time::clock_gettime(rustix::time::ClockId::Realtime).tv_sec.max(0) as u64
+}
+
+/// Exécution unique, comme `std::sync::Once` (sans empoisonnement) : un appel concurrent
+/// attend la fin du premier.
+pub struct Once(AtomicU8);
+
+impl Once {
+    pub const fn new() -> Self {
+        Self(AtomicU8::new(0))
+    }
+    pub fn call_once(&self, f: impl FnOnce()) {
+        if self.0.load(Ordering::Acquire) == 2 {
+            return;
+        }
+        match self.0.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire) {
+            Ok(_) => {
+                f();
+                self.0.store(2, Ordering::Release);
+            }
+            Err(_) => {
+                while self.0.load(Ordering::Acquire) != 2 {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
+    pub fn is_completed(&self) -> bool {
+        self.0.load(Ordering::Acquire) == 2
+    }
+}
+
+impl Default for Once {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Environnement du processus au démarrage (`/proc/self/environ`), lu une fois dans une
 /// plage `mmap` : ni libc, ni allocation (l'allocateur le lit à son initialisation). Un
 /// `setenv` ultérieur n'est pas vu ; la crate ne lit que de la configuration de démarrage.

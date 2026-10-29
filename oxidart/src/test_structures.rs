@@ -1,3 +1,7 @@
+#[allow(unused_imports)]
+use crate::prelude::*;
+#[allow(unused_imports)]
+use std::{dbg, eprintln, print, println, thread_local};
 /// Comprehensive tests for Hash, Set, and ZSet commands.
 ///
 /// Focus areas:

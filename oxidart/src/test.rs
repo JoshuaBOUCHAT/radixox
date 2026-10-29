@@ -1,3 +1,7 @@
+#[allow(unused_imports)]
+use crate::prelude::*;
+#[allow(unused_imports)]
+use std::{dbg, eprintln, print, println, thread_local};
 use crate::value::Value;
 
 use radixox_lib::shared_byte::SharedByte;

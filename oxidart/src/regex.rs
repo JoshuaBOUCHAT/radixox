@@ -1,4 +1,6 @@
-use std::fmt::Write;
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::fmt::Write;
 
 use regex_automata::dfa::{Automaton, dense::DFA};
 use regex_automata::nfa::thompson;
@@ -374,6 +376,10 @@ fn push_byte(re: &mut String, b: u8) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
+    #[allow(unused_imports)]
+    use std::{dbg, eprintln, print, println, thread_local};
     use radixox_lib::shared_byte::SharedByte;
 
     use super::*;
@@ -485,7 +491,7 @@ mod tests {
         tree.set_now(100);
         tree.set_ttl(
             SharedByte::from_str("user:1:admin:x"),
-            std::time::Duration::from_secs(10),
+            core::time::Duration::from_secs(10),
             Value::String(SharedByte::from_str("val")),
         );
         tree.set(
@@ -514,7 +520,7 @@ mod tests {
         const KEY_ALPHA: &[u8] = b"ab-]^\\*";
         const PAT_ALPHA: &[u8] = b"ab-]^\\*?[";
         let mut tree = OxidArt::new();
-        let mut keys = std::collections::BTreeSet::new();
+        let mut keys = alloc::collections::BTreeSet::new();
         for _ in 0..400 {
             let len = rng.gen_range(1..7);
             let k: Vec<u8> = (0..len).map(|_| KEY_ALPHA[rng.gen_range(0..KEY_ALPHA.len())]).collect();

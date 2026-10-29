@@ -1,6 +1,11 @@
 //! Save progressive : la vue T0 lue par le parcours doit être exactement
 //! l'état au `begin_save`, quelles que soient les mutations entrelacées.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+#[allow(unused_imports)]
+use std::{dbg, eprintln, print, println, thread_local};
+
 use std::time::Duration;
 
 use radixox_lib::shared_byte::SharedByte;

@@ -21,6 +21,8 @@
 //! tant que quelqu'un tient des `idx` de nœuds entre deux tranches (jobs) : c'est au
 //! pilote (le serveur) de ne pas l'avancer dans ces cas.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
 use radixox_lib::prefetch::prefetch_l1;
 
 use crate::OxidArt;
@@ -234,7 +236,7 @@ impl OxidArt {
                 for (_, e) in node.iter() {
                     if let EntryRef::Child(ch) = e {
                         let at = self.map.slot_ptr(ch) as *const u8;
-                        prefetch_l1(at.wrapping_add(std::mem::offset_of!(Node, parent_idx)));
+                        prefetch_l1(at.wrapping_add(core::mem::offset_of!(Node, parent_idx)));
                         fetched = true;
                     }
                 }

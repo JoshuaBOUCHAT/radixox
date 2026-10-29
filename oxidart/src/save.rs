@@ -26,7 +26,9 @@
 //! - **I9** : jamais de pause au milieu d'un nœud ou d'un enregistrement.
 //! - **I10** : dropper un `SaveCursor` entre deux tranches est sûr.
 
-use std::mem::ManuallyDrop;
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::mem::ManuallyDrop;
 
 use radixox_lib::save_barrier::SaveBarrier;
 
@@ -50,7 +52,7 @@ fn image_val(tag: Tag, val: &ValUnion) -> ValUnion {
             ptr: unsafe { crate::small::deep_clone::<1>(val.ptr) },
         },
         // SAFETY: pas de ressource possédée hors Bytes : copie bit à bit.
-        _ => unsafe { std::ptr::read(val) },
+        _ => unsafe { core::ptr::read(val) },
     }
 }
 
@@ -150,7 +152,7 @@ impl OxidSave {
     pub(crate) fn clear_images(&mut self) {
         self.childs.clear();
         if self.leftover.is_empty() {
-            std::mem::swap(&mut self.leaves, &mut self.leftover);
+            core::mem::swap(&mut self.leaves, &mut self.leftover);
         } else {
             self.leftover.append(&mut self.leaves);
         }
@@ -167,6 +169,11 @@ impl OxidSave {
 #[cfg(test)]
 pub(crate) mod reference {
     //! Outils de test : dump complet décodé, comparé à l'état attendu.
+
+    #[allow(unused_imports)]
+    use crate::prelude::*;
+    #[allow(unused_imports)]
+    use std::{dbg, eprintln, print, println, thread_local};
 
     use radixox_lib::shared_byte::SharedByte;
 
@@ -332,7 +339,7 @@ pub mod format {
     }
 }
 
-use std::collections::VecDeque;
+use alloc::collections::VecDeque;
 
 use radixox_lib::prefetch::prefetch_l1;
 use radixox_lib::shared_byte::SharedByte;
@@ -785,7 +792,7 @@ impl SaveCursor {
                 },
                 // I3 : copie sans refcount, valide jusqu'à la fin de la tranche.
                 Tag::Bytes => PVal::Bytes {
-                    sb: ManuallyDrop::new(std::ptr::read(&*val.bytes)),
+                    sb: ManuallyDrop::new(core::ptr::read(&*val.bytes)),
                     owned: false,
                 },
                 Tag::Int => PVal::Int(val.integer),
@@ -863,7 +870,7 @@ fn emit_oldest(cur: &mut SaveCursor, out: &mut Vec<u8>, budget: &mut u32) {
             sub(budget, 1 + (buf.len() >> 12) as u32);
         }
     }
-    cur.spare.push(std::mem::take(&mut p.head));
+    cur.spare.push(core::mem::take(&mut p.head));
 }
 
 // ─── Lecture d'un dump ───────────────────────────────────────────────────────
@@ -923,6 +930,7 @@ pub fn parse_dump(buf: &[u8]) -> Result<Dump, DumpError> {
     };
     parse().map_err(|e| match e {
         LoadError::Dump(e) => e,
+        #[cfg(feature = "std")]
         LoadError::Io(_) => unreachable!("lecture d'une tranche en mémoire"),
     })
 }

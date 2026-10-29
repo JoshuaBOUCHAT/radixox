@@ -22,6 +22,8 @@
 //! reste court ([`block_size`]), et [`ZstdStream::compress`] donne l'entrée
 //! bloc par bloc jusqu'à épuiser son temps.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
 use std::io::Read;
 use std::time::{Duration, Instant};
 

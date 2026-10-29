@@ -1,3 +1,5 @@
+#[allow(unused_imports)]
+use crate::prelude::*;
 use radixox_lib::shared_byte::SharedByte;
 
 use crate::OxidArt;
@@ -58,6 +60,10 @@ impl OxidArt {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
+    #[allow(unused_imports)]
+    use std::{dbg, eprintln, print, println, thread_local};
     use super::*;
 
     #[test]
@@ -163,7 +169,7 @@ mod tests {
         tree.set_now(100);
         tree.set_ttl(
             SharedByte::from_str("counter"),
-            std::time::Duration::from_secs(10),
+            core::time::Duration::from_secs(10),
             Value::String(SharedByte::from_str("50")),
         );
         assert_eq!(tree.incr(SharedByte::from_str("counter")), Ok(51));
@@ -178,7 +184,7 @@ mod tests {
         tree.set_now(100);
         tree.set_ttl(
             SharedByte::from_str("counter"),
-            std::time::Duration::from_secs(60),
+            core::time::Duration::from_secs(60),
             Value::String(SharedByte::from_str("10")),
         );
         assert_eq!(tree.incr(SharedByte::from_str("counter")), Ok(11));

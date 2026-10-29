@@ -10,6 +10,8 @@
 //! - Une List supprimée pendant la save garde ses blocs jusqu'à la fin (liste différée,
 //!   rendue par tranches ensuite) ; la libération par tranches (`lazy`) est gelée.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
 use radixox_lib::save_barrier::{SaveBarrier, T0};
 use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::varint::{put_bytes, put_varint};
