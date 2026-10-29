@@ -217,45 +217,49 @@ sec_repl() {
 # cmd « commande » ratio motif → arguments memtier d'une commande arbitraire
 cmd() { echo "--command=$1" "--command-ratio=$2" "--command-key-pattern=$3"; }
 sec_types() {
-  say "== types : 1 cœur, 60 connexions ; RSS = après chargement − à vide"
+  say "== types : 1 cœur, 60 connexions ; RSS = après chargement − avant, tous les types chargés avant les runs"
   local pre=(--key-prefix '' --key-minimum 1)
+  local load=(--threads 1 --clients 1 "${pre[@]}")
   for srv in rx vk; do
     fresh $P1
     if [ $srv = rx ]; then rx $P1; else vk $P1 0,1 "${VK1[@]}"; fi
-    local base; base=$(rss $P1)
+    # Chargements d'abord, chacun mesuré seul : les runs font grossir les Set et ZSet
+    # (membres aléatoires) et laissent au GC des pages vides rendues après 10 s, qui se
+    # comptaient dans le type suivant.
+    local r0 r1 r2 r3 r4
+    r0=$(rss $P1)
     # Hash : 1M clés à un champ de 100 o
-    mt $P1 64 --threads 1 --clients 1 "${pre[@]}" --key-maximum "$KEYS" --requests allkeys \
-      "--command=HSET h:__key__ f __data__" --command-key-pattern=P >/dev/null
-    local r1; r1=$(rss $P1)
+    mt $P1 64 "${load[@]}" --key-maximum "$KEYS" --requests allkeys "--command=HSET h:__key__ f __data__" --command-key-pattern=P >/dev/null
+    r1=$(rss $P1)
+    # Set : un Set de 1M membres
+    mt $P1 64 "${load[@]}" --key-maximum "$KEYS" --requests allkeys "--command=SADD s __key__" --command-key-pattern=P >/dev/null
+    r2=$(rss $P1)
+    # ZSet : un ZSet de 1M membres (score = membre − 1). Chaque __key__ prend la clé
+    # suivante du motif P : 2 clés par commande, KEYS commandes sur 2 × KEYS clés.
+    mt $P1 64 "${load[@]}" --key-maximum $((KEYS * 2)) --requests "$KEYS" "--command=ZADD z __key__ __key__" --command-key-pattern=P >/dev/null
+    r3=$(rss $P1)
+    # List : 1 000 listes, 1M éléments de 100 o au total
+    mt $P1 64 --threads 1 --clients 1 "${pre[@]}" --key-maximum 1000 --requests "$KEYS" \
+      "--command=LPUSH l:__key__ __data__" --command-key-pattern=R >/dev/null
+    r4=$(rss $P1)
+    say "$srv chargés : Hash +$((r1 - r0)) Mo, Set +$((r2 - r1)) Mo, ZSet +$((r3 - r2)) Mo ($(redis-cli -p $P1 ZCARD z) membres), List +$((r4 - r3)) Mo"
     local h=("${pre[@]}" --key-maximum "$KEYS" --test-time "$TEST_TIME"
       "--command=HSET h:__key__ f __data__" --command-ratio=1 --command-key-pattern=R
       "--command=HGET h:__key__ f" --command-ratio=4 --command-key-pattern=R)
-    say "$srv Hash ($KEYS × 1 champ, +$((r1 - base)) Mo) HSET:HGET 1:4 p1  $(mt $P1 1 "${h[@]}" | row Totals)"
+    say "$srv Hash ($KEYS × 1 champ, +$((r1 - r0)) Mo) HSET:HGET 1:4 p1  $(mt $P1 1 "${h[@]}" | row Totals)"
     say "$srv Hash HSET:HGET 1:4 p32 $(mt $P1 32 "${h[@]}" | row Totals)"
-    # Set : un Set de 1M membres
-    mt $P1 64 --threads 1 --clients 1 "${pre[@]}" --key-maximum "$KEYS" --requests allkeys \
-      "--command=SADD s __key__" --command-key-pattern=P >/dev/null
-    local r2; r2=$(rss $P1)
     local st=("${pre[@]}" --key-maximum $((KEYS * 2)) --test-time "$TEST_TIME"
       "--command=SADD s __key__" --command-ratio=1 --command-key-pattern=R
       "--command=SISMEMBER s __key__" --command-ratio=4 --command-key-pattern=R)
     say "$srv Set (1 × $KEYS membres, +$((r2 - r1)) Mo) SADD:SISMEMBER 1:4 p1  $(mt $P1 1 "${st[@]}" | row Totals)"
     say "$srv Set SADD:SISMEMBER 1:4 p32 $(mt $P1 32 "${st[@]}" | row Totals)"
-    # ZSet : un ZSet de 1M membres, score = membre
-    mt $P1 64 --threads 1 --clients 1 "${pre[@]}" --key-maximum "$KEYS" --requests allkeys \
-      "--command=ZADD z __key__ __key__" --command-key-pattern=P >/dev/null
-    local r3; r3=$(rss $P1)
-    local z=("${pre[@]}" --key-maximum "$KEYS" --test-time "$TEST_TIME"
+    local z=("${pre[@]}" --key-maximum $((KEYS * 2)) --test-time "$TEST_TIME"
       "--command=ZADD z __key__ __key__" --command-ratio=1 --command-key-pattern=R
       "--command=ZSCORE z __key__" --command-ratio=2 --command-key-pattern=R
       "--command=ZRANK z __key__" --command-ratio=1 --command-key-pattern=R
       "--command=ZRANGEBYSCORE z __key__ +inf LIMIT 0 10" --command-ratio=1 --command-key-pattern=R)
     say "$srv ZSet (1 × $KEYS membres, +$((r3 - r2)) Mo) ZADD/ZSCORE/ZRANK/ZRANGEBYSCORE 1/2/1/1 p1  $(mt $P1 1 "${z[@]}" | row Totals)"
     say "$srv ZSet p32 $(mt $P1 32 "${z[@]}" | row Totals)"
-    # List : 1 000 listes, 1M éléments de 100 o au total
-    mt $P1 64 --threads 1 --clients 1 "${pre[@]}" --key-maximum 1000 --requests "$KEYS" \
-      "--command=LPUSH l:__key__ __data__" --command-key-pattern=R >/dev/null
-    local r4; r4=$(rss $P1)
     local l=("${pre[@]}" --key-maximum 1000 --test-time "$TEST_TIME"
       "--command=LPUSH l:__key__ __data__" --command-ratio=2 --command-key-pattern=R
       "--command=RPOP l:__key__" --command-ratio=2 --command-key-pattern=R
