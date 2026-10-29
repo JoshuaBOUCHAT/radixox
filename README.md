@@ -59,8 +59,45 @@ redis-cli UNLINK 'user:10:*'                     # the whole namespace
 
 - `--features eviction` adds the LRU and LFU policies (one extra write per read, so the
   default build leaves them out).
-- `--target x86_64-unknown-linux-musl` gives a ~2.6 MB static binary that runs on any
-  Linux ≥ 6.12.
+- The default build is tuned for the build machine (`target-cpu=native` in
+  `.cargo/config.toml`): copy it only to machines with the same CPU features.
+
+### Portable and static builds
+
+`target-cpu=native` lets the compiler use everything the build machine has (AVX-512 on a
+Zen 4), and the binary then dies with `SIGILL` on a CPU without it. For a binary you ship
+elsewhere, set the CPU level explicitly (`RUSTFLAGS` replaces the setting of
+`.cargo/config.toml`):
+
+```bash
+# glibc, any x86-64 with AVX2 (Intel Haswell 2013+, AMD Zen 1+, current cloud VMs)
+RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -p radixox --target-dir target/portable
+
+# static (musl, static-pie, ~2.8 MB, no shared library), same CPU level
+rustup target add x86_64-unknown-linux-musl
+RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -p radixox \
+  --target x86_64-unknown-linux-musl --target-dir target/portable
+# → target/portable/x86_64-unknown-linux-musl/release/radixox
+```
+
+`x86-64-v2` (SSE4.2) or plain `x86-64` also build, for older machines; the SIMD paths then
+fall back to scalar code. The static binary still uses RadixOx's own allocator (it
+replaces musl's `malloc`), runs under `env -i`, and needs Linux ≥ 6.12 like the others.
+
+Cost, measured on one core (Ryzen 7600X, 1M keys, `GET`:`SET` 4:1, throughput counted by
+the server, 3 alternated runs, 2026-10-29):
+
+| Build | No pipeline | Pipeline 32 |
+|---|---|---|
+| `native`, glibc | 277 k ops/s | 3.10 M ops/s |
+| `x86-64-v3`, glibc | 279 k ops/s | **3.17 M ops/s** |
+| `x86-64-v3`, musl static | 278 k ops/s | 2.74 M ops/s (−13 %) |
+
+- `x86-64-v3` costs nothing here: the AVX-512 paths do not pay on these workloads.
+- musl costs 13 % under pipelining and nothing without: pipelining is where the server's
+  own CPU work dominates, while without it the network round trip hides the difference.
+  The likely cause is musl's slower `memcpy` / `memcmp` (the allocator is ours in both
+  builds); not profiled yet.
 
 ## What Redis doesn't have
 

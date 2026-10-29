@@ -39,7 +39,7 @@ le 2026-10-28 ; `~/rust/hislab` n'est plus utilisé par RadixOx).
 
 ```bash
 cargo build --release -p radixox          # binaire target/release/radixox
-cargo build --release -p radixox --target x86_64-unknown-linux-musl   # binaire statique (static-pie)
+RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -p radixox --target x86_64-unknown-linux-musl --target-dir target/portable   # binaire statique portable (sans RUSTFLAGS : native, AVX-512 du 7600X → SIGILL ailleurs) ; README « Portable and static builds »
 cargo run --release --bin radixox         # écoute 127.0.0.1:6379 (RADIXOX_BIND / RADIXOX_PORT)
 
 cargo test -p oxidart --features regex    # arbre (dont tests différentiels contre oxidart-legacy)
