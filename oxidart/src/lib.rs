@@ -1548,7 +1548,7 @@ impl OxidArt {
         let now = self.now;
         let node = self.node(idx);
         let self_exp = node.has_val() && expired(node.exp_and_radix.exp(), now);
-        let mut radixes: smallvec::SmallVec<[u8; 16]> = smallvec::SmallVec::new();
+        let mut radixes: radixox_lib::small_vec::SmallVec<16, u8> = radixox_lib::small_vec::SmallVec::new();
         for (r, e) in node.iter() {
             if let EntryRef::Leaf { ttl, .. } = e
                 && expired(ttl, now)
@@ -1582,7 +1582,7 @@ impl OxidArt {
     /// Clé du nœud `idx` (sa valeur propre) dans `out` : radix et préfixes depuis la racine,
     /// en remontant les parents (comme la descente de [`Self::walk`], à l'envers).
     fn key_to_node(&self, idx: u32, out: &mut Vec<u8>) {
-        let mut chain: smallvec::SmallVec<[u32; 16]> = smallvec::SmallVec::new();
+        let mut chain: radixox_lib::small_vec::SmallVec<16, u32> = radixox_lib::small_vec::SmallVec::new();
         let mut i = idx;
         while i != self.root_idx {
             chain.push(i);
@@ -1678,7 +1678,7 @@ impl OxidArt {
     ) -> usize {
         let node = self.node(idx);
         let own = node.has_val() && pick(node.exp_and_radix.exp(), node.tag, &node.val);
-        let mut leaves: smallvec::SmallVec<[(u8, smallvec::SmallVec<[u8; 16]>); 16]> = smallvec::SmallVec::new();
+        let mut leaves: radixox_lib::small_vec::SmallVec<16, (u8, radixox_lib::small_vec::SmallVec<16, u8>)> = radixox_lib::small_vec::SmallVec::new();
         for (r, e) in node.iter() {
             if let EntryRef::Leaf { ttl, sfx, tag, val } = e
                 && pick(ttl, tag, val)

@@ -18,7 +18,7 @@ use oxidart::lcommand::End;
 use oxidart::value::RedisType;
 use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::shared_frame::{SharedFrame as Frame, encode_array_len, encode_bulk, extend_encode};
-use smallvec::SmallVec;
+use radixox_lib::small_vec::SmallVec;
 
 use crate::exec::journal::Stream;
 
@@ -46,7 +46,7 @@ impl Kind {
 
 /// Commande bloquante pas servie tout de suite : à inscrire, la connexion attend.
 pub(in super::super) struct Block {
-    pub keys: SmallVec<[SharedByte; 2]>,
+    pub keys: SmallVec<2, SharedByte>,
     pub kind: Kind,
     /// Secondes ; 0 : sans fin.
     pub timeout: f64,
@@ -85,7 +85,7 @@ impl Blocked {
         let id = self.next;
         self.next += 1;
         // externes : vivent hors de l'arbre, le GC ne les voit pas (MEMORY_ARCH.md §16.9)
-        let keys: SmallVec<[SharedByte; 2]> = b.keys.into_iter().map(SharedByte::into_external).collect();
+        let keys: SmallVec<2, SharedByte> = b.keys.into_iter().map(SharedByte::into_external).collect();
         for k in &keys {
             self.by_key.entry(k.clone()).or_default().push_back(id);
         }

@@ -1,7 +1,40 @@
 use hashbrown::HashMap;
-use ordered_float::OrderedFloat;
 use radixox_lib::shared_byte::SharedByte;
 use std::collections::BTreeSet;
+
+/// Score ordonné, comme `ordered_float::OrderedFloat` : `-0.0 == 0.0`, NaN égal à lui-même
+/// et plus grand que tout.
+#[derive(Clone, Copy, Debug)]
+pub struct OrdF64(pub f64);
+
+impl OrdF64 {
+    pub fn into_inner(self) -> f64 {
+        self.0
+    }
+}
+
+impl PartialEq for OrdF64 {
+    fn eq(&self, o: &Self) -> bool {
+        self.0 == o.0 || (self.0.is_nan() && o.0.is_nan())
+    }
+}
+impl Eq for OrdF64 {}
+impl PartialOrd for OrdF64 {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for OrdF64 {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering::*;
+        match (self.0.is_nan(), o.0.is_nan()) {
+            (true, true) => Equal,
+            (true, false) => Greater,
+            (false, true) => Less,
+            _ => self.0.partial_cmp(&o.0).unwrap(),
+        }
+    }
+}
 
 /// ZSet internal representation with double indexing for optimal performance.
 ///
@@ -13,9 +46,9 @@ use std::collections::BTreeSet;
 #[derive(Clone, Debug, PartialEq)]
 pub struct ZSetInner {
     /// Sorted index: (score, member) tuples ordered by score, then lexicographically.
-    pub(crate) sorted: BTreeSet<(OrderedFloat<f64>, SharedByte)>,
+    pub(crate) sorted: BTreeSet<(OrdF64, SharedByte)>,
     /// Score lookup: member -> score mapping for O(1) access.
-    pub(crate) scores: HashMap<SharedByte, OrderedFloat<f64>>,
+    pub(crate) scores: HashMap<SharedByte, OrdF64>,
 }
 
 impl ZSetInner {
@@ -30,7 +63,7 @@ impl ZSetInner {
     /// Insert or update a member with a score.
     /// Returns true if this is a new member (not an update).
     pub fn insert(&mut self, score: f64, member: SharedByte) -> bool {
-        let score = OrderedFloat(score);
+        let score = OrdF64(score);
 
         // Membre déjà là : on garde celui qui est stocké. Membre nouveau : externe,
         // le GC ne visite pas les ZSet (MEMORY_ARCH.md §16.9).
@@ -74,7 +107,7 @@ impl ZSetInner {
     }
 
     /// Iterate over members in score order (ascending).
-    pub fn iter(&self) -> impl Iterator<Item = &(OrderedFloat<f64>, SharedByte)> {
+    pub fn iter(&self) -> impl Iterator<Item = &(OrdF64, SharedByte)> {
         self.sorted.iter()
     }
 }

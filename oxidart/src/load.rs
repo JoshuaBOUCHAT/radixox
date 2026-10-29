@@ -751,7 +751,7 @@ impl OxidArt {
             node.has_val() || childs.len() - p.childs_start >= 2,
             "nœud sans valeur à une seule entrée"
         );
-        let mut kids: smallvec::SmallVec<[(u8, u32); 16]> = smallvec::SmallVec::new();
+        let mut kids: radixox_lib::small_vec::SmallVec<16, (u8, u32)> = radixox_lib::small_vec::SmallVec::new();
         for (r, entry) in childs.drain(p.childs_start..) {
             if let Entry::Child(c) = entry {
                 kids.push((r, c));

@@ -355,13 +355,10 @@ version = "0.6.0"
 dependencies = [
  "crc32fast",
  "hashbrown",
- "ordered-float",
  "oxidart-legacy",
  "radixox-lib",
  "rand",
  "regex-automata",
- "smallvec",
- "thin-vec",
  "valart",
  "zmij",
  "zstd-safe",
@@ -379,7 +376,6 @@ dependencies = [
  "rand",
  "regex-automata",
  "smallvec",
- "thin-vec",
  "valart",
  "zstd-safe",
 ]
@@ -448,7 +444,6 @@ dependencies = [
  "oxidart",
  "radixox-lib",
  "redis",
- "smallvec",
  "zstd-safe",
 ]
 
@@ -618,12 +613,6 @@ dependencies = [
  "quote",
  "syn",
 ]
-
-[[package]]
-name = "thin-vec"
-version = "0.2.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "144f754d318415ac792f9d69fc87abbbfc043ce2ef041c60f16ad828f638717d"
 
 [[package]]
 name = "tinystr"

@@ -122,6 +122,56 @@ impl<const S: usize, T> SmallVec<S, T> {
             removed
         }
     }
+    /// Insère à `index` en décalant la suite (`index <= len`).
+    pub fn insert(&mut self, index: usize, item: T) {
+        assert!(index <= self.len as usize);
+        self.push(item);
+        self[index..].rotate_right(1);
+    }
+    /// Retire l'élément `index` en gardant l'ordre de la suite.
+    pub fn remove(&mut self, index: usize) -> T {
+        assert!(index < self.len as usize);
+        self[index..].rotate_left(1);
+        self.pop().unwrap()
+    }
+    /// Capacité pour au moins `additional` éléments de plus, sans la doubler (une seule
+    /// allocation exacte).
+    pub fn reserve_exact(&mut self, additional: usize) {
+        let need = self.len as usize + additional;
+        if need <= self.size as usize {
+            return;
+        }
+        if self.is_inline() {
+            self.promote();
+        }
+        if need > self.size as usize {
+            let ptr = unsafe {
+                let p = realloc(
+                    self.data.ptr.as_ptr() as *mut u8,
+                    Layout::array::<T>(self.size as usize).unwrap(),
+                    Layout::array::<T>(need).unwrap().size(),
+                );
+                if p.is_null() {
+                    panic!("alloc failed");
+                }
+                NonNull::new_unchecked(p as *mut T)
+            };
+            self.data.ptr = ptr;
+            self.size = need as u32;
+        }
+    }
+    pub fn clear(&mut self) {
+        self.truncate(0);
+    }
+    /// Garde les `n` premiers (rien si `n >= len`).
+    pub fn truncate(&mut self, n: usize) {
+        while self.len as usize > n {
+            drop(self.pop());
+        }
+    }
+    pub fn capacity(&self) -> usize {
+        self.size as usize
+    }
     unsafe fn get_ptr(&mut self) -> NonNull<T> {
         unsafe {
             if self.is_heap() {
@@ -168,28 +218,72 @@ impl<const S: usize, T> IntoIterator for SmallVec<S, T> {
     type Item = T;
     type IntoIter = SmallVecIterator<S, T>;
     fn into_iter(self) -> Self::IntoIter {
-        SmallVecIterator { vec: self }
+        SmallVecIterator { vec: ManuallyDrop::new(self), pos: 0 }
     }
 }
-/// Itère du dernier élément au premier. Ne garde pas de pointeur : en mode
-/// inline, les données vivent dans `vec` lui-même, qui est déplacé avec
-/// l'itérateur. Les éléments non consommés sont droppés avec `vec`.
+impl<'a, const S: usize, T> IntoIterator for &'a SmallVec<S, T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+impl<'a, const S: usize, T> IntoIterator for &'a mut SmallVec<S, T> {
+    type Item = &'a mut T;
+    type IntoIter = std::slice::IterMut<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+/// Itère dans l'ordre. Ne garde pas de pointeur : en mode inline, les données vivent dans
+/// `vec` lui-même, qui est déplacé avec l'itérateur. Les éléments non consommés sont
+/// droppés avec l'itérateur.
 pub struct SmallVecIterator<const S: usize, T> {
-    vec: SmallVec<S, T>,
+    vec: ManuallyDrop<SmallVec<S, T>>,
+    pos: u32,
 }
 impl<const S: usize, T> Iterator for SmallVecIterator<S, T> {
     type Item = T;
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        self.vec.pop()
+        if self.pos == self.vec.len {
+            return None;
+        }
+        let i = self.pos as usize;
+        self.pos += 1;
+        // SAFETY: `i < len`, chaque case n'est lue qu'une fois (pos avance, len recule).
+        Some(unsafe { self.vec.get_ptr().add(i).read() })
     }
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.vec.len as usize;
-        (len, Some(len))
+        let n = (self.vec.len - self.pos) as usize;
+        (n, Some(n))
+    }
+}
+impl<const S: usize, T> DoubleEndedIterator for SmallVecIterator<S, T> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.pos == self.vec.len {
+            return None;
+        }
+        self.vec.len -= 1;
+        Some(unsafe { self.vec.get_ptr().add(self.vec.len as usize).read() })
     }
 }
 impl<const S: usize, T> ExactSizeIterator for SmallVecIterator<S, T> {}
+impl<const S: usize, T> Drop for SmallVecIterator<S, T> {
+    fn drop(&mut self) {
+        // les `pos` premiers sont déjà sortis : on décale le reste au début, puis le Drop
+        // du vecteur libère comme d'habitude
+        let (pos, len) = (self.pos as usize, self.vec.len as usize);
+        unsafe {
+            let p = self.vec.get_ptr().as_ptr();
+            std::ptr::copy(p.add(pos), p, len - pos);
+            self.vec.len = (len - pos) as u32;
+            ManuallyDrop::drop(&mut self.vec);
+        }
+    }
+}
 
 #[repr(align(8))]
 union SmallVecData<const S: usize, T> {
@@ -260,6 +354,30 @@ macro_rules! impl_into_shareds {
         }
     };
 }
+impl<const S: usize, T> Default for SmallVec<S, T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl<const S: usize, T> Extend<T> for SmallVec<S, T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        for x in iter {
+            self.push(x);
+        }
+    }
+}
+impl<const S: usize, T> FromIterator<T> for SmallVec<S, T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let iter = iter.into_iter();
+        let mut v = Self::with_capacity(iter.size_hint().0);
+        v.extend(iter);
+        v
+    }
+}
+// SAFETY: le vecteur possède ses éléments (pointeur de tas ou cases en ligne).
+unsafe impl<const S: usize, T: Send> Send for SmallVec<S, T> {}
+unsafe impl<const S: usize, T: Sync> Sync for SmallVec<S, T> {}
+
 impl<const S: usize, T: std::fmt::Debug> std::fmt::Debug for SmallVec<S, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         (**self).fmt(f)
@@ -282,3 +400,77 @@ impl<const S: usize, T: Clone> Clone for SmallVec<S, T> {
 impl_into_shareds!(OwnedByte, SharedByte);
 impl_into_shareds!((OwnedByte, OwnedByte), (SharedByte, SharedByte));
 impl_into_shareds!((f64, OwnedByte), (f64, SharedByte));
+
+#[cfg(test)]
+mod tests {
+    use super::SmallVec;
+    use std::rc::Rc;
+
+    #[test]
+    fn into_iter_in_order_inline_and_heap() {
+        for n in [0usize, 1, 3, 4, 5, 40] {
+            let v: SmallVec<4, usize> = (0..n).collect();
+            assert_eq!(&*v, &(0..n).collect::<Vec<_>>()[..]);
+            assert_eq!(v.into_iter().collect::<Vec<_>>(), (0..n).collect::<Vec<_>>());
+            let v: SmallVec<4, usize> = (0..n).collect();
+            assert_eq!(v.into_iter().rev().collect::<Vec<_>>(), (0..n).rev().collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn partial_iteration_drops_rest_once() {
+        for n in [3usize, 4, 9] {
+            for take in 0..=n {
+                let rc = Rc::new(());
+                let v: SmallVec<4, Rc<()>> = (0..n).map(|_| rc.clone()).collect();
+                let mut it = v.into_iter();
+                let got: Vec<_> = it.by_ref().take(take).collect();
+                if take < n {
+                    it.next_back();
+                }
+                drop(it);
+                assert_eq!(Rc::strong_count(&rc), 1 + got.len());
+                drop(got);
+                assert_eq!(Rc::strong_count(&rc), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn insert_remove_reserve_exact() {
+        let mut v: SmallVec<2, String> = SmallVec::new();
+        let mut model = Vec::new();
+        for i in 0..12usize {
+            let at = (i * 7) % (model.len() + 1);
+            v.insert(at, i.to_string());
+            model.insert(at, i.to_string());
+            if i % 3 == 2 {
+                let at = (i * 5) % model.len();
+                assert_eq!(v.remove(at), model.remove(at));
+            }
+            assert_eq!(&*v, &model[..]);
+        }
+        let mut w: SmallVec<2, u8> = SmallVec::new();
+        w.push(1);
+        w.push(2);
+        w.reserve_exact(1);
+        assert!(w.capacity() >= 3);
+        w.push(3);
+        assert_eq!(&*w, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn clear_truncate_extend() {
+        let rc = Rc::new(());
+        let mut v: SmallVec<2, Rc<()>> = SmallVec::default();
+        v.extend((0..5).map(|_| rc.clone()));
+        assert_eq!(v.len(), 5);
+        v.truncate(2);
+        assert_eq!(Rc::strong_count(&rc), 3);
+        v.clear();
+        assert!(v.is_empty());
+        assert_eq!(Rc::strong_count(&rc), 1);
+        v.push(rc.clone());
+        assert_eq!(v.len(), 1);
+    }
+}

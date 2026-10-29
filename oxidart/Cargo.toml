@@ -11,8 +11,6 @@ keywords = ["art", "radix-tree", "trie", "data-structure", "ttl"]
 categories = ["data-structures"]
 
 [dependencies]
-smallvec.workspace = true
-ordered-float = "5.1.0"
 zmij = "1.0"
 radixox-lib = { workspace = true }
 valart = { workspace = true }
@@ -23,7 +21,6 @@ regex-automata = { version = "0.4", optional = true, default-features = false, f
     "dfa-search",
     "syntax",
 ] }
-thin-vec = "0.2.14"
 hashbrown = "0.17.0"
 zstd-safe = { version = "8.1", default-features = false, features = ["experimental", "std"] }
 

@@ -26,9 +26,9 @@ mod oracle {
     use crate::zset_inner::ZSetInner;
 
     use hashbrown::HashMap;
-    use ordered_float::OrderedFloat;
+    use crate::zset_inner::OrdF64;
     use radixox_lib::shared_byte::SharedByte;
-    use smallvec::SmallVec;
+    use radixox_lib::small_vec::SmallVec;
     use std::collections::BTreeSet;
 
 
@@ -44,12 +44,12 @@ mod oracle {
     }
 
     enum ZIterInner<'a> {
-        Small(std::slice::Iter<'a, (OrderedFloat<f64>, SharedByte)>),
-        Large(std::collections::btree_set::Iter<'a, (OrderedFloat<f64>, SharedByte)>),
+        Small(std::slice::Iter<'a, (OrdF64, SharedByte)>),
+        Large(std::collections::btree_set::Iter<'a, (OrdF64, SharedByte)>),
     }
 
     impl<'a> Iterator for ZIter<'a> {
-        type Item = &'a (OrderedFloat<f64>, SharedByte);
+        type Item = &'a (OrdF64, SharedByte);
 
         fn next(&mut self) -> Option<Self::Item> {
             match &mut self.inner {
@@ -64,7 +64,7 @@ mod oracle {
     pub enum InnerZCommand {
         /// Small ZSet: sorted Vec<(score, member)> for sets below the threshold.
         /// Vec = 24 bytes — cache-friendly, no heap indirection.
-        Small(SmallVec<[(OrderedFloat<f64>, SharedByte); 2]>),
+        Small(SmallVec<2, (OrdF64, SharedByte)>),
         /// Large ZSet: boxed double-indexed structure for O(1) score lookup + O(log n) range.
         /// Box = 8 bytes — keeps InnerZCommand ≤32 bytes total.
         Large(ZSetInner),
@@ -78,7 +78,7 @@ mod oracle {
         /// Insert or update a member with a score.
         /// Returns true if this is a new member (not an update).
         pub(crate) fn insert(&mut self, score: f64, member: SharedByte) -> bool {
-            let score = OrderedFloat(score);
+            let score = OrdF64(score);
             match self {
                 InnerZCommand::Small(vec) => {
                     // Check if member already exists.
@@ -101,7 +101,7 @@ mod oracle {
                         let cap = vec.len() + 1;
                         let mut scores = HashMap::with_capacity(cap);
                         let mut sorted = BTreeSet::new();
-                        for (s, m) in vec.drain(..) {
+                        for (s, m) in std::mem::take(vec) {
                             scores.insert(m.clone(), s);
                             sorted.insert((s, m));
                         }

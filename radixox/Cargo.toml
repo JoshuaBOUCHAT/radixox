@@ -23,7 +23,6 @@ eviction = ["oxidart/eviction", "radixox-lib/eviction"]
 [dependencies]
 oxidart = { workspace = true, features = ["regex"] }
 radixox-lib = { workspace = true }
-smallvec.workspace = true
 
 io-uring = "0.7.15"
 libc = "0.2"

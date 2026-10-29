@@ -17,7 +17,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::time::{Duration, Instant};
 
 use oxidart::OxidArt;
-use smallvec::SmallVec;
+use radixox_lib::small_vec::SmallVec;
 use radixox_lib::cmd::{Cmd, FrameLen, Parse, frame_len};
 use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::shared_frame::{SharedFrame as Frame, extend_encode};
@@ -279,10 +279,10 @@ struct FsJob {
 }
 
 /// Une fenêtre de préchargement, sur la pile (pas d'allocation par fenêtre).
-type Window<T> = SmallVec<[T; 16]>;
+type Window<T> = SmallVec<16, T>;
 /// Ce qui est borné par la largeur de la fenêtre (`PREFETCH_BATCH`) : jamais sur le tas
 /// (une allocation par fenêtre, dans une mémoire hors du L1, mesuré).
-type Batch<T> = SmallVec<[T; oxidart::PREFETCH_BATCH]>;
+type Batch<T> = SmallVec<{ oxidart::PREFETCH_BATCH }, T>;
 
 /// Tableau de taille fixe (une fenêtre : au plus `PREFETCH_BATCH` éléments) : une
 /// longueur et des emplacements, lus par tranche. Contrairement à `SmallVec`, aucun
@@ -509,8 +509,8 @@ enum After {
     LastSave,
     Info,
     /// Pub/Sub : touchent le registre et l'`out` d'autres connexions (§10).
-    Subscribe(SmallVec<[SharedByte; 4]>),
-    Unsubscribe(SmallVec<[SharedByte; 4]>),
+    Subscribe(SmallVec<4, SharedByte>),
+    Unsubscribe(SmallVec<4, SharedByte>),
     Publish { channel: SharedByte, message: SharedByte },
     /// Réplication (DURABILITY_DESIGN.md §10) : état du serveur ; les
     /// octets reçus sont recopiés (la frame est rendue à l'anneau avant).

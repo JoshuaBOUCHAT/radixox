@@ -178,14 +178,14 @@ fn smallvec_drop_runs_for_inline_items() {
 }
 
 #[test]
-fn smallvec_into_iter_yields_reverse_order() {
-    // L'itérateur parcourt du dernier au premier.
+fn smallvec_into_iter_yields_in_order() {
+    // L'itérateur parcourt du premier au dernier.
     let mut v: SmallVec<4, u32> = SmallVec::new();
     v.push(1);
     v.push(2);
     v.push(3);
     let collected: Vec<u32> = v.into_iter().collect();
-    assert_eq!(collected, vec![3, 2, 1]);
+    assert_eq!(collected, vec![1, 2, 3]);
 }
 
 /// Mode inline avec des éléments qui possèdent du heap : l'itérateur ne
@@ -197,7 +197,7 @@ fn smallvec_into_iter_inline_owned_items() {
         v.push(format!("element-numero-{i}"));
     }
     let collected: Vec<String> = v.into_iter().collect();
-    let expect: Vec<String> = (0..4).rev().map(|i| format!("element-numero-{i}")).collect();
+    let expect: Vec<String> = (0..4).map(|i| format!("element-numero-{i}")).collect();
     assert_eq!(collected, expect);
 }
 
@@ -210,7 +210,7 @@ fn smallvec_into_iter_heap_mode() {
     let it = v.into_iter();
     assert_eq!(it.len(), 20);
     let collected: Vec<String> = it.collect();
-    let expect: Vec<String> = (0..20).rev().map(|i| i.to_string()).collect();
+    let expect: Vec<String> = (0..20).map(|i| i.to_string()).collect();
     assert_eq!(collected, expect);
 }
 
@@ -251,7 +251,7 @@ fn smallvec_into_iter_survives_moves() {
     }
     let it = make();
     let boxed = Box::new(it);
-    assert_eq!(boxed.collect::<Vec<_>>(), vec![30, 20, 10]);
+    assert_eq!(boxed.collect::<Vec<_>>(), vec![10, 20, 30]);
 }
 
 #[test]
