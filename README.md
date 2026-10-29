@@ -705,7 +705,7 @@ Environment variables:
 | `RADIXOX_RECV_ASYNC` | off | experimental: single-shot receives on io-wq workers instead of multishot on the loop; measured slower on loopback (more CPU per command), kept for testing on real NICs |
 | `RADIXOX_IOWQ_WORKERS` / `RADIXOX_IOWQ_CPUS` | `1` / unset | io-wq network workers at most, and the CPUs they may run on (e.g. `1,7`) |
 | `RADIXOX_FILE_CPUS` | unset | run the dump's writes and fsync on an io-wq worker pinned to these CPUs (e.g. `1`), off the server's core; io-wq has one CPU mask, the union of this and `RADIXOX_IOWQ_CPUS` |
-| `RADIXOX_MIN_WAIT_US` / `RADIXOX_WAIT_NR` | off / `32` | experimental: when idle, let the kernel wait up to this many µs for `WAIT_NR` completions before waking the loop for one (lower CPU per command, same throughput unless the loop is the bottleneck) |
+| `RADIXOX_MIN_WAIT_US` / `RADIXOX_WAIT_NR` | auto / `16` | grouped wait: when idle, let the kernel wait up to this many µs for `WAIT_NR` completions before waking the loop for one (lower CPU per command). Unset = automatic (10 µs, only while ≥ 2 × `WAIT_NR` connections wake the loop for fewer than `WAIT_NR` completions at ≥ 100 K completions/s; a single client never pays the wait), `0` = never, a value = always |
 | `RADIXOX_GC` | `1` | `0`: no compaction of the pool nor of the node slab (pages that empty by themselves are still returned) |
 | `RADIXOX_GC_LOG` | `0` | `1`: one stderr line per compaction pass (pool and node slab) |
 | `RADIXOX_GC_RESERVE_DIV` | `16` | blocks kept in reserve for compaction: `max(4 MiB, live / div)` |

@@ -1211,6 +1211,11 @@ impl Core {
         self.quiet() && !self.has_background()
     }
 
+    /// Connexions ouvertes (clients et liens de réplication) : slots pris.
+    pub fn open_conns(&self) -> usize {
+        self.outs.len() - self.free.len()
+    }
+
     /// Rien à exécuter, à envoyer ni à soumettre pour les clients ; il peut
     /// rester du travail de fond.
     pub fn quiet(&self) -> bool {

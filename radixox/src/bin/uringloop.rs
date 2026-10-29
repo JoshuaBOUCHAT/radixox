@@ -187,9 +187,9 @@ struct Server {
     recv_async: bool,
     /// Écritures du dump sur io-wq, épinglé hors de notre cœur (`RADIXOX_FILE_CPUS`).
     file_async: bool,
-    /// Attente groupée (expérimental) : `(want, µs)`, le noyau attend `want`
-    /// complétions pendant au plus `µs` avant de rendre la main pour une seule.
-    min_wait: Option<(u32, u32)>,
+    /// Attente groupée (RUNTIME_ARCH.md §12.5) : le noyau attend `want` complétions
+    /// pendant au plus `µs` avant de rendre la main pour une seule.
+    min_wait: MinWait,
     /// Anneau en SQPOLL (`RADIXOX_SQPOLL_CPU`, RUNTIME_ARCH.md §6.4 bis) : un thread
     /// noyau lit la SQ et fait tourner nos recv ; sans `DEFER_TASKRUN`, les CQE
     /// arrivent dans la CQ sans `enter` de notre part.
@@ -502,16 +502,16 @@ impl Server {
         Ok(())
     }
 
-    /// Récolte les CQE et les passe au cœur.
-    fn harvest(&mut self) -> bool {
-        let mut any = false;
+    /// Récolte les CQE et les passe au cœur ; rend leur nombre.
+    fn harvest(&mut self) -> u32 {
+        let mut any = 0;
         let mut cq = self.ring.completion();
         cq.sync();
         // Recopiés d'abord : `complete` peut vouloir soumettre (rien ici, mais
         // le cœur ne doit pas dépendre de l'ordre des emprunts).
         let cqes: Vec<cqueue::Entry> = cq.collect();
         for cqe in cqes {
-            any = true;
+            any += 1;
             let (kind, slot) = (cqe.user_data() >> 32, cqe.user_data() as u32);
             let (res, flags) = (cqe.result(), cqe.flags());
             let c = match kind {
@@ -571,8 +571,12 @@ impl Server {
         loop {
             // Deux horloges par tour : murale pour le TTL, monotone pour les timers.
             self.core.tick();
-            self.core.set_now(Instant::now());
-            self.harvest();
+            let now = Instant::now();
+            self.core.set_now(now);
+            let cqes = self.harvest();
+            if let MinWait::Auto(auto) = &mut self.min_wait {
+                auto.tick(now, cqes, self.core.open_conns());
+            }
             if let Some(save) = self.stop.take() {
                 eprintln!("[shutdown] signal reçu : arrêt (second signal : sortie immédiate)");
                 exit_on_second_signal();
@@ -679,7 +683,7 @@ impl Server {
             .next_deadline()
             .map_or(Duration::from_secs(1), |t| t.saturating_duration_since(Instant::now()));
         let ts = Timespec::from(timeout);
-        let (want, usec) = self.min_wait.unwrap_or((1, 0));
+        let (want, usec) = self.min_wait.on_wait();
         let args = SubmitArgs::new().timespec(&ts).min_wait_usec(usec);
         let mut flags = EnterFlags::GETEVENTS | EnterFlags::EXT_ARG;
         if self.no_iowait {
@@ -824,17 +828,94 @@ fn raise_nofile(wanted: u32) -> u32 {
     }
 }
 
-/// `RADIXOX_MIN_WAIT_US=<µs>` (expérimental) : au repos, attendre jusqu'à
-/// `RADIXOX_WAIT_NR` complétions (défaut 32) pendant au plus ce délai, pour
-/// regrouper le travail en lots au lieu de se réveiller pour une seule.
-fn min_wait(ring: &IoUring) -> Option<(u32, u32)> {
-    let usec: u32 = std::env::var("RADIXOX_MIN_WAIT_US").ok()?.parse().ok().filter(|&u| u > 0)?;
-    if !ring.params().is_feature_min_timeout() {
-        eprintln!("[uring] RADIXOX_MIN_WAIT_US ignoré : noyau sans IORING_FEAT_MIN_TIMEOUT");
-        return None;
+/// Attente groupée : au repos, attendre jusqu'à `want` complétions pendant au plus
+/// `usec` µs, pour regrouper le travail en lots au lieu de se réveiller pour une seule
+/// (RUNTIME_ARCH.md §12.5 : −20 % de cycles user, −12 % noyau par commande à 10 µs / 16).
+enum MinWait {
+    Off,
+    Fixed { want: u32, usec: u32 },
+    Auto(AutoWait),
+}
+
+impl MinWait {
+    /// `(want, µs)` de l'`enter` qui attend ; compte le réveil en mode automatique.
+    fn on_wait(&mut self) -> (u32, u32) {
+        match self {
+            MinWait::Off => (1, 0),
+            MinWait::Fixed { want, usec } => (*want, *usec),
+            MinWait::Auto(a) => {
+                a.waits += 1;
+                if a.on { (a.want, a.usec) } else { (1, 0) }
+            }
+        }
     }
-    let want = std::env::var("RADIXOX_WAIT_NR").ok().and_then(|v| v.parse().ok()).unwrap_or(32u32).max(1);
-    Some((want, usec))
+}
+
+/// Fenêtre de décision du mode automatique.
+const AUTO_WINDOW: Duration = Duration::from_millis(100);
+/// Activation : au moins ce nombre de complétions par fenêtre (100 K/s), et moins de
+/// `want` complétions par réveil (au-delà, le noyau rend déjà la main avec des lots
+/// pleins : sans envois délégués, ~80 par réveil à 84 connexions p1).
+const AUTO_ON_CQES: u32 = 10_000;
+/// Désactivation sous ce nombre de complétions par fenêtre (50 K/s) : hystérésis.
+const AUTO_OFF_CQES: u32 = 5_000;
+
+/// Mode automatique : actif seulement quand beaucoup de connexions (au moins `2 × want`)
+/// font réveiller la boucle souvent pour peu de complétions. Un client seul, ou une charge
+/// faible, garde le réveil à la première complétion : l'attente coûterait jusqu'à `usec`
+/// de latence par requête. Saturée, la boucle n'attend plus et les lots grossissent seuls.
+struct AutoWait {
+    want: u32,
+    usec: u32,
+    on: bool,
+    since: Instant,
+    waits: u32,
+    cqes: u32,
+}
+
+impl AutoWait {
+    fn tick(&mut self, now: Instant, cqes: u32, conns: usize) {
+        self.cqes += cqes;
+        if now.saturating_duration_since(self.since) < AUTO_WINDOW {
+            return;
+        }
+        let many = conns >= 2 * self.want as usize;
+        let on = if self.on {
+            conns >= self.want as usize && self.cqes >= AUTO_OFF_CQES
+        } else {
+            many && self.cqes >= AUTO_ON_CQES && self.cqes < self.want * self.waits
+        };
+        if on != self.on {
+            eprintln!(
+                "[uring] attente groupée {} ({conns} connexions, {} complétions / {} réveils en 100 ms)",
+                if on { "activée" } else { "désactivée" },
+                self.cqes,
+                self.waits
+            );
+            self.on = on;
+        }
+        (self.since, self.waits, self.cqes) = (now, 0, 0);
+    }
+}
+
+/// `RADIXOX_MIN_WAIT_US` : absent = automatique (10 µs), `0` = jamais, une valeur =
+/// toujours, ce délai. `RADIXOX_WAIT_NR` : complétions attendues (défaut 16).
+fn min_wait(ring: &IoUring) -> MinWait {
+    let usec: Option<u32> = std::env::var("RADIXOX_MIN_WAIT_US").ok().and_then(|v| v.parse().ok());
+    if usec == Some(0) {
+        return MinWait::Off;
+    }
+    if !ring.params().is_feature_min_timeout() {
+        if usec.is_some() {
+            eprintln!("[uring] RADIXOX_MIN_WAIT_US ignoré : noyau sans IORING_FEAT_MIN_TIMEOUT");
+        }
+        return MinWait::Off;
+    }
+    let want = std::env::var("RADIXOX_WAIT_NR").ok().and_then(|v| v.parse().ok()).unwrap_or(16u32).max(1);
+    match usec {
+        Some(usec) => MinWait::Fixed { want, usec },
+        None => MinWait::Auto(AutoWait { want, usec: 10, on: false, since: Instant::now(), waits: 0, cqes: 0 }),
+    }
 }
 
 /// Délégation à io-wq (RUNTIME_ARCH.md §6.4), version statique ; rend

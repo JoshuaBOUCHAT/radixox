@@ -1724,7 +1724,16 @@ pendant au plus ce délai avant de nous rendre la main pour une seule.
   thread (lots plus gros par réveil, les changements de contexte ne baissent pas).
 - Débit −3 à −5 % (workers saturés ; bruit d'un run), latence égale : inutile pour le
   débit tant que la boucle n'est pas le goulot ; libère ~30 % du cœur (travail de fond).
-  À saturation de la boucle, les lots grossissent seuls. Désactivé par défaut.
+  À saturation de la boucle, les lots grossissent seuls. **Automatique par défaut depuis le
+  2026-10-29** (`MinWait::Auto`, `uringloop.rs`) : fenêtres de 100 ms ; activée (10 µs,
+  `WAIT_NR` = 16) si ≥ 2 × `WAIT_NR` connexions, ≥ 100 K complétions/s et moins de `WAIT_NR`
+  complétions par réveil ; coupée sous 50 K complétions/s ou sous `WAIT_NR` connexions.
+  Vérifié (fonctionnel, machine chargée, pas de mesure de débit) : 84 connexions p1 sans
+  délégation, ~80 complétions par réveil → reste coupée (rien à gagner) ; avec
+  `RADIXOX_SEND_ASYNC=1`, ~10 par réveil → activée ; un client seul → jamais. Message
+  `[uring] attente groupée activée / désactivée` à chaque bascule. `RADIXOX_MIN_WAIT_US=0`
+  la coupe, une valeur la force. Reste à mesurer : débit, latence et CPU par commande, jeu
+  fermé.
 - Plafond de la boucle, en cycles : ~7 600/cmd classique → **~680 K** ; ~6 400 avec
   `min_wait` → **~810 K** (l'occupation `/proc/stat` en mode `min_wait` est incohérente
   avec les cycles : ~6,5 GHz implicites ; se fier aux cycles). À mesurer sur deux machines.
@@ -2221,9 +2230,8 @@ automatique sous 2 CPU de quota (§6.4 piège 1) ; SMT en cloud : ~+30 %, pas ×
 
 Pistes, par gain attendu (chacune mesurée seule, jeu fermé, `bench_compare.sh` + CPU par
 CPU) :
-1. **Attente groupée automatique** quand les envois sont délégués et que la boucle fait
-   ~1 `enter` par commande (§12.7 : `enter` ÷7). Existe déjà en option
-   (`RADIXOX_MIN_WAIT_US` / `RADIXOX_WAIT_NR`).
+1. **Attente groupée automatique** : FAITE le 2026-10-29 (§12.5), active quand la boucle
+   se réveille pour moins de `WAIT_NR` complétions sous charge ; mesures à faire.
 2. ~~**Recv simple en `IOSQE_ASYNC`**~~ : mesuré le 2026-10-24 (§6.4), perte nette
    (+66 % de CPU serveur et boucle +25 % à débit égal) ; `RADIXOX_RECV_ASYNC` reste en
    option, désactivé.
