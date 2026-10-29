@@ -51,7 +51,7 @@ cargo test -p oxidart --features regex    # arbre (dont tests différentiels con
 cargo test -p radixox-lib                 # parseur, SharedByte, barrière
 cargo build -p radixox-lib -p valart -p oxidart --no-default-features --features oxidart/regex   # #![no_std] + alloc : ne doit pas casser
 cargo build -p radixox --lib --no-default-features   # lib radixox no_std
-cargo build --release -p radixox --no-default-features --features nostd-bin --bin radixox-nostd   # binaire sans std ni libc (release seulement : panic = abort) ; README « Portable and static builds »
+cargo nostd                               # = build --release … --features nostd-bin --bin radixox-nostd (alias de .cargo/config.toml) ; binaire sans std ni libc (release seulement : panic = abort) ; README « Portable and static builds »
 RADIXOX_TEST_BIN=$PWD/target/release/radixox-nostd cargo test -p radixox --test '*'   # intégration contre ce binaire
 cargo test -p radixox                     # intégration : lance le binaire sur un port de test
 cargo test -p radixox --features eviction  # + LRU/LFU (tests sous cfg(feature = "eviction"))

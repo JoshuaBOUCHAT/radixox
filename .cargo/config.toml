@@ -7,3 +7,7 @@ RUST_TEST_THREADS = "1"
 # binaire sans libc n'installe pas, et `__stack_chk_fail` n'existe pas sans libc
 # (NOSTD_PLAN.md, étape 3). Vaut aussi pour le binaire glibc.
 CFLAGS_x86_64_unknown_linux_gnu = "-fno-stack-protector"
+
+[alias]
+# `cargo nostd` : binaire sans std ni libc → target/release/radixox-nostd (NOSTD_PLAN.md).
+nostd = "build --release -p radixox --no-default-features --features nostd-bin --bin radixox-nostd"
