@@ -1280,8 +1280,9 @@ impl Node {
                 debug_assert!(kids + leaves == 0);
                 trash()
             } else {
-                // Pool des structures, aligné sur 8 (MEMORY_ARCH.md §17).
-                let p = NonNull::new(pool::struct_alloc(new_block)).expect("page alloc");
+                // Pool des structures, aligné sur 8 (MEMORY_ARCH.md §17) ; classes 2–16 :
+                // nurserie anti-churn (§17.2 ter).
+                let p = NonNull::new(pool::class_alloc(new_block)).expect("page alloc");
                 if old_block > 0 {
                     debug_assert!(head + kids + leaves <= new_block);
                     let old = self.ptr.as_ptr();

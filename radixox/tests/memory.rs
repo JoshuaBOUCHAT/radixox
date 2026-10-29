@@ -46,7 +46,8 @@ fn rss_is_accounted_and_emptied_slabs_shrink() {
 
     let m = info(&mut c);
     let untracked = m["mem_untracked_bytes"];
-    assert!(m["mem_rss_anon_bytes"] > 60 * MB, "jeu chargé : {} o", m["mem_rss_anon_bytes"]);
+    // ~58 Mio depuis les pages sans en-tête et la nurserie (MEMORY_ARCH.md §17.2 ter)
+    assert!(m["mem_rss_anon_bytes"] > 50 * MB, "jeu chargé : {} o", m["mem_rss_anon_bytes"]);
     // pile, binaire, données de la libc : ~0,2 Mo, fixes. Une huge page à cheval sur deux
     // régions en faisait 2 à 3 Mo (MEMORY_ARCH.md §18.14), une région oubliée des dizaines.
     assert!(untracked.abs() < MB && (untracked - empty).abs() < MB, "à vide {empty} o, chargé {untracked} o");

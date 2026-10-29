@@ -1777,6 +1777,19 @@ surtout des blocs de nœud qui grossissent (le pool est bump + compteur par bloc
   134,3 → 117,5 (−12,5 %), ycsb 111,2 → 98,6 (−11 %) ; vitesse uuid chargement 322 → 288 ns, GET présent 506 → 432,
   DEL 737 → 697 ; `pipe` uuid fenêtre 64 (AMAC) 3,05 → 4,0 Mops/s (+30 %). Le slab n'a donc plus que des cases
   sans en-tête : 16, 32, 64, 96, 128 o (classes 2–16), partagées par `Overflow` et `Large`.
+- **Fait (2026-10-29, `main`) : nurserie anti-churn des pages de nœud** (choix utilisateur : le slab sert à absorber
+  le churn du chargement, pas à stocker). `pool::class_alloc` (appelé par `page_resize`) : pour 16, 32, 64, 96 et
+  128 o, **une seule nurserie par classe** = un bloc de 64 Kio ouvert du pool, découpé en cases de la classe, bitset
+  des cases libres (64 mots + un mot résumé, recherche O(1) par `trailing_zeros`) ; une case libérée est reprise tout
+  de suite. **Pleine, elle se ferme (`close_block`) et devient un bloc normal du pool** : son compteur de vivants est
+  déjà juste, la libération et le GC la traitent comme les autres ; une nurserie neuve la remplace. La libération ne
+  change pas : bloc ouvert → `rewind` (chemin froid), qui remet la case libre. Bloc ouvert : jamais marqué par le GC ;
+  `Mark::All` ferme les nurseries avec les curseurs. `RADIXOX_NURSERY=0` coupe (A/B). Mesure serveur, 1M UUID,
+  juste après le chargement (deux passages par mode, identiques) : pool tenu 92,54 → 90,77 Mo pour 78,87 Mo vivants,
+  **trous 13,7 → 11,9 Mo (−13 %)**, fragmentation 0,15 → 0,13 ; débit de chargement inchangé (2,18–2,20 M/s). Les
+  ~12 Mo restants ne viennent donc pas surtout des pages (hypothèse toujours à vérifier : suffixes `CompactPath`
+  réalloués au `split_leaf`). Variante à essayer plus tard (utilisateur) : deux nurseries par classe, la précédente
+  gardée le temps que ses nœuds proches d'un changement de classe churnent.
 
 ### 17.4 Petits blocs Hash/Set et débordements valart (fait, branche `pool-structures`)
 

@@ -89,6 +89,28 @@ struct Window {
 
 const NO_WINDOW: Window = Window { block: [NONE; WINDOW], rest: [0; WINDOW] };
 
+/// Classes de la nurserie (pages des nœuds sans en-tête, MEMORY_ARCH.md §17.2 ter).
+const NURSERY_SIZES: [usize; 5] = [16, 32, 64, 96, 128];
+
+/// Nurserie anti-churn d'une classe : un bloc ouvert découpé en cases de la taille de la
+/// classe, une case libérée est reprise tout de suite (les pages qui changent de classe
+/// pendant un chargement ne laissent pas de trou). Pleine, elle se ferme et devient un bloc
+/// normal du pool (son compteur de vivants est déjà juste) ; une autre la remplace.
+#[derive(Clone, Copy)]
+struct Nursery {
+    block: u32,
+    /// Bit à 1 = case libre ; `summary` : bit `w` si `free[w]` n'est pas nul.
+    free: [u64; BLOCK / 16 / 64],
+    summary: u64,
+}
+
+const NO_NURSERY: Nursery = Nursery { block: NONE, free: [0; BLOCK / 16 / 64], summary: 0 };
+
+#[inline]
+fn nursery_class(size: usize) -> Option<usize> {
+    NURSERY_SIZES.iter().position(|&s| s == size)
+}
+
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Stats {
     /// Somme des emplacements vivants.
@@ -192,6 +214,9 @@ pub struct Pool {
     pressed: bool,
     /// Pages vidées par la passe en cours (mode pages).
     evacuating: Vec<u32>,
+    nurseries: [Nursery; NURSERY_SIZES.len()],
+    /// `RADIXOX_NURSERY=0` : les classes passent par le curseur des structures (mesures).
+    nursery_on: bool,
 }
 
 /// `mmap` anonyme `MAP_NORESERVE` : rien n'est engagé avant d'être touché.
@@ -272,6 +297,8 @@ impl Pool {
             suspended_until: None,
             pressed: false,
             evacuating: Vec::new(),
+            nurseries: [NO_NURSERY; NURSERY_SIZES.len()],
+            nursery_on: true,
         })
     }
 
@@ -370,6 +397,47 @@ impl Pool {
     #[inline]
     pub fn alloc8_survivor(&mut self, size: usize) -> *mut u8 {
         self.alloc_in(STRUCT_SURVIVOR, size)
+    }
+
+    /// Objet de structure à classe fixe (16, 32, 64, 96 ou 128 o) : dans la nurserie de sa
+    /// classe ; autre taille : comme [`alloc8`](Self::alloc8). Se libère par [`free`](Self::free).
+    #[inline]
+    pub fn alloc_class8(&mut self, size: usize) -> *mut u8 {
+        match nursery_class(size) {
+            Some(n) if self.nursery_on => self.alloc_nursery(n),
+            _ => self.alloc8(size),
+        }
+    }
+
+    fn alloc_nursery(&mut self, n: usize) -> *mut u8 {
+        let size = NURSERY_SIZES[n];
+        if self.nurseries[n].summary == 0 {
+            // pleine (ou aucune) : bloc normal du pool, nurserie neuve
+            let old = self.nurseries[n].block;
+            self.nurseries[n] = NO_NURSERY;
+            if old != NONE {
+                self.close_block(old);
+            }
+            let Some(b) = self.take_block() else { return null_mut() };
+            let nu = &mut self.nurseries[n];
+            nu.block = b;
+            let slots = BLOCK / size;
+            for (w, word) in nu.free.iter_mut().enumerate().take(slots.div_ceil(64)) {
+                *word = if (w + 1) * 64 <= slots { !0 } else { (1 << (slots % 64)) - 1 };
+                nu.summary |= 1 << w;
+            }
+        }
+        let nu = &mut self.nurseries[n];
+        let w = nu.summary.trailing_zeros() as usize;
+        let i = nu.free[w].trailing_zeros() as usize;
+        nu.free[w] &= nu.free[w] - 1;
+        if nu.free[w] == 0 {
+            nu.summary &= !(1 << w);
+        }
+        let b = nu.block;
+        *self.live(b) += (size / 2) as u16;
+        self.live_bytes += size as u64;
+        (self.block_addr(b) + (w * 64 + i) * size) as *mut u8
     }
 
     /// Objet à poignée (§19, `size` pair, ≤ [`MEDIUM`]) : bump seul.
@@ -552,8 +620,15 @@ impl Pool {
         self.close_block(b);
     }
 
-    /// Ferme tous les curseurs et fenêtres (passe forcée des tests).
+    /// Ferme tous les curseurs, fenêtres et nurseries (passe forcée des tests).
     fn close_cursors(&mut self) {
+        for n in 0..NURSERY_SIZES.len() {
+            let b = self.nurseries[n].block;
+            self.nurseries[n] = NO_NURSERY;
+            if b != NONE {
+                self.close_block(b);
+            }
+        }
         for k in 0..CURSORS {
             self.close_cursor(k);
             for i in 0..WINDOW {
@@ -606,10 +681,18 @@ impl Pool {
     }
 
     /// Objet d'un bloc encore ouvert : s'il était le dernier, le `top` recule ; si le
-    /// bloc est vide, il repart de zéro.
+    /// bloc est vide, il repart de zéro. Nurserie : la case redevient libre.
     #[cold]
     fn rewind(&mut self, b: u32, addr: usize, size: usize, empty: bool) {
         let start = self.block_addr(b);
+        for nu in &mut self.nurseries {
+            if nu.block == b {
+                let i = (addr - start) / size;
+                nu.free[i / 64] |= 1 << (i % 64);
+                nu.summary |= 1 << (i / 64);
+                return;
+            }
+        }
         for c in &mut self.cursors {
             if c.block == b {
                 if empty {
@@ -994,11 +1077,12 @@ pub(crate) fn init() -> Option<&'static mut Pool> {
         }
         let gb: usize = env("RADIXOX_POOL_VIRT_GB", 256);
         let decay = Duration::from_secs(env("RADIXOX_MEMORY_DECAY", 10));
-        let Some(pool) = Pool::new(gb << 30, decay, env("RADIXOX_GC_RESERVE_DIV", 16)) else {
+        let Some(mut pool) = Pool::new(gb << 30, decay, env("RADIXOX_GC_RESERVE_DIV", 16)) else {
             eprintln!("radixox: mmap de la plage du pool ({gb} Gio) refusé, valeurs allouées hors pool");
             DISABLED = true;
             return None;
         };
+        pool.nursery_on = env("RADIXOX_NURSERY", 1) != 0;
         (*&raw mut POOL).insert(pool).into()
     }
 }
@@ -1104,8 +1188,27 @@ pub unsafe fn struct_alloc(size: usize) -> *mut u8 {
     }
     unsafe { crate::raw_alloc::external::malloc(size) }
 }
+/// Comme [`struct_alloc`], par la nurserie de la classe pour 16, 32, 64, 96 et 128 o
+/// (pages des nœuds). Se libère par [`struct_free`].
+///
 /// # Safety
-/// `ptr` vient de [`struct_alloc`] avec cette `size`, pas encore rendu.
+/// Comme [`struct_alloc`].
+#[cfg(not(any(radixox_nopool, radixox_sysalloc)))]
+pub unsafe fn class_alloc(size: usize) -> *mut u8 {
+    debug_assert!(size % 8 == 0 && size > 0);
+    if size <= crate::shared_byte::SharedByte::POOL_MAX_LEN {
+        let p = match global() {
+            Some(p) => p.alloc_class8(size),
+            None => init().map_or(null_mut(), |p| p.alloc_class8(size)),
+        };
+        if !p.is_null() {
+            return p;
+        }
+    }
+    unsafe { crate::raw_alloc::external::malloc(size) }
+}
+/// # Safety
+/// `ptr` vient de [`struct_alloc`] ou [`class_alloc`] avec cette `size`, pas encore rendu.
 #[cfg(not(any(radixox_nopool, radixox_sysalloc)))]
 pub unsafe fn struct_free(ptr: *mut u8, size: usize) {
     match global() {
@@ -1116,6 +1219,10 @@ pub unsafe fn struct_free(ptr: *mut u8, size: usize) {
 }
 #[cfg(any(radixox_nopool, radixox_sysalloc))]
 pub unsafe fn struct_alloc(size: usize) -> *mut u8 {
+    unsafe { crate::raw_alloc::malloc(size) }
+}
+#[cfg(any(radixox_nopool, radixox_sysalloc))]
+pub unsafe fn class_alloc(size: usize) -> *mut u8 {
     unsafe { crate::raw_alloc::malloc(size) }
 }
 #[cfg(any(radixox_nopool, radixox_sysalloc))]
@@ -1306,6 +1413,43 @@ mod tests {
         unsafe { p.free(a, 100) }; // pas le dernier : le top ne bouge pas
         assert_eq!(p.alloc(100) as usize, b as usize + 100);
         assert_eq!(p.stats().live_bytes, 200);
+    }
+
+    #[test]
+    fn nursery_reuses_then_hands_over_when_full() {
+        let mut p = pool(2);
+        let a = p.alloc_class8(96);
+        let b = p.alloc_class8(96);
+        assert_eq!(b as usize, a as usize + 96);
+        unsafe { p.free(a, 96) };
+        assert_eq!(p.alloc_class8(96), a, "case libérée reprise tout de suite");
+        // une autre classe a sa propre nurserie, une taille hors classe va au curseur
+        let c = p.alloc_class8(32);
+        assert_ne!(p.block_of(c), p.block_of(a));
+        let d = p.alloc_class8(40);
+        assert_ne!(p.block_of(d), p.block_of(a));
+        // remplir : 682 cases de 96 o, la 683ᵉ ouvre une nurserie neuve
+        let first = p.block_of(a);
+        let mut all = vec![a, b];
+        for _ in 2..BLOCK / 96 {
+            let x = p.alloc_class8(96);
+            assert_eq!(p.block_of(x), first);
+            all.push(x);
+        }
+        assert!(p.is_open(first));
+        let next = p.alloc_class8(96);
+        assert_ne!(p.block_of(next), first);
+        assert!(!p.is_open(first), "pleine : bloc normal du pool");
+        assert_eq!(p.live_of_addr(a as usize), Some((BLOCK / 96 * 48) as u64));
+        // bloc normal : libéré quand son compteur tombe à 0
+        let held = p.stats().held_blocks;
+        for x in all {
+            unsafe { p.free(x, 96) };
+        }
+        assert_eq!(p.stats().held_blocks, held - 1);
+        // passe exhaustive : les nurseries se ferment comme les curseurs
+        p.close_cursors();
+        assert!(!p.is_open(p.block_of(next)));
     }
 
     #[test]
