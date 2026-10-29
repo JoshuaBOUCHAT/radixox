@@ -970,13 +970,13 @@ mod tests {
                 }
             }
             if fanout >= 200 {
-                assert!(kinds.contains(&(Kind::Wide256 as u8)), "fanout {fanout} : formes {kinds:?}");
+                assert!(kinds.contains(&(Kind::VeryLarge as u8)), "fanout {fanout} : formes {kinds:?}");
             }
             if fanout == 20 || fanout == 30 {
-                assert!(kinds.contains(&(Kind::Wide32 as u8)), "fanout {fanout} : formes {kinds:?}");
+                assert!(kinds.contains(&(Kind::Large as u8)), "fanout {fanout} : formes {kinds:?}");
             }
             if fanout == 12 {
-                assert!(kinds.contains(&(Kind::Overflow8 as u8)), "fanout {fanout} : formes {kinds:?}");
+                assert!(kinds.contains(&(Kind::Overflow as u8)), "fanout {fanout} : formes {kinds:?}");
             }
         }
     }

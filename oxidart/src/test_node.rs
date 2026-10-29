@@ -112,7 +112,7 @@ fn random_entry(rng: &mut StdRng, pool: &[SharedByte]) -> RefEntry {
 
 #[derive(Default, Debug)]
 struct Stats {
-    /// pas passés dans chaque forme : Inline, Overflow8, Wide32, Wide256
+    /// pas passés dans chaque forme : Inline, Overflow, Large, VeryLarge
     kinds: [usize; 4],
     max_len: usize,
 }
@@ -190,10 +190,11 @@ fn fuzz(seed: u64, ops: usize, radix_space: u16, insert_bias: u32, stats: &mut S
 
 #[test]
 fn v2_node_fuzz_small() {
-    // autour de la frontière petite forme / Wide32
+    // autour de la frontière petite forme / Large
     let mut stats = Stats::default();
-    for seed in 0..200 {
-        let space = if seed % 2 == 0 { 12 } else { 20 };
+    // 6 radixs : Inline (48 o de cellules) ; 12 et 20 : Overflow et Large
+    for seed in 0..300 {
+        let space = [6, 12, 20][seed as usize % 3];
         fuzz(seed, 2_000, space, 0, &mut stats);
     }
     eprintln!("{stats:?}");
@@ -202,7 +203,7 @@ fn v2_node_fuzz_small() {
 
 #[test]
 fn v2_node_fuzz_mid() {
-    // autour de Wide32 / Wide256 (descente à 24, montée à 33)
+    // autour de Large / VeryLarge (descente à 24, montée à 33)
     let mut stats = Stats::default();
     for seed in 500..560 {
         fuzz(seed, 3_000, 40, 3, &mut stats);
@@ -245,7 +246,7 @@ fn v2_node_fill_all_256() {
             }
         }
         assert_eq!(node.len(), 256);
-        assert_eq!(kinds.last(), Some(&Kind::Wide256));
+        assert_eq!(kinds.last(), Some(&Kind::VeryLarge));
         order.shuffle(&mut rng);
         for &r in &order {
             assert_eq!(node.remove(r).map(from_owned), reference.remove(&r));
@@ -269,7 +270,7 @@ fn v2_alloc_class() {
 
 #[test]
 fn v2_node_layout() {
-    // user:{n} : 10 feuilles de 8 o → 8 inline + 2 en page
+    // user:{n} : 10 feuilles de 8 o → 6 dans le nœud (48 o) + 4 en page
     let mut node = Node::new(CompactPath::from_slice(b"user:1"), 0, b'1');
     for d in b'0'..=b'9' {
         let leaf = Leaf {
@@ -281,7 +282,7 @@ fn v2_node_layout() {
         node.insert(d, Entry::Leaf(leaf));
     }
     node.check();
-    assert_eq!(node.kind(), Kind::Overflow8);
+    assert_eq!(node.kind(), Kind::Overflow);
     for d in b'0'..=b'9' {
         assert!(matches!(
             node.get(d),

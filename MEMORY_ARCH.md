@@ -1765,6 +1765,18 @@ surtout des blocs de nœud qui grossissent (le pool est bump + compteur par bloc
   de l'étape 3 ci-dessus, avec ces classes au lieu de 64 / 256 o ; à trancher : classes de la taille totale, en-tête
   de 16 o des Overflow8 compris, ou des données), au-delà le pool ; puis fusion avec l'essai des groupes de collision
   (`linear-small`).
+- **Fait (2026-10-29, `main`) : plus d'en-tête de page en petite forme.** Formes renommées par comportement :
+  `Inline`, `Overflow`, `Large` (ex-Wide32), `VeryLarge` (ex-Wide256). Petites formes : `keys = radixs[16]` en
+  ligne 1, `tags[16]` en tête du body, **par rang** (communs au nœud et à la page : un déversement ne bouge que des
+  cellules ; `Seg::shared_keys`), 48 o de cellules dans le nœud (plus de limite de 8 entrées dans le nœud, seulement
+  les 48 o), page = cellules seules. Recherche : une comparaison SSE2 sur les 16 radixs de la ligne 1 (`search16`),
+  la page n'est jamais lue pour chercher ; `search_needs_page`, l'étape AMAC `PageSearch` et `prefetch_page_all`
+  supprimés. Seule `VeryLarge` garde un en-tête. Classes de cellules **2, 4, 8, 12, 16, 24, 32…** (6 retirée :
+  48 o chevauche deux lignes une case sur deux dans un slab). Mesures `tree_bench`, 1M clés, contre `main` 591cbb8 :
+  RSS o/clé uuid 102,8 → 96,5 (−6 %), ycsb 81,8 → 79,7, user-email 67,2 → 65,1, memtier-rand 57,4 = ; avec TTL uuid
+  134,3 → 117,5 (−12,5 %), ycsb 111,2 → 98,6 (−11 %) ; vitesse uuid chargement 322 → 288 ns, GET présent 506 → 432,
+  DEL 737 → 697 ; `pipe` uuid fenêtre 64 (AMAC) 3,05 → 4,0 Mops/s (+30 %). Le slab n'a donc plus que des cases
+  sans en-tête : 16, 32, 64, 96, 128 o (classes 2–16), partagées par `Overflow` et `Large`.
 
 ### 17.4 Petits blocs Hash/Set et débordements valart (fait, branche `pool-structures`)
 

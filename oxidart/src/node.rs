@@ -1,11 +1,11 @@
 //! Nœud 128 o à feuilles inline, quatre formes selon le nombre d'entrées.
 //!
-//! | forme       | entrées | métadonnées                          | données          |
-//! |-------------|---------|--------------------------------------|------------------|
-//! | `Inline`    | ≤ 8     | nœud : radixs, tags, maps u16        | nœud             |
-//! | `Overflow8` | ≤ 16    | idem, les maps couvrent nœud + page  | nœud + page      |
-//! | `Wide32`    | ≤ 32    | nœud : bitmap radix, tags, maps u32  | page             |
-//! | `Wide256`   | ≤ 256   | nœud : bitmap radix ; page : maps+tags | page           |
+//! | forme       | entrées | métadonnées                                          | données     |
+//! |-------------|---------|------------------------------------------------------|-------------|
+//! | `Inline`    | ≤ 16    | ligne 1 : radixs[16], maps u16 ; body : tags[16]     | nœud (48 o) |
+//! | `Overflow`  | ≤ 16    | idem, par rang sur nœud + page                       | nœud + page |
+//! | `Large`     | ≤ 32    | ligne 1 : maps u32 ; body : bitmap radix, tags[32]   | page        |
+//! | `VeryLarge` | ≤ 256   | body : bitmap radix ; page : maps + tags (en-tête)   | page        |
 //!
 //! Entrées triées par radix, numérotées par rang `e`. Un segment (nœud, page)
 //! range ses cellules ainsi, tout s'adressant par popcount des maps sous `e` :
@@ -15,12 +15,13 @@
 //! feuille : [sfx?][ttl?][val]       val toujours en fin de record
 //! ```
 //!
-//! Petites formes : le nœud garde le plus long préfixe d'entrées qui tient
-//! (≤ 8 entrées, ≤ 64 o), la page prend le reste (≤ 8 entrées).
+//! Petites formes : le nœud garde le plus long préfixe d'entrées qui tient en
+//! 48 o, la page prend le reste ; la recherche ne lit que la ligne 1. Seule
+//! `VeryLarge` a un en-tête de page (MEMORY_ARCH.md §17.2 ter).
 //!
-//! Page : taille = classe de taille du besoin (on paie la classe de toute façon),
-//! réduite seulement quand le besoin passe sous ¾ du bloc. Changements de forme
-//! avec hystérésis aussi (montée à 17 / 33 entrées, descente à 12 / 24).
+//! Page : taille = classe de cellules du besoin (2, 4, 8, 12, 16, 24…), réduite
+//! seulement avec hystérésis. Changements de forme avec hystérésis aussi
+//! (montée à 17 / 33 entrées, descente à 12 / 24).
 
 use std::mem::ManuallyDrop;
 use std::ptr::{self, NonNull};
@@ -32,18 +33,18 @@ use crate::ExpAndRadix;
 use crate::compact_path::CompactPath;
 use crate::value::{Tag, ValUnion, drop_raw};
 
-const SMALL_ENTRIES: usize = 8;
-const NODE_CELLS: usize = 64;
-/// radixs[8] + tags[8] en tête de page `Overflow8`.
-const SMALL_PAGE_HEADER: usize = 16;
-/// child, ttl, sfx en 3 × 256 bits en tête de page `Wide256`.
+/// Cellules du body en petite forme, après `tags[16]`.
+const NODE_CELLS: usize = 48;
+/// child, ttl, sfx en 3 × 256 bits en tête de page `VeryLarge`.
 const WIDE_MAPS: usize = 96;
+/// Entrées des petites formes : `radixs[16]` en ligne 1, `tags[16]` en tête du
+/// body, indexés par rang ; la page n'a pas d'en-tête.
 pub(crate) const SMALL_MAX: usize = 16;
-pub(crate) const WIDE32_MAX: usize = 32;
-/// Descente `Wide32` → petite forme à ce nombre d'entrées (si ça tient).
-const WIDE32_DOWN: usize = 12;
-/// Descente `Wide256` → `Wide32`.
-const WIDE256_DOWN: usize = 24;
+pub(crate) const LARGE_MAX: usize = 32;
+/// Descente `Large` → petite forme à ce nombre d'entrées (si ça tient).
+const LARGE_DOWN: usize = 12;
+/// Descente `VeryLarge` → `Large`.
+const VERY_LARGE_DOWN: usize = 24;
 
 /// Cible du thin ptr sans page : le préchargement se fait sans test,
 /// sur une ligne toujours chaude. Jamais écrite.
@@ -69,18 +70,18 @@ pub(crate) fn alloc_class(size: usize) -> usize {
 }
 
 /// Capacité de données d'une page de nœud (hors en-tête), en cellules de 8 o :
-/// 2, 4, 6, 8, 12, 16, 24, 32, 48… (deux classes par doublement après 4). Pas de
-/// classe 1 : une étape de réallocation de moins, pour ~11 Ko sur 1M UUID
-/// (MEMORY_ARCH.md §17.2 ter). Rend des octets.
+/// 2, 4, 8, 12, 16, 24, 32, 48… (deux classes par doublement après 8). Pas de
+/// classe 1 (une réallocation de moins, ~11 Ko sur 1M UUID) ni 6 : 48 o chevauche
+/// deux lignes de cache une case sur deux dans un slab (MEMORY_ARCH.md §17.2 ter).
+/// Rend des octets.
 pub(crate) fn cell_class(bytes: usize) -> usize {
     let cells = bytes.div_ceil(8);
     if cells == 0 {
         return 0;
     }
-    if cells <= 2 {
-        return 16;
+    if cells <= 8 {
+        return cells.max(2).next_power_of_two() * 8;
     }
-    let cells = cells.max(4);
     let b = usize::BITS - 1 - (cells - 1).leading_zeros();
     let step = 1usize << (b - 1);
     cells.div_ceil(step) * step * 8
@@ -101,46 +102,56 @@ fn round8(n: usize) -> usize {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Kind {
     Inline = 0,
-    Overflow8 = 1,
-    Wide32 = 2,
-    Wide256 = 3,
+    Overflow = 1,
+    Large = 2,
+    VeryLarge = 3,
 }
 
 impl Kind {
     #[inline]
     fn is_small(self) -> bool {
-        matches!(self, Kind::Inline | Kind::Overflow8)
+        matches!(self, Kind::Inline | Kind::Overflow)
     }
+}
+
+/// Petites formes : radixs des 16 entrées (nœud puis page). `Large` : maps
+/// child, ttl, sfx (u32).
+#[repr(C)]
+union Keys {
+    radixs: [u8; SMALL_MAX],
+    maps: [u32; 4],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct SmallKeys {
-    radixs: [u8; SMALL_ENTRIES],
-    tags: [Tag; SMALL_ENTRIES],
-}
-
-/// Petites formes : radixs + tags. `Wide32` : maps child, ttl, sfx (u32).
-#[repr(C)]
-union Keys {
-    small: SmallKeys,
-    maps: [u32; 4],
+struct SmallBody {
+    /// Par rang, comme `Keys::radixs`.
+    tags: [Tag; SMALL_MAX],
+    cells: [u64; NODE_CELLS / 8],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct WideMeta {
     radix_bits: [u64; 4],
-    /// `Wide32` seulement.
-    tags: [Tag; WIDE32_MAX],
+    /// `Large` seulement.
+    tags: [Tag; LARGE_MAX],
 }
 
-/// Petites formes : cellules. Formes larges : métadonnées.
+/// Petites formes : tags et cellules. Formes larges : métadonnées.
 #[repr(C)]
 union Body {
-    cells: [u64; NODE_CELLS / 8],
+    small: SmallBody,
     wide: WideMeta,
 }
+
+const EMPTY_KEYS: Keys = Keys { radixs: [0; SMALL_MAX] };
+const EMPTY_BODY: Body = Body {
+    small: SmallBody {
+        tags: [Tag::None; SMALL_MAX],
+        cells: [0; NODE_CELLS / 8],
+    },
+};
 
 /// Aligné sur 128 (sa taille) : un nœud = deux lignes de cache entières, copie vectorielle
 /// alignée au compactage (MEMORY_ARCH.md §17.2 bis).
@@ -160,7 +171,7 @@ pub(crate) struct Node {
     sfx_map: u16,
     kind: Kind,
     pub(crate) tag: Tag,
-    /// Nombre d'entrées, sauf en `Wide256` (popcount de `radix_bits`).
+    /// Nombre d'entrées, sauf en `VeryLarge` (popcount de `radix_bits`).
     count: u8,
     n_in: u8,
     /// Taille du bloc de page en unités de 8 o (0 = pas de page).
@@ -460,6 +471,10 @@ struct Seg<M: Bits> {
     c: M,
     t: M,
     s: M,
+    /// Petites formes : radixs et tags sont des tableaux par rang communs aux deux
+    /// segments ; `insert` / `remove` ne bougent que les cellules, l'appelant les
+    /// tient à jour comme les maps.
+    shared_keys: bool,
 }
 
 impl<M: Bits> Seg<M> {
@@ -566,12 +581,14 @@ impl<M: Bits> Seg<M> {
     unsafe fn insert(&mut self, i: usize, raw: &Raw) {
         debug_assert!(i <= self.n && self.fits(raw.size()));
         unsafe {
-            if !self.radixs.is_null() {
-                ptr::copy(self.radixs.add(i), self.radixs.add(i + 1), self.n - i);
-                *self.radixs.add(i) = raw.radix;
+            if !self.shared_keys {
+                if !self.radixs.is_null() {
+                    ptr::copy(self.radixs.add(i), self.radixs.add(i + 1), self.n - i);
+                    *self.radixs.add(i) = raw.radix;
+                }
+                ptr::copy(self.tags.add(i), self.tags.add(i + 1), self.n - i);
+                *self.tags.add(i) = raw.tag;
             }
-            ptr::copy(self.tags.add(i), self.tags.add(i + 1), self.n - i);
-            *self.tags.add(i) = raw.tag;
             if raw.child {
                 let off = self.child_off(i);
                 let end = self.kid_bytes();
@@ -619,10 +636,12 @@ impl<M: Bits> Seg<M> {
                     end - size - start,
                 );
             }
-            if !self.radixs.is_null() {
-                ptr::copy(self.radixs.add(i + 1), self.radixs.add(i), self.n - i - 1);
+            if !self.shared_keys {
+                if !self.radixs.is_null() {
+                    ptr::copy(self.radixs.add(i + 1), self.radixs.add(i), self.n - i - 1);
+                }
+                ptr::copy(self.tags.add(i + 1), self.tags.add(i), self.n - i - 1);
             }
-            ptr::copy(self.tags.add(i + 1), self.tags.add(i), self.n - i - 1);
             self.c.remove(i);
             self.t.remove(i);
             self.s.remove(i);
@@ -632,16 +651,43 @@ impl<M: Bits> Seg<M> {
     }
 }
 
-/// Position de `radix` parmi les `n` premiers octets, en une passe SWAR.
-#[inline]
-fn swar_find(radixs: [u8; 8], n: usize, radix: u8) -> Option<usize> {
-    let word = u64::from_le_bytes(radixs);
-    let x = word ^ (0x0101_0101_0101_0101u64 * radix as u64);
-    let mut z = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
-    if n < 8 {
-        z &= (1u64 << (8 * n)) - 1;
+/// Masques (égal, inférieur) de `radix` contre les 16 radixs, bit `i` = octet `i`.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn cmp16(radixs: &[u8; SMALL_MAX], radix: u8) -> (u32, u32) {
+    use std::arch::x86_64::*;
+    // SAFETY: SSE2 fait partie de x86_64 ; chargement non aligné de 16 o.
+    unsafe {
+        let v = _mm_loadu_si128(radixs.as_ptr() as *const __m128i);
+        let r = _mm_set1_epi8(radix as i8);
+        let eq = _mm_movemask_epi8(_mm_cmpeq_epi8(v, r)) as u32;
+        // comparaison non signée : biais de 0x80 puis comparaison signée
+        let bias = _mm_set1_epi8(i8::MIN);
+        let lt = _mm_movemask_epi8(_mm_cmplt_epi8(_mm_xor_si128(v, bias), _mm_xor_si128(r, bias))) as u32;
+        (eq, lt)
     }
-    (z != 0).then(|| z.trailing_zeros() as usize / 8)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn cmp16(radixs: &[u8; SMALL_MAX], radix: u8) -> (u32, u32) {
+    let (mut eq, mut lt) = (0, 0);
+    for (i, &r) in radixs.iter().enumerate() {
+        eq |= ((r == radix) as u32) << i;
+        lt |= ((r < radix) as u32) << i;
+    }
+    (eq, lt)
+}
+
+/// Rang de `radix` parmi les `n` premiers radixs (triés), ou rang d'insertion.
+#[inline(always)]
+fn search16(radixs: &[u8; SMALL_MAX], n: usize, radix: u8) -> Result<usize, usize> {
+    let valid = (1u32 << n) - 1;
+    let (eq, lt) = cmp16(radixs, radix);
+    match eq & valid {
+        0 => Err((lt & valid).count_ones() as usize),
+        m => Ok(m.trailing_zeros() as usize),
+    }
 }
 
 /// Emplacement physique d'une entrée, tiré de son segment.
@@ -674,19 +720,16 @@ impl Loc {
 }
 
 /// Placement en petite forme pour une liste de tailles : (entrées dans le
-/// nœud, octets de la page). `None` si la page dépasse 8 entrées.
+/// nœud, octets de la page). `None` au-delà de 16 entrées.
 fn plan(sizes: &[u8]) -> Option<(usize, usize)> {
     if sizes.len() > SMALL_MAX {
         return None;
     }
     let mut n_in = 0;
     let mut used = 0;
-    while n_in < sizes.len() && n_in < SMALL_ENTRIES && used + sizes[n_in] as usize <= NODE_CELLS {
+    while n_in < sizes.len() && used + sizes[n_in] as usize <= NODE_CELLS {
         used += sizes[n_in] as usize;
         n_in += 1;
-    }
-    if sizes.len() - n_in > SMALL_ENTRIES {
-        return None;
     }
     Some((n_in, sizes[n_in..].iter().map(|&s| s as usize).sum()))
 }
@@ -700,12 +743,7 @@ impl Node {
             prefix,
             val: ValUnion { integer: 0 },
             exp_and_radix: ExpAndRadix::no_expiracy(parent_radix),
-            keys: Keys {
-                small: SmallKeys {
-                    radixs: [0; SMALL_ENTRIES],
-                    tags: [Tag::None; SMALL_ENTRIES],
-                },
-            },
+            keys: EMPTY_KEYS,
             parent_idx,
             child_map: 0,
             ttl_map: 0,
@@ -715,9 +753,7 @@ impl Node {
             count: 0,
             n_in: 0,
             pg_block8: 0,
-            body: Body {
-                cells: [0; NODE_CELLS / 8],
-            },
+            body: EMPTY_BODY,
         }
     }
 
@@ -729,7 +765,7 @@ impl Node {
     #[inline]
     pub(crate) fn len(&self) -> usize {
         match self.kind {
-            Kind::Wide256 => self.radix_bits().pop(),
+            Kind::VeryLarge => self.radix_bits().pop(),
             _ => self.count as usize,
         }
     }
@@ -744,20 +780,6 @@ impl Node {
     #[inline]
     pub(crate) fn prefetch_page(&self) {
         prefetch_l1(self.ptr.as_ptr());
-    }
-
-    /// Précharge toute la page d'une petite forme (≤ 224 o, au plus 5 lignes),
-    /// sans test : les adresses au-delà du bloc retombent sur son dernier octet
-    /// (cmov). Forme large ou sans page : la première ligne seulement (ou
-    /// `TRASH`), comme [`prefetch_page`](Self::prefetch_page).
-    #[inline(always)]
-    pub(crate) fn prefetch_page_all(&self) {
-        let p = self.ptr.as_ptr() as *const u8;
-        let last = if self.kind.is_small() { self.block().saturating_sub(1) } else { 0 };
-        for i in 0..4 {
-            prefetch_l1(p.wrapping_add((64 * i).min(last)));
-        }
-        prefetch_l1(p.wrapping_add(last));
     }
 
     /// Préchargement de second étage, une fois le nœud arrivé en cache :
@@ -788,9 +810,9 @@ impl Node {
     }
 
     #[inline]
-    fn small_keys(&self) -> &SmallKeys {
+    fn small_radixs(&self) -> &[u8; SMALL_MAX] {
         debug_assert!(self.kind.is_small());
-        unsafe { &self.keys.small }
+        unsafe { &self.keys.radixs }
     }
 
     #[inline]
@@ -814,15 +836,16 @@ impl Node {
             let n = (*this).n_in as usize;
             let m = mask64(n) as u16;
             Seg {
-                radixs: ptr::addr_of_mut!((*this).keys.small.radixs) as *mut u8,
-                tags: ptr::addr_of_mut!((*this).keys.small.tags) as *mut Tag,
-                cells: ptr::addr_of_mut!((*this).body.cells) as *mut u8,
+                radixs: ptr::addr_of_mut!((*this).keys.radixs) as *mut u8,
+                tags: ptr::addr_of_mut!((*this).body.small.tags) as *mut Tag,
+                cells: ptr::addr_of_mut!((*this).body.small.cells) as *mut u8,
                 cap: NODE_CELLS,
                 n,
-                max_n: SMALL_ENTRIES,
+                max_n: SMALL_MAX,
                 c: (*this).child_map & m,
                 t: (*this).ttl_map & m,
                 s: (*this).sfx_map & m,
+                shared_keys: true,
             }
         }
     }
@@ -842,24 +865,28 @@ impl Node {
         let start = self.n_in as usize;
         let n = self.count as usize - start;
         let m = mask64(n) as u16;
-        let p = self.ptr.as_ptr();
-        Seg {
-            radixs: p,
-            tags: unsafe { p.add(SMALL_ENTRIES) } as *mut Tag,
-            cells: unsafe { p.add(SMALL_PAGE_HEADER) },
-            cap: self.block().saturating_sub(SMALL_PAGE_HEADER),
-            n,
-            max_n: SMALL_ENTRIES,
-            c: (self.child_map >> start) & m,
-            t: (self.ttl_map >> start) & m,
-            s: (self.sfx_map >> start) & m,
+        // radixs et tags lus seulement (`shared_keys`) : jamais écrits via ce segment
+        let this = self as *const Node as *mut Node;
+        unsafe {
+            Seg {
+                radixs: (ptr::addr_of_mut!((*this).keys.radixs) as *mut u8).add(start),
+                tags: (ptr::addr_of_mut!((*this).body.small.tags) as *mut Tag).add(start),
+                cells: self.ptr.as_ptr(),
+                cap: self.block(),
+                n,
+                max_n: SMALL_MAX,
+                c: (self.child_map >> start) & m,
+                t: (self.ttl_map >> start) & m,
+                s: (self.sfx_map >> start) & m,
+                shared_keys: true,
+            }
         }
     }
 
     /// # Safety
     /// Comme `node_seg_raw` (les tags vivent dans le nœud).
     #[inline]
-    unsafe fn wide32_seg_raw(this: *mut Node) -> Seg<u32> {
+    unsafe fn large_seg_raw(this: *mut Node) -> Seg<u32> {
         unsafe {
             let maps = (*this).keys.maps;
             Seg {
@@ -868,22 +895,23 @@ impl Node {
                 cells: (*this).ptr.as_ptr(),
                 cap: (*this).block(),
                 n: (*this).count as usize,
-                max_n: WIDE32_MAX,
+                max_n: LARGE_MAX,
                 c: maps[0],
                 t: maps[1],
                 s: maps[2],
+                shared_keys: false,
             }
         }
     }
 
     #[inline]
-    fn wide32_store(&mut self, seg: &Seg<u32>) {
+    fn large_store(&mut self, seg: &Seg<u32>) {
         self.keys.maps = [seg.c, seg.t, seg.s, 0];
         self.count = seg.n as u8;
     }
 
-    /// Segment `Wide256` avec une zone de tags de `tags_len` octets.
-    fn wide256_seg(&self, tags_len: usize) -> Seg<U256> {
+    /// Segment `VeryLarge` avec une zone de tags de `tags_len` octets.
+    fn very_large_seg(&self, tags_len: usize) -> Seg<U256> {
         let p = self.ptr.as_ptr();
         unsafe {
             let maps = p as *const [u64; 4];
@@ -898,11 +926,12 @@ impl Node {
                 c: U256(maps.read()),
                 t: U256(maps.add(1).read()),
                 s: U256(maps.add(2).read()),
+                shared_keys: false,
             }
         }
     }
 
-    fn wide256_store(&mut self, seg: &Seg<U256>) {
+    fn very_large_store(&mut self, seg: &Seg<U256>) {
         unsafe {
             let maps = self.ptr.as_ptr() as *mut [u64; 4];
             maps.write(seg.c.0);
@@ -925,34 +954,8 @@ impl Node {
                 Err(e)
             };
         }
-        let n_in = self.n_in as usize;
-        let count = self.count as usize;
-        let radixs = self.small_keys().radixs;
-        if n_in > 0 && radix <= radixs[n_in - 1] {
-            return match swar_find(radixs, n_in, radix) {
-                Some(i) => Ok(i),
-                None => Err(radixs[..n_in].iter().take_while(|&&r| r < radix).count()),
-            };
-        }
-        let page_n = count - n_in;
-        if page_n == 0 {
-            return Err(count);
-        }
-        let page = unsafe { (self.ptr.as_ptr() as *const [u8; 8]).read() };
-        match swar_find(page, page_n, radix) {
-            Some(i) => Ok(n_in + i),
-            None => Err(n_in + page[..page_n].iter().take_while(|&&r| r < radix).count()),
-        }
-    }
-
-    /// La recherche de `radix` doit-elle lire l'en-tête de la page
-    /// (radixs du débordement en petite forme) ?
-    #[inline]
-    pub(crate) fn search_needs_page(&self, radix: u8) -> bool {
-        self.kind == Kind::Overflow8 && {
-            let n_in = self.n_in as usize;
-            n_in == 0 || radix > self.small_keys().radixs[n_in - 1]
-        }
+        // les 16 radixs en ligne 1 : la page n'est jamais lue pour chercher
+        search16(self.small_radixs(), self.count as usize, radix)
     }
 
     #[inline]
@@ -965,19 +968,14 @@ impl Node {
         if !self.kind.is_small() {
             return self.radix_bits().select(e) as u8;
         }
-        let n_in = self.n_in as usize;
-        if e < n_in {
-            self.small_keys().radixs[e]
-        } else {
-            unsafe { *self.ptr.as_ptr().add(e - n_in) }
-        }
+        self.small_radixs()[e]
     }
 
     #[inline]
     pub(crate) fn entry_ref(&self, e: usize) -> EntryRef<'_> {
         unsafe {
             match self.kind {
-                Kind::Inline | Kind::Overflow8 => {
+                Kind::Inline | Kind::Overflow => {
                     let n_in = self.n_in as usize;
                     if e < n_in {
                         self.node_seg().entry_ref(e)
@@ -985,8 +983,8 @@ impl Node {
                         self.page_seg().entry_ref(e - n_in)
                     }
                 }
-                Kind::Wide32 => Self::wide32_seg_raw(self as *const Node as *mut Node).entry_ref(e),
-                Kind::Wide256 => self.wide256_seg(round8(self.len())).entry_ref(e),
+                Kind::Large => Self::large_seg_raw(self as *const Node as *mut Node).entry_ref(e),
+                Kind::VeryLarge => self.very_large_seg(round8(self.len())).entry_ref(e),
             }
         }
     }
@@ -1005,19 +1003,12 @@ impl Node {
     /// précharger avant de la lire).
     #[inline(always)]
     pub(crate) fn probe(&self, radix: u8) -> Probe<'_> {
-        if self.kind.is_small() {
-            let n_in = self.n_in as usize;
-            let radixs = self.small_keys().radixs;
-            if n_in > 0 && radix <= radixs[n_in - 1] {
-                return match swar_find(radixs, n_in, radix) {
-                    Some(e) => Probe::Here(self.inline_entry(e)),
-                    None => Probe::Miss,
-                };
-            }
-        }
         let Some(e) = self.find(radix) else {
             return Probe::Miss;
         };
+        if self.kind.is_small() && e < self.n_in as usize {
+            return Probe::Here(self.inline_entry(e));
+        }
         match self.entry_addr(e) {
             Some(addr) => Probe::Page(e, addr),
             None => Probe::Here(self.entry_ref(e)),
@@ -1032,7 +1023,7 @@ impl Node {
         debug_assert!(self.kind.is_small() && e < self.n_in as usize);
         let m = ((1u32 << e) - 1) as u16;
         let c = self.child_map;
-        let cells = unsafe { self.body.cells.as_ptr() as *const u8 };
+        let cells = unsafe { self.body.small.cells.as_ptr() as *const u8 };
         unsafe {
             if c >> e & 1 == 1 {
                 return EntryRef::Child((cells.add(4 * (c & m).count_ones() as usize) as *const u32).read());
@@ -1043,7 +1034,7 @@ impl Node {
             let has_ttl = t >> e & 1 == 1;
             let has_sfx = sx >> e & 1 == 1;
             EntryRef::Leaf {
-                tag: self.keys.small.tags[e],
+                tag: self.body.small.tags[e],
                 val: &*(cells.add(end - 8) as *const ValUnion),
                 ttl: has_ttl.then(|| (cells.add(end - 16) as *const u64).read()),
                 sfx: has_sfx.then(|| {
@@ -1069,7 +1060,7 @@ impl Node {
     unsafe fn loc_raw(this: *mut Node, e: usize) -> Loc {
         unsafe {
             match (*this).kind {
-                Kind::Inline | Kind::Overflow8 => {
+                Kind::Inline | Kind::Overflow => {
                     let n_in = (*this).n_in as usize;
                     if e < n_in {
                         Loc::of(&Self::node_seg_raw(this), e)
@@ -1077,8 +1068,8 @@ impl Node {
                         Loc::of(&(*this).page_seg(), e - n_in)
                     }
                 }
-                Kind::Wide32 => Loc::of(&Self::wide32_seg_raw(this), e),
-                Kind::Wide256 => Loc::of(&(*this).wide256_seg(round8((*this).len())), e),
+                Kind::Large => Loc::of(&Self::large_seg_raw(this), e),
+                Kind::VeryLarge => Loc::of(&(*this).very_large_seg(round8((*this).len())), e),
             }
         }
     }
@@ -1215,9 +1206,9 @@ impl Node {
             return true;
         }
         match self.kind {
-            Kind::Inline | Kind::Overflow8 => self.ttl_map != 0,
-            Kind::Wide32 => unsafe { self.keys.maps[1] != 0 },
-            Kind::Wide256 => self.wide256_seg(round8(self.len())).t != U256::default(),
+            Kind::Inline | Kind::Overflow => self.ttl_map != 0,
+            Kind::Large => unsafe { self.keys.maps[1] != 0 },
+            Kind::VeryLarge => self.very_large_seg(round8(self.len())).t != U256::default(),
         }
     }
 
@@ -1249,9 +1240,8 @@ impl Node {
     /// Taille d'en-tête de page de la forme courante.
     fn page_header(&self) -> usize {
         match self.kind {
-            Kind::Inline | Kind::Overflow8 => SMALL_PAGE_HEADER,
-            Kind::Wide32 => 0,
-            Kind::Wide256 => WIDE_MAPS + round8(self.len()),
+            Kind::Inline | Kind::Overflow | Kind::Large => 0,
+            Kind::VeryLarge => WIDE_MAPS + round8(self.len()),
         }
     }
 
@@ -1261,16 +1251,16 @@ impl Node {
             return (0, 0);
         }
         match self.kind {
-            Kind::Inline | Kind::Overflow8 => {
+            Kind::Inline | Kind::Overflow => {
                 let s = self.page_seg();
                 (s.kid_bytes(), s.leaf_bytes())
             }
-            Kind::Wide32 => {
-                let s = unsafe { Self::wide32_seg_raw(self as *const Node as *mut Node) };
+            Kind::Large => {
+                let s = unsafe { Self::large_seg_raw(self as *const Node as *mut Node) };
                 (s.kid_bytes(), s.leaf_bytes())
             }
-            Kind::Wide256 => {
-                let s = self.wide256_seg(round8(self.len()));
+            Kind::VeryLarge => {
+                let s = self.very_large_seg(round8(self.len()));
                 (s.kid_bytes(), s.leaf_bytes())
             }
         }
@@ -1374,14 +1364,17 @@ impl Node {
         self.n_in += 1;
     }
 
-    /// Insère au rang `e` en petite forme. `false` si le débordement devrait
-    /// dépasser 8 entrées : l'appelant passe en `Wide32` (l'état reste valide,
-    /// éventuellement avec quelques entrées déjà déversées).
+    /// Insère au rang `e` en petite forme. `false` (rien de changé) si le nœud a
+    /// déjà 16 entrées : l'appelant passe en `Large`.
     ///
     /// Sans débordement et avec de la place, insertion directe. Sinon on
     /// déverse la queue du nœud vers le débordement (croissance seulement),
-    /// une entrée O(1) à la fois, agrandi à la demande.
+    /// une entrée O(1) à la fois, agrandi à la demande. Radixs, tags et maps sont
+    /// par rang : seules les cellules bougent avant leur mise à jour.
     fn small_insert_at(&mut self, e: usize, raw: &Raw) -> bool {
+        if self.count as usize == SMALL_MAX {
+            return false;
+        }
         let size = raw.size();
         if self.pg_block8 == 0 && self.node_seg().fits(size) {
             unsafe { self.node_seg_mut().insert(e, raw) };
@@ -1391,9 +1384,7 @@ impl Node {
         }
         while e < self.n_in as usize && !self.node_seg().fits(size) {
             let node = self.node_seg();
-            if !self.page_room(node.size_of(node.n - 1)) {
-                return false;
-            }
+            self.page_room(node.size_of(node.n - 1));
             self.spill_one();
         }
         let n_in = self.n_in as usize;
@@ -1402,9 +1393,7 @@ impl Node {
                 self.node_seg_mut().insert(e, raw);
                 self.n_in += 1;
             } else {
-                if !self.page_room(size) {
-                    return false;
-                }
+                self.page_room(size);
                 self.page_seg().insert(e - n_in, raw);
             }
         }
@@ -1412,8 +1401,18 @@ impl Node {
         true
     }
 
+    /// Radix, tag et maps de la nouvelle entrée `e` (tableaux par rang).
     #[inline]
     fn small_maps_insert(&mut self, e: usize, raw: &Raw) {
+        let n = self.count as usize;
+        unsafe {
+            let radixs = &mut self.keys.radixs;
+            radixs.copy_within(e..n, e + 1);
+            radixs[e] = raw.radix;
+            let tags = &mut self.body.small.tags;
+            tags.copy_within(e..n, e + 1);
+            tags[e] = raw.tag;
+        }
         self.child_map.insert(e, raw.child);
         self.ttl_map.insert(e, raw.ttl);
         self.sfx_map.insert(e, raw.sfx);
@@ -1421,15 +1420,11 @@ impl Node {
     }
 
     /// Place pour une entrée de `size` octets de plus dans le débordement
-    /// (agrandi à la demande). `false` s'il a déjà 8 entrées.
-    fn page_room(&mut self, size: usize) -> bool {
-        if self.count as usize - self.n_in as usize >= SMALL_ENTRIES {
-            return false;
-        }
+    /// (agrandi à la demande).
+    fn page_room(&mut self, size: usize) {
         let (kids, leaves) = self.page_usage();
-        self.page_grow(SMALL_PAGE_HEADER, kids + leaves + size);
-        self.kind = Kind::Overflow8;
-        true
+        self.page_grow(0, kids + leaves + size);
+        self.kind = Kind::Overflow;
     }
 
     /// Retire le rang `e` puis remonte la tête de page tant qu'elle tient.
@@ -1444,6 +1439,11 @@ impl Node {
                 self.page_seg().remove(e - n_in)
             }
         };
+        let n = self.count as usize;
+        unsafe {
+            self.keys.radixs.copy_within(e + 1..n, e);
+            self.body.small.tags.copy_within(e + 1..n, e);
+        }
         self.child_map.remove(e);
         self.ttl_map.remove(e);
         self.sfx_map.remove(e);
@@ -1460,24 +1460,24 @@ impl Node {
 
     // ── formes larges ──
 
-    fn wide32_insert_at(&mut self, e: usize, raw: &Raw) {
+    fn large_insert_at(&mut self, e: usize, raw: &Raw) {
         let (kids, leaves) = self.page_usage();
         self.page_grow(0, kids + leaves + raw.size());
         unsafe {
-            let mut seg = Self::wide32_seg_raw(self);
+            let mut seg = Self::large_seg_raw(self);
             seg.insert(e, raw);
-            self.wide32_store(&seg);
+            self.large_store(&seg);
         }
         let mut bits = self.radix_bits();
         bits.set(raw.radix as usize, true);
         self.set_radix_bits(bits);
     }
 
-    fn wide32_remove_at(&mut self, e: usize) -> Raw {
+    fn large_remove_at(&mut self, e: usize) -> Raw {
         let mut raw = unsafe {
-            let mut seg = Self::wide32_seg_raw(self);
+            let mut seg = Self::large_seg_raw(self);
             let raw = seg.remove(e);
-            self.wide32_store(&seg);
+            self.large_store(&seg);
             raw
         };
         raw.radix = self.radix_bits().select(e) as u8;
@@ -1487,7 +1487,7 @@ impl Node {
         raw
     }
 
-    fn wide256_insert_at(&mut self, e: usize, raw: &Raw) {
+    fn very_large_insert_at(&mut self, e: usize, raw: &Raw) {
         let n = self.len();
         let (tags_old, tags_new) = (round8(n), round8(n + 1));
         let (kids, leaves) = self.page_usage();
@@ -1498,22 +1498,22 @@ impl Node {
                 let base = self.ptr.as_ptr().add(WIDE_MAPS);
                 ptr::copy(base.add(tags_old), base.add(tags_new), kids);
             }
-            let mut seg = self.wide256_seg(tags_new);
+            let mut seg = self.very_large_seg(tags_new);
             seg.insert(e, raw);
-            self.wide256_store(&seg);
+            self.very_large_store(&seg);
         }
         let mut bits = self.radix_bits();
         bits.set(raw.radix as usize, true);
         self.set_radix_bits(bits);
     }
 
-    fn wide256_remove_at(&mut self, e: usize) -> Raw {
+    fn very_large_remove_at(&mut self, e: usize) -> Raw {
         let n = self.len();
         let (tags_old, tags_new) = (round8(n), round8(n - 1));
         let mut raw = unsafe {
-            let mut seg = self.wide256_seg(tags_old);
+            let mut seg = self.very_large_seg(tags_old);
             let raw = seg.remove(e);
-            self.wide256_store(&seg);
+            self.very_large_store(&seg);
             if tags_new < tags_old {
                 let base = self.ptr.as_ptr().add(WIDE_MAPS);
                 ptr::copy(base.add(tags_old), base.add(tags_new), seg.kid_bytes());
@@ -1538,7 +1538,7 @@ impl Node {
             let radix = self.radix_at(e);
             let mut raw = unsafe {
                 match self.kind {
-                    Kind::Inline | Kind::Overflow8 => {
+                    Kind::Inline | Kind::Overflow => {
                         let n_in = self.n_in as usize;
                         if e < n_in {
                             self.node_seg().read(e)
@@ -1546,8 +1546,8 @@ impl Node {
                             self.page_seg().read(e - n_in)
                         }
                     }
-                    Kind::Wide32 => Self::wide32_seg_raw(self).read(e),
-                    Kind::Wide256 => self.wide256_seg(round8(n)).read(e),
+                    Kind::Large => Self::large_seg_raw(self).read(e),
+                    Kind::VeryLarge => self.very_large_seg(round8(n)).read(e),
                 }
             };
             raw.radix = radix;
@@ -1559,15 +1559,8 @@ impl Node {
         self.ptr = trash();
         self.pg_block8 = 0;
         self.kind = Kind::Inline;
-        self.keys = Keys {
-            small: SmallKeys {
-                radixs: [0; SMALL_ENTRIES],
-                tags: [Tag::None; SMALL_ENTRIES],
-            },
-        };
-        self.body = Body {
-            cells: [0; NODE_CELLS / 8],
-        };
+        self.keys = EMPTY_KEYS;
+        self.body = EMPTY_BODY;
         self.child_map = 0;
         self.ttl_map = 0;
         self.sfx_map = 0;
@@ -1580,38 +1573,38 @@ impl Node {
     fn rebuild(&mut self, kind: Kind, raws: &[Raw]) {
         let cells: usize = raws.iter().map(Raw::size).sum();
         match kind {
-            Kind::Inline | Kind::Overflow8 => {
+            Kind::Inline | Kind::Overflow => {
                 for (e, raw) in raws.iter().enumerate() {
                     assert!(self.small_insert_at(e, raw), "rebuild : ne tient pas en petite forme");
                 }
             }
-            Kind::Wide32 => {
-                self.kind = Kind::Wide32;
+            Kind::Large => {
+                self.kind = Kind::Large;
                 self.keys = Keys { maps: [0; 4] };
                 self.body = Body {
                     wide: WideMeta {
                         radix_bits: [0; 4],
-                        tags: [Tag::None; WIDE32_MAX],
+                        tags: [Tag::None; LARGE_MAX],
                     },
                 };
                 self.page_grow(0, cells);
                 for (e, raw) in raws.iter().enumerate() {
-                    self.wide32_insert_at(e, raw);
+                    self.large_insert_at(e, raw);
                 }
             }
-            Kind::Wide256 => {
-                self.kind = Kind::Wide256;
+            Kind::VeryLarge => {
+                self.kind = Kind::VeryLarge;
                 self.keys = Keys { maps: [0; 4] };
                 self.body = Body {
                     wide: WideMeta {
                         radix_bits: [0; 4],
-                        tags: [Tag::None; WIDE32_MAX],
+                        tags: [Tag::None; LARGE_MAX],
                     },
                 };
                 self.page_grow(WIDE_MAPS + round8(raws.len()), cells);
                 unsafe { ptr::write_bytes(self.ptr.as_ptr(), 0, WIDE_MAPS) };
                 for (e, raw) in raws.iter().enumerate() {
-                    self.wide256_insert_at(e, raw);
+                    self.very_large_insert_at(e, raw);
                 }
             }
         }
@@ -1625,10 +1618,10 @@ impl Node {
     /// Descente de forme après une suppression ou un retrait de TTL.
     fn maybe_shrink_kind(&mut self) {
         match self.kind {
-            Kind::Wide256 if self.len() <= WIDE256_DOWN => self.convert(Kind::Wide32),
-            Kind::Wide32 if self.len() <= WIDE32_DOWN => {
+            Kind::VeryLarge if self.len() <= VERY_LARGE_DOWN => self.convert(Kind::Large),
+            Kind::Large if self.len() <= LARGE_DOWN => {
                 let mut sizes = [0u8; SMALL_MAX + 1];
-                let seg = unsafe { Self::wide32_seg_raw(self) };
+                let seg = unsafe { Self::large_seg_raw(self) };
                 for (i, s) in sizes.iter_mut().enumerate().take(seg.n) {
                     *s = seg.size_of(i) as u8;
                 }
@@ -1658,23 +1651,23 @@ impl Node {
             if self.small_insert_at(e, raw) {
                 return;
             }
-            self.convert(Kind::Wide32);
+            self.convert(Kind::Large);
         }
-        if self.kind == Kind::Wide32 && self.len() == WIDE32_MAX {
-            self.convert(Kind::Wide256);
+        if self.kind == Kind::Large && self.len() == LARGE_MAX {
+            self.convert(Kind::VeryLarge);
         }
         match self.kind {
-            Kind::Wide32 => self.wide32_insert_at(e, raw),
-            Kind::Wide256 => self.wide256_insert_at(e, raw),
+            Kind::Large => self.large_insert_at(e, raw),
+            Kind::VeryLarge => self.very_large_insert_at(e, raw),
             _ => unreachable!(),
         }
     }
 
     fn remove_raw(&mut self, e: usize) -> Raw {
         match self.kind {
-            Kind::Inline | Kind::Overflow8 => self.small_remove_at(e),
-            Kind::Wide32 => self.wide32_remove_at(e),
-            Kind::Wide256 => self.wide256_remove_at(e),
+            Kind::Inline | Kind::Overflow => self.small_remove_at(e),
+            Kind::Large => self.large_remove_at(e),
+            Kind::VeryLarge => self.very_large_remove_at(e),
         }
     }
 
@@ -1700,7 +1693,7 @@ impl Node {
         };
         self.insert_raw(e, &Raw::from_entry(radix, Entry::Child(child)));
         self.page_trim();
-        // l'entrée a rétréci : un Wide32 qui tient en petite forme redescend (forme canonique)
+        // l'entrée a rétréci : un Large qui tient en petite forme redescend (forme canonique)
         self.maybe_shrink_kind();
         old
     }
@@ -1749,9 +1742,9 @@ impl Node {
             let header = self.page_header();
             let cap = self.block() - header;
             assert!(kids + leaves <= cap, "page trop petite");
-            // en Wide256 l'en-tête suit le nombre d'entrées : la zone de données n'est
+            // en VeryLarge l'en-tête suit le nombre d'entrées : la zone de données n'est
             // une classe qu'à l'allocation
-            if self.kind != Kind::Wide256 {
+            if self.kind != Kind::VeryLarge {
                 assert_eq!(cap, cell_class(cap), "bloc hors classe");
             }
             assert!(!cell_should_shrink(kids + leaves, cap), "page non réduite");
@@ -1761,10 +1754,10 @@ impl Node {
             assert_eq!(c(i), tag == Tag::None, "tag incohérent");
         };
         match self.kind {
-            Kind::Inline | Kind::Overflow8 => {
+            Kind::Inline | Kind::Overflow => {
                 assert!(n <= SMALL_MAX);
                 let n_in = self.n_in as usize;
-                assert!(n_in <= n && n_in <= SMALL_ENTRIES);
+                assert!(n_in <= n);
                 let m = mask64(n) as u16;
                 assert_eq!(self.child_map & !m, 0);
                 assert_eq!(self.ttl_map & !m, 0);
@@ -1773,7 +1766,7 @@ impl Node {
                 assert!(self.node_seg().used() <= NODE_CELLS);
                 let mut sizes = [0u8; SMALL_MAX + 1];
                 self.sizes(&mut sizes);
-                let (want_in, want_page) = plan(&sizes[..n]).expect("page > 8 entrées");
+                let (want_in, want_page) = plan(&sizes[..n]).expect("plus de 16 entrées");
                 assert_eq!(n_in, want_in, "placement non canonique");
                 assert_eq!(kids + leaves, want_page);
                 assert_eq!(self.kind == Kind::Inline, self.pg_block8 == 0);
@@ -1785,18 +1778,18 @@ impl Node {
                     check_tags(page.tags, &|i| page.c.bit(i), i);
                 }
             }
-            Kind::Wide32 => {
-                assert!(n <= WIDE32_MAX);
-                if n <= WIDE32_DOWN {
+            Kind::Large => {
+                assert!(n <= LARGE_MAX);
+                if n <= LARGE_DOWN {
                     let mut sizes = [0u8; SMALL_MAX + 1];
-                    let seg = unsafe { Self::wide32_seg_raw(self as *const Node as *mut Node) };
+                    let seg = unsafe { Self::large_seg_raw(self as *const Node as *mut Node) };
                     for (i, s) in sizes.iter_mut().enumerate().take(n) {
                         *s = seg.size_of(i) as u8;
                     }
-                    assert!(plan(&sizes[..n]).is_none(), "Wide32 aurait dû redescendre");
+                    assert!(plan(&sizes[..n]).is_none(), "Large aurait dû redescendre");
                 }
                 assert_eq!(self.count as usize, self.radix_bits().pop());
-                let seg = unsafe { Self::wide32_seg_raw(self as *const Node as *mut Node) };
+                let seg = unsafe { Self::large_seg_raw(self as *const Node as *mut Node) };
                 let m = mask64(n) as u32;
                 assert_eq!((seg.c | seg.t | seg.s) & !m, 0);
                 assert_eq!(seg.c & (seg.t | seg.s), 0);
@@ -1804,9 +1797,9 @@ impl Node {
                     check_tags(seg.tags, &|i| seg.c.bit(i), i);
                 }
             }
-            Kind::Wide256 => {
-                assert!(n > WIDE256_DOWN);
-                let seg = self.wide256_seg(round8(n));
+            Kind::VeryLarge => {
+                assert!(n > VERY_LARGE_DOWN);
+                let seg = self.very_large_seg(round8(n));
                 for k in 0..4 {
                     assert_eq!(seg.c.0[k] & (seg.t.0[k] | seg.s.0[k]), 0);
                 }
@@ -1845,7 +1838,7 @@ pub(crate) enum Ahead<'a> {
 /// contient le rang courant est décodé une fois, masques sur 64 bits, au lieu
 /// de l'être à chaque entrée par [`Node::entry_ref`] (choix de la forme, vue du
 /// segment) ; le radix des formes larges est suivi pas à pas au lieu d'un
-/// `select` par entrée. `Wide256` (maps de 256 bits dans la page) garde
+/// `select` par entrée. `VeryLarge` (maps de 256 bits dans la page) garde
 /// `entry_ref`. Le parcours n'en tient qu'un, celui du nœud au sommet de sa
 /// pile : rien de gros dans les étages.
 ///
@@ -1894,26 +1887,25 @@ impl Cursor {
     pub(crate) fn new(node: &Node, e: usize) -> Self {
         let mut cur = Cursor::empty();
         match node.kind {
-            Kind::Inline | Kind::Overflow8 => {
+            Kind::Inline | Kind::Overflow => {
                 let n_in = node.n_in as usize;
                 // SAFETY: lecture des cellules / de la page du nœud vivant.
                 unsafe {
                     if e < n_in {
                         let m = mask64(n_in);
-                        cur.cells = node.body.cells.as_ptr() as *const u8;
-                        cur.radixs = node.keys.small.radixs.as_ptr();
-                        cur.tags = node.keys.small.tags.as_ptr();
+                        cur.cells = node.body.small.cells.as_ptr() as *const u8;
+                        cur.radixs = node.keys.radixs.as_ptr();
+                        cur.tags = node.body.small.tags.as_ptr();
                         cur.cap = NODE_CELLS as u32;
                         (cur.c, cur.t, cur.s) = (node.child_map as u64 & m, node.ttl_map as u64 & m, node.sfx_map as u64 & m);
                         (cur.lo, cur.hi) = (0, n_in as u16);
                     } else {
                         let count = node.count as usize;
                         let m = mask64(count - n_in);
-                        let p = node.ptr.as_ptr() as *const u8;
-                        cur.radixs = p;
-                        cur.tags = p.add(SMALL_ENTRIES) as *const Tag;
-                        cur.cells = p.add(SMALL_PAGE_HEADER);
-                        cur.cap = node.block().saturating_sub(SMALL_PAGE_HEADER) as u32;
+                        cur.radixs = node.keys.radixs.as_ptr().add(n_in);
+                        cur.tags = node.body.small.tags.as_ptr().add(n_in);
+                        cur.cells = node.ptr.as_ptr();
+                        cur.cap = node.block() as u32;
                         (cur.c, cur.t, cur.s) = (
                             (node.child_map as u64 >> n_in) & m,
                             (node.ttl_map as u64 >> n_in) & m,
@@ -1923,7 +1915,7 @@ impl Cursor {
                     }
                 }
             }
-            Kind::Wide32 => unsafe {
+            Kind::Large => unsafe {
                 let maps = node.keys.maps;
                 cur.cells = node.ptr.as_ptr();
                 cur.tags = node.body.wide.tags.as_ptr();
@@ -1932,7 +1924,7 @@ impl Cursor {
                 (cur.lo, cur.hi) = (0, node.count as u16);
                 cur.wide = true;
             },
-            Kind::Wide256 => {
+            Kind::VeryLarge => {
                 (cur.lo, cur.hi) = (0, node.len() as u16);
                 cur.wide = true;
                 cur.wide256 = true;
@@ -1985,7 +1977,7 @@ impl Cursor {
     /// Cible de préchargement du rang `e < node.len()`, sans construire
     /// l'entrée complète : idx d'un enfant, suffixe long d'une feuille (une
     /// feuille sans suffixe ne coûte aucun popcount). Hors du segment
-    /// décodé (page de débordement, `Wide256`) : chemin complet.
+    /// décodé (page de débordement, `VeryLarge`) : chemin complet.
     ///
     /// # Safety
     /// Comme [`get`](Self::get).
