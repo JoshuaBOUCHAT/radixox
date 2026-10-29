@@ -32,7 +32,8 @@ fn count(start: usize, end: usize, fallback: usize) -> u64 {
     let n = (end - start) / PAGE;
     let mut vec = vec![0u8; n];
     // SAFETY: `[start, end)` est dans la réservation de la région ; `vec` a une case par page.
-    let r = unsafe { libc::mincore(start as *mut libc::c_void, end - start, vec.as_mut_ptr()) };
+    // Appel direct : `mincore` est absent de rustix.
+    let r = unsafe { sc::syscall!(MINCORE, start, end - start, vec.as_mut_ptr()) };
     if r != 0 {
         return fallback.next_multiple_of(PAGE) as u64;
     }

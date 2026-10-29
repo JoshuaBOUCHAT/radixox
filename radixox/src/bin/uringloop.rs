@@ -230,18 +230,23 @@ impl Signals {
         if !save && !aof {
             return Ok(None);
         }
-        // SAFETY: masque initialisé, appels libc sur le thread principal.
-        let fd = unsafe {
+        // SAFETY: masque initialisé, appels sur le thread principal.
+        unsafe {
             let mut mask: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&mut mask);
             libc::sigaddset(&mut mask, libc::SIGINT);
             libc::sigaddset(&mut mask, libc::SIGTERM);
             libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
-            libc::signalfd(-1, &mask, libc::SFD_CLOEXEC)
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
         }
+        // `signalfd4` en appel direct (absent de rustix) : masque du noyau
+        // sur 8 octets, bit `n - 1` pour le signal `n`.
+        let kmask: u64 = (1 << (libc::SIGINT - 1)) | (1 << (libc::SIGTERM - 1));
+        // SAFETY: masque valide pendant l'appel.
+        let r = unsafe { sc::syscall!(SIGNALFD4, -1isize, &kmask as *const u64, 8usize, libc::SFD_CLOEXEC) } as isize;
+        if r < 0 {
+            return Err(io::Error::from_raw_os_error(-r as i32));
+        }
+        let fd = r as RawFd;
         // SAFETY: structure C, tout à zéro est valide.
         Ok(Some(Self { fd, buf: Box::new(unsafe { std::mem::zeroed() }), save }))
     }

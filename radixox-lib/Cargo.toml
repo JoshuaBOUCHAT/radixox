@@ -19,6 +19,8 @@ eviction = []
 # notre allocateur tient le rôle de la libc (errno de malloc, getenv avant std) et pour mincore.
 rustix = { version = "1.1", default-features = false, features = ["std", "mm", "rand", "stdio"] }
 libc = "0.2"
+# Appel direct pour mincore, absent de rustix.
+sc = "0.2"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(radixox_sysalloc)', 'cfg(radixox_nopool)', 'cfg(radixox_gc_debug)'] }
