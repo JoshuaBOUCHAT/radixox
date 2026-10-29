@@ -1,0 +1,15 @@
+[package]
+name = "radixox-mem"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "memcpy, memmove, memset, memcmp and bcmp in Rust for binaries without a libc"
+keywords = ["no-std", "memcpy", "libc"]
+categories = ["no-std", "embedded"]
+
+[features]
+# Exporte les fonctions sous leurs noms C (`memcpy`…) : seulement pour un binaire sans libc,
+# sinon elles entrent en conflit avec celles de la libc.
+export = []
