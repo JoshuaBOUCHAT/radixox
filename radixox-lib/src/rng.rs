@@ -4,8 +4,6 @@
 //! `/dev/urandom`, sinon l'horloge — jamais de panic, le premier appel peut venir d'une
 //! commande client.
 
-use std::io::Read;
-
 /// État ; 0 = pas encore tiré (une graine nulle est remplacée par 1).
 static mut STATE: u64 = 0;
 
@@ -21,7 +19,16 @@ fn os_seed() -> Option<u64> {
         }
     }
     if got < b.len() {
-        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).ok()?;
+        use rustix::fs::{Mode, OFlags};
+        let fd = rustix::fs::open("/dev/urandom", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).ok()?;
+        got = 0;
+        while got < b.len() {
+            match rustix::io::read(&fd, &mut b[got..]) {
+                Ok(n) if n > 0 => got += n,
+                Err(rustix::io::Errno::INTR) => {}
+                _ => return None,
+            }
+        }
     }
     Some(u64::from_ne_bytes(b))
 }
@@ -30,8 +37,9 @@ fn os_seed() -> Option<u64> {
 #[inline(never)]
 fn seed() -> u64 {
     let s = os_seed().unwrap_or_else(|| {
-        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-        t.as_nanos() as u64 ^ (std::process::id() as u64).rotate_left(32)
+        let t = rustix::time::clock_gettime(rustix::time::ClockId::Realtime);
+        (t.tv_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(t.tv_nsec as u64)
+            ^ (rustix::process::getpid().as_raw_nonzero().get() as u64).rotate_left(32)
     });
     s.max(1)
 }
@@ -66,6 +74,8 @@ pub fn below(n: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
 
     #[test]

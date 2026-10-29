@@ -125,7 +125,7 @@ pub mod external {
 /// bloc, en-tête dans la même page, de tout thread. Ne passe jamais par la libc : le
 /// binaire exporte `malloc` ([`heap::c`]), la libc retomberait sur nous.
 pub mod direct {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
     const PAGE: usize = 4096;
     const MAGIC: usize = 0x5258_4449_5245_4354; // "RXDIRECT"
@@ -142,17 +142,17 @@ pub mod direct {
     #[cold]
     fn bad_free() -> ! {
         message(b"radixox: free d'un pointeur inconnu\n");
-        std::process::abort()
+        crate::sys::abort()
     }
 
     /// Bloc de `size` octets aligné sur `align` (puissance de deux) ; nul si `mmap` refuse.
     pub fn alloc(size: usize, align: usize) -> *mut u8 {
         let align = align.max(16);
         let Some(len) = size.checked_add(align + HEADER).map(|n| n.next_multiple_of(PAGE)) else {
-            return std::ptr::null_mut();
+            return core::ptr::null_mut();
         };
         let Ok(base) = crate::sys::map_anon(len, false) else {
-            return std::ptr::null_mut();
+            return core::ptr::null_mut();
         };
         let base = base as usize;
         let data = (base + HEADER).next_multiple_of(align);
@@ -204,8 +204,9 @@ pub mod direct {
 /// son adresse ([`crate::large::owns`]). Un autre thread qui rendrait un bloc du tas arrête
 /// le processus : jamais le cas (ARCHITECTURE.md §1, un seul thread métier).
 pub mod heap {
-    use std::alloc::{GlobalAlloc, Layout};
-    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    use alloc::alloc::{GlobalAlloc, Layout};
+    #[cfg(feature = "std")]
+    use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
     use super::direct;
     use crate::large;
@@ -214,12 +215,15 @@ pub mod heap {
     static mut BYTES: u64 = 0;
     static mut PEAK: u64 = 0;
     /// Thread du tas : adresse de son [`MARK`] (0 : personne n'a encore alloué).
+    #[cfg(feature = "std")]
     static OWNER: AtomicUsize = AtomicUsize::new(0);
-    thread_local! { static MARK: u8 = const { 0 }; }
+    #[cfg(feature = "std")]
+    std::thread_local! { static MARK: u8 = const { 0 }; }
 
     pub struct RxAlloc;
 
     /// Vrai sur le thread du tas (le premier à allouer).
+    #[cfg(feature = "std")]
     #[inline]
     fn on_owner() -> bool {
         let me = MARK.with(|m| m as *const u8 as usize);
@@ -227,10 +231,17 @@ pub mod heap {
         o == me || (o == 0 && OWNER.compare_exchange(0, me, Relaxed, Relaxed).is_ok())
     }
 
+    /// Sans `std`, pas de threads : tout vient du thread du tas.
+    #[cfg(not(feature = "std"))]
+    #[inline]
+    fn on_owner() -> bool {
+        true
+    }
+
     #[cold]
     fn foreign_free() -> ! {
         direct::message(b"radixox: bloc du tas rendu par un autre thread\n");
-        std::process::abort()
+        crate::sys::abort()
     }
 
     #[inline]
@@ -239,6 +250,7 @@ pub mod heap {
             BYTES = BYTES + add as u64 - sub as u64;
             PEAK = PEAK.max(BYTES);
         }
+        #[cfg(feature = "std")]
         if add >= 4096 {
             trace(add);
         }
@@ -247,10 +259,11 @@ pub mod heap {
     /// `RADIXOX_HEAP_TRACE=octets` : pile d'appel de chaque allocation d'au moins cette
     /// taille sur stderr (binaire avec symboles : `CARGO_PROFILE_RELEASE_STRIP=none`,
     /// `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`). Lu une fois, sous la garde.
+    #[cfg(feature = "std")]
     #[cold]
     fn trace(size: usize) {
-        use std::cell::Cell;
-        thread_local! { static IN: Cell<bool> = const { Cell::new(false) }; }
+        use core::cell::Cell;
+        std::thread_local! { static IN: Cell<bool> = const { Cell::new(false) }; }
         // usize::MAX : pas encore lu ; 0 : éteint
         static MIN: AtomicUsize = AtomicUsize::new(usize::MAX);
         if IN.with(Cell::get) {
@@ -259,11 +272,11 @@ pub mod heap {
         IN.with(|g| g.set(true));
         let mut min = MIN.load(Relaxed);
         if min == usize::MAX {
-            min = std::env::var("RADIXOX_HEAP_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            min = crate::sys::env_parse("RADIXOX_HEAP_TRACE", 0);
             MIN.store(min, Relaxed);
         }
         if min != 0 && size >= min {
-            eprintln!("[heap] {size} o\n{}", std::backtrace::Backtrace::force_capture());
+            std::eprintln!("[heap] {size} o\n{}", std::backtrace::Backtrace::force_capture());
         }
         IN.with(|g| g.set(false));
     }
@@ -317,7 +330,7 @@ pub mod heap {
             let q = unsafe { self.alloc(nl) };
             if !q.is_null() {
                 unsafe {
-                    std::ptr::copy_nonoverlapping(p, q, l.size().min(new));
+                    core::ptr::copy_nonoverlapping(p, q, l.size().min(new));
                     self.dealloc(p, l);
                 }
             }
@@ -335,9 +348,20 @@ pub mod heap {
         /// Alignement de `max_align_t`.
         const ALIGN: usize = 16;
 
+        /// `errno` de la libc, quand il y en a une (le `malloc` exporté la remplace).
+        #[inline]
+        fn set_errno(e: rustix::io::Errno) {
+            #[cfg(feature = "std")]
+            unsafe {
+                *libc::__errno_location() = e.raw_os_error()
+            };
+            #[cfg(not(feature = "std"))]
+            let _ = e;
+        }
+
         fn enomem() -> *mut u8 {
-            unsafe { *libc::__errno_location() = libc::ENOMEM };
-            std::ptr::null_mut()
+            set_errno(rustix::io::Errno::NOMEM);
+            core::ptr::null_mut()
         }
 
         fn alloc(size: usize, align: usize) -> *mut u8 {
@@ -402,7 +426,7 @@ pub mod heap {
             }
             if new == 0 {
                 unsafe { free(p) };
-                return std::ptr::null_mut();
+                return core::ptr::null_mut();
             }
             if large::owns(p as usize) && on_owner() && large::ptr_fits(p, new, ALIGN) {
                 return p;
@@ -411,7 +435,7 @@ pub mod heap {
             let q = malloc(new);
             if !q.is_null() {
                 unsafe {
-                    std::ptr::copy_nonoverlapping(p, q, old.min(new));
+                    core::ptr::copy_nonoverlapping(p, q, old.min(new));
                     free(p);
                 }
             }
@@ -430,8 +454,8 @@ pub mod heap {
         /// Nul (`EINVAL`) si `align` n'est pas une puissance de deux.
         pub fn aligned_alloc(align: usize, size: usize) -> *mut u8 {
             if !align.is_power_of_two() {
-                unsafe { *libc::__errno_location() = libc::EINVAL };
-                return std::ptr::null_mut();
+                set_errno(rustix::io::Errno::INVAL);
+                return core::ptr::null_mut();
             }
             alloc(size, align.max(ALIGN))
         }
@@ -440,11 +464,11 @@ pub mod heap {
         /// `out` valide en écriture.
         pub unsafe fn posix_memalign(out: *mut *mut u8, align: usize, size: usize) -> i32 {
             if !align.is_power_of_two() || align % size_of::<usize>() != 0 {
-                return libc::EINVAL;
+                return rustix::io::Errno::INVAL.raw_os_error();
             }
             let p = alloc(size, align.max(ALIGN));
             if p.is_null() {
-                return libc::ENOMEM;
+                return rustix::io::Errno::NOMEM.raw_os_error();
             }
             unsafe { *out = p };
             0
@@ -477,6 +501,8 @@ pub mod heap {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::heap::{self, c};
 
     /// L'API C de bout en bout (un seul test : le tas appartient au premier thread qui y
@@ -490,7 +516,7 @@ mod tests {
         for (&p, &n) in ps.iter().zip(&sizes) {
             assert!(!p.is_null() && p as usize % 16 == 0, "{n} o : {p:?}");
             assert!(c::usable_size(p) >= n);
-            unsafe { std::ptr::write_bytes(p, 0xAB, n) };
+            unsafe { core::ptr::write_bytes(p, 0xAB, n) };
         }
         assert!(heap::bytes() > b0);
         // Mémoire sale réutilisée : calloc la remet à zéro quand même.
@@ -499,31 +525,31 @@ mod tests {
         }
         for &n in &sizes {
             let p = c::calloc(1, n);
-            assert!(unsafe { std::slice::from_raw_parts(p, n) }.iter().all(|&b| b == 0), "calloc {n} o");
+            assert!(unsafe { core::slice::from_raw_parts(p, n) }.iter().all(|&b| b == 0), "calloc {n} o");
             unsafe { c::free(p) };
         }
         assert!(c::calloc(usize::MAX, 2).is_null(), "débordement");
         // realloc : contenu gardé en grandissant et en rétrécissant, sur place si même route.
         let mut p = c::malloc(10);
-        unsafe { std::ptr::copy_nonoverlapping(b"0123456789".as_ptr(), p, 10) };
+        unsafe { core::ptr::copy_nonoverlapping(b"0123456789".as_ptr(), p, 10) };
         for n in [12, 200, 50_000, 2 << 20, 30, 5] {
             p = unsafe { c::realloc(p, n) };
             let keep = n.min(10);
-            assert_eq!(unsafe { std::slice::from_raw_parts(p, keep) }, &b"0123456789"[..keep]);
+            assert_eq!(unsafe { core::slice::from_raw_parts(p, keep) }, &b"0123456789"[..keep]);
         }
         let q = unsafe { c::realloc(p, 6) };
         assert_eq!(q, p, "même classe : sur place");
         assert!(unsafe { c::realloc(q, 0) }.is_null());
         // Alignements : jusqu'à 4 Kio dans le tas, au-delà en mapping direct.
         for align in [8usize, 16, 64, 4096, 8192, 1 << 20] {
-            let mut out = std::ptr::null_mut();
+            let mut out = core::ptr::null_mut();
             assert_eq!(unsafe { c::posix_memalign(&mut out, align, 3000) }, 0);
             assert_eq!(out as usize % align, 0, "align {align}");
             assert_eq!(crate::large::owns(out as usize), align <= 4096, "align {align}");
             assert!(c::usable_size(out) >= 3000);
             unsafe { c::free(out) };
         }
-        let mut out = std::ptr::null_mut();
+        let mut out = core::ptr::null_mut();
         assert_eq!(unsafe { c::posix_memalign(&mut out, 24, 8) }, libc::EINVAL);
         assert!(c::aligned_alloc(3, 8).is_null());
         let p = c::pvalloc(10);

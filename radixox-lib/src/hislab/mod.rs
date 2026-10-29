@@ -7,8 +7,10 @@
 //! huge page prise à la première écriture ne déborde jamais sur une autre région, et
 //! [`HiSlab::resident_bytes`] la compte entière.
 
-use std::cell::{Cell, UnsafeCell};
-use std::ops::{Index, IndexMut};
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::cell::{Cell, UnsafeCell};
+use core::ops::{Index, IndexMut};
 
 use self::bit_block::BitBlock;
 use self::bitmap_tree::BitmapTree;
@@ -27,7 +29,7 @@ struct Mapping {
 }
 
 impl Mapping {
-    fn new(bytes: usize) -> Result<Self, std::io::Error> {
+    fn new(bytes: usize) -> Result<Self, rustix::io::Errno> {
         let len = bytes.max(1).next_multiple_of(HUGE);
         let raw = len + HUGE;
         let p = crate::sys::map_anon(raw, false)?;
@@ -97,8 +99,8 @@ impl<T> HiSlab<T> {
     /// Creates a new empty `HiSlab`.
     ///
     /// `virtual_capacity * size_of::<T>()` bytes are reserved right away in virtual
-    /// memory. The pages covering `initial_capacity` slots are pre-faulted with
-    /// `madvise(MADV_POPULATE_WRITE)`; the following pages are committed on demand.
+    /// memory; pages are committed on demand. `initial_capacity` slots are reserved in
+    /// the free-slot tree up front (not pre-faulted: see the comment in the body).
     ///
     /// # Panics
     ///
@@ -108,30 +110,24 @@ impl<T> HiSlab<T> {
     /// # Errors
     ///
     /// Returns an error if `mmap` fails (system out of memory).
-    pub fn new(initial_capacity: u32, virtual_capacity: u32) -> Result<Self, std::io::Error> {
+    pub fn new(initial_capacity: u32, virtual_capacity: u32) -> Result<Self, rustix::io::Errno> {
         assert!(
             initial_capacity <= virtual_capacity,
             "initial_capacity must be <= virtual_capacity"
         );
 
         let virtual_bytes = (virtual_capacity as usize)
-            .checked_mul(std::mem::size_of::<T>())
+            .checked_mul(core::mem::size_of::<T>())
             .expect("virtual_capacity * size_of::<T>() dépasse usize::MAX");
 
         let mmap = Mapping::new(virtual_bytes)?;
         let ptr = mmap.ptr as *mut T;
 
-        if initial_capacity > 0 {
-            let initial_bytes = initial_capacity as usize * std::mem::size_of::<T>();
-            unsafe {
-                libc::madvise(
-                    ptr as *mut libc::c_void,
-                    initial_bytes,
-                    libc::MADV_POPULATE_WRITE | libc::MADV_HUGEPAGE,
-                );
-            }
-        }
-
+        // `initial_capacity` : préchargement voulu des premiers nœuds. L'ancien appel
+        // passait MADV_POPULATE_WRITE | MADV_HUGEPAGE à un seul madvise (14 | 23 = 31,
+        // conseil invalide, EINVAL ignoré) : il n'a jamais rien fait, retiré sans changer le
+        // comportement. Deux appels séparés le rendraient effectif (≈ 2,5 Mo touchés au
+        // démarrage pour l'arbre principal) : à décider et mesurer.
         let slab = Self {
             data: ptr,
             virtual_capacity,
@@ -161,7 +157,7 @@ impl<T> HiSlab<T> {
             idx < self.virtual_capacity,
             "HiSlab: virtual_capacity épuisée"
         );
-        unsafe { std::ptr::write(self.data.add(idx as usize), val) };
+        unsafe { core::ptr::write(self.data.add(idx as usize), val) };
         self.len.set(self.len.get() + 1);
         if idx >= self.touched_end.get() {
             self.grow(idx);
@@ -174,7 +170,7 @@ impl<T> HiSlab<T> {
     #[cold]
     #[inline(never)]
     fn grow(&self, idx: u32) {
-        let size = std::mem::size_of::<T>().max(1);
+        let size = core::mem::size_of::<T>().max(1);
         self.pages.ensure((idx as usize + 1) * size);
         let end = (self.pages.covered() / size).min(self.virtual_capacity as usize);
         self.touched_end.set(end as u32);
@@ -190,7 +186,7 @@ impl<T> HiSlab<T> {
         // SAFETY: !Sync guarantees single-threaded access.
         unsafe { &mut *self.tree.get() }.clear_bit(idx);
         self.len.set(self.len.get() - 1);
-        Some(unsafe { std::ptr::read(self.data.add(idx as usize)) })
+        Some(unsafe { core::ptr::read(self.data.add(idx as usize)) })
     }
 
     /// Number of occupied slots.
@@ -211,7 +207,7 @@ impl<T> HiSlab<T> {
         let lvl1 = &unsafe { &*self.tree.get() }.lvl1;
         // SAFETY: see `copy_occupancy`, a `Vec<BitBlock>` is a contiguous run of u64.
         let words =
-            unsafe { std::slice::from_raw_parts(lvl1.as_ptr() as *const u64, lvl1.len() * 8) };
+            unsafe { core::slice::from_raw_parts(lvl1.as_ptr() as *const u64, lvl1.len() * 8) };
         let w = words.iter().rposition(|&w| w != 0)?;
         Some((w * 64) as u32 + 63 - words[w].leading_zeros())
     }
@@ -230,7 +226,7 @@ impl<T> HiSlab<T> {
             return None;
         }
         tree.set_bit(dst);
-        unsafe { std::ptr::copy_nonoverlapping(self.data.add(src as usize), self.data.add(dst as usize), 1) };
+        unsafe { core::ptr::copy_nonoverlapping(self.data.add(src as usize), self.data.add(dst as usize), 1) };
         tree.clear_bit(src);
         Some(dst)
     }
@@ -243,7 +239,7 @@ impl<T> HiSlab<T> {
         let lvl1 = &unsafe { &*self.tree.get() }.lvl1;
         // SAFETY: see `copy_occupancy`.
         let words =
-            unsafe { std::slice::from_raw_parts(lvl1.as_ptr() as *const u64, lvl1.len() * 8) };
+            unsafe { core::slice::from_raw_parts(lvl1.as_ptr() as *const u64, lvl1.len() * 8) };
         let last = (below - 1) as usize;
         let mut w = (last / 64).min(words.len().checked_sub(1)?);
         let mut word = if w == last / 64 { words[w] & (u64::MAX >> (63 - last % 64)) } else { words[w] };
@@ -281,7 +277,7 @@ impl<T> HiSlab<T> {
     /// slab is alive.
     pub unsafe fn move_to(&self, src: u32, dst: u32) {
         unsafe {
-            std::ptr::copy_nonoverlapping(self.data.add(src as usize), self.data.add(dst as usize), 1);
+            core::ptr::copy_nonoverlapping(self.data.add(src as usize), self.data.add(dst as usize), 1);
             (*self.tree.get()).clear_bit(src);
         }
         if dst >= self.touched_end.get() {
@@ -304,7 +300,7 @@ impl<T> HiSlab<T> {
     pub unsafe fn release_above(&self, from: u32) -> usize {
         const PAGE: usize = 2 << 20;
         debug_assert!(self.last_occupied().is_none_or(|l| l < from));
-        let size = std::mem::size_of::<T>();
+        let size = core::mem::size_of::<T>();
         let base = self.data as usize;
         let start = (base + from as usize * size).next_multiple_of(PAGE);
         let end = (base + self.touched_end.get() as usize * size).next_multiple_of(PAGE);
@@ -387,7 +383,7 @@ impl<T> HiSlab<T> {
         // SAFETY: BitBlock = [u64; 8] en repr(align(64)), taille 64 :
         // un Vec<BitBlock> est une suite contiguë de u64.
         let words =
-            unsafe { std::slice::from_raw_parts(lvl1.as_ptr() as *const u64, lvl1.len() * 8) };
+            unsafe { core::slice::from_raw_parts(lvl1.as_ptr() as *const u64, lvl1.len() * 8) };
         out.clear();
         out.extend_from_slice(words);
         (words.len() * 64) as u32
@@ -405,7 +401,7 @@ impl<T> HiSlab<T> {
     /// peuvent tenir résident. Les bitmaps sont sur le tas, comptés ailleurs.
     #[inline]
     pub fn touched_bytes(&self) -> usize {
-        self.touched_end.get() as usize * std::mem::size_of::<T>()
+        self.touched_end.get() as usize * core::mem::size_of::<T>()
     }
 
     /// Octets des données du slab réellement résidents (`mincore` sur la partie touchée
@@ -421,7 +417,7 @@ impl<T> HiSlab<T> {
         let lvl1 = &unsafe { &*self.tree.get() }.lvl1;
         // SAFETY: see `copy_occupancy`, a `Vec<BitBlock>` is a contiguous run of u64.
         let words =
-            unsafe { std::slice::from_raw_parts(lvl1.as_ptr() as *const u64, lvl1.len() * 8) };
+            unsafe { core::slice::from_raw_parts(lvl1.as_ptr() as *const u64, lvl1.len() * 8) };
         let mut w = from as usize / 64;
         let mut word = *words.get(w)? & (!0u64 << (from % 64));
         while word == 0 {
@@ -527,7 +523,7 @@ pub struct SlabIterMut<'a, T> {
     block_idx: usize,
     word_idx: usize,
     current_word: u64,
-    _marker: std::marker::PhantomData<&'a mut T>,
+    _marker: core::marker::PhantomData<&'a mut T>,
 }
 
 impl<'a, T> SlabIterMut<'a, T> {
@@ -541,7 +537,7 @@ impl<'a, T> SlabIterMut<'a, T> {
             block_idx: 0,
             word_idx: 0,
             current_word: first_word,
-            _marker: std::marker::PhantomData,
+            _marker: core::marker::PhantomData,
         }
     }
 }
@@ -607,7 +603,7 @@ impl<T> Iterator for SlabIntoIter<T> {
 
         self.current_word &= self.current_word - 1;
 
-        let value = unsafe { std::ptr::read(self.data.add(final_idx)) };
+        let value = unsafe { core::ptr::read(self.data.add(final_idx)) };
         Some((final_idx as u32, value))
     }
 }
@@ -619,14 +615,14 @@ impl<T> IntoIterator for HiSlab<T> {
     fn into_iter(mut self) -> Self::IntoIter {
         let data = self.data;
         let tree = self.tree.get_mut();
-        let lvl1 = std::mem::take(&mut tree.lvl1);
-        let _lvl2 = std::mem::take(&mut tree.lvl2);
-        let _lvl3 = std::mem::take(&mut tree.lvl3);
+        let lvl1 = core::mem::take(&mut tree.lvl1);
+        let _lvl2 = core::mem::take(&mut tree.lvl2);
+        let _lvl3 = core::mem::take(&mut tree.lvl3);
         let first_word = lvl1.first().map(|b| b.data[0]).unwrap_or(0);
         // Safety: ptr::read + forget is the standard pattern for moving out of a
         // Drop type field-by-field.
-        let mmap = unsafe { std::ptr::read(&self.mmap) };
-        std::mem::forget(self);
+        let mmap = unsafe { core::ptr::read(&self.mmap) };
+        core::mem::forget(self);
 
         SlabIntoIter {
             data,
@@ -658,7 +654,7 @@ impl<T> Drop for HiSlab<T> {
                     let bit = temp_word.trailing_zeros();
                     let final_idx = base_idx | (bit as usize);
                     unsafe {
-                        std::ptr::drop_in_place(self.data.add(final_idx));
+                        core::ptr::drop_in_place(self.data.add(final_idx));
                     }
                     temp_word &= temp_word - 1;
                 }
@@ -694,7 +690,7 @@ impl<T> TaggedHiSlab<T> {
     /// Creates a new empty `TaggedHiSlab`.
     ///
     /// See [`HiSlab::new`] for the meaning of `initial_capacity` and `virtual_capacity`.
-    pub fn new(initial_capacity: u32, virtual_capacity: u32) -> Result<Self, std::io::Error> {
+    pub fn new(initial_capacity: u32, virtual_capacity: u32) -> Result<Self, rustix::io::Errno> {
         Ok(Self {
             inner: HiSlab::new(initial_capacity, virtual_capacity)?,
             tagged_tree: UnsafeCell::new(BitmapTree::new()),
@@ -868,7 +864,7 @@ impl<T: 'static> TaggedHiSlab<T> {
     pub fn next_tagged(&self, from: u32) -> Option<u32> {
         let lvl1 = &unsafe { &*self.tagged_tree.get() }.lvl1;
         // SAFETY: comme `HiSlab::next_occupied`, un `Vec<BitBlock>` est une suite de u64.
-        let words = unsafe { std::slice::from_raw_parts(lvl1.as_ptr() as *const u64, lvl1.len() * 8) };
+        let words = unsafe { core::slice::from_raw_parts(lvl1.as_ptr() as *const u64, lvl1.len() * 8) };
         let mut w = from as usize / 64;
         let mut word = *words.get(w)? & (!0u64 << (from % 64));
         while word == 0 {

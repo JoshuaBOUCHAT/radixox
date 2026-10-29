@@ -12,8 +12,8 @@
 //! `mincore` (`crate::resident`) reste la vérification : `tests/memory.rs` exige que le
 //! registre couvre le résident mesuré.
 
-use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use core::cell::Cell;
+use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Huge page : granularité des régions sous THP.
 pub const TRANCHE: usize = 2 << 20;
@@ -118,6 +118,8 @@ impl Drop for Tranches {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
 
     #[test]

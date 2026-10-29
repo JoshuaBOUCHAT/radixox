@@ -1,4 +1,4 @@
-use std::mem::MaybeUninit;
+use core::mem::MaybeUninit;
 
 use crate::shared_byte::SharedByte;
 
@@ -148,6 +148,8 @@ impl<const N: usize> Drop for InlineChilds<N> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
 
     #[test]

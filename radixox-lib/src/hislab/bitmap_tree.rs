@@ -1,3 +1,5 @@
+#[allow(unused_imports)]
+use crate::prelude::*;
 use super::bit_block::BitBlock;
 
 /// Arbre de bitmaps hiérarchique pour le suivi des slots occupés/libres.
@@ -222,7 +224,7 @@ impl BitmapTree {
 fn select_nth_bit_u64(word: u64, n: u32) -> usize {
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     {
-        use std::arch::x86_64::_pdep_u64;
+        use core::arch::x86_64::_pdep_u64;
         unsafe {
             let mask = 1u64 << n;
             let deposited = _pdep_u64(mask, word);

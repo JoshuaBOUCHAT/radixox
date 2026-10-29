@@ -1,3 +1,7 @@
+#[allow(unused_imports)]
+use std::{dbg, eprintln, print, println};
+#[allow(unused_imports)]
+use crate::prelude::*;
 use std::time::Instant;
 
 use super::HiSlab;

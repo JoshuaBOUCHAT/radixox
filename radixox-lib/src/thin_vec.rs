@@ -1,5 +1,5 @@
-use std::{
-    alloc::{Layout, alloc, dealloc, handle_alloc_error, realloc},
+use alloc::alloc::{Layout, alloc, dealloc, handle_alloc_error, realloc};
+use core::{
     marker::PhantomData,
     ops::{Deref, DerefMut},
     ptr::NonNull,
@@ -228,7 +228,7 @@ impl<T> Drop for ThinVec<T> {
             return;
         }
         unsafe {
-            std::ptr::drop_in_place(std::slice::from_raw_parts_mut(self.data_ptr(), self.len()));
+            core::ptr::drop_in_place(core::slice::from_raw_parts_mut(self.data_ptr(), self.len()));
             let base = self.ptr.as_ptr().cast::<u8>().sub(Self::data_offset());
             dealloc(base, Self::layout_for(cap));
         }
@@ -238,19 +238,19 @@ impl<T> Drop for ThinVec<T> {
 impl<T> Deref for ThinVec<T> {
     type Target = [T];
     fn deref(&self) -> &[T] {
-        unsafe { std::slice::from_raw_parts(self.data_ptr(), self.len()) }
+        unsafe { core::slice::from_raw_parts(self.data_ptr(), self.len()) }
     }
 }
 
 impl<T> DerefMut for ThinVec<T> {
     fn deref_mut(&mut self) -> &mut [T] {
         let len = self.len();
-        unsafe { std::slice::from_raw_parts_mut(self.data_ptr(), len) }
+        unsafe { core::slice::from_raw_parts_mut(self.data_ptr(), len) }
     }
 }
 
-impl<T: std::fmt::Debug> std::fmt::Debug for ThinVec<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<T: core::fmt::Debug> core::fmt::Debug for ThinVec<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         (**self).fmt(f)
     }
 }
@@ -301,11 +301,11 @@ impl<T> Drop for ThinVecIntoIter<T> {
         let len = self.vec.len();
         if self.idx < len {
             unsafe {
-                let remaining = std::slice::from_raw_parts_mut(
+                let remaining = core::slice::from_raw_parts_mut(
                     self.vec.data_ptr().add(self.idx),
                     len - self.idx,
                 );
-                std::ptr::drop_in_place(remaining);
+                core::ptr::drop_in_place(remaining);
             }
         }
         // Prevent ThinVec::drop from re-dropping the (already-consumed) elements.
@@ -315,6 +315,8 @@ impl<T> Drop for ThinVecIntoIter<T> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
 
     #[test]
@@ -340,7 +342,7 @@ mod tests {
 
     #[test]
     fn drop_runs_on_elements() {
-        use std::rc::Rc;
+        use alloc::rc::Rc;
         let counter = Rc::new(());
         let mut v: ThinVec<Rc<()>> = ThinVec::new();
         for _ in 0..10 {

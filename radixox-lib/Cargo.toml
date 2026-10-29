@@ -13,14 +13,17 @@ categories = ["network-programming", "parser-implementations"]
 # Compteur d'accès dans l'octet `lfu` des valeurs (LRU / LFU de `maxmemory`, MEMORY_ARCH.md
 # §10.2 bis) : une écriture par lecture. Sans elle, rien n'est écrit à la lecture.
 eviction = []
+# Processus `std` (défaut) ; sans elle, la crate est `no_std` + `alloc` (lib.rs).
+default = ["std"]
+std = ["rustix/std", "dep:libc"]
 
 [dependencies]
-# Appels système directs (sans libc) : mémoire, getrandom, stderr. `libc` ne reste que là où
-# notre allocateur tient le rôle de la libc (errno de malloc, getenv avant std) et pour mincore.
-rustix = { version = "1.1", default-features = false, features = ["std", "mm", "rand", "stdio"] }
-libc = "0.2"
-# Appel direct pour mincore, absent de rustix.
+# Appels système directs (sans libc) : mémoire, horloge, fichiers, getrandom, stderr.
+rustix = { version = "1.1", default-features = false, features = ["mm", "rand", "stdio", "fs", "time", "process"] }
+# Appels directs absents de rustix (mincore, exit_group).
 sc = "0.2"
+# Seulement là où notre `malloc` exporté tient le rôle de la libc (`errno`), sous `std`.
+libc = { version = "0.2", optional = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(radixox_sysalloc)', 'cfg(radixox_nopool)', 'cfg(radixox_gc_debug)'] }

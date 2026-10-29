@@ -1,3 +1,23 @@
+//! `#![no_std]` + `alloc` : tout ce que la crate demande au système passe par [`sys`]
+//! (rustix et `sc`, sans libc). La feature `std` (par défaut) n'ajoute que ce qui sert à un
+//! processus `std` : thread propriétaire du tas, trace des allocations, `errno` du `malloc`
+//! exporté, `std::io::Error` des constructeurs.
+#![no_std]
+
+extern crate alloc;
+#[cfg(any(feature = "std", test))]
+extern crate std;
+
+/// Ce que le prélude de `std` donnait, pour un module `no_std`.
+#[allow(unused_imports)]
+pub(crate) mod prelude {
+    pub use alloc::borrow::ToOwned;
+    pub use alloc::boxed::Box;
+    pub use alloc::string::{String, ToString};
+    pub use alloc::vec::Vec;
+    pub use alloc::{format, vec};
+}
+
 pub mod array_vec;
 pub mod big_buf;
 pub mod cmd;

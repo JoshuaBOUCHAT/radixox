@@ -14,9 +14,13 @@
 //! Mono-thread : état global en `static mut` (ARCHITECTURE.md §1, `RUST_TEST_THREADS=1`).
 //! Les tests construisent leurs propres [`Pool`], plus petits.
 
-use std::collections::VecDeque;
-use std::ptr::null_mut;
-use std::time::{Duration, Instant};
+#[allow(unused_imports)]
+use crate::prelude::*;
+use alloc::collections::VecDeque;
+use core::ptr::null_mut;
+use core::time::Duration;
+
+use crate::sys::Instant;
 
 pub const BLOCK_SHIFT: u32 = 16;
 /// Bloc : unité du bump et du compteur.
@@ -277,7 +281,7 @@ impl Pool {
             marked: maps[3].0 as *mut u64,
             handled: maps[4].0 as *mut u64,
             fill: maps[5].0 as *mut u16,
-            meta_pages: std::array::from_fn(|i| crate::pages::Tranches::new(maps[i + 1].0 as usize, crate::pages::TRANCHE)),
+            meta_pages: core::array::from_fn(|i| crate::pages::Tranches::new(maps[i + 1].0 as usize, crate::pages::TRANCHE)),
             maps,
             charged_pages: 0,
             pages: Vec::new(),
@@ -514,7 +518,7 @@ impl Pool {
                     }
                     let last = *self.live(b) as usize * 2 == size;
                     unsafe {
-                        std::ptr::copy_nonoverlapping(a as *const u8, new, size);
+                        core::ptr::copy_nonoverlapping(a as *const u8, new, size);
                         (a as *mut u16).write(head | DEAD);
                         self.free(a as *mut u8, size);
                     }
@@ -863,7 +867,7 @@ impl Pool {
     fn release_block(&mut self, b: u32) {
         #[cfg(radixox_gc_debug)]
         unsafe {
-            std::ptr::write_bytes(self.block_addr(b) as *mut u8, 0xDB, BLOCK)
+            core::ptr::write_bytes(self.block_addr(b) as *mut u8, 0xDB, BLOCK)
         };
         if bit(self.marked, b) {
             set_bit(self.marked, b, false);
@@ -1050,7 +1054,7 @@ impl Pool {
 
     /// Les pages que la passe n'a pas vidées reviennent dans les listes.
     fn end_evacuation(&mut self) {
-        for p in std::mem::take(&mut self.evacuating) {
+        for p in core::mem::take(&mut self.evacuating) {
             let ps = &mut self.pages[p as usize];
             if ps.evacuating {
                 ps.evacuating = false;
@@ -1106,8 +1110,8 @@ impl Drop for Pool {
 static mut POOL: Option<Pool> = None;
 static mut DISABLED: bool = false;
 
-fn env<T: std::str::FromStr>(name: &str, default: T) -> T {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+fn env<T: core::str::FromStr>(name: &str, default: T) -> T {
+    crate::sys::env_parse(name, default)
 }
 
 #[cold]
@@ -1119,7 +1123,7 @@ pub(crate) fn init() -> Option<&'static mut Pool> {
         let gb: usize = env("RADIXOX_POOL_VIRT_GB", 256);
         let decay = Duration::from_secs(env("RADIXOX_MEMORY_DECAY", 10));
         let Some(mut pool) = Pool::new(gb << 30, decay, env("RADIXOX_GC_RESERVE_DIV", 16)) else {
-            eprintln!("radixox: mmap de la plage du pool ({gb} Gio) refusé, valeurs allouées hors pool");
+            crate::rx_eprintln!("radixox: mmap de la plage du pool ({gb} Gio) refusé, valeurs allouées hors pool");
             DISABLED = true;
             return None;
         };
@@ -1289,7 +1293,7 @@ pub unsafe fn relocate8(ptr: &mut *mut u8, size: usize) -> usize {
         return 0;
     }
     unsafe {
-        std::ptr::copy_nonoverlapping(*ptr, new, size);
+        core::ptr::copy_nonoverlapping(*ptr, new, size);
         p.free(*ptr, size);
     }
     *ptr = new;
@@ -1409,7 +1413,7 @@ pub fn verify_census(slots: &[(usize, usize)]) -> Result<u64, String> {
         return if slots.is_empty() { Ok(0) } else { Err("emplacements recensés sans pool".into()) };
     };
     let end = p.base + p.nb_pages as usize * PAGE;
-    let mut per_block = std::collections::HashMap::<u32, u64>::new();
+    let mut per_block = alloc::collections::BTreeMap::<u32, u64>::new();
     let mut total = 0;
     for &(a, size) in slots {
         if a < p.base || a + size > end || a % 2 != 0 || size % 2 != 0 {
@@ -1438,6 +1442,8 @@ pub fn live_bytes() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
 
     fn pool(pages: usize) -> Pool {

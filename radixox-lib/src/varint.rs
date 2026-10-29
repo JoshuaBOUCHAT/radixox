@@ -13,6 +13,8 @@
 //! dès le premier octet (un seul branchement, pas de boucle sur un bit de
 //! continuation).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
 /// Nombre d'octets de l'encodage de `v`.
 #[inline]
 pub fn varint_len(v: u64) -> usize {
@@ -84,6 +86,8 @@ pub fn unzigzag(v: u64) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
 
     fn roundtrip(v: u64) {

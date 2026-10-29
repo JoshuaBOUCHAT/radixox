@@ -11,7 +11,7 @@
 //! pendant qu'on écrit. Une fois rempli, il ne bouge plus (envoi direct par le
 //! noyau, `pending_send`).
 
-use std::ptr::null_mut;
+use core::ptr::null_mut;
 
 /// Première réservation, puis doublement (virtuel seulement).
 const FIRST: usize = 2 << 20;
@@ -54,12 +54,12 @@ impl BigBuf {
 
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        if self.cap == 0 { &[] } else { unsafe { std::slice::from_raw_parts(self.ptr, self.len) } }
+        if self.cap == 0 { &[] } else { unsafe { core::slice::from_raw_parts(self.ptr, self.len) } }
     }
 
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        if self.cap == 0 { &mut [] } else { unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) } }
+        if self.cap == 0 { &mut [] } else { unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) } }
     }
 
     #[cold]
@@ -72,7 +72,7 @@ impl BigBuf {
         };
         // Plage virtuelle épuisée : comme un échec d'allocation.
         let Ok(p) = p else {
-            std::alloc::handle_alloc_error(std::alloc::Layout::from_size_align(cap, 1).unwrap());
+            alloc::alloc::handle_alloc_error(alloc::alloc::Layout::from_size_align(cap, 1).unwrap());
         };
         if self.cap == 0 {
             unsafe { crate::sys::advise(p, cap, crate::sys::Advice::LinuxHugepage) };
@@ -91,7 +91,7 @@ impl BigBuf {
             self.grow(end);
         }
         unsafe {
-            std::ptr::copy_nonoverlapping(b.as_ptr(), self.ptr.add(self.len), b.len());
+            core::ptr::copy_nonoverlapping(b.as_ptr(), self.ptr.add(self.len), b.len());
             BYTES += b.len() as u64;
         }
         self.len = end;
@@ -134,6 +134,8 @@ impl Drop for BigBuf {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
 
     #[test]

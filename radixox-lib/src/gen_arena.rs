@@ -1,3 +1,5 @@
+#[allow(unused_imports)]
+use crate::prelude::*;
 const SENTINEL: u32 = u32::MAX;
 
 /// Generational key. Stale after the slot is removed.
@@ -128,14 +130,14 @@ impl<T> GenArena<T> {
 
 // ── Index ─────────────────────────────────────────────────────────────────────
 
-impl<T> std::ops::Index<Key> for GenArena<T> {
+impl<T> core::ops::Index<Key> for GenArena<T> {
     type Output = T;
     fn index(&self, key: Key) -> &T {
         self.get(key).expect("GenArena: stale or invalid key")
     }
 }
 
-impl<T> std::ops::IndexMut<Key> for GenArena<T> {
+impl<T> core::ops::IndexMut<Key> for GenArena<T> {
     fn index_mut(&mut self, key: Key) -> &mut T {
         self.get_mut(key).expect("GenArena: stale or invalid key")
     }
@@ -145,6 +147,8 @@ impl<T> std::ops::IndexMut<Key> for GenArena<T> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
 
     #[test]

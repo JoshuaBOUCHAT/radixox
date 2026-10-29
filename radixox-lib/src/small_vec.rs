@@ -1,5 +1,5 @@
-use std::{
-    alloc::{Layout, alloc, dealloc, realloc},
+use alloc::alloc::{Layout, alloc, dealloc, realloc};
+use core::{
     mem::{ManuallyDrop, MaybeUninit},
     ops::Deref,
     ptr::NonNull,
@@ -76,7 +76,7 @@ impl<const S: usize, T> SmallVec<S, T> {
             NonNull::new_unchecked(ptr as *mut T)
         };
         unsafe {
-            std::ptr::copy_nonoverlapping(
+            core::ptr::copy_nonoverlapping(
                 self.data.inline_ptr(),
                 ptr.as_ptr(),
                 self.len as usize,
@@ -196,20 +196,20 @@ impl<const S: usize, T> Deref for SmallVec<S, T> {
     fn deref(&self) -> &Self::Target {
         unsafe {
             if self.is_heap() {
-                std::slice::from_raw_parts(self.data.ptr.as_ptr(), self.len as usize)
+                core::slice::from_raw_parts(self.data.ptr.as_ptr(), self.len as usize)
             } else {
-                std::slice::from_raw_parts(self.data.inline_ptr(), self.len as usize)
+                core::slice::from_raw_parts(self.data.inline_ptr(), self.len as usize)
             }
         }
     }
 }
-impl<const S: usize, T> std::ops::DerefMut for SmallVec<S, T> {
+impl<const S: usize, T> core::ops::DerefMut for SmallVec<S, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe {
             if self.is_heap() {
-                std::slice::from_raw_parts_mut(self.data.ptr.as_ptr(), self.len as usize)
+                core::slice::from_raw_parts_mut(self.data.ptr.as_ptr(), self.len as usize)
             } else {
-                std::slice::from_raw_parts_mut(self.data.inline_mut_ptr(), self.len as usize)
+                core::slice::from_raw_parts_mut(self.data.inline_mut_ptr(), self.len as usize)
             }
         }
     }
@@ -223,14 +223,14 @@ impl<const S: usize, T> IntoIterator for SmallVec<S, T> {
 }
 impl<'a, const S: usize, T> IntoIterator for &'a SmallVec<S, T> {
     type Item = &'a T;
-    type IntoIter = std::slice::Iter<'a, T>;
+    type IntoIter = core::slice::Iter<'a, T>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
 }
 impl<'a, const S: usize, T> IntoIterator for &'a mut SmallVec<S, T> {
     type Item = &'a mut T;
-    type IntoIter = std::slice::IterMut<'a, T>;
+    type IntoIter = core::slice::IterMut<'a, T>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter_mut()
     }
@@ -278,7 +278,7 @@ impl<const S: usize, T> Drop for SmallVecIterator<S, T> {
         let (pos, len) = (self.pos as usize, self.vec.len as usize);
         unsafe {
             let p = self.vec.get_ptr().as_ptr();
-            std::ptr::copy(p.add(pos), p, len - pos);
+            core::ptr::copy(p.add(pos), p, len - pos);
             self.vec.len = (len - pos) as u32;
             ManuallyDrop::drop(&mut self.vec);
         }
@@ -312,22 +312,22 @@ impl<const S: usize, T> SmallVecData<S, T> {
     }
     ///Safety the unrderlying data should represente an inline array and count the number on initialise and valide item
     unsafe fn free_inline(&mut self, count: usize) {
-        if std::mem::needs_drop::<T>() {
+        if core::mem::needs_drop::<T>() {
             unsafe {
                 let base_ptr = self.inline_mut_ptr();
 
-                let slice = std::slice::from_raw_parts_mut(base_ptr, count);
+                let slice = core::slice::from_raw_parts_mut(base_ptr, count);
 
-                std::ptr::drop_in_place(slice);
+                core::ptr::drop_in_place(slice);
             }
         }
     }
     ///Safety the unrderlying data should represente a ptr that point to len valid item and size*sizeof(item) memory space
     unsafe fn free_heap(&mut self, len: usize, size: usize) {
-        if std::mem::needs_drop::<T>() {
+        if core::mem::needs_drop::<T>() {
             unsafe {
-                let slice = std::slice::from_raw_parts_mut(self.ptr.as_ptr(), len);
-                std::ptr::drop_in_place(slice);
+                let slice = core::slice::from_raw_parts_mut(self.ptr.as_ptr(), len);
+                core::ptr::drop_in_place(slice);
             }
         }
         unsafe {
@@ -347,7 +347,7 @@ macro_rules! impl_into_shareds {
                     let result = (&self as *const SmallVec<S, $src>)
                         .cast::<SmallVec<S, $dst>>()
                         .read();
-                    std::mem::forget(self);
+                    core::mem::forget(self);
                     result
                 }
             }
@@ -378,8 +378,8 @@ impl<const S: usize, T> FromIterator<T> for SmallVec<S, T> {
 unsafe impl<const S: usize, T: Send> Send for SmallVec<S, T> {}
 unsafe impl<const S: usize, T: Sync> Sync for SmallVec<S, T> {}
 
-impl<const S: usize, T: std::fmt::Debug> std::fmt::Debug for SmallVec<S, T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<const S: usize, T: core::fmt::Debug> core::fmt::Debug for SmallVec<S, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         (**self).fmt(f)
     }
 }
@@ -403,8 +403,10 @@ impl_into_shareds!((f64, OwnedByte), (f64, SharedByte));
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::SmallVec;
-    use std::rc::Rc;
+    use alloc::rc::Rc;
 
     #[test]
     fn into_iter_in_order_inline_and_heap() {

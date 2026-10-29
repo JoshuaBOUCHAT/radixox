@@ -1,4 +1,4 @@
-use std::ptr::NonNull;
+use core::ptr::NonNull;
 
 pub trait PreFetch {
     #[inline]
@@ -37,13 +37,13 @@ impl<T> PreFetchPtr for *mut T {
 pub fn prefetch_l1(ptr: *const u8) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
         _mm_prefetch(ptr as *const i8, _MM_HINT_T0);
     }
 
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        use std::arch::aarch64::{_PREFETCH_LOCALITY3, _PREFETCH_READ, _prefetch};
+        use core::arch::aarch64::{_PREFETCH_LOCALITY3, _PREFETCH_READ, _prefetch};
         _prefetch(ptr as *const i8, _PREFETCH_READ, _PREFETCH_LOCALITY3);
     }
 

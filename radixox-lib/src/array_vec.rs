@@ -1,4 +1,4 @@
-use std::{
+use core::{
     mem::MaybeUninit,
     ops::{Deref, DerefMut},
 };
@@ -117,9 +117,9 @@ impl<T, const N: usize> Default for ArrayVec<T, N> {
 
 impl<T, const N: usize> Drop for ArrayVec<T, N> {
     fn drop(&mut self) {
-        if std::mem::needs_drop::<T>() {
+        if core::mem::needs_drop::<T>() {
             unsafe {
-                std::ptr::drop_in_place(std::slice::from_raw_parts_mut(
+                core::ptr::drop_in_place(core::slice::from_raw_parts_mut(
                     self.data_ptr_mut(),
                     self.len(),
                 ));
@@ -131,19 +131,19 @@ impl<T, const N: usize> Drop for ArrayVec<T, N> {
 impl<T, const N: usize> Deref for ArrayVec<T, N> {
     type Target = [T];
     fn deref(&self) -> &[T] {
-        unsafe { std::slice::from_raw_parts(self.data_ptr(), self.len()) }
+        unsafe { core::slice::from_raw_parts(self.data_ptr(), self.len()) }
     }
 }
 
 impl<T, const N: usize> DerefMut for ArrayVec<T, N> {
     fn deref_mut(&mut self) -> &mut [T] {
         let len = self.len();
-        unsafe { std::slice::from_raw_parts_mut(self.data_ptr_mut(), len) }
+        unsafe { core::slice::from_raw_parts_mut(self.data_ptr_mut(), len) }
     }
 }
 
-impl<T: std::fmt::Debug, const N: usize> std::fmt::Debug for ArrayVec<T, N> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<T: core::fmt::Debug, const N: usize> core::fmt::Debug for ArrayVec<T, N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         (**self).fmt(f)
     }
 }
@@ -193,13 +193,13 @@ impl<T, const N: usize> Iterator for ArrayVecIntoIter<T, N> {
 impl<T, const N: usize> Drop for ArrayVecIntoIter<T, N> {
     fn drop(&mut self) {
         let len = self.vec.len();
-        if std::mem::needs_drop::<T>() && self.idx < len {
+        if core::mem::needs_drop::<T>() && self.idx < len {
             unsafe {
-                let remaining = std::slice::from_raw_parts_mut(
+                let remaining = core::slice::from_raw_parts_mut(
                     self.vec.data_ptr_mut().add(self.idx),
                     len - self.idx,
                 );
-                std::ptr::drop_in_place(remaining);
+                core::ptr::drop_in_place(remaining);
             }
         }
         // Prevent ArrayVec::drop from re-dropping the (already-consumed) elements.
@@ -209,6 +209,8 @@ impl<T, const N: usize> Drop for ArrayVecIntoIter<T, N> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
 
     #[test]
@@ -234,7 +236,7 @@ mod tests {
 
     #[test]
     fn drop_runs_on_elements() {
-        use std::rc::Rc;
+        use alloc::rc::Rc;
         let counter = Rc::new(());
         let mut v: ArrayVec<Rc<()>, 4> = ArrayVec::new();
         for _ in 0..4 {

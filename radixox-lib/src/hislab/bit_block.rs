@@ -46,7 +46,7 @@ impl BitBlock {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     #[target_feature(enable = "avx512f")]
     unsafe fn is_full_x86_512(&self) -> bool {
-        use std::arch::x86_64::*;
+        use core::arch::x86_64::*;
         unsafe {
             let data = _mm512_load_si512(self.data.as_ptr() as *const __m512i);
             let full = _mm512_set1_epi64(-1);
@@ -63,7 +63,7 @@ impl BitBlock {
     ))]
     #[target_feature(enable = "avx2")]
     unsafe fn is_full_x86_256(&self) -> bool {
-        use std::arch::x86_64::*;
+        use core::arch::x86_64::*;
         let ptr = self.data.as_ptr() as *const __m256i;
         let full = _mm256_set1_epi64x(-1);
 
@@ -79,7 +79,7 @@ impl BitBlock {
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     #[target_feature(enable = "neon")]
     unsafe fn is_full_arm_neon(&self) -> bool {
-        use std::arch::aarch64::*;
+        use core::arch::aarch64::*;
         let ptr = self.data.as_ptr();
 
         // NEON travaille sur 128 bits (2 x u64), on fait donc 4 loads
@@ -129,7 +129,7 @@ impl BitBlock {
     // --- x86_64 AVX-512 ---
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     unsafe fn find_x86_512(&self) -> Option<usize> {
-        use std::arch::x86_64::*;
+        use core::arch::x86_64::*;
         unsafe {
             let data = _mm512_load_si512(self.data.as_ptr() as *const __m512i);
             let full = _mm512_set1_epi64(-1);
@@ -157,7 +157,7 @@ impl BitBlock {
         not(target_feature = "avx512f")
     ))]
     unsafe fn find_x86_256(&self) -> Option<usize> {
-        use std::arch::x86_64::*;
+        use core::arch::x86_64::*;
         let ptr = self.data.as_ptr() as *const __m256i;
         unsafe {
             let full = _mm256_set1_epi64x(-1);

@@ -24,7 +24,9 @@
 //! rester vivant jusqu'à `finish` (valart diffère toutes ses libérations
 //! pendant une save, SAVE_DESIGN.md §2.B).
 
-use std::collections::BTreeMap;
+#[allow(unused_imports)]
+use crate::prelude::*;
+use alloc::collections::BTreeMap;
 
 /// Bitset 1 bit par slot sur `Vec<u64>` (`Vec<bool>` coûterait 1 octet/slot).
 /// Même layout que le bitmap de niveau 1 de HiSlab : slot `i` = bit `i % 64`
@@ -202,6 +204,8 @@ impl<I> SaveBarrier<I> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
 
     /// Nœud jouet : `String` et `Vec` pour avoir du vrai heap. Les images

@@ -12,6 +12,8 @@
 //! La forme se lit à l'adresse : dans la plage du pool ou non.
 
 
+#[allow(unused_imports)]
+use crate::prelude::*;
 use crate::pool;
 use crate::raw_alloc::external;
 
@@ -155,10 +157,10 @@ unsafe fn obj_bytes<'a>(a: usize, in_pool: bool) -> &'a [u8] {
     unsafe {
         if in_pool {
             let len = (a as *const u16).read() & !DEAD;
-            std::slice::from_raw_parts((a + HEADER) as *const u8, len as usize)
+            core::slice::from_raw_parts((a + HEADER) as *const u8, len as usize)
         } else {
             let len = (a as *const u32).read();
-            std::slice::from_raw_parts((a + EXT_HEADER) as *const u8, len as usize)
+            core::slice::from_raw_parts((a + EXT_HEADER) as *const u8, len as usize)
         }
     }
 }
@@ -175,7 +177,7 @@ fn write_obj(pool: Option<&mut pool::Pool>, h: u32, bytes: &[u8]) -> usize {
             unsafe {
                 (a as *mut u16).write(len as u16);
                 (a.add(2) as *mut u32).write_unaligned(h);
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), a.add(HEADER), len);
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), a.add(HEADER), len);
             }
             return a as usize;
         }
@@ -185,7 +187,7 @@ fn write_obj(pool: Option<&mut pool::Pool>, h: u32, bytes: &[u8]) -> usize {
         let a = external::malloc(EXT_HEADER + len);
         (a as *mut u32).write(len32);
         (a.add(4) as *mut u32).write(h);
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), a.add(EXT_HEADER), len);
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), a.add(EXT_HEADER), len);
         a as usize
     }
 }
@@ -285,7 +287,7 @@ impl Space<'_> {
         }
         let Some(p) = pool else { return Ok(()) };
         let mut seen = 0u64;
-        let mut per_block = std::collections::HashMap::<usize, u64>::new();
+        let mut per_block = alloc::collections::BTreeMap::<usize, u64>::new();
         p.handled_objects(|a, h, size| {
             if err.is_some() {
                 return;
@@ -318,7 +320,7 @@ static mut HANDLES: Option<Handles> = None;
 
 #[cold]
 fn init_table() -> &'static mut Handles {
-    let cap: u32 = std::env::var("RADIXOX_HANDLES_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 28);
+    let cap: u32 = crate::sys::env_parse("RADIXOX_HANDLES_MAX", 1 << 28);
     let t = Handles::new(cap).expect("radixox: mmap de la table des poignées refusé");
     unsafe { (*&raw mut HANDLES).insert(t) }
 }
@@ -412,9 +414,12 @@ pub fn stats() -> (u64, u64) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
     use crate::pool::{Mark, PAGE, Pool};
-    use std::time::{Duration, Instant};
+    use core::time::Duration;
+    use crate::sys::Instant;
 
     /// Générateur sans dépendance (xorshift).
     struct Rng(u64);

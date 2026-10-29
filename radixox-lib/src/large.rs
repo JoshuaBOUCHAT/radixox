@@ -14,9 +14,11 @@
 //! Sert aussi d'allocateur global du binaire ([`crate::raw_alloc::heap::RxAlloc`]).
 //! Les tests construisent leurs propres [`Large`], plus petits.
 
-use std::ptr::null_mut;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::time::{Duration, Instant};
+use core::ptr::null_mut;
+use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use core::time::Duration;
+
+use crate::sys::Instant;
 
 pub const GRANULE_SHIFT: u32 = 12;
 /// Unité d'allocation et de rendu du tas.
@@ -166,7 +168,7 @@ impl<T: Copy> MapArr<T> {
     }
 }
 
-impl<T: Copy> std::ops::Index<usize> for MapArr<T> {
+impl<T: Copy> core::ops::Index<usize> for MapArr<T> {
     type Output = T;
     #[inline]
     fn index(&self, i: usize) -> &T {
@@ -175,7 +177,7 @@ impl<T: Copy> std::ops::Index<usize> for MapArr<T> {
     }
 }
 
-impl<T: Copy> std::ops::IndexMut<usize> for MapArr<T> {
+impl<T: Copy> core::ops::IndexMut<usize> for MapArr<T> {
     #[inline]
     fn index_mut(&mut self, i: usize) -> &mut T {
         assert!(i < self.len);
@@ -319,7 +321,7 @@ impl Large {
             prev: maps[3].0 as *mut u32,
             owner: maps[4].0 as *mut u32,
             last: maps[5].0 as *mut u32,
-            meta_pages: std::array::from_fn(|i| crate::pages::Tranches::new(maps[i + 1].0 as usize, crate::pages::PAGE)),
+            meta_pages: core::array::from_fn(|i| crate::pages::Tranches::new(maps[i + 1].0 as usize, crate::pages::PAGE)),
             maps,
             idx: [Index::EMPTY, Index::EMPTY],
             fifo: Fifo { a: fifo, head: 0 },
@@ -962,14 +964,10 @@ fn with<R>(f: impl FnOnce(&mut Large) -> R) -> Option<R> {
     }
 }
 
-/// Variable d'environnement entière, lue sans allouer (`getenv` : le tas n'existe pas encore).
-fn env_u64(name: &std::ffi::CStr, default: u64) -> u64 {
-    let v = unsafe { libc::getenv(name.as_ptr()) };
-    if v.is_null() {
-        return default;
-    }
-    let v = unsafe { std::ffi::CStr::from_ptr(v) }.to_bytes();
-    std::str::from_utf8(v).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+/// Variable d'environnement entière, lue sans allouer ([`crate::sys::env`] : le tas
+/// n'existe pas encore).
+fn env_u64(name: &str, default: u64) -> u64 {
+    crate::sys::env_parse(name, default)
 }
 
 /// Plage refusée (`vm.overcommit_memory = 2`, `ulimit -v`) : on retente en la divisant par
@@ -977,8 +975,8 @@ fn env_u64(name: &std::ffi::CStr, default: u64) -> u64 {
 #[cold]
 #[allow(static_mut_refs)]
 unsafe fn init() -> Option<&'static mut Large> {
-    let mut gb = env_u64(c"RADIXOX_LARGE_VIRT_GB", 64).max(1) as usize;
-    let decay = Duration::from_secs(env_u64(c"RADIXOX_MEMORY_DECAY", 10));
+    let mut gb = env_u64("RADIXOX_LARGE_VIRT_GB", 64).max(1) as usize;
+    let decay = Duration::from_secs(env_u64("RADIXOX_MEMORY_DECAY", 10));
     unsafe {
         loop {
             if let Some(l) = Large::new(gb << 30, decay) {
@@ -1040,7 +1038,7 @@ pub fn global_alloc_zeroed(size: usize, align: usize) -> *mut u8 {
     let Some(r) = Route::of(size, align) else { return null_mut() };
     let (p, zero) = with(|l| l.alloc_route_z(r)).unwrap_or((null_mut(), false));
     if !p.is_null() && !zero {
-        unsafe { std::ptr::write_bytes(p, 0, size) };
+        unsafe { core::ptr::write_bytes(p, 0, size) };
     }
     p
 }
@@ -1110,6 +1108,8 @@ pub fn resident() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
 
     struct Rng(u64);

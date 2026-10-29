@@ -1,8 +1,8 @@
 use crate::raw_alloc::external;
-use std::borrow::Borrow;
+use core::borrow::Borrow;
 
-use std::ops::Deref;
-use std::ptr::NonNull;
+use core::ops::Deref;
+use core::ptr::NonNull;
 
 use crate::prefetch::PreFetch;
 
@@ -60,7 +60,7 @@ impl SharedByte {
         assert!(len <= Self::MAX_LEN);
         unsafe {
             let short = if external || len > Self::POOL_MAX_LEN {
-                std::ptr::null_mut()
+                core::ptr::null_mut()
             } else {
                 crate::pool::short_alloc(Self::slot(len))
             };
@@ -90,7 +90,7 @@ impl SharedByte {
     fn copy_of(data: &[u8], external: bool) -> Self {
         unsafe {
             let sb = Self::alloc(data.len(), external);
-            std::ptr::copy_nonoverlapping(data.as_ptr(), sb.ptr.as_ptr(), data.len());
+            core::ptr::copy_nonoverlapping(data.as_ptr(), sb.ptr.as_ptr(), data.len());
             sb
         }
     }
@@ -130,7 +130,7 @@ impl SharedByte {
             return false;
         }
         unsafe {
-            std::ptr::copy(src.as_ptr(), self.ptr.as_ptr(), src.len());
+            core::ptr::copy(src.as_ptr(), self.ptr.as_ptr(), src.len());
             (self.ptr.as_ptr() as *mut u16).sub(2).write(src.len() as u16);
             if new < old {
                 crate::pool::short_shrink(self.ptr.as_ptr().sub(Self::SHORT_HEADER), old, new);
@@ -164,10 +164,10 @@ impl SharedByte {
                 return 0; // plage pleine : l'objet reste
             }
             unsafe {
-                std::ptr::copy_nonoverlapping(base, new, size);
+                core::ptr::copy_nonoverlapping(base, new, size);
                 let moved = Self { ptr: NonNull::new_unchecked(new.add(Self::SHORT_HEADER)) };
                 // rc 1 → 0 : l'ancien emplacement est rendu par le chemin normal.
-                drop(std::mem::replace(self, moved));
+                drop(core::mem::replace(self, moved));
             }
             crate::pool::note_evacuated(size);
             size
@@ -221,11 +221,11 @@ impl SharedByte {
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.data_ptr(), self.len()) }
+        unsafe { core::slice::from_raw_parts(self.data_ptr(), self.len()) }
     }
 
-    pub fn as_str(&self) -> Result<&str, std::str::Utf8Error> {
-        std::str::from_utf8(self.as_slice())
+    pub fn as_str(&self) -> Result<&str, core::str::Utf8Error> {
+        core::str::from_utf8(self.as_slice())
     }
 
     /// Nombre de détenteurs, table de débordement comprise.
@@ -242,7 +242,7 @@ impl SharedByte {
     fn clone_overflow(&self) -> Self {
         unsafe {
             let rc = self.rc_ptr();
-            let t = &mut *std::ptr::addr_of_mut!(RC_OVERFLOW);
+            let t = &mut *core::ptr::addr_of_mut!(RC_OVERFLOW);
             let b = *rc;
             if b & RC_TABLE != 0 {
                 // 2³² détenteurs = 32 Gio de pointeurs : pas atteignable.
@@ -267,7 +267,7 @@ impl SharedByte {
     fn drop_overflow(&self) {
         unsafe {
             let rc = self.rc_ptr();
-            let t = &mut *std::ptr::addr_of_mut!(RC_OVERFLOW);
+            let t = &mut *core::ptr::addr_of_mut!(RC_OVERFLOW);
             let i = (*rc & !RC_TABLE) as usize;
             t.counts[i] -= 1;
             if t.counts[i] == RC_INLINE_MAX as u32 {
@@ -421,12 +421,12 @@ static mut RC_OVERFLOW: RcOverflow = RcOverflow { counts: [0; 128], used: 0, cop
 /// `INFO` : (cases occupées, copies faites faute de case).
 pub fn rc_overflow_stats() -> (u32, u64) {
     unsafe {
-        let t = &*std::ptr::addr_of!(RC_OVERFLOW);
+        let t = &*core::ptr::addr_of!(RC_OVERFLOW);
         (t.used, t.copies)
     }
 }
 
-impl std::ops::Deref for SharedByte {
+impl core::ops::Deref for SharedByte {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         self.as_slice()
@@ -439,8 +439,8 @@ impl AsRef<[u8]> for SharedByte {
     }
 }
 
-impl std::fmt::Debug for SharedByte {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for SharedByte {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // octets échappés : une clé binaire (non UTF-8) reste lisible
         write!(f, "SharedByte(\"{}\", rc={})", self.as_slice().escape_ascii(), self.rc())
     }
@@ -457,18 +457,18 @@ impl PartialEq for SharedByte {
 }
 impl Eq for SharedByte {}
 
-impl std::hash::Hash for SharedByte {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl core::hash::Hash for SharedByte {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.as_slice().hash(state);
     }
 }
 impl PartialOrd for SharedByte {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 impl Ord for SharedByte {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         self.as_slice().cmp(other.as_slice())
     }
 }
@@ -506,7 +506,7 @@ impl OwnedByte {
         self.0
     }
 }
-impl std::ops::Deref for OwnedByte {
+impl core::ops::Deref for OwnedByte {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         &self.0
@@ -525,6 +525,8 @@ impl Into<SharedByte> for OwnedByte {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
     use super::*;
 
     #[test]

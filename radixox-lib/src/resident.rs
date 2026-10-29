@@ -5,6 +5,8 @@
 //! tantôt 4 Kio (alignement, `khugepaged`) ; l'estimation à 2 Mio comptait 8 Mo de trop.
 //! Pour `INFO` seulement (un appel système et un octet par 4 Kio de région).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
 const PAGE: usize = 4096;
 /// Au-delà de la partie touchée : une huge page prise à la première écriture déborde
 /// jusqu'à la frontière de 2 Mio suivante (dans la réservation virtuelle de la région).

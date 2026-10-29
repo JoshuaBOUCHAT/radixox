@@ -1,4 +1,6 @@
-use std::hash::{Hash, Hasher};
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::hash::{Hash, Hasher};
 
 use crate::shared_byte::SharedByte;
 

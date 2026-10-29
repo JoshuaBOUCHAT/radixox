@@ -683,7 +683,7 @@ mod tests {
             z.remove(format!("membre:{i}").as_bytes()).unwrap();
         }
         let before: Vec<(u64, Vec<u8>)> = z.iter().map(|(s, m)| (s, m.to_vec())).collect();
-        if radixox_lib::pool::gc_begin(radixox_lib::pool::Mark::All, std::time::Instant::now()) > 0 {
+        if radixox_lib::pool::gc_begin(radixox_lib::pool::Mark::All, radixox_lib::sys::Instant::now()) > 0 {
             let mut at = Some(0);
             let mut moved = 0;
             while let Some(from) = at {
