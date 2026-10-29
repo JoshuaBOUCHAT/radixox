@@ -11,7 +11,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > - SCAN → [`SCAN_DESIGN.md`](SCAN_DESIGN.md) ; transactions → [`TX_DESIGN.md`](TX_DESIGN.md) ;
 >   ZSet → [`ANALYSE_ART_UNIFIE.md`](ANALYSE_ART_UNIFIE.md) §13 ;
 > - AOF, réplication, journal des commandes → [`DURABILITY_DESIGN.md`](DURABILITY_DESIGN.md) ;
-> - allocation, GC, compactage des slabs, `maxmemory` → [`MEMORY_ARCH.md`](MEMORY_ARCH.md).
+> - allocation, GC, compactage des slabs, `maxmemory` → [`MEMORY_ARCH.md`](MEMORY_ARCH.md) ;
+> - binaire sans `std` ni libc (chantier en cours, bibliothèques déjà `no_std`) →
+>   [`NOSTD_PLAN.md`](NOSTD_PLAN.md).
 
 ## Projet
 
