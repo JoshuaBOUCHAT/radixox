@@ -5,7 +5,8 @@ set -uo pipefail
 export RADIXOX_SAVE="${RADIXOX_SAVE-}"
 cd /home/joshua/rust/radixox
 S=${OUT_DIR:-/tmp/stress_save}; mkdir -p "$S"
-BIN=target/release/radixox; PORT=6390
+# NOSTD=1 : binaire sans libc (construit par `cargo nostd`).
+BIN=target/release/radixox${NOSTD:+-nostd}; PORT=6390
 # SERVER=valkey : même test sur Valkey (1 thread, RDB écrit dans $S, fork pour BGSAVE)
 if [ "${SERVER:-radixox}" = valkey ]; then
   SRV=(valkey-server --port $PORT --save "" --appendonly no --dir $S --dbfilename dump.rdb)

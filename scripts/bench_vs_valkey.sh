@@ -5,6 +5,7 @@
 #
 #   scripts/bench_vs_valkey.sh                 # ~3 min
 #   ROUNDS=1 TEST_TIME=5 scripts/bench_vs_valkey.sh   # essai rapide
+#   NOSTD=1 scripts/bench_vs_valkey.sh         # binaire sans libc (radixox-nostd)
 #   VK_IO_THREADS=4 VK_CPUS=0,1,6,7 SKIP_YCSB=1 SKIP_BGSAVE=1 scripts/bench_vs_valkey.sh
 #                                              # Valkey multi-thread sur 2 cœurs physiques
 #
@@ -47,8 +48,14 @@ RX_PORT=6501
 VK_PORT=6502
 mkdir -p "$OUT"
 
-cargo build --release -q -p radixox --manifest-path "$ROOT/Cargo.toml"
-RX_BIN="$ROOT/target/release/radixox"
+# NOSTD=1 : binaire sans libc (`cargo nostd`, alias de .cargo/config.toml).
+if [ -n "${NOSTD:-}" ]; then
+  (cd "$ROOT" && cargo nostd -q)
+  RX_BIN="$ROOT/target/release/radixox-nostd"
+else
+  cargo build --release -q -p radixox --manifest-path "$ROOT/Cargo.toml"
+  RX_BIN="$ROOT/target/release/radixox"
+fi
 
 pids=()
 cleanup() {

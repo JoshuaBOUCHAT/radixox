@@ -14,6 +14,7 @@ set -euo pipefail
 #                                          # kill anything. label defaults to "Service".
 #   RECORDS=1000000 OPS=2000000 ./bench_compare.sh   # smaller run (defaults 5M / 10M)
 #   RADIXOX_* variables of the calling shell reach RadixOx (e.g. RADIXOX_MIN_WAIT_US=10).
+#   NOSTD=1: bench the libc-free binary (built by `cargo nostd`, target/release/radixox-nostd).
 #   WARMUP=2: run latencies leave out the first WARMUP seconds (JVM warm-up of YCSB).
 #   TARGET=350000: run phase throttled to that many ops/s (YCSB -target), the same for both
 #                  servers: latencies compared at equal load, not each at its own maximum.
@@ -68,7 +69,11 @@ THREADS=100
 TARGET="${TARGET:-}"
 FIELDLENGTH=100
 
-RADIXOX_BIN="${RADIXOX_BIN:-$SCRIPT_DIR/target/release/radixox}"
+if [ -n "${NOSTD:-}" ]; then
+  RADIXOX_BIN="${RADIXOX_BIN:-$SCRIPT_DIR/target/release/radixox-nostd}"
+else
+  RADIXOX_BIN="${RADIXOX_BIN:-$SCRIPT_DIR/target/release/radixox}"
+fi
 CURRENT_LOG=""
 
 # ── Répartition des cœurs (SERVER_CORES = cœurs physiques par serveur) ──────
@@ -407,8 +412,13 @@ fi
 echo "═══════════════════════════════════════════════════"
 echo ""
 echo "[0/4] Building RadixOx (release)..."
-RUSTFLAGS="-C target-cpu=native" cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml" 2>&1 |
-  tail -3
+if [ -n "${NOSTD:-}" ]; then
+  # alias de .cargo/config.toml : lu depuis le dossier du dépôt
+  (cd "$SCRIPT_DIR" && RUSTFLAGS="-C target-cpu=native" cargo nostd 2>&1 | tail -3)
+else
+  RUSTFLAGS="-C target-cpu=native" cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml" 2>&1 |
+    tail -3
+fi
 echo "  Build done: $RADIXOX_BIN"
 echo ""
 

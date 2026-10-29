@@ -20,7 +20,7 @@
 #
 # - RadixOx : `target/release/radixox`, recompilé à chaque lancement (rien à
 #   faire s'il est à jour) ; RX_BIN=… pour un autre binaire, RX_BIN_KEEP=1 pour
-#   ne pas compiler.
+#   ne pas compiler ; NOSTD=1 pour le binaire sans libc (`cargo nostd`).
 # - Un serveur à la fois, 1M clés préchargées (une fois chacune, pipeline 64).
 # - Placement automatique (topologie lue dans sysfs), sauf SERVER_CPUS / MT_CPUS
 #   donnés : le serveur prend un thread par cœur physique, les cœurs
@@ -50,13 +50,20 @@ ZIPF="${ZIPF:-0.99}"
 PIPELINES="${PIPELINES:-1 64}"
 CONFIGS="${CONFIGS:-rx-1c rx-2c vk-1t vk-2t}"
 MT_CONNS="${MT_CONNS:-80}"
-RX_BIN="${RX_BIN:-$ROOT/target/release/radixox}"
+if [ -n "${NOSTD:-}" ]; then
+  RX_BIN="${RX_BIN:-$ROOT/target/release/radixox-nostd}"
+else
+  RX_BIN="${RX_BIN:-$ROOT/target/release/radixox}"
+fi
 VALKEY_BIN="${VALKEY_BIN:-valkey-server}"
 PORT="${PORT:-6440}"
 MEM_MAX="${MEM_MAX:-4G}"
 
 # toujours recompilé (rien à faire si à jour) : un binaire périmé fausserait la mesure
-[ -n "${RX_BIN_KEEP:-}" ] || cargo build -q --release -p radixox --manifest-path "$ROOT/Cargo.toml"
+if [ -z "${RX_BIN_KEEP:-}" ]; then
+  if [ -n "${NOSTD:-}" ]; then (cd "$ROOT" && cargo nostd -q)
+  else cargo build -q --release -p radixox --manifest-path "$ROOT/Cargo.toml"; fi
+fi
 command -v memtier_benchmark >/dev/null
 mkdir -p "$OUT"
 SUMMARY="$OUT/summary.txt"
