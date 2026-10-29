@@ -29,7 +29,9 @@
 //!    `parent_or_card` = idx du parent, `parent_radix` = radix du slot parent
 //!    (back-pointer pour la compaction).
 
-use std::mem::{ManuallyDrop, MaybeUninit};
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::mem::{ManuallyDrop, MaybeUninit};
 
 use radixox_lib::prefetch::PreFetch;
 use radixox_lib::shared_byte::SharedByte;
@@ -78,10 +80,10 @@ impl SetNode {
     pub(crate) fn image_copy(&self) -> ManuallyDrop<Self> {
         // SAFETY: copie bit à bit jamais droppée ; son overflow est remplacé
         // par une copie à elle avant toute utilisation.
-        let mut copy = ManuallyDrop::new(unsafe { std::ptr::read(self) });
+        let mut copy = ManuallyDrop::new(unsafe { core::ptr::read(self) });
         if let Some(ov) = &self.overflow {
             let ov = ManuallyDrop::into_inner(ov.shallow_copy());
-            unsafe { std::ptr::write(&mut copy.overflow, Some(ov)) };
+            unsafe { core::ptr::write(&mut copy.overflow, Some(ov)) };
         }
         copy
     }
@@ -209,7 +211,7 @@ impl SetNode {
         let base = POOL_WORDS - k;
         unsafe {
             let words = self.words_mut();
-            std::ptr::copy(words.add(base), words.add(base - 1), r);
+            core::ptr::copy(words.add(base), words.add(base - 1), r);
             words.add(base - 1 + r).write(child);
         }
     }
@@ -222,7 +224,7 @@ impl SetNode {
         unsafe {
             let words = self.words_mut();
             let child = words.add(base + r).read();
-            std::ptr::copy(words.add(base), words.add(base + 1), r);
+            core::ptr::copy(words.add(base), words.add(base + 1), r);
             child
         }
     }
@@ -349,7 +351,7 @@ impl SetNode {
         match slot {
             Slot::Inline(i) => {
                 self.ctrl[i] = ctrl;
-                unsafe { std::ptr::replace(self.key_ptr_mut(i), key) }
+                unsafe { core::ptr::replace(self.key_ptr_mut(i), key) }
             }
             Slot::Overflow(i) => self.overflow_mut().replace_key(i, key, ctrl),
         }
@@ -451,7 +453,7 @@ impl SetNode {
 impl Drop for SetNode {
     fn drop(&mut self) {
         for i in 0..self.count as usize {
-            unsafe { std::ptr::drop_in_place(self.key_ptr_mut(i)) };
+            unsafe { core::ptr::drop_in_place(self.key_ptr_mut(i)) };
         }
     }
 }
@@ -1033,6 +1035,10 @@ impl ValTrees {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
+    #[allow(unused_imports)]
+    use std::{dbg, eprintln, print, println};
     use super::*;
     use std::collections::HashSet;
 
@@ -1047,7 +1053,7 @@ mod tests {
     #[test]
     fn layout() {
         assert_eq!(size_of::<SetNode>(), 128);
-        assert_eq!(std::mem::offset_of!(SetNode, node_type), crate::NODE_TYPE_OFFSET);
+        assert_eq!(core::mem::offset_of!(SetNode, node_type), crate::NODE_TYPE_OFFSET);
     }
 
     /// Nœud seul : modèle de référence `radix → (clé, enfant)`, enfants posés,

@@ -12,7 +12,7 @@ categories = ["data-structures"]
 
 [dependencies]
 zmij = "1.0"
-radixox-lib = { workspace = true }
+radixox-lib = { workspace = true, features = ["std"] }
 valart = { workspace = true }
 
 crc32fast = "1.4"

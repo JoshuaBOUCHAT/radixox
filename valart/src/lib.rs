@@ -4,7 +4,25 @@
 //! Voir `set.rs` pour la structure et ses invariants ; `hash.rs` en est le
 //! miroir avec une valeur par entrée.
 
-use std::mem::{ManuallyDrop, offset_of};
+#![no_std]
+
+extern crate alloc;
+#[cfg(any(feature = "std", test))]
+extern crate std;
+
+/// Ce que le prélude de `std` donnait, pour un module `no_std`.
+#[allow(unused_imports)]
+pub(crate) mod prelude {
+    pub use alloc::borrow::ToOwned;
+    pub use alloc::boxed::Box;
+    pub use alloc::string::{String, ToString};
+    pub use alloc::vec::Vec;
+    pub use alloc::{format, vec};
+}
+
+#[allow(unused_imports)]
+use prelude::*;
+use core::mem::{ManuallyDrop, offset_of};
 
 use radixox_lib::hislab::HiSlab;
 use radixox_lib::save_barrier::{SaveBarrier, T0};
@@ -160,8 +178,8 @@ impl ValTrees {
     pub const DEFAULT_VIRTUAL_CAPACITY: u32 = 1 << 26;
 
     pub fn new() -> Self {
-        use std::hash::BuildHasher;
-        let seed = std::collections::hash_map::RandomState::new().hash_one(0u64);
+        // graine tirée du noyau (radixox_lib::rng) : contre les collisions provoquées
+        let seed = radixox_lib::rng::u64();
         Self::with_seed(seed, Self::DEFAULT_VIRTUAL_CAPACITY)
     }
 

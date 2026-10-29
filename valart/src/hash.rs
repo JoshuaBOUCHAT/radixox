@@ -8,7 +8,9 @@
 //! - Mêmes invariants que le Set (voir `set.rs`). Racine : `parent_or_card`
 //!   = nombre de champs (HLEN).
 
-use std::mem::{ManuallyDrop, MaybeUninit};
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::mem::{ManuallyDrop, MaybeUninit};
 
 use radixox_lib::prefetch::PreFetch;
 use radixox_lib::shared_byte::SharedByte;
@@ -57,10 +59,10 @@ impl HashNode {
     pub(crate) fn image_copy(&self) -> ManuallyDrop<Self> {
         // SAFETY: copie bit à bit jamais droppée ; son overflow est remplacé
         // par une copie à elle avant toute utilisation.
-        let mut copy = ManuallyDrop::new(unsafe { std::ptr::read(self) });
+        let mut copy = ManuallyDrop::new(unsafe { core::ptr::read(self) });
         if let Some(ov) = &self.overflow {
             let ov = ManuallyDrop::into_inner(ov.shallow_copy());
-            unsafe { std::ptr::write(&mut copy.overflow, Some(ov)) };
+            unsafe { core::ptr::write(&mut copy.overflow, Some(ov)) };
         }
         copy
     }
@@ -204,7 +206,7 @@ impl HashNode {
         let base = POOL_WORDS - k;
         unsafe {
             let words = self.words_mut();
-            std::ptr::copy(words.add(base), words.add(base - 1), r);
+            core::ptr::copy(words.add(base), words.add(base - 1), r);
             words.add(base - 1 + r).write(child);
         }
     }
@@ -217,7 +219,7 @@ impl HashNode {
         unsafe {
             let words = self.words_mut();
             let child = words.add(base + r).read();
-            std::ptr::copy(words.add(base), words.add(base + 1), r);
+            core::ptr::copy(words.add(base), words.add(base + 1), r);
             child
         }
     }
@@ -367,8 +369,8 @@ impl HashNode {
                 self.ctrl[i] = ctrl;
                 unsafe {
                     (
-                        std::ptr::replace(self.key_ptr_mut(i), key),
-                        std::ptr::replace(self.val_ptr_mut(i), val),
+                        core::ptr::replace(self.key_ptr_mut(i), key),
+                        core::ptr::replace(self.val_ptr_mut(i), val),
                     )
                 }
             }
@@ -476,8 +478,8 @@ impl Drop for HashNode {
     fn drop(&mut self) {
         for i in 0..self.count as usize {
             unsafe {
-                std::ptr::drop_in_place(self.key_ptr_mut(i));
-                std::ptr::drop_in_place(self.val_ptr_mut(i));
+                core::ptr::drop_in_place(self.key_ptr_mut(i));
+                core::ptr::drop_in_place(self.val_ptr_mut(i));
             }
         }
     }
@@ -690,7 +692,7 @@ impl ValTrees {
                 if !saving && cur.overwrite_from(&val) {
                     return false;
                 }
-                let old = std::mem::replace(cur, val);
+                let old = core::mem::replace(cur, val);
                 self.dispose(idx, old);
                 return false;
             }
@@ -1086,6 +1088,10 @@ impl ValTrees {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
+    #[allow(unused_imports)]
+    use std::{dbg, eprintln, print, println};
     use super::*;
     use std::collections::HashMap;
 
@@ -1171,7 +1177,7 @@ mod tests {
         // Budget 1 : la racine est écrite seule dans la première tranche.
         let mut first = true;
         let got = ser_all(&mut t, root, 1, |t| {
-            if std::mem::take(&mut first) {
+            if core::mem::take(&mut first) {
                 for i in 0..6 {
                     assert!(t.hash_remove(root, format!("f{i}").as_bytes()));
                 }
@@ -1250,7 +1256,7 @@ mod tests {
         t.begin_save();
         let mut first = true;
         let got = ser_all(&mut t, root, 1, |t| {
-            if std::mem::take(&mut first) {
+            if core::mem::take(&mut first) {
                 for i in (0..40).step_by(2) {
                     assert!(t.hash_remove(root, format!("f{i}").as_bytes()));
                 }
@@ -1268,7 +1274,7 @@ mod tests {
     #[test]
     fn layout() {
         assert_eq!(size_of::<HashNode>(), 128);
-        assert_eq!(std::mem::offset_of!(HashNode, node_type), crate::NODE_TYPE_OFFSET);
+        assert_eq!(core::mem::offset_of!(HashNode, node_type), crate::NODE_TYPE_OFFSET);
     }
 
     #[test]

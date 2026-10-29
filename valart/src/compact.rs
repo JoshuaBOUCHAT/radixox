@@ -10,6 +10,8 @@
 //! des idx d'une tranche à l'autre) et en même temps qu'une passe du GC (il parcourt la
 //! slab par idx) : c'est au pilote de ne pas l'avancer dans ces cas.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
 use crate::{NodeType, ValNode, ValTrees};
 
 /// Slots par page de 2 Mio.
@@ -114,9 +116,13 @@ impl ValTrees {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
+    #[allow(unused_imports)]
+    use std::{dbg, eprintln, print, println};
     use super::*;
     use radixox_lib::shared_byte::SharedByte;
-    use std::collections::{BTreeMap, BTreeSet};
+    use alloc::collections::{BTreeMap, BTreeSet};
 
     fn sb(s: String) -> SharedByte {
         SharedByte::from_slice(s.as_bytes())

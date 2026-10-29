@@ -15,7 +15,8 @@ repository = "https://github.com/JoshuaBOUCHAT/radixox"
 [workspace.dependencies]
 bytes = "1"
 oxidart = { path = "oxidart", version = "0.6.0" }
-radixox-lib = { path = "radixox-lib", version = "0.6.0" }
+# Sans `std` par défaut (no_std) : chaque crate active `radixox-lib/std` elle-même.
+radixox-lib = { path = "radixox-lib", version = "0.6.0", default-features = false }
 valart = { path = "valart", version = "0.6.0" }
 
 

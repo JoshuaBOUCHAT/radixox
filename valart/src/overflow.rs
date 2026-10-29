@@ -1,4 +1,6 @@
-use std::alloc::{Layout, handle_alloc_error};
+#[allow(unused_imports)]
+use crate::prelude::*;
+use alloc::alloc::{Layout, handle_alloc_error};
 
 // Blocs overflow : pool des structures, alignés sur 8 (MEMORY_ARCH.md §17.4) ; ce qui
 // suffit au tag de 3 bits. Taille arrondie à 8 (les curseurs du pool n'allouent que des
@@ -11,7 +13,7 @@ unsafe fn block_zalloc(layout: Layout) -> *mut u8 {
     unsafe {
         let p = radixox_lib::pool::struct_alloc(size);
         if !p.is_null() {
-            std::ptr::write_bytes(p, 0, size);
+            core::ptr::write_bytes(p, 0, size);
         }
         p
     }
@@ -22,13 +24,13 @@ unsafe fn block_free(ptr: *mut u8, layout: Layout) {
 }
 #[cfg(test)]
 unsafe fn block_zalloc(layout: Layout) -> *mut u8 {
-    unsafe { std::alloc::alloc_zeroed(layout) }
+    unsafe { alloc::alloc::alloc_zeroed(layout) }
 }
 #[cfg(test)]
 unsafe fn block_free(ptr: *mut u8, layout: Layout) {
-    unsafe { std::alloc::dealloc(ptr, layout) }
+    unsafe { alloc::alloc::dealloc(ptr, layout) }
 }
-use std::ptr::NonNull;
+use core::ptr::NonNull;
 
 use radixox_lib::prefetch::PreFetch;
 use radixox_lib::prefetch::PreFetchPtr;
@@ -273,7 +275,7 @@ impl SetOverflow {
         }
         unsafe {
             let childs = self.childs_ptr();
-            std::ptr::copy(childs.add(r), childs.add(r + 1), n - r);
+            core::ptr::copy(childs.add(r), childs.add(r + 1), n - r);
             childs.add(r).write(child);
         }
         self.set_childs_len(n + 1);
@@ -286,7 +288,7 @@ impl SetOverflow {
         unsafe {
             let childs = self.childs_ptr();
             let child = childs.add(r).read();
-            std::ptr::copy(childs.add(r + 1), childs.add(r), n - r - 1);
+            core::ptr::copy(childs.add(r + 1), childs.add(r), n - r - 1);
             self.set_childs_len(n - 1);
             child
         }
@@ -298,7 +300,7 @@ impl SetOverflow {
         debug_assert!(i < self.len());
         unsafe {
             *self.ctrl_ptr().add(i) = ctrl;
-            std::ptr::replace(self.keys_ptr().add(i), key)
+            core::ptr::replace(self.keys_ptr().add(i), key)
         }
     }
 
@@ -343,20 +345,20 @@ impl SetOverflow {
         unsafe {
             new.base_ptr().write(len as u8);
             new.base_ptr().add(1).write(nb_childs as u8);
-            std::ptr::copy_nonoverlapping(self.radix_ptr(), new.radix_ptr(), len);
-            std::ptr::copy_nonoverlapping(self.ctrl_ptr(), new.ctrl_ptr(), len);
+            core::ptr::copy_nonoverlapping(self.radix_ptr(), new.radix_ptr(), len);
+            core::ptr::copy_nonoverlapping(self.ctrl_ptr(), new.ctrl_ptr(), len);
             // Les bits ≥ len sont toujours à 0 : copier `bitmap_len(len)`
             // suffit et reste dans les bornes quand on réduit la classe.
-            std::ptr::copy_nonoverlapping(self.bitmap_ptr(), new.bitmap_ptr(), bitmap_len(len));
-            std::ptr::copy_nonoverlapping(self.keys_ptr(), new.keys_ptr(), len);
-            std::ptr::copy_nonoverlapping(self.childs_ptr(), new.childs_ptr(), nb_childs);
+            core::ptr::copy_nonoverlapping(self.bitmap_ptr(), new.bitmap_ptr(), bitmap_len(len));
+            core::ptr::copy_nonoverlapping(self.keys_ptr(), new.keys_ptr(), len);
+            core::ptr::copy_nonoverlapping(self.childs_ptr(), new.childs_ptr(), nb_childs);
             block_free(self.base_ptr(), self.block_layout());
         }
         // Pas `*self = new` : ça déclencherait le `Drop` de l'ancienne valeur
         // (déjà désallouée, clés déplacées). On adopte le pointeur et on
         // `forget` `new`.
         self.ptr = new.ptr;
-        std::mem::forget(new);
+        core::mem::forget(new);
     }
 
     /// Ajoute une entrée en fin de tableau, sans vérifier si `radix` est déjà
@@ -484,23 +486,23 @@ impl SetOverflow {
     /// Copie bit à bit du bloc pour une image de save : les entrées ne sont
     /// pas clonées (pas de refcount). Libérer avec [`Self::free_shallow`],
     /// jamais dropper.
-    pub(crate) fn shallow_copy(&self) -> std::mem::ManuallyDrop<Self> {
+    pub(crate) fn shallow_copy(&self) -> core::mem::ManuallyDrop<Self> {
         let layout = self.block_layout();
         unsafe {
             let raw = block_zalloc(layout);
             if raw.is_null() {
                 handle_alloc_error(layout);
             }
-            std::ptr::copy_nonoverlapping(self.base_ptr(), raw, layout.size());
+            core::ptr::copy_nonoverlapping(self.base_ptr(), raw, layout.size());
             let tagged = (raw as usize | self.class() as usize) as *mut u8;
-            std::mem::ManuallyDrop::new(Self {
+            core::mem::ManuallyDrop::new(Self {
                 ptr: NonNull::new_unchecked(tagged),
             })
         }
     }
 
     /// Libère le bloc d'une copie superficielle sans dropper ses entrées.
-    pub(crate) fn free_shallow(copy: std::mem::ManuallyDrop<Self>) {
+    pub(crate) fn free_shallow(copy: core::mem::ManuallyDrop<Self>) {
         unsafe { block_free(copy.base_ptr(), copy.block_layout()) };
     }
 }
@@ -526,7 +528,7 @@ impl SetOverflow {
 impl Drop for SetOverflow {
     fn drop(&mut self) {
         for i in 0..self.len() {
-            unsafe { std::ptr::drop_in_place(self.keys_ptr().add(i)) };
+            unsafe { core::ptr::drop_in_place(self.keys_ptr().add(i)) };
         }
         unsafe { block_free(self.base_ptr(), self.block_layout()) };
     }
@@ -768,7 +770,7 @@ impl HashOverflow {
         }
         unsafe {
             let childs = self.childs_ptr();
-            std::ptr::copy(childs.add(r), childs.add(r + 1), n - r);
+            core::ptr::copy(childs.add(r), childs.add(r + 1), n - r);
             childs.add(r).write(child);
         }
         self.set_childs_len(n + 1);
@@ -780,7 +782,7 @@ impl HashOverflow {
         unsafe {
             let childs = self.childs_ptr();
             let child = childs.add(r).read();
-            std::ptr::copy(childs.add(r + 1), childs.add(r), n - r - 1);
+            core::ptr::copy(childs.add(r + 1), childs.add(r), n - r - 1);
             self.set_childs_len(n - 1);
             child
         }
@@ -799,8 +801,8 @@ impl HashOverflow {
         unsafe {
             *self.ctrl_ptr().add(i) = ctrl;
             (
-                std::ptr::replace(self.keys_ptr().add(i), key),
-                std::ptr::replace(self.vals_ptr().add(i), val),
+                core::ptr::replace(self.keys_ptr().add(i), key),
+                core::ptr::replace(self.vals_ptr().add(i), val),
             )
         }
     }
@@ -845,18 +847,18 @@ impl HashOverflow {
         unsafe {
             new.base_ptr().write(len as u8);
             new.base_ptr().add(1).write(nb_childs as u8);
-            std::ptr::copy_nonoverlapping(self.radix_ptr(), new.radix_ptr(), len);
-            std::ptr::copy_nonoverlapping(self.ctrl_ptr(), new.ctrl_ptr(), len);
+            core::ptr::copy_nonoverlapping(self.radix_ptr(), new.radix_ptr(), len);
+            core::ptr::copy_nonoverlapping(self.ctrl_ptr(), new.ctrl_ptr(), len);
             // Bits ≥ len toujours à 0 : `bitmap_len(len)` suffit.
-            std::ptr::copy_nonoverlapping(self.bitmap_ptr(), new.bitmap_ptr(), bitmap_len(len));
-            std::ptr::copy_nonoverlapping(self.keys_ptr(), new.keys_ptr(), len);
-            std::ptr::copy_nonoverlapping(self.vals_ptr(), new.vals_ptr(), len);
-            std::ptr::copy_nonoverlapping(self.childs_ptr(), new.childs_ptr(), nb_childs);
+            core::ptr::copy_nonoverlapping(self.bitmap_ptr(), new.bitmap_ptr(), bitmap_len(len));
+            core::ptr::copy_nonoverlapping(self.keys_ptr(), new.keys_ptr(), len);
+            core::ptr::copy_nonoverlapping(self.vals_ptr(), new.vals_ptr(), len);
+            core::ptr::copy_nonoverlapping(self.childs_ptr(), new.childs_ptr(), nb_childs);
             block_free(self.base_ptr(), self.block_layout());
         }
         // Voir `SetOverflow::realloc` : on adopte le pointeur, sans Drop.
         self.ptr = new.ptr;
-        std::mem::forget(new);
+        core::mem::forget(new);
     }
 
     /// Ajoute une entrée en fin de tableau, sans dédup (à l'appelant de
@@ -963,23 +965,23 @@ impl HashOverflow {
     /// Copie bit à bit du bloc pour une image de save : les entrées ne sont
     /// pas clonées (pas de refcount). Libérer avec [`Self::free_shallow`],
     /// jamais dropper.
-    pub(crate) fn shallow_copy(&self) -> std::mem::ManuallyDrop<Self> {
+    pub(crate) fn shallow_copy(&self) -> core::mem::ManuallyDrop<Self> {
         let layout = self.block_layout();
         unsafe {
             let raw = block_zalloc(layout);
             if raw.is_null() {
                 handle_alloc_error(layout);
             }
-            std::ptr::copy_nonoverlapping(self.base_ptr(), raw, layout.size());
+            core::ptr::copy_nonoverlapping(self.base_ptr(), raw, layout.size());
             let tagged = (raw as usize | self.class() as usize) as *mut u8;
-            std::mem::ManuallyDrop::new(Self {
+            core::mem::ManuallyDrop::new(Self {
                 ptr: NonNull::new_unchecked(tagged),
             })
         }
     }
 
     /// Libère le bloc d'une copie superficielle sans dropper ses entrées.
-    pub(crate) fn free_shallow(copy: std::mem::ManuallyDrop<Self>) {
+    pub(crate) fn free_shallow(copy: core::mem::ManuallyDrop<Self>) {
         unsafe { block_free(copy.base_ptr(), copy.block_layout()) };
     }
 }
@@ -1006,8 +1008,8 @@ impl Drop for HashOverflow {
     fn drop(&mut self) {
         for i in 0..self.len() {
             unsafe {
-                std::ptr::drop_in_place(self.keys_ptr().add(i));
-                std::ptr::drop_in_place(self.vals_ptr().add(i));
+                core::ptr::drop_in_place(self.keys_ptr().add(i));
+                core::ptr::drop_in_place(self.vals_ptr().add(i));
             }
         }
         unsafe { block_free(self.base_ptr(), self.block_layout()) };
@@ -1023,6 +1025,10 @@ const _: () = assert!(size_of::<Option<HashOverflow>>() == 8);
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::prelude::*;
+    #[allow(unused_imports)]
+    use std::{dbg, eprintln, print, println};
     use super::*;
 
     #[test]

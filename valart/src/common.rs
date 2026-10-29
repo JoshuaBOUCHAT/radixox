@@ -1,7 +1,9 @@
 //! Pièces communes au Set et au Hash : hash des membres, dispatch, slots,
 //! buckets de collision.
 
-use std::hash::{BuildHasher, Hasher};
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::hash::{BuildHasher, Hasher};
 
 use crate::ValTrees;
 
