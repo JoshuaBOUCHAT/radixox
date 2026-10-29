@@ -1805,6 +1805,18 @@ surtout des blocs de nœud qui grossissent (le pool est bump + compteur par bloc
   ~12 Mo restants ne viennent donc pas surtout des pages (hypothèse toujours à vérifier : suffixes `CompactPath`
   réalloués au `split_leaf`). Variante à essayer plus tard (utilisateur) : deux nurseries par classe, la précédente
   gardée le temps que ses nœuds proches d'un changement de classe churnent.
+- **Fenêtre de nurseries (2026-10-29, `main`)** : la variante ci-dessus généralisée. Compteur temporaire des trous par
+  origine (YCSB A 5 M, fin de chargement, après le correctif `ZADD` de §16.9) : pages libérées dans un bloc fermé
+  34 Mo (main) / 110 Mo (groupes de collision), toutes de classe 16 à 192 o : une page change de classe longtemps
+  après que sa nurserie a été rendue. **Chaque classe garde 32 blocs ouverts** (`RADIXOX_NURSERY_WINDOW`, 1 à 64 ;
+  1 = l'ancienne nurserie unique) ; masque `nursery_avail` par classe (bit = bloc avec une case libre, choix par
+  `trailing_zeros`) ; tous pleins, le plus ancien (tourniquet) se ferme et devient un bloc normal. `rewind` retrouve
+  la nurserie d'un bloc en O(1) par la table `fill` (sans objet sur un bloc sans poignée : indice + 1 tant qu'il est
+  en fenêtre, remis à 0 à la fermeture et au rendu du bloc) — une recherche linéaire dans 160 blocs coûtait +2,8 %
+  d'instructions. `tree_bench mem` 1 M (`fresh100`, sans GC) : main ycsb 184,6 → 178,3 o/clé, uuid 199,3 → 190,9,
+  memtier-rand 163,2 → 156,6 (−3 à −4 %) ; groupes 174,1 → 159,5, 193,1 → 178,3, 152,2 → 138,9 (−8 à −9 %) ;
+  instructions +0,3 %. Serveur YCSB 5 M (groupes) : fragmentation du chargement 0,09–0,10 → 0,03–0,05, pic RSS
+  1400 → 1356 Mo (32) / 1344 Mo (64). Coût fixe : au plus 5 × 32 blocs ouverts (10 Mio) une fois les classes remplies.
 
 ### 17.4 Petits blocs Hash/Set et débordements valart (fait, branche `pool-structures`)
 

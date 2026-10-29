@@ -92,10 +92,16 @@ const NO_WINDOW: Window = Window { block: [NONE; WINDOW], rest: [0; WINDOW] };
 /// Classes de la nurserie (pages des nœuds sans en-tête, MEMORY_ARCH.md §17.2 ter).
 const NURSERY_SIZES: [usize; 5] = [16, 32, 64, 96, 128];
 
+/// Blocs de nurserie gardés ouverts par classe (`RADIXOX_NURSERY_WINDOW`, 1 à
+/// [`NURSERY_WINDOW_MAX`]).
+const NURSERY_WINDOW: usize = 32;
+const NURSERY_WINDOW_MAX: usize = 64;
+
 /// Nurserie anti-churn d'une classe : un bloc ouvert découpé en cases de la taille de la
 /// classe, une case libérée est reprise tout de suite (les pages qui changent de classe
-/// pendant un chargement ne laissent pas de trou). Pleine, elle se ferme et devient un bloc
-/// normal du pool (son compteur de vivants est déjà juste) ; une autre la remplace.
+/// pendant un chargement ne laissent pas de trou). Chaque classe garde une fenêtre de
+/// blocs ouverts ; tous pleins, le plus ancien se ferme et devient un bloc normal du pool
+/// (son compteur de vivants est déjà juste), un neuf prend sa place.
 #[derive(Clone, Copy)]
 struct Nursery {
     block: u32,
@@ -177,7 +183,8 @@ pub struct Pool {
     marked: *mut u64,
     /// Bloc d'un curseur à poignée (§19) : ne contient que des objets à poignée.
     handled: *mut u64,
-    /// Fin de remplissage d'un bloc à poignée, en granules, tenue à la fermeture du curseur.
+    /// Fin de remplissage d'un bloc à poignée, en granules, tenue à la fermeture du curseur ;
+    /// sur un bloc sans poignée : indice + 1 dans `nurseries` tant qu'il y est ouvert, sinon 0.
     fill: *mut u16,
     maps: [(*mut u8, usize); 6],
     /// Registre des pages (MEMORY_ARCH.md §10.4) : pages de données comptées (prises neuves
@@ -214,7 +221,14 @@ pub struct Pool {
     pressed: bool,
     /// Pages vidées par la passe en cours (mode pages).
     evacuating: Vec<u32>,
-    nurseries: [Nursery; NURSERY_SIZES.len()],
+    /// Fenêtres des classes, `nursery_window` blocs chacune : la classe `n` occupe
+    /// `[n * nursery_window, (n + 1) * nursery_window)`.
+    nurseries: Vec<Nursery>,
+    nursery_window: usize,
+    /// Par classe : bit `j` si le bloc `j` de la fenêtre a une case libre ; prochain bloc
+    /// à fermer quand tous sont pleins.
+    nursery_avail: [u64; NURSERY_SIZES.len()],
+    nursery_victim: [u8; NURSERY_SIZES.len()],
     /// `RADIXOX_NURSERY=0` : les classes passent par le curseur des structures (mesures).
     nursery_on: bool,
 }
@@ -297,7 +311,10 @@ impl Pool {
             suspended_until: None,
             pressed: false,
             evacuating: Vec::new(),
-            nurseries: [NO_NURSERY; NURSERY_SIZES.len()],
+            nurseries: vec![NO_NURSERY; NURSERY_SIZES.len() * NURSERY_WINDOW],
+            nursery_window: NURSERY_WINDOW,
+            nursery_avail: [0; NURSERY_SIZES.len()],
+            nursery_victim: [0; NURSERY_SIZES.len()],
             nursery_on: true,
         })
     }
@@ -409,35 +426,64 @@ impl Pool {
         }
     }
 
+    /// Fenêtre de `w` blocs par classe, avant toute allocation de classe.
+    fn set_nursery_window(&mut self, w: usize) {
+        debug_assert!(self.nurseries.iter().all(|nu| nu.block == NONE));
+        self.nursery_window = w.clamp(1, NURSERY_WINDOW_MAX);
+        self.nurseries = vec![NO_NURSERY; NURSERY_SIZES.len() * self.nursery_window];
+        self.nursery_avail = [0; NURSERY_SIZES.len()];
+    }
+
     fn alloc_nursery(&mut self, n: usize) -> *mut u8 {
         let size = NURSERY_SIZES[n];
-        if self.nurseries[n].summary == 0 {
-            // pleine (ou aucune) : bloc normal du pool, nurserie neuve
-            let old = self.nurseries[n].block;
-            self.nurseries[n] = NO_NURSERY;
-            if old != NONE {
-                self.close_block(old);
-            }
-            let Some(b) = self.take_block() else { return null_mut() };
-            let nu = &mut self.nurseries[n];
-            nu.block = b;
-            let slots = BLOCK / size;
-            for (w, word) in nu.free.iter_mut().enumerate().take(slots.div_ceil(64)) {
-                *word = if (w + 1) * 64 <= slots { !0 } else { (1 << (slots % 64)) - 1 };
-                nu.summary |= 1 << w;
-            }
+        if self.nursery_avail[n] == 0 && !self.nursery_refill(n) {
+            return null_mut();
         }
-        let nu = &mut self.nurseries[n];
+        let j = self.nursery_avail[n].trailing_zeros() as usize;
+        let nu = &mut self.nurseries[n * self.nursery_window + j];
         let w = nu.summary.trailing_zeros() as usize;
         let i = nu.free[w].trailing_zeros() as usize;
         nu.free[w] &= nu.free[w] - 1;
         if nu.free[w] == 0 {
             nu.summary &= !(1 << w);
+            if nu.summary == 0 {
+                self.nursery_avail[n] &= !(1 << j);
+            }
         }
         let b = nu.block;
         *self.live(b) += (size / 2) as u16;
         self.live_bytes += size as u64;
         (self.block_addr(b) + (w * 64 + i) * size) as *mut u8
+    }
+
+    /// Fenêtre de la classe `n` pleine : une place vide, sinon la plus ancienne (pleine,
+    /// fermée : bloc normal du pool), reçoit un bloc neuf. Faux si la plage est pleine.
+    #[cold]
+    fn nursery_refill(&mut self, n: usize) -> bool {
+        let w0 = n * self.nursery_window;
+        let k = match (w0..w0 + self.nursery_window).find(|&k| self.nurseries[k].block == NONE) {
+            Some(k) => k,
+            None => {
+                let v = self.nursery_victim[n] as usize;
+                self.nursery_victim[n] = ((v + 1) % self.nursery_window) as u8;
+                let old = self.nurseries[w0 + v].block;
+                self.nurseries[w0 + v] = NO_NURSERY;
+                unsafe { *self.fill.add(old as usize) = 0 };
+                self.close_block(old);
+                w0 + v
+            }
+        };
+        let Some(b) = self.take_block() else { return false };
+        self.nursery_avail[n] |= 1 << (k - w0);
+        let slots = BLOCK / NURSERY_SIZES[n];
+        unsafe { *self.fill.add(b as usize) = (k + 1) as u16 };
+        let nu = &mut self.nurseries[k];
+        nu.block = b;
+        for (w, word) in nu.free.iter_mut().enumerate().take(slots.div_ceil(64)) {
+            *word = if (w + 1) * 64 <= slots { !0 } else { (1 << (slots % 64)) - 1 };
+            nu.summary |= 1 << w;
+        }
+        true
     }
 
     /// Objet à poignée (§19, `size` pair, ≤ [`MEDIUM`]) : bump seul.
@@ -622,10 +668,12 @@ impl Pool {
 
     /// Ferme tous les curseurs, fenêtres et nurseries (passe forcée des tests).
     fn close_cursors(&mut self) {
-        for n in 0..NURSERY_SIZES.len() {
-            let b = self.nurseries[n].block;
-            self.nurseries[n] = NO_NURSERY;
+        self.nursery_avail = [0; NURSERY_SIZES.len()];
+        for k in 0..self.nurseries.len() {
+            let b = self.nurseries[k].block;
+            self.nurseries[k] = NO_NURSERY;
             if b != NONE {
+                unsafe { *self.fill.add(b as usize) = 0 };
                 self.close_block(b);
             }
         }
@@ -685,13 +733,15 @@ impl Pool {
     #[cold]
     fn rewind(&mut self, b: u32, addr: usize, size: usize, empty: bool) {
         let start = self.block_addr(b);
-        for nu in &mut self.nurseries {
-            if nu.block == b {
-                let i = (addr - start) / size;
-                nu.free[i / 64] |= 1 << (i % 64);
-                nu.summary |= 1 << (i / 64);
-                return;
-            }
+        let k = unsafe { *self.fill.add(b as usize) } as usize;
+        if k != 0 && !bit(self.handled, b) {
+            let k = k - 1;
+            let nu = &mut self.nurseries[k];
+            let i = (addr - start) / size;
+            nu.free[i / 64] |= 1 << (i % 64);
+            nu.summary |= 1 << (i / 64);
+            self.nursery_avail[k / self.nursery_window] |= 1 << (k % self.nursery_window);
+            return;
         }
         for c in &mut self.cursors {
             if c.block == b {
@@ -830,6 +880,7 @@ impl Pool {
             self.freed_in_pass += 1;
         }
         set_bit(self.handled, b, false);
+        unsafe { *self.fill.add(b as usize) = 0 };
         self.held_blocks -= 1;
         let p = b / BLOCKS_PER_PAGE;
         let n = self.free_count(p);
@@ -1083,6 +1134,7 @@ pub(crate) fn init() -> Option<&'static mut Pool> {
             return None;
         };
         pool.nursery_on = env("RADIXOX_NURSERY", 1) != 0;
+        pool.set_nursery_window(env("RADIXOX_NURSERY_WINDOW", NURSERY_WINDOW));
         (*&raw mut POOL).insert(pool).into()
     }
 }
@@ -1418,6 +1470,7 @@ mod tests {
     #[test]
     fn nursery_reuses_then_hands_over_when_full() {
         let mut p = pool(2);
+        p.set_nursery_window(1);
         let a = p.alloc_class8(96);
         let b = p.alloc_class8(96);
         assert_eq!(b as usize, a as usize + 96);
@@ -1450,6 +1503,32 @@ mod tests {
         // passe exhaustive : les nurseries se ferment comme les curseurs
         p.close_cursors();
         assert!(!p.is_open(p.block_of(next)));
+    }
+
+    #[test]
+    fn nursery_window_keeps_full_blocks_open() {
+        let mut p = pool(2);
+        p.set_nursery_window(2);
+        let per = BLOCK / 128;
+        let first: Vec<_> = (0..per).map(|_| p.alloc_class8(128)).collect();
+        let b0 = p.block_of(first[0]);
+        let x = p.alloc_class8(128);
+        let b1 = p.block_of(x);
+        assert_ne!(b1, b0);
+        assert!(p.is_open(b0), "plein mais dans la fenêtre : reste ouvert");
+        unsafe { p.free(first[7], 128) };
+        assert_eq!(p.alloc_class8(128), first[7], "case du bloc plein reprise");
+        for _ in 1..per {
+            let z = p.alloc_class8(128);
+            assert_eq!(p.block_of(z), b1);
+        }
+        // fenêtre pleine : le plus ancien se ferme, un neuf prend sa place
+        let y = p.alloc_class8(128);
+        assert!(!p.is_open(b0));
+        assert!(p.is_open(b1));
+        assert_ne!(p.block_of(y), b1);
+        unsafe { p.free(first[3], 128) };
+        assert_ne!(p.alloc_class8(128), first[3], "bloc fermé : trou ordinaire");
     }
 
     #[test]
