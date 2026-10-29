@@ -6,7 +6,7 @@
 //!   uuidload --mode uniform --keys 15000000 --time 10
 //!
 //! Options : --host, --port (6379), --threads (6), --conns (14 par thread),
-//! --pipeline (64), --shape uuid|key, --zipf (0.99), --scramble (rang Zipf
+//! --pipeline (64), --shape uuid|b64|key, --zipf (0.99), --scramble (rang Zipf
 //! mélangé par bijection : les clés chaudes ne sont plus `key:1`, `key:2`…),
 //! --sets N (1 SET pour N commandes, 5 → 1:4), --seed.
 //!
@@ -29,6 +29,8 @@ struct Cfg {
     pipeline: usize,
     keys: u64,
     shape_uuid: bool,
+    /// UUID en base64url (22 o) au lieu de l'hexadécimal.
+    b64: bool,
     mode: Mode,
     zipf: f64,
     scramble: bool,
@@ -53,6 +55,7 @@ fn parse_args() -> Cfg {
         pipeline: 64,
         keys: 1_000_000,
         shape_uuid: true,
+        b64: false,
         mode: Mode::Zipf,
         zipf: 0.99,
         scramble: false,
@@ -70,7 +73,11 @@ fn parse_args() -> Cfg {
             "--conns" => c.conns = v().parse().unwrap(),
             "--pipeline" => c.pipeline = v().parse().unwrap(),
             "--keys" => c.keys = v().parse().unwrap(),
-            "--shape" => c.shape_uuid = v() == "uuid",
+            "--shape" => {
+                let s = v();
+                c.shape_uuid = s == "uuid" || s == "b64";
+                c.b64 = s == "b64";
+            }
             "--mode" => {
                 c.mode = match v().as_str() {
                     "load" => Mode::Load,
@@ -125,11 +132,26 @@ fn uuid(out: &mut Vec<u8>, i: u64, salt: u64) {
     }
 }
 
+/// Les mêmes 128 bits que [`uuid`], en base64url sans remplissage (22 o).
+fn uuid_b64(out: &mut Vec<u8>, i: u64, salt: u64) {
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let a = splitmix(i ^ salt);
+    let b = splitmix(a ^ i.rotate_left(32));
+    let bits = (a as u128) << 64 | b as u128;
+    for n in 0..22 {
+        let shift = 128i32 - 6 * (n + 1);
+        let v = if shift >= 0 { bits >> shift } else { bits << -shift };
+        out.push(B64[(v & 0x3f) as usize]);
+    }
+}
+
 const KEY_SALT: u64 = 0x6b65_7973;
 const VAL_SALT: u64 = 0x7661_6c73;
 
 fn key(out: &mut Vec<u8>, cfg: &Cfg, i: u64) {
-    if cfg.shape_uuid {
+    if cfg.b64 {
+        uuid_b64(out, i, KEY_SALT);
+    } else if cfg.shape_uuid {
         uuid(out, i, KEY_SALT);
     } else {
         out.extend_from_slice(b"key:");

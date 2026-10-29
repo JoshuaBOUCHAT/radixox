@@ -239,6 +239,14 @@ pub(crate) fn starts_with_fast(hay: &[u8], needle: &[u8]) -> bool {
     if n > 16 {
         return &hay[..n] == needle;
     }
+    if n >= 8 {
+        // deux mots de 8 o qui se chevauchent : début et fin, sans boucle
+        // SAFETY: 8 ≤ n ≤ hay.len(), lectures dans les deux tranches.
+        unsafe {
+            let w = |p: *const u8| (p as *const u64).read_unaligned();
+            return w(hay.as_ptr()) == w(needle.as_ptr()) && w(hay.as_ptr().add(n - 8)) == w(needle.as_ptr().add(n - 8));
+        }
+    }
     let mut i = 0;
     while i < n {
         // SAFETY: i < n ≤ hay.len().
