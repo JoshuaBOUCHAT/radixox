@@ -2,12 +2,20 @@
 
 **An in-memory key-value store that speaks the Redis protocol, with its keys kept in
 order.** Rust, an adaptive radix tree instead of a hash table, a hand-written io_uring
-loop, one thread per dataset.
+loop, one thread per dataset, and a single static binary **without any libc**.
 
 Because the keys are sorted, prefix and range queries are cheap: `SCAN MATCH user:*` only
 walks the `user:` subtree, `KRANGE` returns the next N keys of a prefix, and
 `UNLINK user:*` drops a whole namespace in one command. `redis-cli` and the usual Redis
 client libraries work for the [supported commands](#commands).
+
+**No libc, one file.** `radixox-nostd` is the whole server built `#![no_std]`: its own
+`_start`, system calls straight to the kernel (`rustix`), its own io_uring ring, its own
+allocator and `memcpy`. No glibc, no musl, no shared library: a 2.3 MB static file you copy
+to any Linux ≥ 6.12 x86-64 machine and run, even under `env -i`. It costs nothing (same
+throughput as the glibc build, 2.3 MB less resident memory) and passes the whole test
+suite. [Download it](https://github.com/JoshuaBOUCHAT/radixox/releases/tag/v0.6.0-nostd)
+or [build it](#portable-and-static-builds).
 
 ## At a glance
 
@@ -46,6 +54,15 @@ data that must survive anything**:
 
 ## Quick start
 
+Static binary, nothing to build or install (Linux ≥ 6.12, x86-64 with AVX2):
+
+```bash
+curl -L https://github.com/JoshuaBOUCHAT/radixox/releases/download/v0.6.0-nostd/radixox-nostd-x86_64-linux-v3.tar.gz | tar xz
+./radixox-nostd-x86_64-linux-v3/radixox          # 127.0.0.1:6379
+```
+
+From source:
+
 ```bash
 git clone https://github.com/JoshuaBOUCHAT/radixox && cd radixox
 cargo build --release -p radixox                 # target/release/radixox
@@ -79,9 +96,9 @@ RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -p radixox \
   --target x86_64-unknown-linux-musl --target-dir target/portable
 # → target/portable/x86_64-unknown-linux-musl/release/radixox
 
-# static without any libc (no glibc, no musl; non-PIE, ~2.3 MB), same CPU level
-RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -p radixox --no-default-features \
-  --features nostd-bin --bin radixox-nostd --target-dir target/portable
+# static without any libc (no glibc, no musl; non-PIE, ~2.3 MB), same CPU level;
+# `cargo nostd` is an alias for the long command (.cargo/config.toml)
+RUSTFLAGS="-C target-cpu=x86-64-v3" cargo nostd --target-dir target/portable
 # → target/portable/release/radixox-nostd
 ```
 
@@ -409,7 +426,12 @@ described in [`RUNTIME_ARCH.md`](RUNTIME_ARCH.md), [`MEMORY_ARCH.md`](MEMORY_ARC
   compacted while the server is idle, and freed memory goes back to the system. `INFO`
   accounts for every resident byte.
 - **Event loop**: io_uring with multishot receives into a shared buffer ring, no async
-  runtime, and a core free of I/O, tested against a simulated kernel.
+  runtime, and a core free of I/O, tested against a simulated kernel. The ring itself is
+  ours too (`radixox/src/ring.rs`, on `rustix::io_uring`).
+- **No libc**: every crate is `#![no_std]` + `alloc`. The server talks to the kernel through
+  `rustix`, reads its configuration from `/proc/self/environ`, and handles signals with
+  `signalfd`; `radixox-mem` provides `memcpy` & co. in Rust. The glibc binary and the
+  libc-free binary (`cargo nostd`) are the same code with a different entry point.
 - **Tests**: differential fuzzing against the previous engine, snapshots under mutation,
   model tests against `BTreeMap`, and server integration tests over TCP.
 
