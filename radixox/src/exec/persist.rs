@@ -3,7 +3,8 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use core::time::Duration;
+use radixox_lib::sys::Instant;
 
 use oxidart::OxidArt;
 use oxidart::compress::ZstdStream;
@@ -14,9 +15,22 @@ pub const FILE_NAME: &str = "dump.rxd";
 /// Fichier en cours d'écriture, renommé en `FILE_NAME` une fois complet.
 pub const TMP_NAME: &str = "dump.rxd.tmp";
 
-/// `RADIXOX_DIR` (défaut : dossier courant).
+/// Dossier imposé par [`set_save_dir`] (sinon `RADIXOX_DIR`). Mono-thread : seul le
+/// thread de la boucle (ou celui d'un test) y touche.
+static mut SAVE_DIR: Option<String> = None;
+
+/// Remplace `RADIXOX_DIR` (lu au démarrage) pour la suite du processus : les tests
+/// changent de dossier sans `setenv`, que [`radixox_lib::sys::env`] ne voit pas.
+pub fn set_save_dir(dir: Option<String>) {
+    // SAFETY: mono-thread (voir `SAVE_DIR`).
+    unsafe { *&raw mut SAVE_DIR = dir };
+}
+
+/// `RADIXOX_DIR` (défaut : dossier courant), ou le dossier de [`set_save_dir`].
 pub fn save_dir() -> PathBuf {
-    PathBuf::from(std::env::var("RADIXOX_DIR").unwrap_or_else(|_| ".".into()))
+    // SAFETY: mono-thread (voir `SAVE_DIR`).
+    let set = unsafe { (*&raw const SAVE_DIR).clone() };
+    PathBuf::from(set.unwrap_or_else(|| radixox_lib::sys::env("RADIXOX_DIR").unwrap_or(".").into()))
 }
 
 /// Où écrire un dump : `dir/tmp`, renommé en `dir/name` une fois complet ;
@@ -175,7 +189,7 @@ pub fn save_sync_to(art: &mut OxidArt, level: Option<i32>, to: &Target) -> io::R
 /// Niveau zstd de `SAVE` et de la save de sortie : `RADIXOX_SAVE_SYNC_ZSTD`
 /// (défaut, absent ou 0 : brut, le plus rapide).
 pub fn sync_level() -> Option<i32> {
-    match std::env::var("RADIXOX_SAVE_SYNC_ZSTD").ok().and_then(|v| v.parse::<i32>().ok()) {
+    match radixox_lib::sys::env("RADIXOX_SAVE_SYNC_ZSTD").and_then(|v| v.parse::<i32>().ok()) {
         Some(0) | None => None,
         Some(l) => Some(l.clamp(zstd_safe::min_c_level(), zstd_safe::max_c_level())),
     }

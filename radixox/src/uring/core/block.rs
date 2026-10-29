@@ -10,8 +10,10 @@
 //! même fenêtre. Sémantique et journal de Redis : le push tel qu'envoyé, puis un pop par
 //! client servi.
 
-use std::collections::{HashMap, VecDeque};
-use std::time::Instant;
+use alloc::collections::VecDeque;
+
+use hashbrown::HashMap;
+use radixox_lib::sys::Instant;
 
 use oxidart::OxidArt;
 use oxidart::lcommand::End;
@@ -89,7 +91,7 @@ impl Blocked {
         for k in &keys {
             self.by_key.entry(k.clone()).or_default().push_back(id);
         }
-        let deadline = (b.timeout > 0.0).then(|| now + std::time::Duration::from_secs_f64(b.timeout));
+        let deadline = (b.timeout > 0.0).then(|| now + core::time::Duration::from_secs_f64(b.timeout));
         let kind = match b.kind {
             Kind::Move { dst, from_right, to_right } => Kind::Move { dst: dst.into_external(), from_right, to_right },
             k => k,

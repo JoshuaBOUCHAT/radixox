@@ -3,7 +3,7 @@
 //! [`ConnOut`] (réponses, envoi, mode, mutables pendant l'exécution).
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use radixox_lib::sys::Instant;
 
 use radixox_lib::shared_byte::SharedByte;
 

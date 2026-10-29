@@ -13,8 +13,11 @@
 //! 5. [`Core::take_ops`] → SQE, puis `enter`.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
-use std::time::{Duration, Instant};
+use alloc::collections::BinaryHeap;
+
+use hashbrown::HashMap;
+use core::time::Duration;
+use radixox_lib::sys::Instant;
 
 use oxidart::OxidArt;
 use radixox_lib::small_vec::SmallVec;
@@ -464,7 +467,7 @@ struct Gc {
 
 impl Gc {
     fn from_env() -> Self {
-        let on = |name: &str, default: bool| std::env::var(name).map_or(default, |v| v != "0");
+        let on = |name: &str, default: bool| radixox_lib::sys::env(name).map_or(default, |v| v != "0");
         Self { pass: None, enabled: on("RADIXOX_GC", true), log: on("RADIXOX_GC_LOG", false), max_slice_us: 0, started: None, compact: None, compact_more: None, compact_list_moved: 0, compact_list_released: 0, compact_val_moved: 0, compact_val_released: 0, compact_ztree_moved: 0, compact_ztree_released: 0, compact_zindex_moved: 0, compact_zindex_released: 0, more_fruitless: [0; 4], compact_passes: 0, compact_moved: 0, compact_released: 0, compact_max_slice_us: 0, compact_total_us: 0, trimmed_bytes: 0 }
     }
 }
@@ -1095,7 +1098,7 @@ impl Core {
                 Timer::MemRelease => {
                     // pas de court-circuit : les deux rendent leur part
                     // horloge de la crate (no_std) : relue ici, une fois par minuterie
-                    let t = radixox_lib::sys::Instant::now();
+                    let t = Instant::now();
                     let more = radixox_lib::pool::release_step(t) | radixox_lib::large::release_step(t);
                     let next = if more { MEM_RELEASE_AGAIN } else { MEM_RELEASE_EVERY };
                     self.timers.push(Reverse((self.now + next, Timer::MemRelease)));
@@ -2593,7 +2596,9 @@ impl Core {
                     persist.note_writes(if matches!(cmd, Cmd::FlushDb) { art.len() as u64 } else { weight });
                 }
                 #[cfg(radixox_gc_debug)]
-                GC_DEBUG_RAW.with(|r| *r.borrow_mut() = raw.to_vec());
+                {
+                    *GC_DEBUG_RAW.borrow_mut() = raw.to_vec();
+                }
                 let plan = journal.is_some().then(|| (journal::plan(&cmd), o.out.len()));
                 // Producteur sur une clé attendue (§14.3). LPUSH / RPUSH sur clé absente :
                 // service direct, seul le reste est posé ; les autres : exécutés, puis servis.
@@ -3259,9 +3264,9 @@ impl Core {
             return;
         }
         let idle = self.now.saturating_duration_since(self.last_rx) >= GC_IDLE_AFTER;
-        let Some(mark) = pool::gc_want(idle, radixox_lib::sys::Instant::now()) else { return };
+        let Some(mark) = pool::gc_want(idle, Instant::now()) else { return };
         let now = Instant::now();
-        let n = pool::gc_begin(mark, radixox_lib::sys::Instant::now());
+        let n = pool::gc_begin(mark, Instant::now());
         if n == 0 {
             return; // rien de marquable : passe faible, déclenchement suspendu
         }
@@ -3284,7 +3289,7 @@ impl Core {
             return true;
         }
         self.gc.pass = None;
-        let r = pool::gc_end_pass(radixox_lib::sys::Instant::now());
+        let r = pool::gc_end_pass(Instant::now());
         if self.gc.log
             && let (Some(r), Some((_, s0)), Some(s1)) = (r, self.gc.started.take(), pool::gc_stats())
         {
@@ -3665,15 +3670,13 @@ fn aof_misconf(err: &str) -> Frame {
 /// temporelle (AOF `continuous`, marge de 200 ms) ne tiennent pas ce ralentissement.
 #[cfg(radixox_gc_debug)]
 fn gc_debug_audit_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RADIXOX_GC_AUDIT").map_or(true, |v| v != "0"))
+    radixox_lib::sys::env("RADIXOX_GC_AUDIT").map_or(true, |v| v != "0")
 }
 
+/// Frame en cours d'exécution, pour le message de l'audit d'unicité.
 #[cfg(radixox_gc_debug)]
-thread_local! {
-    /// Frame en cours d'exécution, pour le message de l'audit d'unicité.
-    static GC_DEBUG_RAW: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-}
+static GC_DEBUG_RAW: crate::mono::Mono<core::cell::RefCell<Vec<u8>>> =
+    crate::mono::Mono::new(core::cell::RefCell::new(Vec::new()));
 
 /// Avec le flux, après l'exécution d'une frame : la frame reçue, décidée avant
 /// (`journal::plan`, la commande est consommée), confirmée par la réponse, qui
@@ -3746,7 +3749,7 @@ fn run_cmd(cmd: Cmd<'_>, art: &mut OxidArt, o: &mut ConnOut, job_budget: usize) 
     if !matches!(after, After::Park(_)) && gc_debug_audit_on() {
         let shared = art.gc_audit_unique();
         if !shared.is_empty() {
-            let raw = GC_DEBUG_RAW.with(|r| r.borrow().escape_ascii().to_string());
+            let raw = GC_DEBUG_RAW.borrow().escape_ascii().to_string();
             eprintln!("radixox_gc_debug : après {raw:.300} : SharedByte partagés : {:?}", &shared[..shared.len().min(5)]);
             panic!("audit d'unicité");
         }

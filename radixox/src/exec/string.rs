@@ -1,4 +1,4 @@
-use std::time::Duration;
+use core::time::Duration;
 
 use radixox_lib::shared_frame::SharedFrame as Frame;
 use oxidart::{Hint, OxidArt, PREFETCH_BATCH, TtlResult, counter::CounterError, value::Value};

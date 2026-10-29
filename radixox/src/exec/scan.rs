@@ -23,7 +23,9 @@
 //! qui abandonne ses scans ne prive pas les autres.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use hashbrown::HashMap;
+
+use crate::mono::Mono;
 
 use oxidart::OxidArt;
 use oxidart::krange::ScanPage;
@@ -77,13 +79,16 @@ struct Cursors {
     warned_full: bool,
 }
 
-thread_local! {
-    static CURSORS: RefCell<Cursors> = RefCell::new(Cursors::from_env());
+/// Table des curseurs, créée au premier usage (configuration lue dans l'environnement).
+static CURSORS: Mono<RefCell<Option<Cursors>>> = Mono::new(RefCell::new(None));
+
+fn with_cursors<R>(f: impl FnOnce(&mut Cursors) -> R) -> R {
+    f(CURSORS.borrow_mut().get_or_insert_with(Cursors::from_env))
 }
 
 /// Nombre de curseurs actifs (pour INFO).
 pub fn active_cursors() -> usize {
-    CURSORS.with(|c| c.borrow().active)
+    with_cursors(|c| c.active)
 }
 
 impl Cursors {
@@ -267,12 +272,12 @@ fn env_or<T: std::str::FromStr + std::fmt::Display + Copy>(
     default: T,
     valid: impl Fn(&T) -> bool,
 ) -> T {
-    match std::env::var(name) {
-        Err(_) => default,
-        Ok(v) => match v.parse::<T>() {
+    match radixox_lib::sys::env(name) {
+        None => default,
+        Some(v) => match v.parse::<T>() {
             Ok(n) if valid(&n) => n,
             _ => {
-                eprintln!("[scan] {name}={v} invalide, {default}");
+                radixox_lib::rx_eprintln!("[scan] {name}={v} invalide, {default}");
                 default
             }
         },
@@ -314,8 +319,7 @@ pub fn with_cursor<R>(
         .ok()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| Frame::Error("ERR invalid cursor".into()))?;
-    CURSORS.with(|c| {
-        let mut c = c.borrow_mut();
+    with_cursors(|c| {
         // Reprise : le slot sort de la liste le temps de l'appel ; il garde
         // son propriétaire, même repris depuis une autre connexion.
         let (slot, from) = if cursor == 0 {
@@ -484,7 +488,7 @@ mod tests {
 
     /// Compteurs cohérents avec les slots.
     fn check_counts(c: &Cursors) {
-        let mut want = std::collections::HashMap::new();
+        let mut want = hashbrown::HashMap::new();
         for s in c.slots.iter().filter(|s| s.from.is_some()) {
             *want.entry(s.owner).or_insert(0u32) += 1;
         }

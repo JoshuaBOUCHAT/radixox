@@ -512,7 +512,7 @@ pub struct AofWriter {
     write_err: Option<String>,
     fsync_err: Option<String>,
     /// Après une erreur d'écriture : pas de nouvel essai avant.
-    retry_at: Option<std::time::Instant>,
+    retry_at: Option<radixox_lib::sys::Instant>,
     base_size: u64,
     /// fsync dus alors que le précédent était encore en vol.
     delayed_fsync: u64,
@@ -604,7 +604,7 @@ impl AofWriter {
     /// l'ordre des demandes) : création du segment suivant d'une rotation,
     /// publication d'une base, marque `follow`. Construite au moment de partir,
     /// depuis le manifeste courant.
-    pub fn next_fs(&mut self, now: std::time::Instant) -> Option<FsTask> {
+    pub fn next_fs(&mut self, now: radixox_lib::sys::Instant) -> Option<FsTask> {
         if self.in_fs.is_some() {
             return None;
         }
@@ -658,7 +658,7 @@ impl AofWriter {
     }
 
     /// Retour de la suite lancée par [`next_fs`](Self::next_fs).
-    pub fn fs_done(&mut self, mut t: FsTask, now: std::time::Instant) {
+    pub fn fs_done(&mut self, mut t: FsTask, now: radixox_lib::sys::Instant) {
         let Some(work) = self.in_fs.take() else { return };
         let err = t.error();
         match work {
@@ -721,7 +721,7 @@ impl AofWriter {
     /// écriture (reprise d'une écriture partielle ou en erreur, sinon blocs
     /// fermés du flux, jamais au-delà d'une frontière de rotation), fsync
     /// `everysec`. À rappeler tant qu'elle rend quelque chose.
-    pub fn next_op(&mut self, stream: &mut super::journal::Stream, now: std::time::Instant) -> Option<AofOp> {
+    pub fn next_op(&mut self, stream: &mut super::journal::Stream, now: radixox_lib::sys::Instant) -> Option<AofOp> {
         if std::mem::take(&mut self.link_next) {
             // Couvre l'écriture liée, rendue juste avant.
             self.syncing = Some(self.written + (self.writing.len() - self.done) as u64);
@@ -763,7 +763,7 @@ impl AofWriter {
     /// ou au timer pour un reste plus petit. Un cycle écrit tout ce qui
     /// attend (plusieurs écritures si besoin) ; seule la dernière porte le
     /// fsync lié : sinon le journal plafonnerait à `WRITE_MAX` par fsync.
-    fn next_cycle(&mut self, stream: &mut super::journal::Stream, now: std::time::Instant) -> Option<AofOp> {
+    fn next_cycle(&mut self, stream: &mut super::journal::Stream, now: radixox_lib::sys::Instant) -> Option<AofOp> {
         if self.in_flight || self.syncing.is_some() || self.retry_at.is_some_and(|t| now < t) {
             return None;
         }
@@ -799,7 +799,7 @@ impl AofWriter {
 
     /// Des octets à écrire dans `writing`, la place réservée. `false` : rien
     /// à écrire, ou préallocation en échec.
-    fn prepare_write(&mut self, stream: &mut super::journal::Stream, now: std::time::Instant) -> bool {
+    fn prepare_write(&mut self, stream: &mut super::journal::Stream, now: radixox_lib::sys::Instant) -> bool {
         if self.done == self.writing.len() {
             self.writing.clear();
             self.done = 0;
@@ -831,7 +831,7 @@ impl AofWriter {
         &self.writing[self.done..]
     }
 
-    fn fail_write(&mut self, msg: String, now: std::time::Instant) {
+    fn fail_write(&mut self, msg: String, now: radixox_lib::sys::Instant) {
         if self.fsync == Fsync::Always {
             // Des réponses retenues ne peuvent plus être garanties (§7.7).
             eprintln!("[aof] erreur d'écriture en appendfsync always : {msg} ; arrêt");
@@ -841,11 +841,11 @@ impl AofWriter {
             eprintln!("[aof] erreur d'écriture : {msg} ; écritures refusées, nouvel essai chaque seconde");
         }
         self.write_err = Some(msg);
-        self.retry_at = Some(now + std::time::Duration::from_secs(1));
+        self.retry_at = Some(now + core::time::Duration::from_secs(1));
     }
 
     /// CQE de l'écriture : octets écrits ou `-errno`.
-    pub fn write_done(&mut self, res: i32, now: std::time::Instant) {
+    pub fn write_done(&mut self, res: i32, now: radixox_lib::sys::Instant) {
         debug_assert!(self.in_flight);
         self.in_flight = false;
         if res < 0 {
@@ -867,7 +867,7 @@ impl AofWriter {
     }
 
     /// Fin du délai d'attente après une erreur.
-    pub fn retry_due(&self, now: std::time::Instant) -> bool {
+    pub fn retry_due(&self, now: radixox_lib::sys::Instant) -> bool {
         self.retry_at.is_none_or(|t| now >= t)
     }
 
@@ -1030,7 +1030,7 @@ impl AofWriter {
             // Pas de délai d'erreur à l'arrêt : la rotation part tout de suite,
             // puis la publication d'une base déjà écrite, s'il y en a une.
             self.retry_at = None;
-            let now = std::time::Instant::now();
+            let now = radixox_lib::sys::Instant::now();
             while let Some(mut t) = self.next_fs(now) {
                 t.run_blocking();
                 self.fs_done(t, now);

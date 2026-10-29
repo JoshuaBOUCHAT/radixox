@@ -2,7 +2,9 @@
 //! séquences de complétions fabriquées, invariants vérifiés à chaque tour.
 
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use radixox_lib::sys::Instant;
 
 use oxidart::OxidArt;
 
@@ -677,7 +679,7 @@ fn bgsave_writes_a_consistent_dump() {
     let dir = std::env::temp_dir().join(format!("radixox-uring-bgsave-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // SAFETY: tests en mono-thread (RUST_TEST_THREADS=1).
-    unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
+    crate::exec::persist::set_save_dir(Some(dir.to_str().unwrap().into()));
     let mut f = Fake::new(Config { max_conn: 8, ..Config::default() });
     let c = f.connect();
     let sets: String = (0..5000).map(|i| format!("SET b{i} v{i}\r\n")).collect();
@@ -695,7 +697,7 @@ fn bgsave_writes_a_consistent_dump() {
     );
     f.settle();
     assert!(!f.core.bgsave_running());
-    unsafe { std::env::remove_var("RADIXOX_DIR") };
+    crate::exec::persist::set_save_dir(None);
     let mut art = OxidArt::new();
     art.load_file(std::fs::File::open(dir.join("dump.rxd")).unwrap()).unwrap();
     assert_eq!(art.len(), 5000);
@@ -1924,7 +1926,7 @@ fn info_field(info: &str, name: &str) -> Option<String> {
 fn replica_follows_random_traffic_across_cuts() {
     let dir = test_dir("repl-rand");
     // SAFETY: tests en mono-thread (RUST_TEST_THREADS=1).
-    unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
+    crate::exec::persist::set_save_dir(Some(dir.to_str().unwrap().into()));
     let seeds: u64 = std::env::var("URING_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
     // `URING_SEED_FROM=n` : reprendre à une graine ; `SEED_LOG=1` : les afficher.
     let from: u64 = std::env::var("URING_SEED_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
@@ -1989,7 +1991,7 @@ fn replica_follows_random_traffic_across_cuts() {
         assert_eq!(info_field(&rinfo, "role").as_deref(), Some("replica"));
         assert_eq!(info_field(&rinfo, "repl_seq"), info_field(&info, "repl_seq"), "graine {seed}");
     }
-    unsafe { std::env::remove_var("RADIXOX_DIR") };
+    crate::exec::persist::set_save_dir(None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1998,7 +2000,7 @@ fn replica_follows_random_traffic_across_cuts() {
 #[test]
 fn replica_resumes_from_backlog_or_resyncs() {
     let dir = test_dir("repl-backlog");
-    unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
+    crate::exec::persist::set_save_dir(Some(dir.to_str().unwrap().into()));
     let mut pair = Net::new(Config { max_conn: 16, reserved: 1, repl_backlog: 4096, ..Config::default() }, 2);
     pair.n[0].wall = Some(1_000);
     let (c, admin) = (pair.n[0].connect(), pair.n[0].connect());
@@ -2045,7 +2047,7 @@ fn replica_resumes_from_backlog_or_resyncs() {
     pair.settle();
     pair.assert_same("synchronisation complète");
     assert_eq!(sync(&mut pair, admin), ("2".into(), "1".into()));
-    unsafe { std::env::remove_var("RADIXOX_DIR") };
+    crate::exec::persist::set_save_dir(None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2055,7 +2057,7 @@ fn replica_resumes_from_backlog_or_resyncs() {
 #[test]
 fn promotion_and_second_source() {
     let dir = test_dir("repl-promote");
-    unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
+    crate::exec::persist::set_save_dir(Some(dir.to_str().unwrap().into()));
     let mut pair = Net::new(Config { max_conn: 16, reserved: 1, ..Config::default() }, 2);
     pair.n[0].wall = Some(1_000);
     let c = pair.n[0].connect();
@@ -2089,7 +2091,7 @@ fn promotion_and_second_source() {
     let pinfo = Net::cmd(&mut pair.n[0], c, b"INFO\r\n");
     assert_eq!(info_field(&pinfo, "connected_replicas").as_deref(), Some("0"), "{pinfo}");
     assert_eq!(Net::cmd(&mut pair.n[0], c, format!("REPLICATE STOP 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes()), "+OK\r\n");
-    unsafe { std::env::remove_var("RADIXOX_DIR") };
+    crate::exec::persist::set_save_dir(None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2099,7 +2101,7 @@ fn promotion_and_second_source() {
 #[test]
 fn replica_bgsave_during_flush_blocks() {
     let dir = test_dir("repl-bgsave");
-    unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
+    crate::exec::persist::set_save_dir(Some(dir.to_str().unwrap().into()));
     let mut pair = Net::new(Config { max_conn: 16, reserved: 1, ..Config::default() }, 2);
     pair.n[0].wall = Some(1_000);
     let c = pair.n[0].connect();
@@ -2127,7 +2129,7 @@ fn replica_bgsave_during_flush_blocks() {
     assert!(!pair.n[1].core.bgsave_running());
     pair.assert_same("après la save");
     assert_eq!(pair.n[1].core.art.len(), 1);
-    unsafe { std::env::remove_var("RADIXOX_DIR") };
+    crate::exec::persist::set_save_dir(None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2136,7 +2138,7 @@ fn replica_bgsave_during_flush_blocks() {
 #[test]
 fn wait_counts_acknowledged_replicas() {
     let dir = test_dir("repl-wait");
-    unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
+    crate::exec::persist::set_save_dir(Some(dir.to_str().unwrap().into()));
     let mut pair = Net::new(Config { max_conn: 16, reserved: 1, ..Config::default() }, 2);
     pair.n[0].wall = Some(1_000);
     let c = pair.n[0].connect();
@@ -2173,7 +2175,7 @@ fn wait_counts_acknowledged_replicas() {
     // Sur le réplica : refusé.
     let rc = pair.n[1].connect();
     assert!(Net::cmd(&mut pair.n[1], rc, b"WAIT 1 0\r\n").starts_with("-ERR WAIT cannot be used with replica"));
-    unsafe { std::env::remove_var("RADIXOX_DIR") };
+    crate::exec::persist::set_save_dir(None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2225,7 +2227,7 @@ fn net_traffic(net: &mut Net, rng: &mut Rng, conns: &[Slot], rounds: usize, cut_
 #[test]
 fn replica_with_aof_restarts_as_replica() {
     let dir = test_dir("repl-raof");
-    unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
+    crate::exec::persist::set_save_dir(Some(dir.to_str().unwrap().into()));
     let seeds: u64 = std::env::var("URING_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
     for seed in 1..=seeds {
         let rdir = dir.join(format!("r{seed}"));
@@ -2268,7 +2270,7 @@ fn replica_with_aof_restarts_as_replica() {
         drop(net);
         let _ = std::fs::remove_dir_all(&rdir);
     }
-    unsafe { std::env::remove_var("RADIXOX_DIR") };
+    crate::exec::persist::set_save_dir(None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2277,7 +2279,7 @@ fn replica_with_aof_restarts_as_replica() {
 #[test]
 fn chained_replicas_follow_the_primary() {
     let dir = test_dir("repl-chain");
-    unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
+    crate::exec::persist::set_save_dir(Some(dir.to_str().unwrap().into()));
     let seeds: u64 = std::env::var("URING_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
     let from: u64 = std::env::var("URING_SEED_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
     for seed in from..=seeds {
@@ -2309,7 +2311,7 @@ fn chained_replicas_follow_the_primary() {
         drop(net);
         let _ = std::fs::remove_dir_all(&ndir);
     }
-    unsafe { std::env::remove_var("RADIXOX_DIR") };
+    crate::exec::persist::set_save_dir(None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2388,7 +2390,7 @@ fn big_value_is_sent_from_the_tree() {
 #[test]
 fn online_replica_too_slow_is_dropped() {
     let dir = test_dir("repl-slow");
-    unsafe { std::env::set_var("RADIXOX_DIR", &dir) };
+    crate::exec::persist::set_save_dir(Some(dir.to_str().unwrap().into()));
     let mut pair = Net::new(Config { max_conn: 16, reserved: 1, repl_online_lag: 64 << 10, ..Config::default() }, 2);
     pair.n[0].wall = Some(1_000);
     let (c, admin) = (pair.n[0].connect(), pair.n[0].connect());

@@ -73,7 +73,8 @@ use std::io;
 use std::net::TcpListener;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::{Duration, Instant};
+use core::time::Duration;
+use radixox_lib::sys::Instant;
 
 use io_uring::types::{BufRingEntry, Fd, Fixed, IOU_PBUF_RING_INC, SubmitArgs, Timespec};
 use io_uring::{EnterFlags, IoUring, cqueue, opcode, squeue};

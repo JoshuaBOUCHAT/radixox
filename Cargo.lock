@@ -455,6 +455,7 @@ name = "radixox"
 version = "0.6.0"
 dependencies = [
  "crc32fast",
+ "hashbrown",
  "io-uring",
  "libc",
  "oxidart",

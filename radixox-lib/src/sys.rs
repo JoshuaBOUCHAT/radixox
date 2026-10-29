@@ -250,10 +250,12 @@ fn environ() -> &'static [u8] {
 
 /// Valeur de la variable `name` au démarrage, si elle existe et est en UTF-8.
 pub fn env(name: &str) -> Option<&'static str> {
-    environ().split(|&b| b == 0).find_map(|kv| {
-        let v = kv.strip_prefix(name.as_bytes())?.strip_prefix(b"=")?;
-        core::str::from_utf8(v).ok()
-    })
+    env_bytes(name).and_then(|v| core::str::from_utf8(v).ok())
+}
+
+/// Variable `name` en octets bruts (pas forcément UTF-8).
+pub fn env_bytes(name: &str) -> Option<&'static [u8]> {
+    environ().split(|&b| b == 0).find_map(|kv| kv.strip_prefix(name.as_bytes())?.strip_prefix(b"="))
 }
 
 /// Variable `name` lue comme un nombre, `default` si absente ou illisible.

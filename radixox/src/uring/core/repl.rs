@@ -17,7 +17,8 @@ use std::io::Write as _;
 use std::net::ToSocketAddrs;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use core::time::Duration;
+use radixox_lib::sys::Instant;
 
 use radixox_lib::shared_frame::{SharedFrame as Frame, encode_array_len, encode_bulk, extend_encode};
 

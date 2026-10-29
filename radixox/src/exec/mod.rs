@@ -31,10 +31,14 @@ pub use zset::{
     cmd_zremrange, cmd_zscore,
 };
 
+use core::cell::Cell;
+
 use oxidart::OxidArt;
 use radixox_lib::cmd::Cmd;
 use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::shared_frame::SharedFrame as Frame;
+
+use crate::mono::Mono;
 
 use string::{
     cmd_dbsize, cmd_decr, cmd_decrby, cmd_del, cmd_exists, cmd_expire, cmd_get, cmd_get_hinted,
@@ -45,19 +49,17 @@ use string::{
 
 // ── Lectures de plage géantes : job (§ commandes bornées) ──────────────────
 
-thread_local! {
-    /// Lecture de plage trop grande pour une seule fois : le job préparé par l'exécution
-    /// (qui n'a rien répondu), repris par le cœur, qui parque la connexion.
-    static DEFERRED: std::cell::Cell<Option<Box<jobs::RangeJob>>> = const { std::cell::Cell::new(None) };
-}
+/// Lecture de plage trop grande pour une seule fois : le job préparé par l'exécution
+/// (qui n'a rien répondu), repris par le cœur, qui parque la connexion.
+static DEFERRED: Mono<Cell<Option<Box<jobs::RangeJob>>>> = Mono::new(Cell::new(None));
 
 pub(crate) fn defer(job: jobs::RangeJob) {
-    DEFERRED.with(|d| d.set(Some(Box::new(job))));
+    DEFERRED.set(Some(Box::new(job)));
 }
 
 /// Job laissé par la dernière commande exécutée (LRANGE, ZRANGE et variantes).
 pub fn take_deferred() -> Option<Box<jobs::RangeJob>> {
-    DEFERRED.with(|d| d.take())
+    DEFERRED.take()
 }
 
 /// À partir de cette taille, une réponse faite d'une seule valeur ne passe pas par le tampon
@@ -65,33 +67,31 @@ pub fn take_deferred() -> Option<Box<jobs::RangeJob>> {
 /// depuis l'arbre (clone du `SharedByte`, sans copie), RUNTIME_ARCH.md §6.2 quater.
 pub const BIG_REPLY: usize = 1 << 20;
 
-thread_local! {
-    /// Grande valeur laissée par la dernière commande, à envoyer après `out`.
-    static BIG_TAIL: std::cell::Cell<Option<SharedByte>> = const { std::cell::Cell::new(None) };
-    /// Le dépôt n'est actif qu'autour des exécutions du cœur ([`with_big_tail`]) : les
-    /// autres appelants (rejeu du journal, oracle des tests) veulent la réponse entière.
-    static BIG_TAIL_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
+/// Grande valeur laissée par la dernière commande, à envoyer après `out`.
+static BIG_TAIL: Mono<Cell<Option<SharedByte>>> = Mono::new(Cell::new(None));
+/// Le dépôt n'est actif qu'autour des exécutions du cœur ([`with_big_tail`]) : les
+/// autres appelants (rejeu du journal, oracle des tests) veulent la réponse entière.
+static BIG_TAIL_ON: Mono<Cell<bool>> = Mono::new(Cell::new(false));
 
 /// `f` avec le dépôt des grandes valeurs actif ; rend aussi la valeur déposée, à envoyer
 /// après ce que `f` a écrit.
 #[inline(always)]
 pub fn with_big_tail<R>(f: impl FnOnce() -> R) -> (R, Option<SharedByte>) {
-    BIG_TAIL_ON.with(|on| on.set(true));
+    BIG_TAIL_ON.set(true);
     let r = f();
-    BIG_TAIL_ON.with(|on| on.set(false));
-    (r, BIG_TAIL.with(|t| t.take()))
+    BIG_TAIL_ON.set(false);
+    (r, BIG_TAIL.take())
 }
 
 /// Encode la réponse ; une grande valeur seule est déposée au lieu d'être recopiée.
 #[inline(always)]
 fn encode_reply(out: &mut Vec<u8>, frame: Frame) {
     match frame {
-        Frame::BulkString(b) if b.len() >= BIG_REPLY && BIG_TAIL_ON.with(|on| on.get()) => {
+        Frame::BulkString(b) if b.len() >= BIG_REPLY && BIG_TAIL_ON.get() => {
             out.push(b'$');
             out.extend_from_slice(b.len().to_string().as_bytes());
             out.extend_from_slice(b"\r\n");
-            BIG_TAIL.with(|t| t.set(Some(b)));
+            BIG_TAIL.set(Some(b));
         }
         frame => radixox_lib::shared_frame::extend_encode(out, &frame),
     }

@@ -3,19 +3,11 @@
 //! commande sauf AUTH et QUIT reçoit `-NOAUTH`. Pas d'ACL : le seul
 //! utilisateur est `default`.
 
-use std::sync::OnceLock;
-
 use radixox_lib::shared_frame::SharedFrame as Frame;
 
 /// Mot de passe configuré ; `None` (variable absente ou vide) : pas d'AUTH.
 pub fn password() -> Option<&'static [u8]> {
-    static PASS: OnceLock<Option<Vec<u8>>> = OnceLock::new();
-    PASS.get_or_init(|| {
-        std::env::var_os("RADIXOX_PASSWORD")
-            .map(|v| v.into_encoded_bytes())
-            .filter(|v| !v.is_empty())
-    })
-    .as_deref()
+    radixox_lib::sys::env_bytes("RADIXOX_PASSWORD").filter(|v| !v.is_empty())
 }
 
 pub fn noauth() -> Frame {

@@ -4,7 +4,9 @@
 //! [`Persistence::due`] le demande et rapporte son issue.
 
 use std::fmt::Write as _;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use core::time::Duration;
+
+use radixox_lib::sys::{self, Instant};
 
 /// Règles de Valkey sans fichier de configuration.
 pub const DEFAULT_RULES: &str = "3600 1 300 100 60 10000";
@@ -37,17 +39,17 @@ pub fn parse_rules(s: &str) -> Result<Vec<Rule>, String> {
 
 /// Règles de `RADIXOX_SAVE` (défaut : celles de Valkey).
 pub fn rules_from_env() -> Result<Vec<Rule>, String> {
-    parse_rules(&std::env::var("RADIXOX_SAVE").unwrap_or_else(|_| DEFAULT_RULES.into()))
+    parse_rules(sys::env("RADIXOX_SAVE").unwrap_or(DEFAULT_RULES))
 }
 
 /// `RADIXOX_STOP_WRITES_ON_BGSAVE_ERROR` (défaut : oui, comme Valkey).
 pub fn stop_writes_from_env() -> bool {
-    std::env::var("RADIXOX_STOP_WRITES_ON_BGSAVE_ERROR")
+    sys::env("RADIXOX_STOP_WRITES_ON_BGSAVE_ERROR")
         .map_or(true, |v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "no" | "false" | "off"))
 }
 
 fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    sys::wall_secs()
 }
 
 pub struct Persistence {

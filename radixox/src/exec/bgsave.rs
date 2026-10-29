@@ -13,7 +13,9 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
-use std::time::{Duration, Instant};
+use core::time::Duration;
+use radixox_lib::rx_eprintln;
+use radixox_lib::sys::{self, Instant};
 
 use oxidart::compress::ZstdStream;
 use oxidart::save::format;
@@ -42,29 +44,29 @@ pub struct ZstdConf {
 }
 
 pub fn zstd_conf() -> Option<ZstdConf> {
-    let level = match std::env::var("RADIXOX_SAVE_ZSTD") {
-        Ok(v) => v.parse().unwrap_or_else(|_| {
-            eprintln!("[bgsave] RADIXOX_SAVE_ZSTD={v} invalide, niveau {DEFAULT_ZSTD_LEVEL}");
+    let level = match sys::env("RADIXOX_SAVE_ZSTD") {
+        Some(v) => v.parse().unwrap_or_else(|_| {
+            rx_eprintln!("[bgsave] RADIXOX_SAVE_ZSTD={v} invalide, niveau {DEFAULT_ZSTD_LEVEL}");
             DEFAULT_ZSTD_LEVEL
         }),
-        Err(_) => DEFAULT_ZSTD_LEVEL,
+        None => DEFAULT_ZSTD_LEVEL,
     };
     if level == 0 {
         return None;
     }
     let level = level.clamp(zstd_safe::min_c_level(), zstd_safe::max_c_level());
-    let mb: usize = std::env::var("RADIXOX_SAVE_BACKLOG_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+    let mb: usize = sys::env_parse("RADIXOX_SAVE_BACKLOG_MB", 64);
     Some(ZstdConf { level, backlog: mb.max(1) << 20 })
 }
 
 /// Part du thread accordée au BGSAVE sous charge (entre 0 et 1).
 pub fn cpu_share() -> f64 {
-    match std::env::var("RADIXOX_SAVE_CPU_SHARE") {
-        Err(_) => DEFAULT_CPU_SHARE,
-        Ok(v) => match v.parse::<f64>() {
+    match sys::env("RADIXOX_SAVE_CPU_SHARE") {
+        None => DEFAULT_CPU_SHARE,
+        Some(v) => match v.parse::<f64>() {
             Ok(x) if x > 0.0 && x <= 1.0 => x,
             _ => {
-                eprintln!("[bgsave] RADIXOX_SAVE_CPU_SHARE={v} invalide, {DEFAULT_CPU_SHARE}");
+                rx_eprintln!("[bgsave] RADIXOX_SAVE_CPU_SHARE={v} invalide, {DEFAULT_CPU_SHARE}");
                 DEFAULT_CPU_SHARE
             }
         },

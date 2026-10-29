@@ -30,6 +30,7 @@ libc = "0.2"
 sc = "0.2"
 rustix = { version = "1.1", default-features = false, features = ["std", "fs", "time", "rand", "net", "process", "thread"] }
 crc32fast = "1.4"
+hashbrown = "0.17.0"
 zstd-safe = { version = "8.1", default-features = false, features = ["experimental", "std"] }
 
 [dev-dependencies]

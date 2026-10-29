@@ -4,8 +4,10 @@
 //! l'horloge monotone ; sans TSC invariant (ou hors x86_64), repli sur
 //! `Instant`, en nanosecondes.
 
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use core::mem::MaybeUninit;
+use core::time::Duration;
+
+use radixox_lib::sys::{Instant, Once};
 
 struct Calib {
     /// Ticks par microseconde.
@@ -14,7 +16,9 @@ struct Calib {
     origin: Instant,
 }
 
-static CALIB: OnceLock<Calib> = OnceLock::new();
+static CALIB_ONCE: Once = Once::new();
+/// Écrite une fois sous `CALIB_ONCE`, en lecture seule ensuite.
+static mut CALIB: MaybeUninit<Calib> = MaybeUninit::uninit();
 
 /// Étalonne l'horloge (~5 ms) : à appeler au démarrage, sinon la première
 /// lecture le fait.
@@ -22,30 +26,38 @@ pub fn init() {
     calib();
 }
 
+#[inline]
 fn calib() -> &'static Calib {
-    CALIB.get_or_init(|| {
-        let origin = Instant::now();
-        if !invariant_tsc() {
-            return Calib { per_us: 1000, tsc: false, origin };
-        }
-        let (t0, c0) = (Instant::now(), raw());
-        while t0.elapsed() < Duration::from_millis(5) {
-            std::hint::spin_loop();
-        }
-        let (dt, dc) = (t0.elapsed(), raw().wrapping_sub(c0));
-        let per_us = (u128::from(dc) * 1000 / dt.as_nanos().max(1)).max(1) as u64;
-        Calib { per_us, tsc: true, origin }
-    })
+    // SAFETY: écrite une seule fois, avant toute lecture (`call_once` rend la main après).
+    CALIB_ONCE.call_once(|| unsafe {
+        (*&raw mut CALIB).write(measure());
+    });
+    unsafe { (*&raw const CALIB).assume_init_ref() }
+}
+
+#[cold]
+fn measure() -> Calib {
+    let origin = Instant::now();
+    if !invariant_tsc() {
+        return Calib { per_us: 1000, tsc: false, origin };
+    }
+    let (t0, c0) = (Instant::now(), raw());
+    while t0.elapsed() < Duration::from_millis(5) {
+        core::hint::spin_loop();
+    }
+    let (dt, dc) = (t0.elapsed(), raw().wrapping_sub(c0));
+    let per_us = (u128::from(dc) * 1000 / dt.as_nanos().max(1)).max(1) as u64;
+    Calib { per_us, tsc: true, origin }
 }
 
 /// TSC à fréquence constante et qui ne s'arrête pas dans les états de veille :
 /// sinon les ticks ne mesurent pas le temps.
 fn invariant_tsc() -> bool {
     cfg!(target_arch = "x86_64")
-        && std::fs::read_to_string("/proc/cpuinfo").is_ok_and(|info| {
-            info.lines().find(|l| l.starts_with("flags")).is_some_and(|l| {
-                let has = |f: &str| l.split_whitespace().any(|x| x == f);
-                has("constant_tsc") && has("nonstop_tsc")
+        && crate::fs::read("/proc/cpuinfo").is_ok_and(|info| {
+            info.split(|&b| b == b'\n').find(|l| l.starts_with(b"flags")).is_some_and(|l| {
+                let has = |f: &[u8]| l.split(u8::is_ascii_whitespace).any(|x| x == f);
+                has(b"constant_tsc") && has(b"nonstop_tsc")
             })
         })
 }
