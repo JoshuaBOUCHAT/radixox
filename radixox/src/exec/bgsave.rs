@@ -160,7 +160,11 @@ impl BgSave {
         }
         let t0 = Instant::now();
         let mut create = FsTask::new();
-        create.open(&target.dir.join(&target.tmp), libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644);
+        create.open(
+            &target.dir.join(&target.tmp),
+            rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::CREATE | rustix::fs::OFlags::TRUNC,
+            rustix::fs::Mode::from_raw_mode(0o644),
+        );
         let mut comp = zstd.map(|c| Compress {
             z: ZstdStream::new(c.level),
             raw: Vec::with_capacity(CHUNK + CHUNK / 4),

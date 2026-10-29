@@ -460,6 +460,7 @@ dependencies = [
  "oxidart",
  "radixox-lib",
  "redis",
+ "rustix",
  "zstd-safe",
 ]
 

@@ -107,9 +107,6 @@ mod tests {
 /// de `SystemTime::now` (~5 % du thread de la boucle avec de petits tours).
 /// Une seconde vue jusqu'à 4 ms en retard ne change rien au TTL.
 pub fn wall_secs() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: `ts` est un timespec valide, l'horloge existe sous Linux ≥ 2.6.32.
-    let r = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut ts) };
-    debug_assert_eq!(r, 0);
-    ts.tv_sec as u64
+    // vDSO, comme la libc ; l'horloge existe sous Linux ≥ 2.6.32.
+    rustix::time::clock_gettime(rustix::time::ClockId::RealtimeCoarse).tv_sec as u64
 }

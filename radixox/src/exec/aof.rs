@@ -57,12 +57,10 @@ pub fn new_replid() -> ReplId {
     let mut id = [0u8; 20];
     let mut got = 0;
     while got < id.len() {
-        // SAFETY: tampon valide de `len - got` octets.
-        let r = unsafe { libc::getrandom(id[got..].as_mut_ptr().cast(), id.len() - got, 0) };
-        if r > 0 {
-            got += r as usize;
-        } else if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-            panic!("getrandom : {}", io::Error::last_os_error());
+        match rustix::rand::getrandom(&mut id[got..], rustix::rand::GetRandomFlags::empty()) {
+            Ok(n) => got += n,
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => panic!("getrandom : {e}"),
         }
     }
     id
@@ -193,12 +191,7 @@ pub fn create_segment(dir: &Path, name: &str) -> io::Result<File> {
 /// Réserve le palier qui commence à `from` (mode 0 : la taille du fichier
 /// augmente, l'espace se lit comme des zéros).
 pub fn preallocate(f: &File, from: u64) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    // SAFETY: fd ouvert en écriture.
-    let r = unsafe { libc::fallocate(f.as_raw_fd(), 0, from as i64, PREALLOC as i64) };
-    if r != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    rustix::fs::fallocate(f, rustix::fs::FallocateFlags::empty(), from, PREALLOC as u64)?;
     Ok(())
 }
 
@@ -627,7 +620,11 @@ impl AofWriter {
             use std::os::fd::AsRawFd;
             t.ftruncate(FdRef::Raw(self.file.as_raw_fd()), self.file_end);
             t.unlink(&self.dir.join(&name), true);
-            let seg = t.open(&self.dir.join(&name), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o644);
+            let seg = t.open(
+                &self.dir.join(&name),
+                rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL,
+                rustix::fs::Mode::from_raw_mode(0o644),
+            );
             t.fallocate(seg, 0, PREALLOC);
             t.fsync(seg, false);
             let mut manifest = self.manifest.clone();
@@ -894,7 +891,7 @@ impl AofWriter {
     /// base réussie.
     pub fn sync_done(&mut self, res: i32) {
         let Some(upto) = self.syncing.take() else { return };
-        if std::mem::take(&mut self.linked_sync) && res == -libc::ECANCELED {
+        if std::mem::take(&mut self.linked_sync) && res == -rustix::io::Errno::CANCELED.raw_os_error() {
             // Écriture liée partielle ou en échec : le cycle suivant reprend.
             return;
         }

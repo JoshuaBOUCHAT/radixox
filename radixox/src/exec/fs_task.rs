@@ -15,6 +15,9 @@ use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
+use rustix::fs::{FallocateFlags, Mode, OFlags};
+use rustix::io::Errno;
+
 /// Descripteur visé par une étape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FdRef {
@@ -26,7 +29,7 @@ pub enum FdRef {
 
 #[derive(Debug)]
 enum Step {
-    Open { path: CString, flags: i32, mode: u32 },
+    Open { path: CString, flags: OFlags, mode: Mode },
     Fallocate { fd: FdRef, off: u64, len: u64 },
     /// `data` : `fdatasync`, sinon `fsync`.
     Fsync { fd: FdRef, data: bool },
@@ -43,7 +46,7 @@ enum Step {
 /// déplace pas.
 #[derive(Debug, Clone, Copy)]
 pub enum StepRef<'a> {
-    Open { path: &'a CStr, flags: i32, mode: u32 },
+    Open { path: &'a CStr, flags: OFlags, mode: Mode },
     Fallocate { fd: RawFd, off: u64, len: u64 },
     Fsync { fd: RawFd, data: bool },
     Write { fd: RawFd, buf: &'a [u8], off: u64 },
@@ -75,9 +78,9 @@ impl FsTask {
     }
 
     /// Ouvre `path` ; le fichier devient `FdRef::Opened(n)`, `n` rendu.
-    pub fn open(&mut self, path: &Path, flags: i32, mode: u32) -> FdRef {
+    pub fn open(&mut self, path: &Path, flags: OFlags, mode: Mode) -> FdRef {
         let n = self.steps.iter().filter(|s| matches!(s, Step::Open { .. })).count();
-        self.steps.push(Step::Open { path: cpath(path), flags: flags | libc::O_CLOEXEC, mode });
+        self.steps.push(Step::Open { path: cpath(path), flags: flags | OFlags::CLOEXEC, mode });
         FdRef::Opened(n)
     }
 
@@ -112,7 +115,7 @@ impl FsTask {
     /// fsync du dossier (ouvert, synchronisé, refermé) : rend durables les
     /// créations, renommages et suppressions qui y ont été faits.
     pub fn sync_dir(&mut self, dir: &Path) {
-        let d = self.open(dir, libc::O_RDONLY | libc::O_DIRECTORY, 0);
+        let d = self.open(dir, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty());
         self.fsync(d, false);
         self.close(d);
     }
@@ -120,7 +123,7 @@ impl FsTask {
     /// Écriture atomique d'un petit fichier : `tmp` écrit et synchronisé, puis
     /// renommé en `name`, puis fsync du dossier.
     pub fn replace_file(&mut self, dir: &Path, tmp: &str, name: &str, bytes: Vec<u8>) {
-        let f = self.open(&dir.join(tmp), libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644);
+        let f = self.open(&dir.join(tmp), OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC, Mode::from_raw_mode(0o644));
         self.write(f, bytes, 0);
         self.fsync(f, true);
         self.close(f);
@@ -173,7 +176,7 @@ impl FsTask {
         debug_assert!(!self.finished());
         let step = &self.steps[self.pc];
         if res < 0 {
-            if !matches!(step, Step::Unlink { missing_ok: true, .. } if res == -libc::ENOENT) {
+            if !matches!(step, Step::Unlink { missing_ok: true, .. } if res == -Errno::NOENT.raw_os_error()) {
                 self.err = Some((self.pc, -res));
                 return;
             }
@@ -182,7 +185,7 @@ impl FsTask {
                 Step::Open { .. } => self.opened.push(res),
                 Step::Write { buf, .. } => {
                     if res == 0 {
-                        self.err = Some((self.pc, libc::EIO));
+                        self.err = Some((self.pc, Errno::IO.raw_os_error()));
                         return;
                     }
                     self.wrote += res as usize;
@@ -208,21 +211,26 @@ impl FsTask {
 
     /// Exécute l'étape courante par un appel bloquant : même résultat qu'un CQE.
     pub fn exec_blocking(step: StepRef<'_>) -> i32 {
-        // SAFETY: appels libc sur des descripteurs et chaînes valides.
-        let r = unsafe {
-            match step {
-                StepRef::Open { path, flags, mode } => libc::open(path.as_ptr(), flags, mode),
-                StepRef::Fallocate { fd, off, len } => libc::fallocate(fd, 0, off as i64, len as i64),
-                StepRef::Fsync { fd, data: true } => libc::fdatasync(fd),
-                StepRef::Fsync { fd, data: false } => libc::fsync(fd),
-                StepRef::Write { fd, buf, off } => libc::pwrite(fd, buf.as_ptr().cast(), buf.len(), off as i64) as i32,
-                StepRef::Ftruncate { fd, len } => libc::ftruncate(fd, len as i64),
-                StepRef::Rename { from, to } => libc::rename(from.as_ptr(), to.as_ptr()),
-                StepRef::Unlink { path } => libc::unlink(path.as_ptr()),
-                StepRef::Close { fd } => libc::close(fd),
+        use rustix::{fs, io};
+        use std::os::fd::{BorrowedFd, IntoRawFd, OwnedFd};
+        // SAFETY: les descripteurs d'une étape restent ouverts jusqu'à son résultat.
+        let b = |fd: RawFd| unsafe { BorrowedFd::borrow_raw(fd) };
+        let r = match step {
+            StepRef::Open { path, flags, mode } => fs::open(path, flags, mode).map(|f| f.into_raw_fd()),
+            StepRef::Fallocate { fd, off, len } => fs::fallocate(b(fd), FallocateFlags::empty(), off, len).map(|()| 0),
+            StepRef::Fsync { fd, data: true } => fs::fdatasync(b(fd)).map(|()| 0),
+            StepRef::Fsync { fd, data: false } => fs::fsync(b(fd)).map(|()| 0),
+            StepRef::Write { fd, buf, off } => io::pwrite(b(fd), buf, off).map(|n| n as i32),
+            StepRef::Ftruncate { fd, len } => fs::ftruncate(b(fd), len).map(|()| 0),
+            StepRef::Rename { from, to } => fs::rename(from, to).map(|()| 0),
+            StepRef::Unlink { path } => fs::unlink(path).map(|()| 0),
+            // SAFETY: l'étape possède `fd` et ne le reprend pas.
+            StepRef::Close { fd } => {
+                drop(unsafe { OwnedFd::from_raw_fd(fd) });
+                Ok(0)
             }
         };
-        if r < 0 { -std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO) } else { r }
+        r.unwrap_or_else(|e| -e.raw_os_error())
     }
 
     /// Toute la suite, d'une traite (faux noyau, arrêt du serveur).
@@ -239,7 +247,7 @@ impl Drop for FsTask {
         for &fd in &self.opened {
             if fd >= 0 {
                 // SAFETY: fd ouvert par la suite et jamais repris.
-                unsafe { libc::close(fd) };
+                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
             }
         }
     }
@@ -261,7 +269,7 @@ mod tests {
         let d = tmpdir("replace");
         let mut t = FsTask::new();
         t.replace_file(&d, "m.tmp", "m", b"hello".to_vec());
-        let seg = t.open(&d.join("seg"), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o644);
+        let seg = t.open(&d.join("seg"), OFlags::RDWR | OFlags::CREATE | OFlags::EXCL, Mode::from_raw_mode(0o644));
         t.fallocate(seg, 0, 4096);
         t.fsync(seg, false);
         t.run_blocking();
@@ -288,18 +296,18 @@ mod tests {
         t.unlink(&d.join("absent"), false);
         t.replace_file(&d, "x.tmp", "x", b"never".to_vec());
         t.run_blocking();
-        assert_eq!(t.error().unwrap().raw_os_error(), Some(libc::ENOENT));
+        assert_eq!(t.error().unwrap().raw_os_error(), Some(Errno::NOENT.raw_os_error()));
         assert!(!d.join("x.tmp").exists(), "rien après l'étape en échec");
 
         // Écriture courte rendue par le noyau : l'étape repart avec le reste.
         let mut t = FsTask::new();
-        let f = t.open(&d.join("w"), libc::O_WRONLY | libc::O_CREAT, 0o644);
+        let f = t.open(&d.join("w"), OFlags::WRONLY | OFlags::CREATE, Mode::from_raw_mode(0o644));
         t.write(f, b"abcdef".to_vec(), 0);
         let res = FsTask::exec_blocking(t.step().unwrap());
         t.done(res);
         let StepRef::Write { fd, .. } = t.step().unwrap() else { panic!() };
         // SAFETY: fd ouvert par la suite.
-        assert_eq!(unsafe { libc::pwrite(fd, b"abc".as_ptr().cast(), 3, 0) }, 3);
+        assert_eq!(rustix::io::pwrite(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }, b"abc", 0), Ok(3));
         t.done(3);
         let StepRef::Write { buf, off, .. } = t.step().unwrap() else { panic!("écriture à reprendre") };
         assert_eq!((buf, off), (&b"def"[..], 3));

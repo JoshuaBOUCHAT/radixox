@@ -44,6 +44,5 @@ pub unsafe fn remap(p: *mut u8, old: usize, new: usize) -> rustix::io::Result<*m
 
 /// Message sur stderr sans allouer (écriture partielle ignorée).
 pub fn stderr(msg: &[u8]) {
-    // SAFETY: le descripteur 2 reste ouvert pendant toute la vie du processus.
-    let _ = rustix::io::write(unsafe { rustix::stdio::stderr() }, msg);
+    let _ = rustix::io::write(rustix::stdio::stderr(), msg);
 }

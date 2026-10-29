@@ -71,7 +71,7 @@ mod c_malloc {
 
 use std::io;
 use std::net::TcpListener;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
@@ -82,6 +82,8 @@ use radixox::exec::fs_task::StepRef;
 use radixox::exec::{aof, autosave};
 use radixox::tsc;
 use radixox::uring::{Bid, Completion, Config, Core, Op, Slot};
+use rustix::io::Errno;
+use rustix::net::{RecvFlags, SendFlags, SocketAddrAny, sockopt};
 
 /// Groupe de tampons du recv multishot.
 const BGID: u16 = 0;
@@ -202,7 +204,7 @@ struct Server {
     signals: Option<Signals>,
     /// Adresses des `connect` en vol (liens de réplication) : lues par le
     /// noyau jusqu'au CQE.
-    connects: std::collections::HashMap<Slot, Box<(libc::sockaddr_storage, libc::socklen_t)>>,
+    connects: std::collections::HashMap<Slot, Box<SocketAddrAny>>,
     /// Signal d'arrêt reçu (`true` : save à l'arrêt) : traité en fin de récolte.
     stop: Option<bool>,
 }
@@ -324,15 +326,15 @@ impl Server {
                     if let Err(e) = res {
                         eprintln!("[uring] installation du slot {slot} : {e}");
                         // Le cœur attend la fin du recv chaîné : on la simule.
-                        self.core.complete(Completion::Recv { slot, res: -libc::EBADF, bid: None, buf_more: false, more: false });
+                        self.core.complete(Completion::Recv { slot, res: -Errno::BADF.raw_os_error(), bid: None, buf_more: false, more: false });
                         continue;
                     }
                     self.recv_sqe(slot)
                 }
                 Op::Reject { fd } => {
                     let msg = b"-ERR max number of clients reached\r\n";
-                    // SAFETY: fd valide, tampon valide.
-                    unsafe { libc::write(fd, msg.as_ptr().cast(), msg.len()) };
+                    // SAFETY: fd accepté, fermé juste après.
+                    let _ = rustix::io::write(unsafe { BorrowedFd::borrow_raw(fd) }, msg);
                     close(fd);
                     continue;
                 }
@@ -341,7 +343,7 @@ impl Server {
                     // Le tampon reste intact jusqu'au CQE (invariant du cœur).
                     let buf = self.core.pending_send(slot);
                     let sqe = opcode::Send::new(Fixed(slot), buf.as_ptr(), buf.len() as u32)
-                        .flags(libc::MSG_WAITALL | libc::MSG_NOSIGNAL)
+                        .flags((RecvFlags::WAITALL.bits() | SendFlags::NOSIGNAL.bits()) as i32)
                         .build()
                         .user_data(ud(K_SEND, slot));
                     // Délégué : la pile TCP de l'envoi tourne sur un worker io-wq,
@@ -409,22 +411,23 @@ impl Server {
                 // Lien de réplication (DURABILITY_DESIGN.md §10) : socket créé ici,
                 // installé dans le slot comme un accept, puis `connect` asynchrone.
                 Op::Connect { slot, addr } => {
-                    let sa = Box::new(sockaddr(addr));
-                    // SAFETY: appel libc simple.
-                    let fd = unsafe { libc::socket(sa.0.ss_family as i32, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-                    if fd < 0 {
-                        let e = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
-                        self.core.complete(Completion::Connect { slot, res: -e });
-                        continue;
-                    }
+                    let sa = Box::new(SocketAddrAny::from(addr));
+                    let fam = sa.address_family();
+                    let fd = match rustix::net::socket_with(fam, rustix::net::SocketType::STREAM, rustix::net::SocketFlags::CLOEXEC, None) {
+                        Ok(fd) => fd.into_raw_fd(),
+                        Err(e) => {
+                            self.core.complete(Completion::Connect { slot, res: -e.raw_os_error() });
+                            continue;
+                        }
+                    };
                     tune_socket(fd);
                     let res = self.ring.submitter().register_files_update(slot, &[fd]);
                     close(fd);
                     if let Err(e) = res {
-                        self.core.complete(Completion::Connect { slot, res: -e.raw_os_error().unwrap_or(libc::EBADF) });
+                        self.core.complete(Completion::Connect { slot, res: -e.raw_os_error().unwrap_or(Errno::BADF.raw_os_error()) });
                         continue;
                     }
-                    let sqe = opcode::Connect::new(Fixed(slot), (&sa.0 as *const libc::sockaddr_storage).cast(), sa.1)
+                    let sqe = opcode::Connect::new(Fixed(slot), sa.as_ptr().cast(), sa.addr_len())
                         .build()
                         .user_data(ud(K_CONNECT, slot));
                     self.connects.insert(slot, sa);
@@ -434,10 +437,10 @@ impl Server {
                 // worker io-wq (`IOSQE_ASYNC`), jamais dans notre `enter`.
                 Op::Fs { id } => {
                     let Some(step) = self.core.fs_step(id) else { continue };
-                    let cwd = Fd(libc::AT_FDCWD);
+                    let cwd = Fd(std::os::fd::AsRawFd::as_raw_fd(&rustix::fs::CWD));
                     let sqe = match step {
                         StepRef::Open { path, flags, mode } => {
-                            opcode::OpenAt::new(cwd, path.as_ptr()).flags(flags).mode(mode).build()
+                            opcode::OpenAt::new(cwd, path.as_ptr()).flags(flags.bits() as i32).mode(mode.bits()).build()
                         }
                         StepRef::Fallocate { fd, off, len } => opcode::Fallocate::new(Fd(fd), len).offset(off).build(),
                         StepRef::Fsync { fd, data } => {
@@ -538,7 +541,7 @@ impl Server {
                 }
                 // Annulation d'une op déjà finie, close d'un slot : rien à faire.
                 K_CANCEL | K_CLOSE => {
-                    if res < 0 && res != -libc::ENOENT && res != -libc::EALREADY {
+                    if res < 0 && res != -Errno::NOENT.raw_os_error() && res != -Errno::ALREADY.raw_os_error() {
                         eprintln!("[uring] kind {kind} slot {slot} : erreur {res}");
                     }
                     continue;
@@ -636,7 +639,7 @@ impl Server {
                 self.ring.submit()
             };
             if let Err(e) = res
-                && !matches!(e.raw_os_error(), Some(libc::ETIME) | Some(libc::EINTR) | Some(libc::EBUSY))
+                && !matches!(e.raw_os_error(), Some(e) if [Errno::TIME, Errno::INTR, Errno::BUSY].contains(&Errno::from_raw_os_error(e)))
             {
                 return Err(e);
             }
@@ -709,45 +712,7 @@ const IDLE_WORK_MAX: Duration = Duration::from_millis(1);
 
 fn close(fd: RawFd) {
     // SAFETY: fd possédé, fermé une fois.
-    unsafe { libc::close(fd) };
-}
-
-fn setsockopt_i32(fd: RawFd, level: i32, name: i32, val: i32) {
-    // SAFETY: option entière, pointeur valide.
-    let r = unsafe {
-        libc::setsockopt(fd, level, name, (&val as *const i32).cast(), size_of::<i32>() as libc::socklen_t)
-    };
-    if r != 0 {
-        eprintln!("[uring] setsockopt({level}, {name}) : {}", io::Error::last_os_error());
-    }
-}
-
-/// `SocketAddr` → adresse C pour `connect`.
-fn sockaddr(addr: std::net::SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
-    // SAFETY: structure C, tout à zéro est valide ; les vues `sockaddr_in(6)`
-    // tiennent dans `sockaddr_storage`.
-    unsafe {
-        let mut st: libc::sockaddr_storage = std::mem::zeroed();
-        let len = match addr {
-            std::net::SocketAddr::V4(a) => {
-                let sin = &mut *(&mut st as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in>();
-                sin.sin_family = libc::AF_INET as libc::sa_family_t;
-                sin.sin_port = a.port().to_be();
-                sin.sin_addr = libc::in_addr { s_addr: u32::from_ne_bytes(a.ip().octets()) };
-                size_of::<libc::sockaddr_in>()
-            }
-            std::net::SocketAddr::V6(a) => {
-                let sin6 = &mut *(&mut st as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in6>();
-                sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-                sin6.sin6_port = a.port().to_be();
-                sin6.sin6_flowinfo = a.flowinfo();
-                sin6.sin6_addr = libc::in6_addr { s6_addr: a.ip().octets() };
-                sin6.sin6_scope_id = a.scope_id();
-                size_of::<libc::sockaddr_in6>()
-            }
-        };
-        (st, len as libc::socklen_t)
-    }
+    drop(unsafe { OwnedFd::from_raw_fd(fd) });
 }
 
 /// `RADIXOX_REPLICATE="h1:p1,h2:p2"` : cibles de réplication au démarrage
@@ -767,29 +732,31 @@ fn replicate_from_env(core: &mut Core) -> io::Result<()> {
 
 /// Réglages d'un socket accepté (RUNTIME_ARCH.md §4.1, §4.2).
 fn tune_socket(fd: RawFd) {
+    // SAFETY: fd ouvert par l'appelant pendant l'appel.
+    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+    let opt = |name: &str, r: rustix::io::Result<()>| {
+        if let Err(e) = r {
+            eprintln!("[uring] setsockopt({name}) : {e}");
+        }
+    };
     // Sans Nagle : le p99.99 en pipeline passait de 43 ms à ~8 ms.
-    setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
+    opt("TCP_NODELAY", sockopt::set_tcp_nodelay(fd, true));
     // Client qui ne lit plus et ne ferme pas : le noyau coupe au bout de 60 s
     // (sinon un send resterait en vol à jamais).
-    setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, 60_000);
-    setsockopt_i32(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
-    setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 300);
+    opt("TCP_USER_TIMEOUT", sockopt::set_tcp_user_timeout(fd, 60_000));
+    opt("SO_KEEPALIVE", sockopt::set_socket_keepalive(fd, true));
+    opt("TCP_KEEPIDLE", sockopt::set_tcp_keepidle(fd, Duration::from_secs(300)));
 }
 
 fn pin_cpu() {
     let Ok(v) = std::env::var("RADIXOX_CPU_PIN") else { return };
     match v.parse::<usize>() {
-        Ok(cpu) if cpu < libc::CPU_SETSIZE as usize => {
-            // SAFETY: cpu_set_t initialisé à zéro puis rempli.
-            let ok = unsafe {
-                let mut set: libc::cpu_set_t = std::mem::zeroed();
-                libc::CPU_SET(cpu, &mut set);
-                libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &set) == 0
-            };
-            if ok {
-                println!("CPU pinned: {cpu}");
-            } else {
-                eprintln!("RADIXOX_CPU_PIN={cpu} : {}", io::Error::last_os_error());
+        Ok(cpu) if cpu < rustix::thread::CpuSet::MAX_CPU => {
+            let mut set = rustix::thread::CpuSet::new();
+            set.set(cpu);
+            match rustix::thread::sched_setaffinity(None, &set) {
+                Ok(()) => println!("CPU pinned: {cpu}"),
+                Err(e) => eprintln!("RADIXOX_CPU_PIN={cpu} : {e}"),
             }
         }
         _ => eprintln!("RADIXOX_CPU_PIN invalide : {v}"),
@@ -803,25 +770,26 @@ fn pin_cpu() {
 fn raise_nofile(wanted: u32) -> u32 {
     // Marge pour les autres fd du processus (écoute, signalfd, dump, anneau…).
     const SPARE: u64 = 32;
-    // SAFETY: structure initialisée, appels libc simples.
-    unsafe {
-        let mut lim: libc::rlimit = std::mem::zeroed();
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
-            return wanted;
-        }
+    use rustix::process::{Resource, getrlimit, setrlimit};
+    {
+        // `None` : illimité.
+        let mut lim = getrlimit(Resource::Nofile);
+        let cur = |l: &rustix::process::Rlimit| l.current.unwrap_or(u64::MAX);
         let need = wanted as u64 + SPARE;
-        if lim.rlim_cur < need {
-            lim.rlim_cur = need.min(lim.rlim_max);
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
-                libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim);
+        if cur(&lim) < need {
+            let want = rustix::process::Rlimit { current: Some(need.min(lim.maximum.unwrap_or(u64::MAX))), maximum: lim.maximum };
+            if setrlimit(Resource::Nofile, want).is_ok() {
+                lim = want;
+            } else {
+                lim = getrlimit(Resource::Nofile);
             }
         }
-        let max = lim.rlim_cur.saturating_sub(SPARE).min(wanted as u64) as u32;
+        let max = cur(&lim).saturating_sub(SPARE).min(wanted as u64) as u32;
         if max < wanted {
             eprintln!(
                 "WARNING: RLIMIT_NOFILE = {} : connexions limitées à {max} au lieu de {wanted} \
                  (ulimit -n ou LimitNOFILE= pour en avoir plus)",
-                lim.rlim_cur
+                cur(&lim)
             );
         }
         max
