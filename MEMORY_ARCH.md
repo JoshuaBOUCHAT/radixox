@@ -1753,6 +1753,18 @@ surtout des blocs de nœud qui grossissent (le pool est bump + compteur par bloc
   blocs fixes sur `main`, oracle `oxidart-legacy` + `test_diff` ; (3) slab à deux classes ;
   (4) mesures ; (5) seulement ensuite, rebaser l'essai des groupes de collision
   (branche `linear-small`).
+- **Suite (2026-10-29)** : blocs fixes abandonnés (saut Overflow8 → Wide32 mal rempli : Wide32 à 48 %, +6,5 Mo
+  vivants sur 1M UUID ; le contenu des nœuds hors Inline s'étale de 64 à 200 o, deux tailles fixes y perdent la moitié
+  du bloc quelles qu'elles soient). Retenu à la place : **classes de page faites main**, en cellules de 8 o hors
+  en-tête, 2, 4, 6, 8, 12, 16, 24, 32… (deux par doublement après 4 ; classe 1 mesurée neutre, retirée), branche
+  `page-classes` (`cell_class`, réduction avec hystérésis d'un quart). Mesures 1M UUID : vivant +0,5 Mo contre `main`,
+  débit identique à < 1 % (Zipf / uniforme / chargement, p1 et p64, AMAC +34–36 % toujours). Recensement des pages
+  (forme, octets de données → nombre) : Overflow8 16:4031, 32:10211, 48:13525, 64:10930, 96:19407, 128:3965 ; Wide32
+  96:1910, 128:48, 192:2485, 256:324 (classe 1 encore présente : 8:1433).
+  **Prochaine étape (utilisateur)** : slab dédié aux classes 2, 4, 6, 8, 12 et peut-être 16 cellules (le slab à bitset
+  de l'étape 3 ci-dessus, avec ces classes au lieu de 64 / 256 o ; à trancher : classes de la taille totale, en-tête
+  de 16 o des Overflow8 compris, ou des données), au-delà le pool ; puis fusion avec l'essai des groupes de collision
+  (`linear-small`).
 
 ### 17.4 Petits blocs Hash/Set et débordements valart (fait, branche `pool-structures`)
 
