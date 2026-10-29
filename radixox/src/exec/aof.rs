@@ -11,11 +11,13 @@
 //!   journal.<n>.rxj   blocs consécutifs, préalloués par paliers de 64 Mio
 //! ```
 
-use std::fs::File;
-use std::io::{self, Read};
-use std::path::{Path, PathBuf};
-
 use oxidart::{JournalPos, OxidArt};
+use radixox_lib::rx_eprintln;
+use rustix::fd::{AsFd, AsRawFd, OwnedFd};
+use rustix::fs::{Mode, OFlags};
+
+use crate::error::{self, Error};
+use crate::fs::{self, FdSource};
 
 use super::fs_task::{FdRef, FsTask};
 use super::journal::{BadBlock, Cursor, HEADER, MAX_PAYLOAD, apply, read_block};
@@ -28,8 +30,8 @@ const MANIFEST_TMP: &str = "manifest.tmp";
 pub const PREALLOC: u64 = 64 << 20;
 
 /// `RADIXOX_DIR/appendonlydir`.
-pub fn aof_dir() -> PathBuf {
-    save_dir().join(DIR_NAME)
+pub fn aof_dir() -> String {
+    fs::join(&save_dir(), DIR_NAME)
 }
 
 pub fn base_name(n: u64) -> String {
@@ -150,23 +152,25 @@ impl Manifest {
     }
 
     /// Écriture atomique : `manifest.tmp`, fdatasync, rename, fsync du dossier.
-    pub fn write(&self, dir: &Path) -> io::Result<()> {
-        use std::io::Write;
-        let tmp = dir.join(MANIFEST_TMP);
-        let mut f = File::create(&tmp)?;
-        f.write_all(self.render().as_bytes())?;
-        f.sync_data()?;
+    pub fn write(&self, dir: &str) -> error::Result<()> {
+        let tmp = fs::join(dir, MANIFEST_TMP);
+        let f = fs::create(&tmp)?;
+        fs::write_all(&f, self.render().as_bytes())?;
+        rustix::fs::fdatasync(&f)?;
         drop(f);
-        std::fs::rename(&tmp, dir.join(MANIFEST))?;
-        File::open(dir)?.sync_all()
+        rustix::fs::rename(&tmp, &fs::join(dir, MANIFEST))?;
+        fs::sync_dir(dir)
     }
 
-    pub fn read(dir: &Path) -> io::Result<Option<Self>> {
-        match std::fs::read_to_string(dir.join(MANIFEST)) {
-            Ok(text) => Self::parse(&text)
+    pub fn read(dir: &str) -> error::Result<Option<Self>> {
+        let path = fs::join(dir, MANIFEST);
+        match fs::read(&path) {
+            Ok(bytes) => core::str::from_utf8(&bytes)
+                .map_err(|_| "manifeste non UTF-8".to_string())
+                .and_then(Self::parse)
                 .map(Some)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", dir.join(MANIFEST).display()))),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                .map_err(|e| invalid(format!("{path}: {e}"))),
+            Err(e) if e.is_not_found() => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -180,33 +184,19 @@ impl Manifest {
 // ── Segments ────────────────────────────────────────────────────────────────
 
 /// Crée un segment vide, préalloué (§6.2) et synchronisé avec son dossier.
-pub fn create_segment(dir: &Path, name: &str) -> io::Result<File> {
-    let f = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(dir.join(name))?;
+pub fn create_segment(dir: &str, name: &str) -> error::Result<OwnedFd> {
+    let f = fs::open(&fs::join(dir, name), OFlags::RDWR | OFlags::CREATE | OFlags::EXCL, Mode::from_raw_mode(0o644))?;
     preallocate(&f, 0)?;
-    f.sync_all()?;
-    File::open(dir)?.sync_all()?;
+    rustix::fs::fsync(&f)?;
+    fs::sync_dir(dir)?;
     Ok(f)
 }
 
 /// Réserve le palier qui commence à `from` (mode 0 : la taille du fichier
 /// augmente, l'espace se lit comme des zéros).
-pub fn preallocate(f: &File, from: u64) -> io::Result<()> {
+pub fn preallocate(f: impl AsFd, from: u64) -> error::Result<()> {
     rustix::fs::fallocate(f, rustix::fs::FallocateFlags::empty(), from, PREALLOC as u64)?;
     Ok(())
-}
-
-/// Lit autant d'octets que possible (moins seulement à la fin du fichier).
-fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
-    let mut got = 0;
-    while got < buf.len() {
-        match r.read(&mut buf[got..]) {
-            Ok(0) => break,
-            Ok(n) => got += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(got)
 }
 
 /// Comment s'arrête la lecture d'un segment.
@@ -221,13 +211,14 @@ pub enum SegEnd {
 /// Rejoue les blocs d'un segment ; rend la fin logique (octets valides) et
 /// la façon dont la lecture s'est arrêtée. Un bloc dont la charge ne se
 /// rejoue pas est une erreur (flux valide d'une autre sémantique ou bogue).
-pub fn replay_segment(art: &mut OxidArt, path: &Path, cur: &mut Cursor) -> io::Result<(u64, SegEnd, u64)> {
-    let mut rd = io::BufReader::with_capacity(1 << 20, File::open(path)?);
+pub fn replay_segment(art: &mut OxidArt, path: &str, cur: &mut Cursor) -> error::Result<(u64, SegEnd, u64)> {
+    let mut rd = fs::BufReader::new(fs::open_read(path)?, 1 << 20);
+    let read_err = |e: rustix::io::Errno| Error::from(e).ctx(path);
     let mut buf = vec![0u8; HEADER];
     let (mut end, mut blocks) = (0u64, 0u64);
     loop {
         buf.resize(HEADER, 0);
-        let got = read_full(&mut rd, &mut buf)?;
+        let got = rd.read_full(&mut buf).map_err(read_err)?;
         if got == 0 {
             return Ok((end, SegEnd::Clean, blocks));
         }
@@ -238,7 +229,7 @@ pub fn replay_segment(art: &mut OxidArt, path: &Path, cur: &mut Cursor) -> io::R
         let len = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
         if len <= MAX_PAYLOAD && !buf.iter().all(|&b| b == 0) {
             buf.resize(HEADER + len, 0);
-            let got = read_full(&mut rd, &mut buf[HEADER..])?;
+            let got = rd.read_full(&mut buf[HEADER..]).map_err(read_err)?;
             buf.truncate(HEADER + got);
         }
         let (b, payload) = match read_block(&buf, cur) {
@@ -247,12 +238,7 @@ pub fn replay_segment(art: &mut OxidArt, path: &Path, cur: &mut Cursor) -> io::R
             Err(e) => return Ok((end, SegEnd::Bad(e), blocks)),
         };
         art.set_now(b.now);
-        apply(art, payload).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{}: bloc {} (octet {end}) : {}", path.display(), b.seq, e.0),
-            )
-        })?;
+        apply(art, payload).map_err(|e| invalid(format!("{path}: bloc {} (octet {end}) : {}", b.seq, e.0)))?;
         end += b.size();
         blocks += 1;
     }
@@ -272,29 +258,28 @@ pub struct Resume {
     pub tail_start_offset: u64,
 }
 
-fn invalid(msg: String) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, msg)
+fn invalid(msg: String) -> Error {
+    Error::msg(msg)
 }
 
 /// Charge la base et rejoue les segments du manifeste. `None` : pas de
 /// manifeste (premier démarrage avec l'AOF). Un bloc invalide en fin du
 /// dernier segment (écriture coupée) est tronqué si `load_truncated` ;
 /// ailleurs, refus de démarrer.
-pub fn recover(art: &mut OxidArt, dir: &Path, load_truncated: bool) -> io::Result<Option<Resume>> {
+pub fn recover(art: &mut OxidArt, dir: &str, load_truncated: bool) -> error::Result<Option<Resume>> {
     let Some(m) = Manifest::read(dir)? else { return Ok(None) };
-    let base_path = dir.join(&m.base);
+    let base_path = fs::join(dir, &m.base);
     // Toutes les clés de la base, même expirées depuis : une commande du
     // journal les a peut-être vues vivantes (DURABILITY_DESIGN.md §6.3).
     art.set_now(0);
-    let file = File::open(&base_path).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", base_path.display())))?;
-    let stats = art.load_file(file).map_err(|e| invalid(format!("{}: {e}", base_path.display())))?;
+    let file = fs::open_read(&base_path)?;
+    let stats = art.load_file(FdSource(file)).map_err(|e| super::persist::load_error(e, &base_path))?;
     if !stats.digest_checked {
-        return Err(invalid(format!("{} : base sans condensé (dump v1)", base_path.display())));
+        return Err(invalid(format!("{base_path} : base sans condensé (dump v1)")));
     }
     if stats.pos != (JournalPos { seq: m.base_seq, offset: m.base_offset, replid: m.replid }) {
         return Err(invalid(format!(
-            "{} : position {:?} différente de celle du manifeste (seq {}, offset {}, replid {})",
-            base_path.display(),
+            "{base_path} : position {:?} différente de celle du manifeste (seq {}, offset {}, replid {})",
             stats.pos,
             m.base_seq,
             m.base_offset,
@@ -306,28 +291,25 @@ pub fn recover(art: &mut OxidArt, dir: &Path, load_truncated: bool) -> io::Resul
     let (mut tail_end, mut tail_start_offset) = (0, cur.offset);
     for (i, name) in m.incrs.iter().enumerate() {
         let last = i + 1 == m.incrs.len();
-        let path = dir.join(name);
+        let path = fs::join(dir, name);
         let start_offset = cur.offset;
         let (end, how, blocks) = replay_segment(art, &path, &mut cur)?;
         match how {
             SegEnd::Clean => {}
             SegEnd::Bad(BadBlock::Version(v)) => {
                 return Err(invalid(format!(
-                    "{} : bloc de version {v}, ce binaire lit la version {} ; faire BGREWRITEAOF avec l'ancienne version avant la montée",
-                    path.display(),
+                    "{path} : bloc de version {v}, ce binaire lit la version {} ; faire BGREWRITEAOF avec l'ancienne version avant la montée",
                     super::journal::VERSION
                 )));
             }
             SegEnd::Bad(e) if last && load_truncated && e.is_torn() => {
-                eprintln!(
-                    "[aof] {} : fin coupée après {blocks} blocs ({e:?}), tronqué à {end} octets (RADIXOX_AOF_LOAD_TRUNCATED=yes)",
-                    path.display()
+                rx_eprintln!(
+                    "[aof] {path} : fin coupée après {blocks} blocs ({e:?}), tronqué à {end} octets (RADIXOX_AOF_LOAD_TRUNCATED=yes)"
                 );
             }
             SegEnd::Bad(e) => {
                 return Err(invalid(format!(
-                    "{} : bloc invalide à l'octet {end} ({e:?}){}",
-                    path.display(),
+                    "{path} : bloc invalide à l'octet {end} ({e:?}){}",
                     if !e.is_torn() {
                         " : bloc intact mais incohérent (segment manquant ou d'une autre histoire ?)"
                     } else if last {
@@ -341,9 +323,9 @@ pub fn recover(art: &mut OxidArt, dir: &Path, load_truncated: bool) -> io::Resul
         if last {
             // La fin logique devient la fin du fichier : rien de l'ancienne
             // queue (préallocation, bloc coupé) ne peut suivre les nouveaux blocs.
-            let f = std::fs::OpenOptions::new().write(true).open(&path)?;
-            f.set_len(end)?;
-            f.sync_all()?;
+            let f = fs::open(&path, OFlags::WRONLY, Mode::empty())?;
+            rustix::fs::ftruncate(&f, end)?;
+            rustix::fs::fsync(&f)?;
             tail_end = end;
             tail_start_offset = start_offset;
         }
@@ -354,16 +336,16 @@ pub fn recover(art: &mut OxidArt, dir: &Path, load_truncated: bool) -> io::Resul
 /// Premier démarrage avec l'AOF (§9.1) : l'état chargé (dump.rxd ou vide)
 /// devient `base.1.rxdb`, suivi du segment vide `journal.1.rxj`, nouvelle
 /// histoire.
-pub fn create(art: &mut OxidArt, dir: &Path) -> io::Result<Resume> {
-    std::fs::create_dir_all(dir)?;
+pub fn create(art: &mut OxidArt, dir: &str) -> error::Result<Resume> {
+    fs::create_dir_all(dir)?;
     let replid = new_replid();
     let pos = JournalPos { seq: 0, offset: 0, replid };
     let base = base_name(1);
-    let target = Target { dir: dir.to_path_buf(), tmp: format!("{base}.tmp"), name: base.clone(), pos };
+    let target = Target { dir: dir.into(), tmp: format!("{base}.tmp"), name: base.clone(), pos };
     save_sync_to(art, super::persist::sync_level(), &target)?;
     let seg = segment_name(1);
     // Un reste d'une tentative précédente (crash avant le manifeste).
-    let _ = std::fs::remove_file(dir.join(&seg));
+    let _ = rustix::fs::unlink(&fs::join(dir, &seg));
     create_segment(dir, &seg)?;
     let manifest = Manifest { replid, base, base_seq: 0, base_offset: 0, incrs: vec![seg], follow: None };
     manifest.write(dir)?;
@@ -377,16 +359,15 @@ pub fn create(art: &mut OxidArt, dir: &Path) -> io::Result<Resume> {
 
 /// Fichiers de l'AOF que le manifeste ne cite pas (anciennes bases et
 /// segments, restes d'une rotation interrompue, temporaires).
-pub fn unlisted(dir: &Path, m: &Manifest) -> io::Result<Vec<PathBuf>> {
+pub fn unlisted(dir: &str, m: &Manifest) -> error::Result<Vec<String>> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let name = entry?.file_name();
-        let Some(name) = name.to_str() else { continue };
+    for name in fs::read_dir(dir)? {
+        let name = name.as_str();
         let listed = name == MANIFEST || name == m.base || m.incrs.iter().any(|n| n == name);
         let ours = file_index(name).is_some() || name.ends_with(".tmp");
         if ours && !listed {
-            eprintln!("[aof] {name} : non cité par le manifeste, supprimé");
-            out.push(dir.join(name));
+            rx_eprintln!("[aof] {name} : non cité par le manifeste, supprimé");
+            out.push(fs::join(dir, name));
         }
     }
     Ok(out)
@@ -395,9 +376,9 @@ pub fn unlisted(dir: &Path, m: &Manifest) -> io::Result<Vec<PathBuf>> {
 /// Supprime, d'une traite, les fichiers que le manifeste ne cite pas, après
 /// un chargement réussi (§9.7). Pendant le service : [`unlisted`] et une
 /// suite de suppressions hors de la boucle.
-pub fn remove_unlisted(dir: &Path, m: &Manifest) -> io::Result<()> {
+pub fn remove_unlisted(dir: &str, m: &Manifest) -> error::Result<()> {
     for path in unlisted(dir, m)? {
-        std::fs::remove_file(path)?;
+        rustix::fs::unlink(&path).map_err(|e| Error::from(e).ctx(&path))?;
     }
     Ok(())
 }
@@ -490,9 +471,9 @@ enum FsWork {
 /// Le cœur demande les opérations ([`next_op`](Self::next_op)), les soumet
 /// et rend leurs résultats ; une seule écriture et un seul fsync en vol.
 pub struct AofWriter {
-    pub dir: PathBuf,
+    pub dir: String,
     pub manifest: Manifest,
-    file: File,
+    file: OwnedFd,
     /// Fin logique du segment : octets écrits avec succès.
     file_end: u64,
     /// Taille préallouée du fichier.
@@ -524,7 +505,7 @@ pub struct AofWriter {
     /// Marque `follow` du manifeste à écrire.
     follow_pending: Option<Option<ReplId>>,
     /// Fichiers que le manifeste ne cite plus : à supprimer hors de la boucle.
-    trash: Vec<PathBuf>,
+    trash: Vec<String>,
     /// Numéro du prochain manifeste temporaire (noms uniques : une suite d'un
     /// écrivain remplacé ne peut pas écrire dans le temporaire d'une autre).
     tmp_seq: u64,
@@ -549,13 +530,13 @@ pub struct AofWriter {
 
 impl AofWriter {
     /// Ouvre le segment courant de la reprise, prêt à écrire à sa fin logique.
-    pub fn open(dir: &Path, res: &Resume, fsync: Fsync) -> io::Result<Self> {
+    pub fn open(dir: &str, res: &Resume, fsync: Fsync) -> error::Result<Self> {
         let name = res.manifest.incrs.last().ok_or_else(|| invalid("manifeste sans segment".into()))?;
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(dir.join(name))?;
-        let base_size = std::fs::metadata(dir.join(&res.manifest.base)).map(|m| m.len()).unwrap_or(0);
-        let reserved = file.metadata()?.len();
+        let file = fs::open(&fs::join(dir, name), OFlags::RDWR, Mode::empty())?;
+        let base_size = fs::path_len(&fs::join(dir, &res.manifest.base)).unwrap_or(0);
+        let reserved = fs::len(&file)?;
         Ok(Self {
-            dir: dir.to_path_buf(),
+            dir: dir.into(),
             manifest: res.manifest.clone(),
             file,
             file_end: res.tail_end,
@@ -617,14 +598,10 @@ impl AofWriter {
             // cité par le manifeste **avant** d'y écrire (§8.3). Un seul fsync
             // du dossier à la fin : il rend durables la création et le renommage.
             let name = segment_name(rot.index);
-            use std::os::fd::AsRawFd;
             t.ftruncate(FdRef::Raw(self.file.as_raw_fd()), self.file_end);
-            t.unlink(&self.dir.join(&name), true);
-            let seg = t.open(
-                &self.dir.join(&name),
-                rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL,
-                rustix::fs::Mode::from_raw_mode(0o644),
-            );
+            let path = fs::join(&self.dir, &name);
+            t.unlink(&path, true);
+            let seg = t.open(&path, OFlags::RDWR | OFlags::CREATE | OFlags::EXCL, Mode::from_raw_mode(0o644));
             t.fallocate(seg, 0, PREALLOC);
             t.fsync(seg, false);
             let mut manifest = self.manifest.clone();
@@ -681,26 +658,26 @@ impl AofWriter {
             FsWork::Publish { manifest, pos } => {
                 if let Some(e) = err {
                     // L'ancien manifeste reste valide ; la prochaine réécriture réessaiera.
-                    eprintln!("[aof] manifeste de la base {} : {e} ; ancienne base gardée", manifest.base);
+                    rx_eprintln!("[aof] manifeste de la base {} : {e} ; ancienne base gardée", manifest.base);
                     return;
                 }
                 self.manifest = manifest;
                 let base = &self.manifest.base;
-                self.base_size = std::fs::metadata(self.dir.join(base)).map(|m| m.len()).unwrap_or(0);
+                self.base_size = fs::path_len(&fs::join(&self.dir, base)).unwrap_or(0);
                 match unlisted(&self.dir, &self.manifest) {
                     Ok(paths) => self.trash.extend(paths),
-                    Err(e) => eprintln!("[aof] liste des anciens fichiers : {e}"),
+                    Err(e) => rx_eprintln!("[aof] liste des anciens fichiers : {e}"),
                 }
                 // Tout ce qui précède la base est dans un fichier neuf, fsyncé : un
                 // fsync raté plus tôt ne compte plus que pour les blocs d'après.
                 if self.fsync_err.take().is_some() {
-                    eprintln!("[aof] nouvelle base publiée : écritures de nouveau acceptées");
+                    rx_eprintln!("[aof] nouvelle base publiée : écritures de nouveau acceptées");
                 }
-                eprintln!("[aof] réécriture publiée : {base} (seq {}), {} segment(s)", pos.seq, self.manifest.incrs.len());
+                rx_eprintln!("[aof] réécriture publiée : {base} (seq {}), {} segment(s)", pos.seq, self.manifest.incrs.len());
             }
             FsWork::Follow { manifest } => match err {
                 None => self.manifest = manifest,
-                Some(e) => eprintln!(
+                Some(e) => rx_eprintln!(
                     "[aof] manifeste (follow) : {e} ; au redémarrage, le serveur reprendrait son ancien rôle"
                 ),
             },
@@ -708,12 +685,11 @@ impl AofWriter {
     }
 
     /// Fichiers à supprimer hors de la boucle (file `Trash` du cœur).
-    pub fn take_trash(&mut self) -> Vec<PathBuf> {
+    pub fn take_trash(&mut self) -> Vec<String> {
         std::mem::take(&mut self.trash)
     }
 
     fn fd(&self) -> i32 {
-        use std::os::fd::AsRawFd;
         self.file.as_raw_fd()
     }
 
@@ -834,11 +810,11 @@ impl AofWriter {
     fn fail_write(&mut self, msg: String, now: radixox_lib::sys::Instant) {
         if self.fsync == Fsync::Always {
             // Des réponses retenues ne peuvent plus être garanties (§7.7).
-            eprintln!("[aof] erreur d'écriture en appendfsync always : {msg} ; arrêt");
-            std::process::exit(1);
+            rx_eprintln!("[aof] erreur d'écriture en appendfsync always : {msg} ; arrêt");
+            radixox_lib::sys::exit(1);
         }
         if self.write_err.is_none() {
-            eprintln!("[aof] erreur d'écriture : {msg} ; écritures refusées, nouvel essai chaque seconde");
+            rx_eprintln!("[aof] erreur d'écriture : {msg} ; écritures refusées, nouvel essai chaque seconde");
         }
         self.write_err = Some(msg);
         self.retry_at = Some(now + core::time::Duration::from_secs(1));
@@ -849,7 +825,7 @@ impl AofWriter {
         debug_assert!(self.in_flight);
         self.in_flight = false;
         if res < 0 {
-            self.fail_write(io::Error::from_raw_os_error(-res).to_string(), now);
+            self.fail_write(radixox_lib::sys::OsError(-res).to_string(), now);
             return;
         }
         let n = res as usize;
@@ -861,7 +837,7 @@ impl AofWriter {
         self.file_end += n as u64;
         self.written += n as u64;
         if self.write_err.take().is_some() {
-            eprintln!("[aof] écriture rétablie");
+            rx_eprintln!("[aof] écriture rétablie");
             self.retry_at = None;
         }
     }
@@ -896,12 +872,12 @@ impl AofWriter {
             return;
         }
         if res < 0 {
-            let e = io::Error::from_raw_os_error(-res);
+            let e = radixox_lib::sys::OsError(-res);
             if self.fsync == Fsync::Always {
-                eprintln!("[aof] fsync en échec en appendfsync always : {e} ; arrêt");
-                std::process::exit(1);
+                rx_eprintln!("[aof] fsync en échec en appendfsync always : {e} ; arrêt");
+                radixox_lib::sys::exit(1);
             }
-            eprintln!("[aof] fsync en échec : {e} ; écritures refusées jusqu'à la prochaine réécriture réussie");
+            rx_eprintln!("[aof] fsync en échec : {e} ; écritures refusées jusqu'à la prochaine réécriture réussie");
             self.fsync_err = Some(format!("fsync : {e}"));
             if let Some(rot) = &mut self.rotation {
                 // La rotation réessaiera son fsync au prochain tour.
@@ -1009,23 +985,22 @@ impl AofWriter {
     /// vol comprise : mêmes octets au même endroit) et fsync, d'une traite.
     /// Une rotation en cours est menée à son terme d'abord. Aucune suite de
     /// fichiers ne doit être en vol (la boucle les attend avant l'arrêt).
-    pub fn flush_sync(&mut self, stream: &mut super::journal::Stream) -> io::Result<()> {
-        use std::os::unix::fs::FileExt;
+    pub fn flush_sync(&mut self, stream: &mut super::journal::Stream) -> error::Result<()> {
         debug_assert!(self.in_fs.is_none(), "suite de fichiers en vol à l'arrêt");
         stream.end_turn();
         let rest = self.writing[self.done..].to_vec();
         self.writing.clear();
         self.done = 0;
-        self.file.write_all_at(&rest, self.file_end)?;
+        fs::pwrite_all(&self.file, &rest, self.file_end)?;
         self.file_end += rest.len() as u64;
         self.written += rest.len() as u64;
         if let Some(rot) = &self.rotation {
             let mut before = Vec::new();
             stream.take_closed(&mut before, usize::MAX, rot.boundary - self.written);
-            self.file.write_all_at(&before, self.file_end)?;
+            fs::pwrite_all(&self.file, &before, self.file_end)?;
             self.file_end += before.len() as u64;
             self.written += before.len() as u64;
-            self.file.sync_data()?;
+            rustix::fs::fdatasync(&self.file)?;
             self.rotation.as_mut().unwrap().synced = true;
             // Pas de délai d'erreur à l'arrêt : la rotation part tout de suite,
             // puis la publication d'une base déjà écrite, s'il y en a une.
@@ -1036,15 +1011,15 @@ impl AofWriter {
                 self.fs_done(t, now);
             }
             if self.rotation.is_some() {
-                return Err(io::Error::other(self.write_err.clone().unwrap_or_default()));
+                return Err(Error::msg(self.write_err.clone().unwrap_or_default()));
             }
         }
         let mut after = Vec::new();
         stream.take_closed(&mut after, usize::MAX, u64::MAX);
-        self.file.write_all_at(&after, self.file_end)?;
+        fs::pwrite_all(&self.file, &after, self.file_end)?;
         self.file_end += after.len() as u64;
         self.written += after.len() as u64;
-        self.file.sync_data()?;
+        rustix::fs::fdatasync(&self.file)?;
         self.durable = self.written;
         Ok(())
     }

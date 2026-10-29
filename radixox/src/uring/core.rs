@@ -141,7 +141,7 @@ pub struct Config {
     pub repl_online_lag: u64,
     /// Dossier de `dump.rxd` et du dump reçu par un réplica (`None` :
     /// `RADIXOX_DIR`, lu à chaque save).
-    pub dir: Option<std::path::PathBuf>,
+    pub dir: Option<String>,
 }
 
 impl Default for Config {
@@ -908,7 +908,7 @@ impl Core {
     }
 
     /// Arrêt : tout le flux sur disque, fsync compris, d'une traite.
-    pub fn flush_journal_sync(&mut self) -> std::io::Result<()> {
+    pub fn flush_journal_sync(&mut self) -> crate::Result<()> {
         match (&mut self.aof, &mut self.journal) {
             (Some(w), Some(j)) => w.flush_sync(j),
             _ => Ok(()),
@@ -943,7 +943,7 @@ impl Core {
     }
 
     /// Suppressions (une suite, file `Trash`).
-    fn fs_trash(&mut self, paths: Vec<std::path::PathBuf>) {
+    fn fs_trash(&mut self, paths: Vec<String>) {
         if paths.is_empty() {
             return;
         }
@@ -1447,7 +1447,7 @@ impl Core {
     }
 
     /// Dossier des dumps (`Config::dir`, sinon `RADIXOX_DIR`).
-    fn dir(&self) -> std::path::PathBuf {
+    fn dir(&self) -> String {
         self.cfg.dir.clone().unwrap_or_else(save_dir)
     }
 

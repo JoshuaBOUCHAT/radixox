@@ -9,14 +9,14 @@
 //! s'arrête à la première erreur. Le faux noyau des tests et l'arrêt du serveur
 //! l'exécutent d'une traite ([`FsTask::run_blocking`]).
 
-use std::ffi::{CStr, CString};
-use std::fs::File;
-use std::os::fd::{FromRawFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use alloc::ffi::CString;
+use core::ffi::CStr;
 
+use rustix::fd::{FromRawFd, OwnedFd, RawFd};
 use rustix::fs::{FallocateFlags, Mode, OFlags};
 use rustix::io::Errno;
+
+use crate::error::Error;
 
 /// Descripteur visé par une étape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,8 +68,8 @@ pub struct FsTask {
     err: Option<(usize, i32)>,
 }
 
-fn cpath(p: &Path) -> CString {
-    CString::new(p.as_os_str().as_bytes()).expect("chemin sans octet nul")
+fn cpath(p: &str) -> CString {
+    CString::new(p).expect("chemin sans octet nul")
 }
 
 impl FsTask {
@@ -78,7 +78,7 @@ impl FsTask {
     }
 
     /// Ouvre `path` ; le fichier devient `FdRef::Opened(n)`, `n` rendu.
-    pub fn open(&mut self, path: &Path, flags: OFlags, mode: Mode) -> FdRef {
+    pub fn open(&mut self, path: &str, flags: OFlags, mode: Mode) -> FdRef {
         let n = self.steps.iter().filter(|s| matches!(s, Step::Open { .. })).count();
         self.steps.push(Step::Open { path: cpath(path), flags: flags | OFlags::CLOEXEC, mode });
         FdRef::Opened(n)
@@ -100,11 +100,11 @@ impl FsTask {
         self.steps.push(Step::Ftruncate { fd, len });
     }
 
-    pub fn rename(&mut self, from: &Path, to: &Path) {
+    pub fn rename(&mut self, from: &str, to: &str) {
         self.steps.push(Step::Rename { from: cpath(from), to: cpath(to) });
     }
 
-    pub fn unlink(&mut self, path: &Path, missing_ok: bool) {
+    pub fn unlink(&mut self, path: &str, missing_ok: bool) {
         self.steps.push(Step::Unlink { path: cpath(path), missing_ok });
     }
 
@@ -114,7 +114,7 @@ impl FsTask {
 
     /// fsync du dossier (ouvert, synchronisé, refermé) : rend durables les
     /// créations, renommages et suppressions qui y ont été faits.
-    pub fn sync_dir(&mut self, dir: &Path) {
+    pub fn sync_dir(&mut self, dir: &str) {
         let d = self.open(dir, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty());
         self.fsync(d, false);
         self.close(d);
@@ -122,12 +122,13 @@ impl FsTask {
 
     /// Écriture atomique d'un petit fichier : `tmp` écrit et synchronisé, puis
     /// renommé en `name`, puis fsync du dossier.
-    pub fn replace_file(&mut self, dir: &Path, tmp: &str, name: &str, bytes: Vec<u8>) {
-        let f = self.open(&dir.join(tmp), OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC, Mode::from_raw_mode(0o644));
+    pub fn replace_file(&mut self, dir: &str, tmp: &str, name: &str, bytes: Vec<u8>) {
+        let tmp = crate::fs::join(dir, tmp);
+        let f = self.open(&tmp, OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC, Mode::from_raw_mode(0o644));
         self.write(f, bytes, 0);
         self.fsync(f, true);
         self.close(f);
-        self.rename(&dir.join(tmp), &dir.join(name));
+        self.rename(&tmp, &crate::fs::join(dir, name));
         self.sync_dir(dir);
     }
 
@@ -141,8 +142,8 @@ impl FsTask {
     }
 
     /// Première erreur : numéro d'étape et `errno`.
-    pub fn error(&self) -> Option<std::io::Error> {
-        self.err.map(|(_, e)| std::io::Error::from_raw_os_error(e))
+    pub fn error(&self) -> Option<Error> {
+        self.err.map(|(_, e)| Error::from(radixox_lib::sys::OsError(e)))
     }
 
     fn fd(&self, r: FdRef) -> RawFd {
@@ -203,16 +204,16 @@ impl FsTask {
     }
 
     /// Reprend le `n`-ième fichier ouvert (la suite ne le fermera plus).
-    pub fn take_file(&mut self, n: usize) -> Option<File> {
-        let fd = std::mem::replace(self.opened.get_mut(n)?, -1);
+    pub fn take_file(&mut self, n: usize) -> Option<OwnedFd> {
+        let fd = core::mem::replace(self.opened.get_mut(n)?, -1);
         // SAFETY: fd ouvert par la suite, possédé par elle seule jusqu'ici.
-        (fd >= 0).then(|| unsafe { File::from_raw_fd(fd) })
+        (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
     /// Exécute l'étape courante par un appel bloquant : même résultat qu'un CQE.
     pub fn exec_blocking(step: StepRef<'_>) -> i32 {
         use rustix::{fs, io};
-        use std::os::fd::{BorrowedFd, IntoRawFd, OwnedFd};
+        use rustix::fd::{BorrowedFd, IntoRawFd};
         // SAFETY: les descripteurs d'une étape restent ouverts jusqu'à son résultat.
         let b = |fd: RawFd| unsafe { BorrowedFd::borrow_raw(fd) };
         let r = match step {
@@ -247,7 +248,7 @@ impl Drop for FsTask {
         for &fd in &self.opened {
             if fd >= 0 {
                 // SAFETY: fd ouvert par la suite et jamais repris.
-                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+                drop(unsafe { OwnedFd::from_raw_fd(fd) });
             }
         }
     }
@@ -264,12 +265,16 @@ mod tests {
         d
     }
 
+    fn s(p: &std::path::Path) -> &str {
+        p.to_str().unwrap()
+    }
+
     #[test]
     fn replace_file_then_take_and_unlink() {
         let d = tmpdir("replace");
         let mut t = FsTask::new();
-        t.replace_file(&d, "m.tmp", "m", b"hello".to_vec());
-        let seg = t.open(&d.join("seg"), OFlags::RDWR | OFlags::CREATE | OFlags::EXCL, Mode::from_raw_mode(0o644));
+        t.replace_file(s(&d), "m.tmp", "m", b"hello".to_vec());
+        let seg = t.open(s(&d.join("seg")), OFlags::RDWR | OFlags::CREATE | OFlags::EXCL, Mode::from_raw_mode(0o644));
         t.fallocate(seg, 0, 4096);
         t.fsync(seg, false);
         t.run_blocking();
@@ -278,11 +283,11 @@ mod tests {
         assert!(!d.join("m.tmp").exists());
         let FdRef::Opened(n) = seg else { unreachable!() };
         let f = t.take_file(n).unwrap();
-        assert_eq!(f.metadata().unwrap().len(), 4096);
+        assert_eq!(crate::fs::len(&f), Ok(4096));
 
         let mut t = FsTask::new();
-        t.unlink(&d.join("absent"), true);
-        t.unlink(&d.join("m"), false);
+        t.unlink(s(&d.join("absent")), true);
+        t.unlink(s(&d.join("m")), false);
         t.run_blocking();
         assert!(t.error().is_none());
         assert!(!d.join("m").exists());
@@ -293,15 +298,15 @@ mod tests {
     fn stops_at_the_first_error_and_short_writes_resume() {
         let d = tmpdir("err");
         let mut t = FsTask::new();
-        t.unlink(&d.join("absent"), false);
-        t.replace_file(&d, "x.tmp", "x", b"never".to_vec());
+        t.unlink(s(&d.join("absent")), false);
+        t.replace_file(s(&d), "x.tmp", "x", b"never".to_vec());
         t.run_blocking();
-        assert_eq!(t.error().unwrap().raw_os_error(), Some(Errno::NOENT.raw_os_error()));
+        assert!(t.error().unwrap().is_not_found());
         assert!(!d.join("x.tmp").exists(), "rien après l'étape en échec");
 
         // Écriture courte rendue par le noyau : l'étape repart avec le reste.
         let mut t = FsTask::new();
-        let f = t.open(&d.join("w"), OFlags::WRONLY | OFlags::CREATE, Mode::from_raw_mode(0o644));
+        let f = t.open(s(&d.join("w")), OFlags::WRONLY | OFlags::CREATE, Mode::from_raw_mode(0o644));
         t.write(f, b"abcdef".to_vec(), 0);
         let res = FsTask::exec_blocking(t.step().unwrap());
         t.done(res);

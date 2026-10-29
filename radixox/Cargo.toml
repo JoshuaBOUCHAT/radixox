@@ -16,6 +16,9 @@ name = "radixox"
 path = "src/bin/uringloop.rs"
 
 [features]
+# Processus `std` (défaut) ; sans elle, la lib est `no_std` + `alloc` (lib.rs).
+default = ["std"]
+std = []
 # Politiques d'éviction LRU / LFU : une écriture par accès (MEMORY_ARCH.md §10.2 quater).
 # Sans elle, le chemin de lecture n'écrit rien de plus.
 eviction = ["oxidart/eviction", "radixox-lib/eviction"]

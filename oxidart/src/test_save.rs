@@ -542,7 +542,7 @@ fn reload_file_rejects_truncation_corruption_and_trailing_bytes() {
 #[test]
 fn reload_compressed_file() {
     use crate::compress::{ZstdReader, ZstdStream};
-    use std::io::Read;
+    use crate::load::Source;
     use std::time::Duration;
 
     let mut rng = Rng(0xC0FF_EE00_1234_5678);
@@ -566,8 +566,13 @@ fn reload_compressed_file() {
         while !z.finish(&mut packed, Duration::ZERO) {}
         assert!(packed.len() < raw.len() / 2, "niveau {level} : {} -> {}", raw.len(), packed.len());
 
-        let mut unpacked = Vec::new();
-        ZstdReader::new(&packed[..]).read_to_end(&mut unpacked).unwrap();
+        let (mut unpacked, mut rd, mut chunk) = (Vec::new(), ZstdReader::new(&packed[..]), [0u8; 4096]);
+        loop {
+            match rd.read_some(&mut chunk).unwrap() {
+                0 => break,
+                n => unpacked.extend_from_slice(&chunk[..n]),
+            }
+        }
         assert!(unpacked == raw, "niveau {level} : frame ≠ fichier brut");
 
         let mut back = OxidArt::new();

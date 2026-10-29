@@ -1026,7 +1026,7 @@ fn main() -> io::Result<()> {
             Some(res) => {
                 println!(
                     "[aof] {} : base {} + {} segment(s), {} blocs, {:.1} MB de flux, en {:.2?}",
-                    dir.display(),
+                    dir,
                     res.manifest.base,
                     res.manifest.incrs.len(),
                     res.cursor.seq,
@@ -1038,7 +1038,7 @@ fn main() -> io::Result<()> {
             None => {
                 radixox::exec::persist::load_at_startup(&mut art)?;
                 let res = aof::create(&mut art, &dir)?;
-                println!("[aof] {} créé (base.1.rxdb, journal.1.rxj)", dir.display());
+                println!("[aof] {} créé (base.1.rxdb, journal.1.rxj)", dir);
                 res
             }
         };

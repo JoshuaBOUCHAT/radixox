@@ -12,13 +12,10 @@
 //! (`Core::tick`) et refuse les écritures des clients (`exec_window`).
 
 use std::collections::VecDeque;
-use std::fs::File;
-use std::io::Write as _;
-use std::net::ToSocketAddrs;
-use std::os::unix::fs::FileExt;
-use std::path::PathBuf;
 use core::time::Duration;
-use radixox_lib::sys::Instant;
+use radixox_lib::rx_eprintln;
+use radixox_lib::sys::{Instant, OsError};
+use rustix::fd::OwnedFd;
 
 use radixox_lib::shared_frame::{SharedFrame as Frame, encode_array_len, encode_bulk, extend_encode};
 
@@ -27,6 +24,7 @@ use crate::exec::jobs::{FlushJob, Step};
 use crate::exec::journal::{self, Blk, Cursor, Stream};
 use crate::exec::persist::Target;
 use crate::exec::resp_ok;
+use crate::fs::{self, FdSource};
 
 use super::super::conn::{ConnOut, Mode};
 use super::{After, Core, Op, REPL_EVERY, Slot, Timer};
@@ -53,7 +51,7 @@ pub(in super::super) enum State {
     /// Synchronisation complète : attend un BGSAVE (`Link::base` une fois lancé).
     WaitSave,
     /// Envoi du dump, de `off` à `len`.
-    Loading { file: File, off: u64, len: u64 },
+    Loading { file: OwnedFd, off: u64, len: u64 },
     Online,
 }
 
@@ -197,8 +195,8 @@ pub(in super::super) struct Waiter {
 
 /// Dump d'une synchronisation complète en cours de réception.
 pub(in super::super) struct LoadIn {
-    file: File,
-    path: PathBuf,
+    file: OwnedFd,
+    path: String,
     len: u64,
     got: u64,
 }
@@ -285,7 +283,7 @@ impl Core {
             l.auth = auth;
             return Ok(());
         }
-        eprintln!("[repl] nouvelle cible {host}:{port}");
+        rx_eprintln!("[repl] nouvelle cible {host}:{port}");
         src.links.push(Link::new(host, port, auth, now));
         let i = src.links.len() - 1;
         self.link_connect(i);
@@ -296,7 +294,7 @@ impl Core {
         let src = self.src.as_mut().ok_or_else(|| refuse("ERR no such replica"))?;
         let i = src.links.iter().position(|l| l.host == host && l.port == port).ok_or_else(|| refuse("ERR no such replica"))?;
         let l = src.links.remove(i);
-        eprintln!("[repl] cible {host}:{port} retirée");
+        rx_eprintln!("[repl] cible {host}:{port} retirée");
         if let Some((slot, _)) = l.slot {
             self.drain(slot);
         }
@@ -312,7 +310,7 @@ impl Core {
     /// IP en pratique, résolue à chaque essai).
     fn link_connect(&mut self, i: usize) {
         let l = &self.src.as_ref().unwrap().links[i];
-        let addr = match (l.host.as_str(), l.port).to_socket_addrs().map(|mut a| a.next()) {
+        let addr = match resolve(&l.host, l.port) {
             Ok(Some(a)) => a,
             Ok(None) => return self.link_failed(i, "adresse introuvable".into()),
             Err(e) => return self.link_failed(i, format!("résolution : {e}")),
@@ -336,7 +334,7 @@ impl Core {
         let now = self.now;
         let l = &mut self.src.as_mut().unwrap().links[i];
         if l.last_err.as_deref() != Some(why.as_str()) {
-            eprintln!("[repl] {}:{} : {why} ; nouvel essai toutes les secondes", l.host, l.port);
+            rx_eprintln!("[repl] {}:{} : {why} ; nouvel essai toutes les secondes", l.host, l.port);
         }
         l.last_err = Some(why);
         l.state = State::Down { retry_at: now + RETRY };
@@ -350,7 +348,7 @@ impl Core {
         let l = &mut self.src.as_mut().unwrap().links[i];
         let why = l.why.take().unwrap_or_else(|| "connexion perdue".into());
         if l.last_err.as_deref() != Some(why.as_str()) {
-            eprintln!("[repl] {}:{} : {why} ; nouvel essai dans 1 s", l.host, l.port);
+            rx_eprintln!("[repl] {}:{} : {why} ; nouvel essai dans 1 s", l.host, l.port);
         }
         l.last_err = Some(why);
         l.slot = None;
@@ -380,7 +378,7 @@ impl Core {
         let i = self.link_of(slot);
         if res < 0 || i.is_none() || self.outs[s].mode != Mode::Normal {
             if let Some(i) = i {
-                self.src.as_mut().unwrap().links[i].why = Some(format!("connexion : {}", std::io::Error::from_raw_os_error(-res)));
+                self.src.as_mut().unwrap().links[i].why = Some(format!("connexion : {}", OsError(-res)));
             }
             self.drain(slot);
             self.maybe_close(slot);
@@ -448,7 +446,7 @@ impl Core {
             e => {
                 if let Some(i) = self.link_of(slot) {
                     self.src.as_mut().unwrap().links[i].why =
-                        Some(format!("réception : {}", std::io::Error::from_raw_os_error(-e)));
+                        Some(format!("réception : {}", OsError(-e)));
                 }
                 self.drain(slot);
             }
@@ -501,7 +499,7 @@ impl Core {
             (_, Reply::Err(e)) => Err(format!("refusé : {}", String::from_utf8_lossy(e))),
             (Expect::Auth | Expect::Load | Expect::Tick, Reply::Ok) => Ok(()),
             (Expect::LoadEnd { seq, end }, Reply::Ok) => {
-                eprintln!("[repl] {}:{} : dump chargé par la cible", l.host, l.port);
+                rx_eprintln!("[repl] {}:{} : dump chargé par la cible", l.host, l.port);
                 l.acked_seq = seq;
                 l.acked_offset = end;
                 Ok(())
@@ -532,7 +530,7 @@ impl Core {
         let Some((slot, _)) = l.slot else { return };
         let partial = u64::try_from(s).is_ok_and(|s| s == last || (first.is_some_and(|f| f <= s + 1) && s < last));
         if !partial {
-            eprintln!(
+            rx_eprintln!(
                 "[repl] {}:{} : synchronisation complète ({})",
                 l.host,
                 l.port,
@@ -561,9 +559,9 @@ impl Core {
         }
         l.state = State::Online;
         if l.last_err.take().is_some() || n > 0 || s > 0 {
-            eprintln!("[repl] {}:{} : en ligne, reprise après le bloc {s} ({n} blocs du backlog)", l.host, l.port);
+            rx_eprintln!("[repl] {}:{} : en ligne, reprise après le bloc {s} ({n} blocs du backlog)", l.host, l.port);
         } else {
-            eprintln!("[repl] {}:{} : en ligne", l.host, l.port);
+            rx_eprintln!("[repl] {}:{} : en ligne", l.host, l.port);
         }
         mark_dirty(o, dirty, slot);
     }
@@ -588,14 +586,14 @@ impl Core {
                 }
             }
             // Réécriture de l'AOF pas finie (rotation) : nouvel essai au timer.
-            Err(e) => eprintln!("[repl] BGSAVE de synchronisation : {e} ; nouvel essai dans 1 s"),
+            Err(e) => rx_eprintln!("[repl] BGSAVE de synchronisation : {e} ; nouvel essai dans 1 s"),
         }
     }
 
     /// Fin d'un BGSAVE : les cibles qui l'attendaient reçoivent son fichier.
     pub(super) fn repl_bgsave_done(&mut self, target: &Target, ok: bool) {
         let Some(src) = &mut self.src else { return };
-        let path = target.dir.join(&target.name);
+        let path = fs::join(&target.dir, &target.name);
         let mut failed = Vec::new();
         for (i, l) in src.links.iter_mut().enumerate() {
             if !(matches!(l.state, State::WaitSave) && l.base.is_some_and(|(seq, _)| seq == target.pos.seq)) {
@@ -607,18 +605,19 @@ impl Core {
                 l.queue_bytes = 0;
                 continue;
             }
-            let file = File::open(&path).and_then(|f| f.metadata().map(|m| (f, m.len())));
+            let file = fs::open_read(&path)
+                .and_then(|f| fs::len(&f).map(|len| (f, len)).map_err(|e| crate::Error::from(e).ctx(&path)));
             match file {
                 Ok((file, len)) => {
                     let Some((slot, _)) = l.slot else { continue };
                     let o = &mut self.outs[slot as usize];
                     command(&mut o.out, &[b"RXLOAD", b"BEGIN", len.to_string().as_bytes()]);
                     l.expect.push_back(Expect::Load);
-                    eprintln!("[repl] {}:{} : envoi du dump ({:.1} MB, bloc {})", l.host, l.port, len as f64 / 1e6, target.pos.seq);
+                    rx_eprintln!("[repl] {}:{} : envoi du dump ({:.1} MB, bloc {})", l.host, l.port, len as f64 / 1e6, target.pos.seq);
                     l.state = State::Loading { file, off: 0, len };
                     mark_dirty(o, &mut self.dirty, slot);
                 }
-                Err(e) => failed.push((i, format!("{} : {e}", path.display()))),
+                Err(e) => failed.push((i, format!("{e}"))),
             }
         }
         for (i, why) in failed {
@@ -694,7 +693,10 @@ impl Core {
                 o.out.extend_from_slice(b"\r\n");
                 let start = o.out.len();
                 o.out.resize(start + n, 0);
-                if let Err(e) = file.read_exact_at(&mut o.out[start..], *off) {
+                let got = fs::pread_full(&*file, &mut o.out[start..], *off);
+                if let Err(e) = got.map_err(|e| OsError::from(e).to_string()).and_then(|got| {
+                    if got == n { Ok(()) } else { Err("fin de fichier inattendue".into()) }
+                }) {
                     o.out.truncate(start);
                     failed.push((i, format!("lecture du dump : {e}")));
                     break;
@@ -714,7 +716,7 @@ impl Core {
                 l.queue_bytes = 0;
                 l.state = State::Online;
                 l.last_err = None;
-                eprintln!("[repl] {}:{} : dump envoyé, en ligne à partir du bloc {}", l.host, l.port, base + 1);
+                rx_eprintln!("[repl] {}:{} : dump envoyé, en ligne à partir du bloc {}", l.host, l.port, base + 1);
             }
             mark_dirty(o, &mut self.dirty, slot);
         }
@@ -866,8 +868,8 @@ impl Core {
             }
             After::RxLoadBegin(len) => {
                 self.check_upstream(slot)?;
-                let path = self.dir().join(LOAD_TMP);
-                let file = File::create(&path).map_err(|e| fatal(format!("ERR {}: {e}", path.display())))?;
+                let path = fs::join(&self.dir(), LOAD_TMP);
+                let file = fs::create(&path).map_err(|e| fatal(format!("ERR {e}")))?;
                 self.loading = Some(LoadIn { file, path, len, got: 0 });
                 reply(self, resp_ok());
             }
@@ -877,7 +879,7 @@ impl Core {
                 if l.got + d.len() as u64 > l.len {
                     return Err(fatal("ERR RXLOAD: more data than announced"));
                 }
-                l.file.write_all(&d).map_err(|e| fatal(format!("ERR {}: {e}", l.path.display())))?;
+                fs::write_all(&l.file, &d).map_err(|e| fatal(format!("ERR {}: {}", l.path, OsError::from(e))))?;
                 l.got += d.len() as u64;
                 reply(self, resp_ok());
             }
@@ -885,7 +887,7 @@ impl Core {
                 let up = self.check_upstream(slot)?;
                 let l = self.loading.take().ok_or_else(|| fatal("ERR RXLOAD BEGIN first"))?;
                 if l.got != l.len {
-                    let _ = std::fs::remove_file(&l.path);
+                    let _ = rustix::fs::unlink(&l.path);
                     return Err(fatal(format!("ERR RXLOAD: {} bytes received, {} announced", l.got, l.len)));
                 }
                 self.load_sync(l, up.replid)?;
@@ -912,7 +914,7 @@ impl Core {
                     // L'état n'est plus celui de la source : la prochaine
                     // connexion repartira d'un dump.
                     f.replid = [0; 20];
-                    eprintln!("[repl] bloc {} inapplicable : {} ; synchronisation complète à la reconnexion", blk.seq, e.0);
+                    rx_eprintln!("[repl] bloc {} inapplicable : {} ; synchronisation complète à la reconnexion", blk.seq, e.0);
                     return Err(fatal(format!("ERR block {}: {}", blk.seq, e.0)));
                 }
                 f.cur = cur;
@@ -965,9 +967,9 @@ impl Core {
         // Toutes les clés du dump : celles qui expirent sont absentes pour les
         // commandes des blocs suivants (DET2), l'évicteur les retirera.
         self.art.set_now(0);
-        let res = File::open(&l.path)
+        let res = fs::open_read(&l.path)
             .map_err(|e| e.to_string())
-            .and_then(|f| self.art.load_file(f).map_err(|e| e.to_string()))
+            .and_then(|f| self.art.load_file(FdSource(f)).map_err(|e| e.to_string()))
             .and_then(|stats| if stats.digest_checked { Ok(stats) } else { Err("dump sans condensé (v1)".into()) });
         // Nouvelle histoire : les réplicas chaînés repartent d'un dump.
         if let Some(src) = &mut self.src {
@@ -985,7 +987,7 @@ impl Core {
             }
             Ok((stats, cur))
         });
-        let _ = std::fs::remove_file(&l.path);
+        let _ = rustix::fs::unlink(&l.path);
         match res {
             Ok((stats, cur)) => {
                 self.art.set_now(stats.t0);
@@ -998,7 +1000,7 @@ impl Core {
                     j.tap = self.src.is_some().then(Vec::new);
                     j
                 });
-                eprintln!(
+                rx_eprintln!(
                     "[repl] synchronisé avec {} : {} clés en {:.2?}, bloc {}",
                     hex(&replid),
                     stats.keys,
@@ -1011,7 +1013,7 @@ impl Core {
                 // Contenu indéterminé : vidé ; en lecture seule jusqu'au prochain dump.
                 self.flush_tree();
                 self.follow = Some(Follow { replid: [0; 20], cur: Cursor::default() });
-                eprintln!("[repl] chargement du dump de synchronisation : {why}");
+                rx_eprintln!("[repl] chargement du dump de synchronisation : {why}");
                 Err(fatal(format!("ERR RXLOAD: {why}")))
             }
         }
@@ -1042,27 +1044,27 @@ impl Core {
         }
         self.aof_pump();
         if let Some(l) = self.loading.take() {
-            let _ = std::fs::remove_file(&l.path);
+            let _ = rustix::fs::unlink(&l.path);
         }
         if let Some(up) = self.upstream_live() {
             self.drain(up.slot);
         }
         self.upstream = None;
-        eprintln!("[repl] promu (REPLICAOF NO ONE) : nouvelle histoire {}, après le bloc {}", hex(&self.replid), f.cur.seq);
+        rx_eprintln!("[repl] promu (REPLICAOF NO ONE) : nouvelle histoire {}, après le bloc {}", hex(&self.replid), f.cur.seq);
     }
 
     /// Réplica avec AOF qui reçoit un dump : il devient la base (renommé
     /// dans `appendonlydir`), suivi d'un segment vide, manifeste marqué
     /// `follow` ; nouvel écrivain (l'ancien finit ses opérations en vol).
-    fn rebase_aof(&mut self, dump: &std::path::Path, pos: oxidart::JournalPos, cur: Cursor, follow: ReplId) -> std::io::Result<()> {
+    fn rebase_aof(&mut self, dump: &str, pos: oxidart::JournalPos, cur: Cursor, follow: ReplId) -> crate::Result<()> {
         let w = self.aof.as_ref().expect("AOF");
         let (dir, fsync) = (w.dir.clone(), w.fsync);
         let index = w.manifest.last_index() + 1;
         let (base, seg) = (aof::base_name(index), aof::segment_name(index));
         // Le dump sur disque avant que le manifeste ne le cite.
-        File::open(dump)?.sync_all()?;
-        std::fs::rename(dump, dir.join(&base))?;
-        let _ = std::fs::remove_file(dir.join(&seg));
+        rustix::fs::fsync(fs::open_read(dump)?)?;
+        rustix::fs::rename(dump, &fs::join(&dir, &base))?;
+        let _ = rustix::fs::unlink(&fs::join(&dir, &seg));
         aof::create_segment(&dir, &seg)?;
         let manifest = Manifest {
             replid: pos.replid,
@@ -1098,7 +1100,7 @@ impl Core {
         let cur = j.cursor();
         self.art.set_now(cur.now);
         self.follow = Some(Follow { replid, cur });
-        eprintln!("[repl] réplica de {} (manifeste de l'AOF), après le bloc {}", hex(&replid), cur.seq);
+        rx_eprintln!("[repl] réplica de {} (manifeste de l'AOF), après le bloc {}", hex(&replid), cur.seq);
     }
 
     // ── INFO ─────────────────────────────────────────────────────────────
@@ -1157,4 +1159,19 @@ impl Core {
             );
         }
     }
+}
+
+/// Adresse de la cible `host:port`. Sous `std`, résolue par la libc (`getaddrinfo`,
+/// bloquant : une IP en pratique) ; sans, une IP littérale ou `localhost`.
+#[cfg(feature = "std")]
+fn resolve(host: &str, port: u16) -> Result<Option<core::net::SocketAddr>, String> {
+    use std::net::ToSocketAddrs;
+    (host, port).to_socket_addrs().map(|mut a| a.next()).map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "std"))]
+fn resolve(host: &str, port: u16) -> Result<Option<core::net::SocketAddr>, String> {
+    let ip = if host == "localhost" { Ok(core::net::IpAddr::from([127, 0, 0, 1])) } else { host.parse() };
+    ip.map(|ip| Some(core::net::SocketAddr::new(ip, port)))
+        .map_err(|_| format!("{host} : ni une IP ni localhost (binaire sans libc, pas de DNS)"))
 }

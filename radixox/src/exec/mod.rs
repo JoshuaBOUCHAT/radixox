@@ -619,7 +619,8 @@ pub fn info_memory_total(out: &mut String, slabs: &[(&str, (u64, u64, u64))]) {
 
 /// `(VmRSS, RssAnon)` du processus en octets (`/proc/self/status`, lu à la demande).
 fn proc_rss() -> (u64, u64) {
-    let Ok(s) = std::fs::read_to_string("/proc/self/status") else { return (0, 0) };
+    let Ok(s) = crate::fs::read("/proc/self/status") else { return (0, 0) };
+    let s = String::from_utf8_lossy(&s);
     let kb = |key: &str| {
         s.lines()
             .find_map(|l| l.strip_prefix(key))

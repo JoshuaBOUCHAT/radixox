@@ -932,5 +932,6 @@ pub fn parse_dump(buf: &[u8]) -> Result<Dump, DumpError> {
         LoadError::Dump(e) => e,
         #[cfg(feature = "std")]
         LoadError::Io(_) => unreachable!("lecture d'une tranche en mémoire"),
+        LoadError::Os(_) => unreachable!("lecture d'une tranche en mémoire"),
     })
 }

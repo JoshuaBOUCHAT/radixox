@@ -11,8 +11,6 @@
 //! dépasse `CHUNK` et qu'aucune écriture n'est en vol, il devient l'écriture
 //! en vol (double tampon : `fill` / `spare` / `writing`).
 
-use std::io;
-use std::os::fd::{AsRawFd, RawFd};
 use core::time::Duration;
 use radixox_lib::rx_eprintln;
 use radixox_lib::sys::{self, Instant};
@@ -20,6 +18,10 @@ use radixox_lib::sys::{self, Instant};
 use oxidart::compress::ZstdStream;
 use oxidart::save::format;
 use oxidart::{OxidArt, SaveCursor};
+use rustix::fd::{AsRawFd, OwnedFd, RawFd};
+
+use crate::error::{Error, Result};
+use crate::fs;
 
 use super::fs_task::FsTask;
 use super::persist::Target;
@@ -121,7 +123,7 @@ pub struct BgSave {
     /// Fichier visé (`dump.rxd`, ou une base de l'AOF) et position du flux.
     target: Target,
     /// Fichier temporaire, une fois créé (suite demandée au démarrage).
-    file: Option<std::fs::File>,
+    file: Option<OwnedFd>,
     /// Suite de fichiers à lancer (création, puis renommage final).
     fs_req: Option<FsTask>,
     /// Une suite de fichiers est en vol.
@@ -141,7 +143,7 @@ pub struct BgSave {
     /// Condensé du contenu, connu à la fin du DFS (pied, DURABILITY_DESIGN.md §6.4).
     digest: u32,
     phase: Phase,
-    err: Option<io::Error>,
+    err: Option<Error>,
     /// Temps passé dans les tranches, au repos compris (plancher de CPU).
     work: Duration,
     start: Instant,
@@ -156,14 +158,14 @@ pub struct BgSave {
 impl BgSave {
     /// Ouvre la barrière de save ; le fichier temporaire de `target` est créé
     /// hors de la boucle ([`take_fs`](Self::take_fs)).
-    pub fn start(art: &mut OxidArt, zstd: Option<ZstdConf>, target: Target) -> io::Result<Self> {
+    pub fn start(art: &mut OxidArt, zstd: Option<ZstdConf>, target: Target) -> Result<Self> {
         if art.save_busy() {
-            return Err(io::Error::other("Background save already in progress"));
+            return Err(Error::msg("Background save already in progress"));
         }
         let t0 = Instant::now();
         let mut create = FsTask::new();
         create.open(
-            &target.dir.join(&target.tmp),
+            &fs::join(&target.dir, &target.tmp),
             rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::CREATE | rustix::fs::OFlags::TRUNC,
             rustix::fs::Mode::from_raw_mode(0o644),
         );
@@ -354,7 +356,7 @@ impl BgSave {
     pub fn write_done(&mut self, res: i32) {
         let len = self.writing.len();
         if res < 0 {
-            self.err = Some(io::Error::from_raw_os_error(-res));
+            self.err = Some(Error::from(radixox_lib::sys::OsError(-res)));
         } else if (res as usize) < len {
             // Écriture courte (disque plein…) : le reste repart.
             self.writing.drain(..res as usize);
@@ -380,13 +382,13 @@ impl BgSave {
     pub fn sync_done(&mut self, res: i32) {
         if res < 0 {
             self.phase = Phase::Done;
-            self.err = Some(io::Error::from_raw_os_error(-res));
+            self.err = Some(Error::from(radixox_lib::sys::OsError(-res)));
             return;
         }
         self.phase = Phase::Finalize;
         let t = &self.target;
         let mut fin = FsTask::new();
-        fin.rename(&t.dir.join(&t.tmp), &t.dir.join(&t.name));
+        fin.rename(&fs::join(&t.dir, &t.tmp), &fs::join(&t.dir, &t.name));
         fin.sync_dir(&t.dir);
         self.fs_req = Some(fin);
         self.finalize_took = self.start.elapsed();
@@ -421,13 +423,13 @@ impl BgSave {
     }
 
     /// Fini (ou en erreur et plus rien en vol) : rend le résultat.
-    pub fn finished(&mut self, art: &mut OxidArt) -> Option<io::Result<()>> {
+    pub fn finished(&mut self, art: &mut OxidArt) -> Option<Result<()>> {
         if self.err.is_some() && !self.in_flight() {
             self.abort(art);
             return Some(Err(self.err.take().unwrap()));
         }
         (self.phase == Phase::Done).then(|| {
-            eprintln!(
+            rx_eprintln!(
                 "[bgsave] {:.1} MB écrits en {:.2?} (DFS {:.2?}) ; {} écritures, CPU {:.2?} ; \
                  démarrage {:.2?}, tranche max {:.2?}, rename+fsync dossier (hors boucle) {:.2?}",
                 self.pos as f64 / 1e6,
@@ -450,7 +452,7 @@ impl BgSave {
             art.finish_save();
         }
         self.phase = Phase::Done;
-        let _ = std::fs::remove_file(self.target.dir.join(&self.target.tmp));
+        let _ = rustix::fs::unlink(&fs::join(&self.target.dir, &self.target.tmp));
     }
 
     /// Le fsync final est en vol.

@@ -24,14 +24,16 @@
 
 #[allow(unused_imports)]
 use crate::prelude::*;
-use std::io::Read;
-use std::time::{Duration, Instant};
+use core::time::Duration;
+
+use radixox_lib::sys::Instant;
 
 use zstd_safe::zstd_sys::ZSTD_EndDirective;
 use zstd_safe::{CCtx, CParameter, DCtx, InBuffer, OutBuffer};
 
-/// Premiers octets d'une frame zstd (magic 0xFD2FB528, little-endian).
-pub const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+pub use crate::load::ZSTD_MAGIC;
+use crate::load::{LoadError, Source};
+use crate::save::DumpError;
 
 /// Taille max de bloc selon le niveau. Mesures sur un dump de 8 MB (valeurs
 /// façon JSON), durée p99 / max d'un appel :
@@ -60,6 +62,28 @@ pub fn block_size(level: i32) -> usize {
 /// premier appel ~1 ms, ratio −1,7 %, débit ×2 (tables en cache). Les niveaux
 /// bas sont déjà en dessous et ne changent pas.
 pub const MAX_TABLE_LOG: u32 = 20;
+
+/// `Vec` vu par zstd comme tampon de sortie (zstd-safe ne l'implémente que sous `std`) :
+/// sa capacité est l'espace disponible, sa longueur ce qui est écrit.
+struct VecBuf<'a>(&'a mut Vec<u8>);
+
+// SAFETY: comme l'implémentation de zstd-safe pour `Vec<u8>` : `capacity` octets à
+// partir de `as_mut_ptr`, `filled_until(n)` n'est appelé qu'après écriture des `n`
+// premiers.
+unsafe impl zstd_safe::WriteBuf for VecBuf<'_> {
+    fn as_slice(&self) -> &[u8] {
+        self.0
+    }
+    fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.0.as_mut_ptr()
+    }
+    unsafe fn filled_until(&mut self, n: usize) {
+        unsafe { self.0.set_len(n) }
+    }
+}
 
 /// Compresseur en flux, une frame pour tout le fichier.
 pub struct ZstdStream {
@@ -105,7 +129,8 @@ impl ZstdStream {
             while ib.pos() < piece.len() {
                 self.reserve(out);
                 let used = out.len();
-                let mut ob = OutBuffer::around_pos(out, used);
+                let mut vb = VecBuf(out);
+                let mut ob = OutBuffer::around_pos(&mut vb, used);
                 self.cctx
                     .compress_stream2(&mut ob, &mut ib, ZSTD_EndDirective::ZSTD_e_continue)
                     .expect("compression zstd");
@@ -125,7 +150,8 @@ impl ZstdStream {
         loop {
             self.reserve(out);
             let used = out.len();
-            let mut ob = OutBuffer::around_pos(out, used);
+            let mut vb = VecBuf(out);
+            let mut ob = OutBuffer::around_pos(&mut vb, used);
             let mut ib = InBuffer::around(&[]);
             let rem = self
                 .cctx
@@ -155,7 +181,7 @@ pub struct ZstdReader<R> {
 
 const ZSTD_READ_CHUNK: usize = 1 << 20;
 
-impl<R: Read> ZstdReader<R> {
+impl<R: Source> ZstdReader<R> {
     pub fn new(src: R) -> Self {
         Self {
             src,
@@ -169,12 +195,12 @@ impl<R: Read> ZstdReader<R> {
     }
 }
 
-fn invalid(msg: &'static str) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
+fn invalid(msg: &'static str) -> LoadError {
+    LoadError::Dump(DumpError(msg))
 }
 
-impl<R: Read> Read for ZstdReader<R> {
-    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+impl<R: Source> Source for ZstdReader<R> {
+    fn read_some(&mut self, out: &mut [u8]) -> Result<usize, LoadError> {
         if out.is_empty() {
             return Ok(0);
         }
@@ -185,7 +211,7 @@ impl<R: Read> Read for ZstdReader<R> {
                     return Err(invalid("octets après la frame zstd"));
                 }
                 if !self.eof {
-                    match self.src.read(&mut self.buf)? {
+                    match self.src.read_some(&mut self.buf)? {
                         0 => self.eof = true,
                         _ => return Err(invalid("octets après la frame zstd")),
                     }
@@ -194,7 +220,7 @@ impl<R: Read> Read for ZstdReader<R> {
             }
             if self.pos == self.end && !self.eof {
                 self.pos = 0;
-                self.end = self.src.read(&mut self.buf)?;
+                self.end = self.src.read_some(&mut self.buf)?;
                 self.eof = self.end == 0;
             }
             let mut ib = InBuffer::around(&self.buf[self.pos..self.end]);

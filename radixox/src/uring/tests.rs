@@ -1131,6 +1131,11 @@ fn expired_keys_are_absent_for_writes() {
 // ── Reprise depuis les fichiers de l'AOF (DURABILITY_DESIGN.md §9, test 4) ──
 
 /// Dossier de test neuf (supprimé s'il existe).
+/// Chemin d'un dossier de test, pour les API à `&str`.
+fn p(d: &std::path::Path) -> &str {
+    d.to_str().unwrap()
+}
+
 fn test_dir(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("radixox-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -1164,25 +1169,24 @@ fn journaled_run(seed: u64) -> (Vec<Vec<u8>>, Fake) {
 /// Base vide + segments contenant `parts` (des listes de blocs), manifeste.
 fn write_aof(dir: &std::path::Path, parts: &[&[Vec<u8>]]) {
     use crate::exec::aof::{self, Manifest};
-    use std::os::unix::fs::FileExt;
     let mut empty = OxidArt::new();
-    let res = aof::create(&mut empty, dir).unwrap();
+    let res = aof::create(&mut empty, p(dir)).unwrap();
     let mut m: Manifest = res.manifest;
     m.incrs.clear();
     for (i, blocks) in parts.iter().enumerate() {
         let name = aof::segment_name(i as u64 + 1);
         let _ = std::fs::remove_file(dir.join(&name));
-        let file = aof::create_segment(dir, &name).unwrap();
+        let file = aof::create_segment(p(dir), &name).unwrap();
         let bytes: Vec<u8> = blocks.iter().flatten().copied().collect();
-        file.write_all_at(&bytes, 0).unwrap();
+        crate::fs::pwrite_all(&file, &bytes, 0).unwrap();
         m.incrs.push(name);
     }
-    m.write(dir).unwrap();
+    m.write(p(dir)).unwrap();
 }
 
 fn recover_state(dir: &std::path::Path, now: u64, truncated: bool) -> std::io::Result<(Vec<String>, crate::exec::aof::Resume)> {
     let mut art = OxidArt::new();
-    let res = crate::exec::aof::recover(&mut art, dir, truncated)?.expect("manifeste");
+    let res = crate::exec::aof::recover(&mut art, p(dir), truncated).map_err(std::io::Error::from)?.expect("manifeste");
     art.set_now(now);
     Ok((state(&mut art), res))
 }
@@ -1267,8 +1271,8 @@ fn aof_unlisted_files_are_removed() {
     std::fs::write(dir.join("base.9.rxdb.tmp"), b"reste").unwrap();
     std::fs::write(dir.join("notes.txt"), b"pas a nous").unwrap();
     let mut art = OxidArt::new();
-    let res = aof::recover(&mut art, &dir, true).unwrap().unwrap();
-    aof::remove_unlisted(&dir, &res.manifest).unwrap();
+    let res = aof::recover(&mut art, p(&dir), true).unwrap().unwrap();
+    aof::remove_unlisted(p(&dir), &res.manifest).unwrap();
     let mut names: Vec<String> =
         std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
     names.sort();
@@ -1286,8 +1290,8 @@ fn fake_with_aof(dir: &std::path::Path, cfg: Config) -> Fake {
 fn fake_with_aof_fsync(dir: &std::path::Path, cfg: Config, fsync: crate::exec::aof::Fsync) -> Fake {
     use crate::exec::aof;
     let mut f = Fake::new(cfg);
-    let res = aof::create(&mut f.core.art, dir).unwrap();
-    let w = aof::AofWriter::open(dir, &res, fsync).unwrap();
+    let res = aof::create(&mut f.core.art, p(dir)).unwrap();
+    let w = aof::AofWriter::open(p(dir), &res, fsync).unwrap();
     f.core.set_aof(crate::exec::journal::Stream::new(res.cursor), w);
     f
 }
@@ -1322,7 +1326,7 @@ fn aof_files_replay_to_the_served_state() {
         f.settle();
         assert_eq!(f.core.aof_pending(), 0);
         let mut back = OxidArt::new();
-        crate::exec::aof::recover(&mut back, &dir, false).unwrap().unwrap();
+        crate::exec::aof::recover(&mut back, p(&dir), false).unwrap().unwrap();
         back.set_now(f.core.art.now);
         assert_eq!(state(&mut back), state(&mut f.core.art), "graine {seed}");
     }
@@ -1358,7 +1362,7 @@ fn aof_backlog_parks_writers_not_readers() {
     f.settle();
     assert_eq!(f.take(r), "$2\r\n19\r\n");
     let mut back = OxidArt::new();
-    crate::exec::aof::recover(&mut back, &dir, false).unwrap().unwrap();
+    crate::exec::aof::recover(&mut back, p(&dir), false).unwrap().unwrap();
     back.set_now(f.core.art.now);
     assert_eq!(state(&mut back), state(&mut f.core.art));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1441,7 +1445,7 @@ fn continuous_cycles_never_overlap_and_replay() {
         let w = f.core.aof().unwrap();
         assert_eq!((f.core.aof_pending(), w.durable), (0, w.written), "graine {seed}");
         let mut back = OxidArt::new();
-        crate::exec::aof::recover(&mut back, &dir, false).unwrap().unwrap();
+        crate::exec::aof::recover(&mut back, p(&dir), false).unwrap().unwrap();
         back.set_now(f.core.art.now);
         assert_eq!(state(&mut back), state(&mut f.core.art), "graine {seed}");
         rewritten += u32::from(manifest_of(&dir).base != "base.1.rxdb");
@@ -1524,7 +1528,7 @@ fn continuous_replies_never_wait_and_small_rests_wait_the_timer() {
 // ── Réécriture (DURABILITY_DESIGN.md §8, tests 6 et 1 depuis une base) ──────
 
 fn manifest_of(dir: &std::path::Path) -> crate::exec::aof::Manifest {
-    crate::exec::aof::Manifest::read(dir).unwrap().unwrap()
+    crate::exec::aof::Manifest::read(p(dir)).unwrap().unwrap()
 }
 
 /// `SET a 1`, `BGSAVE`, `SET a 2` dans un même pipeline : la base contient
@@ -1754,7 +1758,7 @@ impl Net {
             .map(|i| {
                 let d = dir.join(format!("n{i}"));
                 std::fs::create_dir_all(&d).unwrap();
-                Fake::new(Config { dir: Some(d), ..cfg.clone() })
+                Fake::new(Config { dir: Some(p(&d).into()), ..cfg.clone() })
             })
             .collect();
         Self { n, wires: Vec::new(), down: false, hold: false }
@@ -2183,8 +2187,8 @@ fn wait_counts_acknowledged_replicas() {
 fn fake_recover(dir: &std::path::Path, cfg: Config) -> Fake {
     use crate::exec::aof;
     let mut f = Fake::new(cfg);
-    let res = aof::recover(&mut f.core.art, dir, true).unwrap().expect("manifeste");
-    let w = aof::AofWriter::open(dir, &res, aof::Fsync::EverySec).unwrap();
+    let res = aof::recover(&mut f.core.art, p(dir), true).unwrap().expect("manifeste");
+    let w = aof::AofWriter::open(p(dir), &res, aof::Fsync::EverySec).unwrap();
     f.core.set_aof(crate::exec::journal::Stream::new(res.cursor), w);
     f
 }
@@ -2242,10 +2246,10 @@ fn replica_with_aof_restarts_as_replica() {
         Net::cmd(&mut net.n[0], admin, format!("REPLICATE 127.0.0.1 {REPLICA_PORT}\r\n").as_bytes());
         net_traffic(&mut net, &mut rng, &conns, 30, &[1]);
         net.assert_same(&format!("graine {seed}"));
-        let m = crate::exec::aof::Manifest::read(&rdir).unwrap().unwrap();
+        let m = crate::exec::aof::Manifest::read(p(&rdir)).unwrap().unwrap();
         assert!(m.follow.is_some(), "graine {seed} : manifeste du réplica");
         let mut back = OxidArt::new();
-        crate::exec::aof::recover(&mut back, &rdir, false).unwrap().unwrap();
+        crate::exec::aof::recover(&mut back, p(&rdir), false).unwrap().unwrap();
         back.set_now(net.n[0].core.art.now);
         assert_eq!(state(&mut back), state(&mut net.n[0].core.art), "graine {seed} : fichiers du réplica");
         // Redémarrage du réplica sur ses fichiers.
@@ -2289,7 +2293,7 @@ fn chained_replicas_follow_the_primary() {
         let ndir = dir.join(format!("s{seed}"));
         let mut net = Net::with_dirs(cfg.clone(), 3, &ndir);
         if seed % 2 == 0 {
-            let mcfg = Config { dir: Some(ndir.join("n1")), ..cfg.clone() };
+            let mcfg = Config { dir: Some(p(&ndir.join("n1")).into()), ..cfg.clone() };
             net.n[1] = fake_with_aof(&ndir.join("m-aof"), mcfg);
         }
         net.n[0].wall = Some(1_000);

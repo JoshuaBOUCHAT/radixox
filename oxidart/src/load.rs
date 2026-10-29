@@ -76,6 +76,8 @@ const MAX_LEN: u64 = 1 << 32;
 pub enum LoadError {
     #[cfg(feature = "std")]
     Io(std::io::Error),
+    /// Lecture d'une source sans `std` (descripteur lu par appel direct).
+    Os(radixox_lib::sys::OsError),
     Dump(DumpError),
 }
 
@@ -95,14 +97,16 @@ impl core::fmt::Display for LoadError {
         match self {
             #[cfg(feature = "std")]
             Self::Io(e) => write!(f, "lecture : {e}"),
+            Self::Os(e) => write!(f, "lecture : {e}"),
             Self::Dump(e) => write!(f, "dump invalide : {}", e.0),
         }
     }
 }
 impl core::error::Error for LoadError {}
 
-/// Source d'octets du rechargement : tout `std::io::Read` sous `std` (fichier,
-/// décompresseur zstd), une tranche en mémoire sans. `Interrupted` est réessayé ici.
+/// Source d'octets du rechargement : tout `std::io::Read` sous `std` (fichier), une
+/// tranche en mémoire sans ; un appelant `no_std` l'implémente sur son lecteur de
+/// fichier ([`LoadError::Os`]). `Interrupted` est réessayé ici.
 pub trait Source {
     /// Comme `Read::read` : 0 à la fin de la source.
     fn read_some(&mut self, buf: &mut [u8]) -> Result<usize, LoadError>;
@@ -129,6 +133,29 @@ impl Source for &[u8] {
         Ok(n)
     }
 }
+
+/// Premiers octets déjà lus (détection du magic zstd), rendus avant la suite.
+struct Prefixed<R> {
+    head: [u8; 4],
+    pos: usize,
+    len: usize,
+    src: R,
+}
+
+impl<R: Source> Source for Prefixed<R> {
+    fn read_some(&mut self, buf: &mut [u8]) -> Result<usize, LoadError> {
+        if self.pos < self.len {
+            let n = buf.len().min(self.len - self.pos);
+            buf[..n].copy_from_slice(&self.head[self.pos..self.pos + n]);
+            self.pos += n;
+            return Ok(n);
+        }
+        self.src.read_some(buf)
+    }
+}
+
+/// Premiers octets d'une frame zstd (magic 0xFD2FB528, little-endian).
+pub const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 /// Le flux se termine-t-il par le pied du fichier (crc32 + `RXDE`) ?
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -594,32 +621,31 @@ type Built = (u8, Entry);
 
 impl OxidArt {
     /// Charge un fichier de dump (flux + pied) depuis n'importe quelle
-    /// source [`Read`], par fragments : seule une fenêtre de lecture est en
+    /// [`Source`], par fragments : seule une fenêtre de lecture est en
     /// mémoire, et le crc du pied est vérifié à la fin. Voir
     /// [`load_dump`](Self::load_dump) pour le reste.
     ///
     /// Le fichier peut être brut ou compressé (une frame zstd, reconnue à son
     /// magic) : il est alors décompressé au fil de la lecture.
-    #[cfg(feature = "std")]
-    pub fn load_file<R: std::io::Read>(&mut self, mut src: R) -> Result<LoadStats, LoadError> {
-        use std::io::Read;
+    /// Sans la feature `zstd`, un fichier compressé est refusé (dump invalide).
+    pub fn load_file<R: Source>(&mut self, mut src: R) -> Result<LoadStats, LoadError> {
         self.check_empty()?;
         let mut head = [0u8; 4];
         let mut got = 0;
         while got < head.len() {
-            match src.read(&mut head[got..]) {
-                Ok(0) => break,
-                Ok(k) => got += k,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e.into()),
+            match src.read_some(&mut head[got..])? {
+                0 => break,
+                k => got += k,
             }
         }
-        let src = std::io::Cursor::new(head).take(got as u64).chain(src);
-        if got == head.len() && head == crate::compress::ZSTD_MAGIC {
-            self.load_from(DumpReader::new(crate::compress::ZstdReader::new(src), Footer::Crc)?)
-        } else {
-            self.load_from(DumpReader::new(src, Footer::Crc)?)
+        let src = Prefixed { head, pos: 0, len: got, src };
+        if got == head.len() && head == ZSTD_MAGIC {
+            #[cfg(feature = "zstd")]
+            return self.load_from(DumpReader::new(crate::compress::ZstdReader::new(src), Footer::Crc)?);
+            #[cfg(not(feature = "zstd"))]
+            return Err(DumpError("dump compressé (zstd), oxidart construit sans la feature zstd").into());
         }
+        self.load_from(DumpReader::new(src, Footer::Crc)?)
     }
 
     /// Charge un dump (flux brut, sans pied) dans un arbre vide, en un seul

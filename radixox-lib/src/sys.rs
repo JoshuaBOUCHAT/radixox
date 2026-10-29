@@ -54,8 +54,25 @@ pub fn stderr(msg: &[u8]) {
     let _ = rustix::io::write(fd, msg);
 }
 
+/// Message sur stdout sans allouer (écriture partielle ignorée).
+pub fn stdout(msg: &[u8]) {
+    // SAFETY: le descripteur 1 reste ouvert pendant toute la vie du processus.
+    #[allow(unused_unsafe)]
+    let fd = unsafe { rustix::stdio::stdout() };
+    let _ = rustix::io::write(fd, msg);
+}
+
 /// Message formaté sur stderr, sans allouer (tronqué à 512 octets).
 pub fn eprint(args: fmt::Arguments<'_>) {
+    format_to(args, stderr);
+}
+
+/// Message formaté sur stdout, sans allouer (tronqué à 512 octets).
+pub fn print(args: fmt::Arguments<'_>) {
+    format_to(args, stdout);
+}
+
+fn format_to(args: fmt::Arguments<'_>, out: fn(&[u8])) {
     struct Buf {
         b: [u8; 512],
         n: usize,
@@ -70,7 +87,7 @@ pub fn eprint(args: fmt::Arguments<'_>) {
     }
     let mut b = Buf { b: [0; 512], n: 0 };
     let _ = fmt::write(&mut b, args);
-    stderr(&b.b[..b.n]);
+    out(&b.b[..b.n]);
 }
 
 /// `eprintln!` sans `std` ni allocation (voir [`eprint`]).
@@ -78,6 +95,87 @@ pub fn eprint(args: fmt::Arguments<'_>) {
 macro_rules! rx_eprintln {
     ($($t:tt)*) => {
         $crate::sys::eprint(format_args!("{}\n", format_args!($($t)*)))
+    };
+}
+
+/// Code d'erreur du noyau (`errno`, positif), affiché comme `std::io::Error` :
+/// « No such file or directory (os error 2) » (textes de la glibc pour les codes
+/// courants, « os error N » seul pour les autres).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OsError(pub i32);
+
+impl OsError {
+    /// Texte de la glibc (`strerror`), pour les codes que la crate peut rencontrer.
+    pub fn text(self) -> Option<&'static str> {
+        Some(match self.0 {
+            1 => "Operation not permitted",
+            2 => "No such file or directory",
+            4 => "Interrupted system call",
+            5 => "Input/output error",
+            9 => "Bad file descriptor",
+            11 => "Resource temporarily unavailable",
+            12 => "Cannot allocate memory",
+            13 => "Permission denied",
+            16 => "Device or resource busy",
+            17 => "File exists",
+            18 => "Invalid cross-device link",
+            20 => "Not a directory",
+            21 => "Is a directory",
+            22 => "Invalid argument",
+            23 => "Too many open files in system",
+            24 => "Too many open files",
+            27 => "File too large",
+            28 => "No space left on device",
+            30 => "Read-only file system",
+            32 => "Broken pipe",
+            36 => "File name too long",
+            38 => "Function not implemented",
+            39 => "Directory not empty",
+            95 => "Operation not supported",
+            98 => "Address already in use",
+            99 => "Cannot assign requested address",
+            101 => "Network is unreachable",
+            103 => "Software caused connection abort",
+            104 => "Connection reset by peer",
+            105 => "No buffer space available",
+            110 => "Connection timed out",
+            111 => "Connection refused",
+            113 => "No route to host",
+            122 => "Disk quota exceeded",
+            125 => "Operation canceled",
+            _ => return None,
+        })
+    }
+}
+
+impl fmt::Display for OsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.text() {
+            Some(t) => write!(f, "{t} (os error {})", self.0),
+            None => write!(f, "os error {}", self.0),
+        }
+    }
+}
+
+impl From<rustix::io::Errno> for OsError {
+    fn from(e: rustix::io::Errno) -> Self {
+        Self(e.raw_os_error())
+    }
+}
+
+/// Fin du processus avec `code` (`exit_group`, comme `_exit(2)` : rien n'est vidé ni
+/// exécuté avant).
+pub fn exit(code: i32) -> ! {
+    // SAFETY: `exit_group` ne rend pas la main.
+    unsafe { sc::syscall!(EXIT_GROUP, code as usize) };
+    loop {}
+}
+
+/// `println!` sans `std` ni allocation (voir [`print`]).
+#[macro_export]
+macro_rules! rx_println {
+    ($($t:tt)*) => {
+        $crate::sys::print(format_args!("{}\n", format_args!($($t)*)))
     };
 }
 
@@ -275,6 +373,14 @@ mod tests {
         assert!(env("PATH").is_some_and(|p| !p.is_empty()));
         assert_eq!(env("RADIXOX_SURELY_UNSET_VARIABLE"), None);
         assert_eq!(env_parse("RADIXOX_SURELY_UNSET_VARIABLE", 7u32), 7);
+    }
+
+    #[test]
+    fn os_error_reads_like_std() {
+        for e in (1..200).filter(|&e| OsError(e).text().is_some()) {
+            assert_eq!(OsError(e).to_string(), std::io::Error::from_raw_os_error(e).to_string(), "{e}");
+        }
+        assert_eq!(OsError(4095).to_string(), "os error 4095");
     }
 
     #[test]

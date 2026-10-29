@@ -1,14 +1,16 @@
 //! Fichiers de persistance indépendants du runtime : emplacement du dump,
 //! rechargement au démarrage (SAVE_DESIGN.md §5bis), `SAVE` bloquante.
 
-use std::io;
-use std::path::PathBuf;
 use core::time::Duration;
 use radixox_lib::sys::Instant;
 
 use oxidart::OxidArt;
 use oxidart::compress::ZstdStream;
 use oxidart::save::format;
+use rustix::fd::OwnedFd;
+
+use crate::error::{Error, Result};
+use crate::fs::{self, FdSource};
 
 /// Nom du dump dans `RADIXOX_DIR`.
 pub const FILE_NAME: &str = "dump.rxd";
@@ -27,17 +29,17 @@ pub fn set_save_dir(dir: Option<String>) {
 }
 
 /// `RADIXOX_DIR` (défaut : dossier courant), ou le dossier de [`set_save_dir`].
-pub fn save_dir() -> PathBuf {
+pub fn save_dir() -> String {
     // SAFETY: mono-thread (voir `SAVE_DIR`).
     let set = unsafe { (*&raw const SAVE_DIR).clone() };
-    PathBuf::from(set.unwrap_or_else(|| radixox_lib::sys::env("RADIXOX_DIR").unwrap_or(".").into()))
+    set.unwrap_or_else(|| radixox_lib::sys::env("RADIXOX_DIR").unwrap_or(".").into())
 }
 
 /// Où écrire un dump : `dir/tmp`, renommé en `dir/name` une fois complet ;
 /// `pos` : position du flux de commandes qu'il contient (en-tête v2).
 #[derive(Debug, Clone)]
 pub struct Target {
-    pub dir: PathBuf,
+    pub dir: String,
     pub tmp: String,
     pub name: String,
     pub pos: oxidart::JournalPos,
@@ -54,27 +56,20 @@ impl Target {
 /// connexions (SAVE_DESIGN.md §5bis). Fichier absent : démarrage à vide.
 /// Fichier illisible, tronqué ou corrompu : erreur, le serveur ne démarre
 /// pas (on n'écrase pas un dump qu'on n'a pas su lire).
-pub fn load_at_startup(art: &mut OxidArt) -> io::Result<()> {
-    let path = save_dir().join(FILE_NAME);
+pub fn load_at_startup(art: &mut OxidArt) -> Result<()> {
+    let path = fs::join(&save_dir(), FILE_NAME);
     let start = Instant::now();
-    let file = match std::fs::File::open(&path) {
+    let file = match fs::open_read(&path) {
         Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
+        Err(e) if e.is_not_found() => return Ok(()),
+        Err(e) => return Err(e),
     };
-    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let size = fs::len(&file).unwrap_or(0);
     art.tick();
     // Lecture par fragments (fenêtre de 1 MB), crc vérifié en fin de flux.
-    let stats = art.load_file(file).map_err(|e| {
-        let kind = match &e {
-            oxidart::LoadError::Io(e) => e.kind(),
-            oxidart::LoadError::Dump(_) => io::ErrorKind::InvalidData,
-        };
-        io::Error::new(kind, format!("{}: {e}", path.display()))
-    })?;
-    println!(
-        "[load] {} : {} clés ({} expirées sautées), {:.1} MB en {:?}{}",
-        path.display(),
+    let stats = art.load_file(FdSource(file)).map_err(|e| load_error(e, &path))?;
+    radixox_lib::rx_println!(
+        "[load] {path} : {} clés ({} expirées sautées), {:.1} MB en {:?}{}",
         stats.keys,
         stats.expired,
         size as f64 / 1e6,
@@ -82,6 +77,16 @@ pub fn load_at_startup(art: &mut OxidArt) -> io::Result<()> {
         if stats.digest_checked { ", condensé vérifié" } else { "" }
     );
     Ok(())
+}
+
+/// Erreur de rechargement de `path` (le code du noyau reste, s'il y en a un).
+pub fn load_error(e: oxidart::LoadError, path: &str) -> Error {
+    // `FdSource` ne rend que des `Os` (pas de `Io` de `std`).
+    let os = match &e {
+        oxidart::LoadError::Os(os) => Some(*os),
+        _ => None,
+    };
+    Error::new(os, format!("{path}: {e}"))
 }
 
 
@@ -104,28 +109,27 @@ pub struct SyncStats {
 /// dans le cache du noyau, qui écrit en parallèle), puis fsync + rename.
 /// `level` : niveau zstd (`None` : brut, le plus rapide en CPU). Erreur si un
 /// BGSAVE est en cours.
-pub fn save_sync(art: &mut OxidArt, level: Option<i32>) -> io::Result<SyncStats> {
+pub fn save_sync(art: &mut OxidArt, level: Option<i32>) -> Result<SyncStats> {
     save_sync_to(art, level, &Target::dump())
 }
 
 /// [`save_sync`] vers `to`.
-pub fn save_sync_to(art: &mut OxidArt, level: Option<i32>, to: &Target) -> io::Result<SyncStats> {
-    use std::io::Write;
+pub fn save_sync_to(art: &mut OxidArt, level: Option<i32>, to: &Target) -> Result<SyncStats> {
     if art.save_busy() {
-        return Err(io::Error::other("Background save already in progress"));
+        return Err(Error::msg("Background save already in progress"));
     }
     let start = Instant::now();
     let dir = &to.dir;
-    let tmp = dir.join(&to.tmp);
-    let res = (|| {
-        let mut file = std::fs::File::create(&tmp)?;
+    let tmp = fs::join(dir, &to.tmp);
+    let res = (|| -> Result<SyncStats> {
+        let mut file = fs::create(&tmp)?;
         let mut z = level.map(ZstdStream::new);
         let mut buf = Vec::with_capacity(SYNC_CHUNK + SYNC_CHUNK / 4);
         let mut packed = Vec::new();
         let mut crc = crc32fast::Hasher::new();
         let (mut raw, mut written) = (0u64, 0u64);
         // `digest` : à la dernière écriture, le condensé du pied.
-        let mut flush = |buf: &mut Vec<u8>, digest: Option<u32>, file: &mut std::fs::File| -> io::Result<()> {
+        let mut flush = |buf: &mut Vec<u8>, digest: Option<u32>, file: &mut OwnedFd| -> Result<()> {
             crc.update(buf);
             raw += buf.len() as u64;
             let last = digest.is_some();
@@ -136,7 +140,7 @@ pub fn save_sync_to(art: &mut OxidArt, level: Option<i32>, to: &Target) -> io::R
             }
             match &mut z {
                 None => {
-                    file.write_all(buf)?;
+                    fs::write_all(&*file, buf)?;
                     written += buf.len() as u64;
                 }
                 Some(z) => {
@@ -144,7 +148,7 @@ pub fn save_sync_to(art: &mut OxidArt, level: Option<i32>, to: &Target) -> io::R
                     if last {
                         while !z.finish(&mut packed, Duration::MAX) {}
                     }
-                    file.write_all(&packed)?;
+                    fs::write_all(&*file, &packed)?;
                     written += packed.len() as u64;
                     packed.clear();
                 }
@@ -171,17 +175,17 @@ pub fn save_sync_to(art: &mut OxidArt, level: Option<i32>, to: &Target) -> io::R
             }
         }
         drop(flush);
-        file.sync_data()?;
+        rustix::fs::fdatasync(&file)?;
         drop(file);
-        std::fs::rename(&tmp, dir.join(&to.name))?;
-        std::fs::File::open(dir)?.sync_all()?;
+        rustix::fs::rename(&tmp, &fs::join(dir, &to.name))?;
+        fs::sync_dir(dir)?;
         Ok(SyncStats { raw, written, walk, total: start.elapsed() })
     })();
     if res.is_err() {
         if art.is_saving() {
             art.finish_save();
         }
-        let _ = std::fs::remove_file(&tmp);
+        let _ = rustix::fs::unlink(&tmp);
     }
     res
 }

@@ -65,7 +65,7 @@ use prelude::*;
 
 pub mod compact;
 pub mod compact_path;
-#[cfg(feature = "std")]
+#[cfg(feature = "zstd")]
 pub mod compress;
 pub mod digest;
 pub mod gc;
@@ -124,7 +124,7 @@ use crate::compact_path::CompactPath;
 use crate::node::{Entry, EntryRef, Leaf, Node};
 use crate::save::{NodeImage, OxidSave};
 
-pub use crate::load::{LoadError, LoadStats};
+pub use crate::load::{LoadError, LoadStats, Source};
 pub use crate::save::{Dump, DumpEntry, DumpError, JournalPos, SaveCursor, check_footer, parse_dump};
 pub use crate::value::Value;
 use crate::value::{

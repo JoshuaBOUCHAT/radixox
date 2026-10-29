@@ -22,14 +22,17 @@ regex-automata = { version = "0.4", optional = true, default-features = false, f
     "syntax",
 ] }
 hashbrown = "0.17.0"
-# Compression du dump : du C, sous `std` seulement.
-zstd-safe = { version = "8.1", default-features = false, features = ["experimental", "std"], optional = true }
+# Compression du dump : du C (il lui faut malloc / free / memcpy, que le binaire fournit).
+zstd-safe = { version = "8.1", default-features = false, features = ["experimental"], optional = true }
 
 [features]
-# Processus `std` (défaut) : fichiers et compression zstd du dump. Sans elle, oxidart est
-# `no_std` + `alloc` (save dans un `Vec`, reload depuis une tranche).
+# Processus `std` (défaut) : lecture de tout `std::io::Read`, compression zstd du dump.
+# Sans elle, oxidart est `no_std` + `alloc` (save dans un `Vec`, reload depuis une
+# tranche ou une `Source` de l'appelant).
 default = ["std"]
-std = ["radixox-lib/std", "valart/std", "crc32fast/std", "dep:zstd-safe"]
+std = ["radixox-lib/std", "valart/std", "crc32fast/std", "zstd"]
+# Compression zstd du dump (`compress`), sans `std` possible.
+zstd = ["dep:zstd-safe"]
 regex = ["dep:regex-automata"]
 # Voir radixox-lib : compteurs d'accès pour LRU / LFU.
 eviction = ["radixox-lib/eviction"]
