@@ -107,12 +107,12 @@ impl ZSet {
     }
 
     /// Petite forme : place pour ces `(score, membre)` d'un coup (voir [`ZSmall::reserve`]).
-    pub fn reserve(&mut self, pairs: &[(f64, radixox_lib::shared_byte::SharedByte)]) {
+    pub fn reserve<M: AsRef<[u8]>>(&mut self, pairs: &[(f64, M)]) {
         if let Self::Small(z) = self
             && pairs.len() > 1
-            && pairs.iter().all(|(_, m)| m.len() <= small::MAX_MEMBER_LEN)
+            && pairs.iter().all(|(_, m)| m.as_ref().len() <= small::MAX_MEMBER_LEN)
         {
-            let bytes = pairs.iter().map(|(_, m)| m.len()).sum();
+            let bytes = pairs.iter().map(|(_, m)| m.as_ref().len()).sum();
             z.reserve(pairs.len(), bytes, pairs.iter().map(|(s, _)| encode_score(*s)));
         }
     }

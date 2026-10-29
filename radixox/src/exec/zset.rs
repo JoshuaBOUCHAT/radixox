@@ -5,7 +5,7 @@ use radixox_lib::cmd::{ZAddFlags, ZRangeBy};
 use radixox_lib::shared_byte::SharedByte;
 use radixox_lib::shared_frame::SharedFrame as Frame;
 
-pub fn cmd_zadd(art: &mut OxidArt, key: &[u8], flags: ZAddFlags, score_members: &[(f64, SharedByte)]) -> Frame {
+pub fn cmd_zadd(art: &mut OxidArt, key: &[u8], flags: ZAddFlags, score_members: &[(f64, &[u8])]) -> Frame {
     // cmd_zadd peut créer le nœud zset : oxidart exige une clé possédée ici.
     match art.cmd_zadd_opts(SharedByte::from_slice(key), flags, score_members, None) {
         Ok(ZAddReply::Count(n)) => Frame::Integer(n as i64),
@@ -99,7 +99,7 @@ pub fn cmd_zrem(art: &mut OxidArt, key: &[u8], members: &[SharedByte]) -> Frame 
     }
 }
 
-pub fn cmd_zincrby(art: &mut OxidArt, key: &[u8], delta: f64, member: SharedByte) -> Frame {
+pub fn cmd_zincrby(art: &mut OxidArt, key: &[u8], delta: f64, member: &[u8]) -> Frame {
     // cmd_zincrby peut créer le nœud zset : oxidart exige une clé possédée ici.
     match art.cmd_zincrby(SharedByte::from_slice(key), delta, member) {
         Ok(new_score) => score_bulk(new_score),

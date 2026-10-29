@@ -1466,6 +1466,21 @@ copie si l'objet est du pool, sinon rien) :
 Les temporaires (arguments de commande, trames de réponse, journal, réplication, motif
 d'un job KEYS) restent dans le pool : ils meurent vite, leur bloc se vide seul.
 
+**Sauf s'ils sont pris en sandwich (mesuré le 2026-10-29).** Le parseur décode tout un lot
+pipeliné avant de l'exécuter : un argument temporaire parsé avant les valeurs *stockées*
+des commandes suivantes du lot (même curseur MAIN) devient, une fois rendu, un trou qui ne
+recule pas le sommet et reste jusqu'au GC. Compteur temporaire du pool par origine
+(YCSB A, 5 M, 3 cœurs, fin de chargement) : raccourcis de suffixes 1–3 Mo, suffixes
+libérés 0–15 Mo, pages de nœuds 34 Mo (main) / 110 Mo (groupes), et **130 à 210 Mo de
+temporaires coincés**, tous de 24–31 o : le membre du `ZADD _indices` que YCSB fait à
+chaque insertion, alloué en `SharedByte` alors que le ZSet le recopie (petit bloc ou
+poignée). Membres de `ZADD` et `ZINCRBY` empruntés au tampon (`&'a [u8]`, comme la clé) : fragmentation
+0,12 → 0,03, aucune passe de GC au chargement (3 avant, 60 Mo évacués), pic RSS
+1590 → 1433 Mo (−10 %), débit inchangé. **Règle** : un argument que l'exécution recopie
+reste emprunté ; seul ce qui est stocké tel quel (valeur de SET, champs de HSET, membres
+de SADD) devient un `SharedByte`. Le pool court des temporaires (§5) reste la protection
+générale.
+
 **Audit d'unicité (prérequis, §15)** : avant d'activer le GC par défaut, le test
 différentiel en mode `radixox_gc_debug` vérifie après chaque commande que chaque
 `SharedByte` visité par les énumérateurs a `rc == 1`. Tout cas `rc > 1` hors ZSet est un

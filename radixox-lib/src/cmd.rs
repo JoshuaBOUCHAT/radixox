@@ -379,7 +379,7 @@ pub enum Cmd<'a> {
     ZAdd {
         key: &'a [u8],
         flags: ZAddFlags,
-        members: SmallVec<2, (f64, SharedByte)>,
+        members: SmallVec<2, (f64, &'a [u8])>,
     },
 
     /// ZCARD key
@@ -449,7 +449,7 @@ pub enum Cmd<'a> {
     ZIncrBy {
         key: &'a [u8],
         delta: f64,
-        member: SharedByte,
+        member: &'a [u8],
     },
 
     // --- Pub/Sub -----------------------------------------------------
@@ -1057,7 +1057,7 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
             }
             let mut members = SmallVec::new();
             for pair in rest.chunks_exact(2) {
-                members.push((float(pair[0])?, sb(pair[1])));
+                members.push((float(pair[0])?, pair[1]));
             }
             Cmd::ZAdd { key: args[0], flags, members }
         }
@@ -1282,7 +1282,7 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
         }
         b"zscore" => { exact!(2); Cmd::ZScore { key: args[0], member: sb(args[1]) } }
         b"zrem" => { at_least!(2); Cmd::ZRem { key: args[0], members: owned!(1) } }
-        b"zincrby" => { exact!(3); Cmd::ZIncrBy { key: args[0], delta: float(args[1])?, member: sb(args[2]) } }
+        b"zincrby" => { exact!(3); Cmd::ZIncrBy { key: args[0], delta: float(args[1])?, member: args[2] } }
         b"zunion" | b"zinter" | b"zdiff" | b"zunionstore" | b"zinterstore" | b"zdiffstore" => {
             let store = lc.ends_with(b"store");
             let op = match lc[1] {

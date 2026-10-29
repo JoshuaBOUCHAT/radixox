@@ -296,7 +296,7 @@ pub fn hint_field<'c>(cmd: &'c Cmd<'_>) -> Option<(&'c [u8], oxidart::ZProbe)> {
         Cmd::ZRank { member, .. } => Some((member, Tree)),
         Cmd::ZIncrBy { member, .. } => Some((member, Tree)),
         Cmd::ZRem { members, .. } => members.first().map(|m| (m.as_slice(), Tree)),
-        Cmd::ZAdd { members, .. } => members.first().map(|(s, m)| (m.as_slice(), Add(*s))),
+        Cmd::ZAdd { members, .. } => members.first().map(|&(s, m)| (m, Add(s))),
         _ => None,
     }
 }

@@ -218,7 +218,7 @@ impl OxidArt {
     }
 
     /// ZADD : nombre de membres ajoutés (les mises à jour ne comptent pas).
-    pub fn cmd_zadd(&mut self, key: SharedByte, score_members: &[(f64, SharedByte)], ttl: Option<u64>) -> Result<u32, TypeError> {
+    pub fn cmd_zadd<M: AsRef<[u8]>>(&mut self, key: SharedByte, score_members: &[(f64, M)], ttl: Option<u64>) -> Result<u32, TypeError> {
         debug_assert!(!score_members.is_empty());
         if score_members.iter().any(|(s, _)| s.is_nan()) {
             return Err(TypeError::NotAFloat);
@@ -226,7 +226,7 @@ impl OxidArt {
         let zset = self.get_zset_mut(ttl, key)?;
         let mut added = 0;
         for (score, member) in score_members {
-            match zset.add(encode_score(*score), member) {
+            match zset.add(encode_score(*score), member.as_ref()) {
                 Some(Added::New) => added += 1,
                 Some(_) => {}
                 None => return Err(TypeError::OutOfMemory),
@@ -240,11 +240,11 @@ impl OxidArt {
     /// que les présents, GT / LT ne mettent à jour que si le score monte / descend (les
     /// nouveaux sont ajoutés), CH compte aussi les mises à jour. XX sur une clé absente ne
     /// la crée pas.
-    pub fn cmd_zadd_opts(
+    pub fn cmd_zadd_opts<M: AsRef<[u8]>>(
         &mut self,
         key: SharedByte,
         flags: ZAddFlags,
-        score_members: &[(f64, SharedByte)],
+        score_members: &[(f64, M)],
         ttl: Option<u64>,
     ) -> Result<ZAddReply, TypeError> {
         if score_members.iter().any(|(s, _)| s.is_nan()) {
@@ -268,7 +268,7 @@ impl OxidArt {
             let mut nan = false;
             // une seule recherche du membre : la décision se prend sur son ancien score
             let r = zset
-                .upsert(member, |old| match old.map(decode_score) {
+                .upsert(member.as_ref(), |old| match old.map(decode_score) {
                     Some(_) if flags.nx => None,
                     None if flags.xx => None,
                     Some(old) => {
@@ -577,13 +577,13 @@ impl OxidArt {
     }
 
     /// ZINCRBY : nouveau score ; un membre absent part de 0.
-    pub fn cmd_zincrby(&mut self, key: SharedByte, increment: f64, member: SharedByte) -> Result<f64, TypeError> {
+    pub fn cmd_zincrby(&mut self, key: SharedByte, increment: f64, member: impl AsRef<[u8]>) -> Result<f64, TypeError> {
         if increment.is_nan() {
             return Err(TypeError::NotAFloat);
         }
         let zset = self.get_zset_mut(None, key)?;
         let mut new = f64::NAN;
-        zset.upsert(&member, |old| {
+        zset.upsert(member.as_ref(), |old| {
             new = old.map_or(0.0, decode_score) + increment;
             (!new.is_nan()).then(|| encode_score(new))
         })

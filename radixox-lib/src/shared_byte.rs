@@ -433,6 +433,12 @@ impl std::ops::Deref for SharedByte {
     }
 }
 
+impl AsRef<[u8]> for SharedByte {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 impl std::fmt::Debug for SharedByte {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // octets échappés : une clé binaire (non UTF-8) reste lisible

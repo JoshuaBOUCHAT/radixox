@@ -539,7 +539,7 @@ fn cmd_zadd() {
             assert_eq!(&*key, b"z");
             assert_eq!(members.len(), 2);
             assert_eq!(members[0].0, 1.5f64);
-            assert_eq!(&*members[0].1, b"m1");
+            assert_eq!(members[0].1, b"m1");
         }
         _ => panic!("expected ZAdd"),
     }
