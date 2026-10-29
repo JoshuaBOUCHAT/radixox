@@ -139,16 +139,29 @@ impl ZLarge {
                 }
             }
         }
-        let mut z = Self { tree: BTree::from_sorted(hs.iter().copied()), index: Index::new(), stale: 0 };
-        for &(s, h) in &hs {
+        Self::from_tree(BTree::from_sorted(hs))
+    }
+
+    /// Grande forme sur un B+tree construit dans l'ordre (rechargement : poignées créées
+    /// au fil de la lecture, sans copie intermédiaire des membres) ; l'index est rempli en
+    /// parcourant ses feuilles. Prend la propriété des poignées ; `None` (toutes rendues)
+    /// si un membre est en double.
+    pub fn from_tree(tree: BTree) -> Option<Self> {
+        let mut index = Index::new();
+        let dup = tree.iter().any(|(s, h)| {
             let hm = rehash(h);
-            if z.index.find(hm, |x| member(x) == member(h)).is_some() {
-                // membre en double (dump corrompu) : tout est rendu (l'arbre tient toutes
-                // les poignées)
-                z.release();
-                return None;
+            if index.find(hm, |x| member(x) == member(h)).is_some() {
+                return true;
             }
-            z.index.insert(hm, h, s, rehash);
+            index.insert(hm, h, s, rehash);
+            false
+        });
+        let mut z = Self { tree, index, stale: 0 };
+        if dup {
+            // membre en double (dump corrompu) : tout est rendu (l'arbre tient toutes les
+            // poignées)
+            z.release();
+            return None;
         }
         Some(z)
     }

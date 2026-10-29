@@ -278,6 +278,18 @@ impl<R: Read> DumpReader<R> {
         }
         Ok(n as usize)
     }
+    /// Comme [`bytes`](Self::bytes), emprunté à la fenêtre (valable jusqu'à la lecture
+    /// suivante) : pour une donnée recopiée ailleurs, sans `SharedByte` temporaire.
+    #[inline]
+    fn bytes_ref(&mut self) -> Result<&[u8], LoadError> {
+        let mut p = self.pos;
+        if let Some(n) = get_bytes(&self.buf[..self.end], &mut p).map(<[u8]>::len) {
+            self.pos = p;
+            return Ok(&self.buf[p - n..p]);
+        }
+        let n = self.len()?;
+        self.fixed(n)
+    }
     #[inline]
     fn bytes(&mut self) -> Result<SharedByte, LoadError> {
         let p0 = self.pos;
@@ -357,6 +369,9 @@ impl<R: Read> DumpReader<R> {
         if self.version >= format::VERSION_3 {
             // v3 : en ligne, dans l'ordre (score, membre) strictement croissant
             let n = self.varint()?;
+            if n > crate::zset::small::MAX_MEMBERS as u64 {
+                return self.zset_large(n);
+            }
             let mut entries: Vec<(u64, SharedByte)> = Vec::new();
             for _ in 0..n {
                 let score = f64::from_bits(self.u64_le()?);
@@ -376,6 +391,58 @@ impl<R: Read> DumpReader<R> {
         let idx = self.varint()? as u32;
         Ok(self.zsets.remove(&idx).ok_or(DumpError("ZSet absent de la section"))?)
     }
+    /// Grande forme (v3, `n` > [`MAX_MEMBERS`](crate::zset::small::MAX_MEMBERS)) : chaque
+    /// membre devient sa poignée dès sa lecture, emprunté à la fenêtre, et va droit dans
+    /// le B+tree construit au fil de la lecture ; l'index suit, sur les feuilles. Aucune
+    /// copie intermédiaire : le pic du rechargement est la taille finale. L'ordre est
+    /// vérifié contre le membre précédent, déjà en poignée ; en cas d'erreur, l'arbre
+    /// partiel et ses poignées sont rendus.
+    fn zset_large(&mut self, n: u64) -> Result<ZSet, LoadError> {
+        use crate::zset::btree::BTree;
+        let mut err: Option<LoadError> = None;
+        let mut prev: Option<(u64, u32)> = None;
+        let mut left = n;
+        let entries = std::iter::from_fn(|| {
+            if left == 0 || err.is_some() {
+                return None;
+            }
+            left -= 1;
+            let r = (|| {
+                let score = f64::from_bits(self.u64_le()?);
+                if score.is_nan() {
+                    return Err(DumpError("score NaN").into());
+                }
+                let s = encode_score(score);
+                let m = self.bytes_ref()?;
+                if prev.is_some_and(|(ps, ph)| (ps, crate::zset::large::member(ph)) >= (s, m)) {
+                    return Err(DumpError("ZSet hors d'ordre").into());
+                }
+                let h = radixox_lib::handle::new_obj(m).ok_or(DumpError("table des poignées pleine"))?;
+                Ok((s, h))
+            })();
+            match r {
+                Ok(e) => {
+                    prev = Some(e);
+                    Some(e)
+                }
+                Err(e) => {
+                    err = Some(e);
+                    None
+                }
+            }
+        });
+        let mut tree = BTree::from_sorted(entries);
+        if let Some(e) = err {
+            for (_, h) in tree.iter() {
+                crate::zset::save::free_handle(h);
+            }
+            tree.free_all();
+            return Err(e);
+        }
+        // from_tree rend lui-même les poignées s'il refuse
+        Ok(ZSet::from_tree(tree).ok_or(DumpError("ZSet : membre en double"))?)
+    }
+
     fn list(&mut self) -> Result<VecDeque<SharedByte>, LoadError> {
         if self.version >= format::VERSION {
             // v4 : en ligne, dans l'ordre

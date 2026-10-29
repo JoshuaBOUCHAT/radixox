@@ -1184,3 +1184,27 @@ fn amac_and_gc_during_save_keep_t0() {
         radixox_lib::handle::verify().unwrap();
     }
 }
+
+/// Grand ZSet relu au fil de la lecture (poignées créées en route, `zset_large`) : un dump
+/// tronqué au milieu de l'enregistrement échoue sans laisser de poignée perdue, et le dump
+/// entier se relit pareil.
+#[test]
+fn reload_large_zset_streamed_frees_handles_on_error() {
+    let mut art = OxidArt::new();
+    let pairs: Vec<(f64, SharedByte)> = (0..400).map(|i| ((i % 37) as f64, sb(&format!("member-{i:05}")))).collect();
+    art.cmd_zadd(sb("big"), &pairs, None).unwrap();
+    let buf = dump_of(&mut art);
+    let live = radixox_lib::handle::stats().0;
+    let (back, _) = reload(&buf, art.now);
+    assert_eq!(expected(&back), expected(&art));
+    assert_eq!(radixox_lib::handle::stats().0, live + 400);
+    drop(back);
+    assert_eq!(radixox_lib::handle::stats().0, live, "poignées rendues avec l'arbre");
+    // coupures dans l'enregistrement du ZSet (après l'en-tête, avant la fin)
+    for cut in (60..buf.len() - 20).step_by(97) {
+        let mut b = OxidArt::new();
+        assert!(b.load_dump(&buf[..cut]).is_err(), "coupure {cut}");
+        drop(b);
+        assert_eq!(radixox_lib::handle::stats().0, live, "poignées perdues, coupure {cut}");
+    }
+}

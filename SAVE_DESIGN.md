@@ -126,6 +126,19 @@ l'ordre), par le DFS, en flux (`Container::ZSet`, budget 1 par feuille + 1 par e
 Mesuré (1 M membres, serveur release) : PING max 0,87 ms pendant le BGSAVE (avant : 340 ms
 de boucle bloquée au `begin`). Lecture des dumps v1 / v2 (section ZSet du début) gardée.
 
+**Rechargement d'un grand ZSet sans transitoire (2026-10-29).** Le rechargement de l'index
+YCSB (`_indices`, 5 M membres) montait à 2094 Mo pour 1475 au repos (+42 %) : (1) tous les
+membres copiés en `SharedByte` dans un `Vec` sans capacité, avant `from_sorted` ; (2) surtout,
+la vérification du condensé du pied **matérialisait** le ZSet (`value_from_raw_ref` : copie
+profonde, 5 M poignées, arbre et index neufs) le temps d'une somme. Désormais : au-delà de
+`MAX_MEMBERS`, `zset_large` (`load.rs`) lit chaque membre emprunté à la fenêtre
+(`bytes_ref`), crée sa poignée et l'envoie droit dans `BTree::from_sorted` par un itérateur
+qui lit le flux (ordre vérifié contre le membre précédent ; en cas d'erreur, arbre partiel
+et poignées rendus) ; l'index est rempli en parcourant les feuilles (`ZLarge::from_tree`) ;
+le condensé lit ZSet et List en place (`digest.rs`, `raw_terms`). YCSB 5 M : pic du
+rechargement 2094 → 1377 Mo (= régime établi), durée 4,4 → 3,0 s, RSS au repos 1475 → 1376 Mo
+(table des poignées 82 → 42 Mo). Mesure en processus : `oxidart/examples/zset_reload.rs`.
+
 **List (v4, 2026-10-27) : CoW, derrière la barrière** (`oxidart/src/list/save.rs`,
 ANALYSE_ART_UNIFIE.md §14.4). Écrite dans l'enregistrement de sa clé (cardinal T0 puis
 éléments dans l'ordre), en flux (`Container::List`, budget 1 par bloc + 1 par élément) :

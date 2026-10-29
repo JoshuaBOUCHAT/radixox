@@ -24,7 +24,7 @@
 use crc32fast::Hasher;
 
 use crate::save::format;
-use crate::value::{Tag, Value, ValUnion, value_from_raw_ref};
+use crate::value::{Tag, Value, ValUnion};
 use crate::{OxidArt, expired};
 
 /// Marque le terme de tête d'un conteneur (cardinal), distinct de ses éléments.
@@ -160,8 +160,7 @@ pub(crate) fn value_terms(d: &mut Digest, key: &[u8], exp: Option<u64>, v: &Valu
 }
 
 /// Termes d'une valeur de l'arbre, lue en place (ni clone ni `Vec` : le
-/// condensé est sur le chemin du reload). ZSet / List : par la valeur
-/// matérialisée (rares).
+/// condensé est sur le chemin du reload).
 ///
 /// # Safety
 /// `tag` / `val` : valeur réelle de l'arbre.
@@ -215,7 +214,17 @@ unsafe fn raw_terms(d: &mut Digest, key: &[u8], exp: Option<u64>, tag: Tag, val:
                 }
                 d.add(head_term(key, format::T_SET, exp, n));
             }
-            Tag::ZSet | Tag::List => value_terms(d, key, exp, &value_from_raw_ref(tag, val)),
+            // en place : matérialiser recopiait tout le conteneur (5 M poignées, arbre et
+            // index neufs pour l'index YCSB) le temps d'une somme
+            Tag::ZSet => {
+                let z = crate::value::zset_ref(val.idx);
+                let inner = zset_inner(z.iter().map(|(s, m)| (crate::zset::decode_score(s), m)));
+                d.add(seq_term(key, format::T_ZSET, exp, inner));
+            }
+            Tag::List => {
+                let inner = list_inner(crate::value::list_ref(val.idx).iter().map(|b| b.as_slice()));
+                d.add(seq_term(key, format::T_LIST, exp, inner));
+            }
             Tag::None => unreachable!("valeur sans tag"),
         }
     }

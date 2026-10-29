@@ -52,6 +52,11 @@ impl ZSet {
         ZLarge::from_sorted(entries).map(Self::Large)
     }
 
+    /// Grande forme sur un B+tree déjà construit (voir [`ZLarge::from_tree`]).
+    pub(crate) fn from_tree(tree: btree::BTree) -> Option<Self> {
+        ZLarge::from_tree(tree).map(Self::Large)
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Self::Small(z) => z.len(),
