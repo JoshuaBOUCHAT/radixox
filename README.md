@@ -21,6 +21,8 @@ Against Valkey 9.1.2 on the same cores, 1M keys of 100 bytes, loopback, 2026-10-
 | 3 cores, no pipeline | 607 k ops/s, p99 0.18 ms | 421 k ops/s, p99 0.27 ms |
 | RSS with 1M keys | 132 MB | 165 MB |
 | `SCAN MATCH key:1234*` over 1M keys | 4 ms | 121 ms |
+| ZSet of 1M members: mixed ops, pipeline 32 / memory | 1.45 M ops/s / 93 MB | 0.55 M ops/s / 46 MB |
+| `BRPOP`: items handed to blocked consumers | 152 k/s, `LPUSH` p99 0.26 ms | 90 k/s, `LPUSH` p99 0.56 ms |
 | `BGSAVE` under saturating load: duration / p99.99 | 1.42 s / 1.21 ms (same core) | 2.01 s / 0.88 ms (child on a 2nd core) |
 | Restart with 1M keys | 0.17 s | 0.54 s |
 | AOF `everysec`, `SET` pipeline 16 | 1.67 M ops/s | 0.66 M ops/s |
@@ -85,7 +87,7 @@ CPU 0. Valkey's background threads and `BGSAVE` child run on CPU 1, a core of th
 memtier 2.4.2 on 6 other CPUs, 60 connections, `--distinct-client-seed --randomize`, 100-byte
 values, 8 s per point, **one run per point**. These are orders of magnitude: repeated runs
 move by a few percent. Dumps and AOF go to a SATA SSD (PNY CS900, ext4) with fsync.
-Reproduce with `DIR=<directory on disk> scripts/readme_bench.sh`, which takes about 7 minutes.
+Reproduce with `DIR=<directory on disk> scripts/readme_bench.sh`, which takes about 10 minutes.
 
 ### Throughput and latency
 
@@ -107,6 +109,43 @@ locks and no shared state.
 
 The pipelined gain comes from interleaved lookups. Inside a window of 64 commands, the
 descents of all keys advance level by level, so their cache misses overlap.
+
+### Data types
+
+Same setup, one core, 60 connections. Each type is loaded first, and "Memory" is the RSS
+after loading minus the RSS of the empty server.
+
+| Workload | Memory | ops/s, no pipeline | p99 | ops/s, pipeline 32 | p99 |
+|---|---|---|---|---|---|
+| **Hash**: 1M keys × 1 field of 100 B, `HSET`:`HGET` 1:4 | | | | | |
+| RadixOx | **150 MB** | **229,418** | **0.50 ms** | **2,513,484** | **1.55 ms** |
+| Valkey | 312 MB | 221,635 | 0.58 ms | 1,246,561 | 2.54 ms |
+| **Set**: one Set of 1M members, `SADD`:`SISMEMBER` 1:4 (half misses) | | | | | |
+| RadixOx | **28 MB** | **308,622** | **0.34 ms** | **2,108,907** | **1.28 ms** |
+| Valkey | 31 MB | 240,912 | 0.54 ms | 1,650,123 | 1.94 ms |
+| **Sorted set**: one ZSet of 1M members, `ZADD` / `ZSCORE` / `ZRANK` / `ZRANGEBYSCORE … LIMIT 0 10`, 1/2/1/1 | | | | | |
+| RadixOx | 93 MB | **227,537** | **0.33 ms** | **1,452,454** | **1.96 ms** |
+| Valkey | **46 MB** | 170,267 | 0.69 ms | 551,179 | 5.12 ms |
+| **List**: 1,000 lists × 1,000 items of 100 B, `LPUSH` / `RPOP` / `LRANGE 0 9`, 2/2/1 | | | | | |
+| RadixOx | **118 MB** | **279,622** | **0.39 ms** | **1,808,474** | **1.86 ms** |
+| Valkey | 128 MB | 197,592 | 0.58 ms | 1,410,339 | 2.94 ms |
+
+- On one-field hashes, throughput without pipelining is a tie. RadixOx's p99.99 is worse
+  (2.2 ms against 1.1 ms), and it uses half the memory.
+- **A large ZSet costs RadixOx twice Valkey's memory** with these short numeric members.
+  In exchange, ranks and ranges run on a counted B+tree, which is ahead under pipelining.
+
+**Blocking commands.** 60 connections wait in `BRPOP` on one shared queue, and 20 producer
+connections `LPUSH` 100-byte items into it as fast as they can (no pipeline). Every item
+pushed was consumed by the end (queue empty for both servers).
+
+| | Items handed over per second | `LPUSH` p50 | p99 | p99.9 |
+|---|---|---|---|---|
+| RadixOx | **152,127** | **0.14 ms** | **0.26 ms** | **0.81 ms** |
+| Valkey | 90,012 | 0.23 ms | 0.56 ms | 0.87 ms |
+
+When a client is waiting, RadixOx's `LPUSH` hands it the item directly, and the item is
+never stored in the list.
 
 ### Prefix scan
 
