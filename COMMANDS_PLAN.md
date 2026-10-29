@@ -139,9 +139,27 @@ du premier octet.
   chaud). Un `EXEC` part dans le flux AOF / réplication en un seul bloc.
 - **La syntaxe `MULTI ATOMIC` de TX_DESIGN.md est abandonnée** au profit de **commandes
   custom en Rust, liées statiquement** (le serveur est une lib : `radixox::server`), en
-  trois niveaux : une fonction (tout-ou-rien : écritures mises de côté par `Ctx`,
-  appliquées si `Ok`), un parcours filtré fourni (l'utilisateur ne donne que le filtre),
+  trois niveaux : une fonction (tout-ou-rien, voir ci-dessous), un parcours filtré fourni (l'utilisateur ne donne que le filtre),
   une machine à états (`trait Job`, une tranche par tour, connexion parquée, reprise sur
   une clé, atomique par tranche seulement). Journaliser les **effets**, pas la commande
   (un réplica n'a pas besoin du même binaire). TX_DESIGN.md est à réorienter dans ce sens
   avant d'implémenter ; ce sera après les lots 1 à 3.
+- **Tout-ou-rien d'une commande Rust : journal d'annulation, pas d'écritures mises de
+  côté.** La commande écrit directement dans l'arbre (lire ses propres écritures est
+  automatique) ; avant de toucher une clé, `Ctx` note de quoi la remettre : ancienne valeur
+  `SharedByte` + TTL pour une string, ancienne valeur **du seul champ** pour un `HSET` dans
+  un gros Hash, valeur **détachée** (pas copiée) pour la suppression d'un gros type,
+  regreffée à l'annulation (TX_DESIGN.md §6–§7). `Ok` : journal jeté ; `Err` : rejoué à
+  l'envers. Mettre les écritures de côté obligerait chaque lecture, pour chaque type, à
+  regarder d'abord les écritures en attente : écarté. Pas de copie de l'arbre (COW) : le
+  mono-thread suffit, personne ne lit pendant la commande. À ne pas rater : effets envoyés
+  à l'AOF / réplication seulement au commit ; annulation par les mêmes points de mutation
+  (barrière de save) ; admission `maxmemory` avant, ou annulation propre en `OOM`.
+- **Idée (utilisateur) : AMAC dans `EXEC`.** Le moteur AMAC (RUNTIME_ARCH.md §8bis)
+  entrelace les descentes d'une fenêtre de commandes (lecture pure), puis exécute dans
+  l'ordre. Appliqué aux commandes d'un `EXEC` (ou d'une commande Rust qui touche plusieurs
+  clés), les accès mémoire se superposent **sans rompre l'atomicité** : l'exécution reste
+  séquentielle et d'un bloc. Redis n'a rien d'équivalent. À vérifier avant d'en faire un
+  argument : qu'une écriture d'une commande du bloc qui change la forme de l'arbre invalide
+  bien les emplacements trouvés pour les suivantes (le moteur gère déjà ce cas pour une
+  fenêtre pipelinée : regarder comment, et réutiliser).
