@@ -97,17 +97,7 @@ impl Index {
 }
 
 fn map(len: usize) -> Option<*mut u8> {
-    let p = unsafe {
-        libc::mmap(
-            null_mut(),
-            len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-            -1,
-            0,
-        )
-    };
-    (p != libc::MAP_FAILED).then_some(p as *mut u8)
+    crate::sys::map_anon(len, true).ok()
 }
 
 /// Tableau à capacité fixe sur un mapping à lui (`MAP_NORESERVE` : seules les pages
@@ -127,7 +117,7 @@ impl<T: Copy> MapArr<T> {
     fn new(cap: usize) -> Option<Self> {
         let p = map(Self::bytes_for(cap))?;
         // Petites tables : sous THP `always`, la première écriture prendrait 2 Mio.
-        unsafe { libc::madvise(p as *mut _, Self::bytes_for(cap), libc::MADV_NOHUGEPAGE) };
+        unsafe { crate::sys::advise(p, Self::bytes_for(cap), crate::sys::Advice::LinuxNoHugepage) };
         Some(Self { ptr: p as *mut T, cap, len: 0, touched: 0, pages: crate::pages::Tranches::new(p as usize, crate::pages::PAGE) })
     }
 
@@ -164,7 +154,7 @@ impl<T: Copy> MapArr<T> {
             let from = (keep * size_of::<T>()).next_multiple_of(4096);
             let to = (self.touched * size_of::<T>()).next_multiple_of(4096);
             if to > from {
-                unsafe { libc::madvise((self.ptr as *mut u8).add(from) as *mut _, to - from, libc::MADV_DONTNEED) };
+                unsafe { crate::sys::advise((self.ptr as *mut u8).add(from), to - from, crate::sys::Advice::LinuxDontNeed) };
             }
             self.touched = keep;
             self.pages.shrink(from);
@@ -195,7 +185,7 @@ impl<T: Copy> std::ops::IndexMut<usize> for MapArr<T> {
 
 impl<T: Copy> Drop for MapArr<T> {
     fn drop(&mut self) {
-        unsafe { libc::munmap(self.ptr as *mut _, Self::bytes_for(self.cap)) };
+        unsafe { crate::sys::unmap(self.ptr as *mut u8, Self::bytes_for(self.cap)) };
     }
 }
 
@@ -297,7 +287,7 @@ impl Large {
         let mut maps = [(null_mut(), 0); 6];
         let unmap = |maps: &[(*mut u8, usize)]| {
             for &(p, len) in maps {
-                unsafe { libc::munmap(p as *mut _, len) };
+                unsafe { crate::sys::unmap(p, len) };
             }
         };
         for (i, &len) in lens.iter().enumerate() {
@@ -318,7 +308,7 @@ impl Large {
         // 2 à 4 Mio pour quelques Ko écrits (mesuré : 21 Mo pour les 5). Elles ne servent que
         // sur les chemins lents du tas.
         for &(p, len) in &maps {
-            unsafe { libc::madvise(p as *mut _, len, libc::MADV_NOHUGEPAGE) };
+            unsafe { crate::sys::advise(p, len, crate::sys::Advice::LinuxNoHugepage) };
         }
         Some(Self {
             base: maps[0].0 as usize,
@@ -582,7 +572,7 @@ impl Large {
             let len = t & LEN;
             self.unlink(s, len, true);
             unsafe {
-                libc::madvise((self.base + s as usize * GRANULE) as *mut _, len as usize * GRANULE, libc::MADV_DONTNEED)
+                crate::sys::advise((self.base + s as usize * GRANULE) as *mut u8, len as usize * GRANULE, crate::sys::Advice::LinuxDontNeed)
             };
             self.dirty -= len as u64;
             self.released += len as u64;
@@ -736,7 +726,7 @@ impl Drop for Large {
     fn drop(&mut self) {
         crate::pages::credit((self.held + self.dirty) as usize * GRANULE);
         for &(p, len) in &self.maps {
-            unsafe { libc::munmap(p as *mut _, len) };
+            unsafe { crate::sys::unmap(p, len) };
         }
     }
 }

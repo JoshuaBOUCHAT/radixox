@@ -136,13 +136,13 @@ pub mod direct {
 
     /// Message sur stderr sans allouer.
     pub fn message(msg: &[u8]) {
-        unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()) };
+        crate::sys::stderr(msg);
     }
 
     #[cold]
     fn bad_free() -> ! {
         message(b"radixox: free d'un pointeur inconnu\n");
-        unsafe { libc::abort() }
+        std::process::abort()
     }
 
     /// Bloc de `size` octets aligné sur `align` (puissance de deux) ; nul si `mmap` refuse.
@@ -151,19 +151,9 @@ pub mod direct {
         let Some(len) = size.checked_add(align + HEADER).map(|n| n.next_multiple_of(PAGE)) else {
             return std::ptr::null_mut();
         };
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
+        let Ok(base) = crate::sys::map_anon(len, false) else {
             return std::ptr::null_mut();
-        }
+        };
         let base = base as usize;
         let data = (base + HEADER).next_multiple_of(align);
         unsafe { ((data - HEADER) as *mut [usize; 3]).write([MAGIC, base, len]) };
@@ -185,7 +175,7 @@ pub mod direct {
     /// `p` vient de [`alloc`], pas encore rendu.
     pub unsafe fn free(p: *mut u8) {
         let (base, len) = unsafe { header(p) };
-        unsafe { libc::munmap(base as *mut _, len) };
+        unsafe { crate::sys::unmap(base as *mut u8, len) };
         BYTES.fetch_sub(len as u64, Relaxed);
         crate::pages::credit(len);
     }
@@ -240,7 +230,7 @@ pub mod heap {
     #[cold]
     fn foreign_free() -> ! {
         direct::message(b"radixox: bloc du tas rendu par un autre thread\n");
-        unsafe { libc::abort() }
+        std::process::abort()
     }
 
     #[inline]

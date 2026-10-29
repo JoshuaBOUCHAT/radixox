@@ -235,17 +235,7 @@ pub struct Pool {
 
 /// `mmap` anonyme `MAP_NORESERVE` : rien n'est engagé avant d'être touché.
 fn map(len: usize) -> Option<*mut u8> {
-    let p = unsafe {
-        libc::mmap(
-            null_mut(),
-            len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-            -1,
-            0,
-        )
-    };
-    (p != libc::MAP_FAILED).then_some(p as *mut u8)
+    crate::sys::map_anon(len, true).ok()
 }
 
 #[inline]
@@ -271,14 +261,14 @@ impl Pool {
         for (i, &len) in lens.iter().enumerate() {
             let Some(p) = map(len) else {
                 for &(p, len) in &maps[..i] {
-                    unsafe { libc::munmap(p as *mut _, len) };
+                    unsafe { crate::sys::unmap(p, len) };
                 }
                 return None;
             };
             maps[i] = (p, len);
         }
         let base = (maps[0].0 as usize).next_multiple_of(PAGE);
-        unsafe { libc::madvise(base as *mut _, virt, libc::MADV_HUGEPAGE) };
+        unsafe { crate::sys::advise(base as *mut u8, virt, crate::sys::Advice::LinuxHugepage) };
         Some(Self {
             base,
             nb_pages,
@@ -913,7 +903,7 @@ impl Pool {
             }
             self.empty_pages.pop_front();
             let a = self.block_addr(p * BLOCKS_PER_PAGE);
-            unsafe { libc::madvise(a as *mut _, PAGE, libc::MADV_DONTNEED) };
+            unsafe { crate::sys::advise(a as *mut u8, PAGE, crate::sys::Advice::LinuxDontNeed) };
             crate::pages::credit(PAGE);
             self.charged_pages -= 1;
             self.pages[p as usize].state = PageKind::Released;
@@ -1106,7 +1096,7 @@ impl Drop for Pool {
     fn drop(&mut self) {
         crate::pages::credit(self.charged_pages as usize * PAGE);
         for (p, len) in self.maps {
-            unsafe { libc::munmap(p as *mut _, len) };
+            unsafe { crate::sys::unmap(p, len) };
         }
     }
 }

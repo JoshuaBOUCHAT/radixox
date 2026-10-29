@@ -30,22 +30,17 @@ impl Mapping {
     fn new(bytes: usize) -> Result<Self, std::io::Error> {
         let len = bytes.max(1).next_multiple_of(HUGE);
         let raw = len + HUGE;
-        let p = unsafe {
-            libc::mmap(std::ptr::null_mut(), raw, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
-        };
-        if p == libc::MAP_FAILED {
-            return Err(std::io::Error::last_os_error());
-        }
+        let p = crate::sys::map_anon(raw, false)?;
         // Rognage des deux bouts : il ne reste que `[début aligné, + len)`.
         let base = p as usize;
         let start = base.next_multiple_of(HUGE);
         unsafe {
             if start > base {
-                libc::munmap(p, start - base);
+                crate::sys::unmap(p, start - base);
             }
             let end = start + len;
             if base + raw > end {
-                libc::munmap(end as *mut _, base + raw - end);
+                crate::sys::unmap(end as *mut u8, base + raw - end);
             }
         }
         Ok(Self { ptr: start as *mut u8, len })
@@ -58,7 +53,7 @@ impl Mapping {
 
 impl Drop for Mapping {
     fn drop(&mut self) {
-        unsafe { libc::munmap(self.ptr as *mut _, self.len) };
+        unsafe { crate::sys::unmap(self.ptr, self.len) };
     }
 }
 #[cfg(test)]
@@ -316,7 +311,7 @@ impl<T> HiSlab<T> {
         if end <= start {
             return 0;
         }
-        unsafe { libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_DONTNEED) };
+        unsafe { crate::sys::advise(start as *mut u8, end - start, crate::sys::Advice::LinuxDontNeed) };
         self.pages.shrink(start - base);
         self.touched_end.set(((start - base) / size) as u32);
         end - start

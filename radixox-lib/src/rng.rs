@@ -14,12 +14,10 @@ fn os_seed() -> Option<u64> {
     let mut b = [0u8; 8];
     let mut got = 0;
     while got < b.len() {
-        // SAFETY: tampon valide de `len - got` octets.
-        let r = unsafe { libc::getrandom(b[got..].as_mut_ptr().cast(), b.len() - got, 0) };
-        if r > 0 {
-            got += r as usize;
-        } else if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            break;
+        match rustix::rand::getrandom(&mut b[got..], rustix::rand::GetRandomFlags::empty()) {
+            Ok(n) if n > 0 => got += n,
+            Err(rustix::io::Errno::INTR) => {}
+            _ => break,
         }
     }
     if got < b.len() {

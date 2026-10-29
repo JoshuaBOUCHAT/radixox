@@ -15,6 +15,7 @@ pub mod rng;
 pub mod save_barrier;
 pub mod shared_byte;
 pub mod shared_frame;
+pub mod sys;
 pub mod small_vec;
 #[cfg(test)]
 mod test;

@@ -11,7 +11,6 @@
 //!
 //! La forme se lit à l'adresse : dans la plage du pool ou non.
 
-use std::ptr::null_mut;
 
 use crate::pool;
 use crate::raw_alloc::external;
@@ -51,17 +50,7 @@ impl Handles {
     pub fn new(cap: u32) -> Option<Self> {
         let cap = cap.clamp(1, NONE - 1);
         let map_len = (cap as usize * 8).next_multiple_of(4096);
-        let p = unsafe {
-            libc::mmap(
-                null_mut(),
-                map_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
-        };
-        (p != libc::MAP_FAILED).then(|| Self {
+        crate::sys::map_anon(map_len, true).ok().map(|p| Self {
             slots: p as *mut u64,
             map_len,
             cap,
@@ -151,7 +140,7 @@ impl Handles {
 
 impl Drop for Handles {
     fn drop(&mut self) {
-        unsafe { libc::munmap(self.slots as *mut _, self.map_len) };
+        unsafe { crate::sys::unmap(self.slots as *mut u8, self.map_len) };
     }
 }
 

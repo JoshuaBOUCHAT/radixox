@@ -65,26 +65,17 @@ impl BigBuf {
     #[cold]
     fn grow(&mut self, need: usize) {
         let cap = need.max(self.cap * 2).max(FIRST).next_multiple_of(FIRST);
-        let p = unsafe {
-            if self.cap == 0 {
-                libc::mmap(
-                    null_mut(),
-                    cap,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                    -1,
-                    0,
-                )
-            } else {
-                libc::mremap(self.ptr as *mut _, self.cap, cap, libc::MREMAP_MAYMOVE)
-            }
+        let p = if self.cap == 0 {
+            crate::sys::map_anon(cap, true)
+        } else {
+            unsafe { crate::sys::remap(self.ptr, self.cap, cap) }
         };
         // Plage virtuelle épuisée : comme un échec d'allocation.
-        if p == libc::MAP_FAILED {
+        let Ok(p) = p else {
             std::alloc::handle_alloc_error(std::alloc::Layout::from_size_align(cap, 1).unwrap());
-        }
+        };
         if self.cap == 0 {
-            unsafe { libc::madvise(p, cap, libc::MADV_HUGEPAGE) };
+            unsafe { crate::sys::advise(p, cap, crate::sys::Advice::LinuxHugepage) };
         }
         // Registre des pages : la capacité entière (au plus 2 × ce qui est écrit), comptée
         // au `mremap` plutôt qu'à chaque écriture.
@@ -134,7 +125,7 @@ impl Drop for BigBuf {
         if self.cap != 0 {
             unsafe {
                 BYTES -= self.len as u64;
-                libc::munmap(self.ptr as *mut _, self.cap);
+                crate::sys::unmap(self.ptr, self.cap);
                 crate::pages::credit(self.cap);
             }
         }
