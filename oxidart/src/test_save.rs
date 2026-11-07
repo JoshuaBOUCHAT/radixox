@@ -165,7 +165,7 @@ fn random_op(art: &mut OxidArt, rng: &mut Rng) {
         // effacements ; les bascules restent en cours d'une opération à l'autre
         20 | 21 => {
             let bk = format!("bits{}", rng.below(3));
-            match rng.below(5) {
+            match rng.below(6) {
                 0 | 1 => {
                     for _ in 0..1 + rng.below(150) {
                         let _ = art.cmd_setbit(bk.as_bytes(), rng.below(4000) as u32, true);
@@ -178,6 +178,11 @@ fn random_op(art: &mut OxidArt, rng: &mut Rng) {
                     for _ in 0..1 + rng.below(200) {
                         let _ = art.cmd_setbit(bk.as_bytes(), rng.below(4000) as u32, false);
                     }
+                }
+                4 => {
+                    let op = [crate::bcommand::BitOp::And, crate::bcommand::BitOp::Or, crate::bcommand::BitOp::Xor][rng.below(3) as usize];
+                    let (a, b) = (format!("bits{}", rng.below(3)), format!("bits{}", rng.below(3)));
+                    let _ = art.cmd_bitop(op, bk.as_bytes(), &[a.as_bytes(), b.as_bytes()]);
                 }
                 _ => {
                     let _ = art.cmd_bitcount(bk.as_bytes(), None);

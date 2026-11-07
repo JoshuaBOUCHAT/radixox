@@ -670,6 +670,11 @@ impl BitsetId {
         Self(id)
     }
 
+    /// Bitset compact depuis `n` offsets **strictement croissants** (vérifié en debug).
+    pub fn from_sorted_iter(n: u64, keys: impl Iterator<Item = u32>) -> Self {
+        Self::create_from(n, keys)
+    }
+
     /// Bitset compact depuis des offsets **strictement croissants** (vérifié en debug).
     pub fn from_sorted(keys: &[u32]) -> Self {
         Self::create_from(keys.len() as u64, keys.iter().copied())

@@ -18,6 +18,7 @@ use core::mem::MaybeUninit;
 use radixox_lib::bitset::{self as tree, BitsetId, WordBits};
 use radixox_lib::hislab::HiSlab;
 
+pub(crate) mod op;
 pub(crate) mod save;
 #[cfg(test)]
 mod test;
@@ -180,6 +181,32 @@ impl Form {
                     }
                 }
                 true
+            }
+        }
+    }
+
+    /// OR des bits de `[from, to)` dans `buf`, qui couvre `[base, base + 64·len)` (`base`
+    /// multiple de 64, `[from, to)` inclus dans ce que couvre `buf`).
+    fn fill(&self, from: u64, to: u64, base: u64, buf: &mut [u64]) {
+        if from >= to {
+            return;
+        }
+        match self {
+            Form::Classic(w) => {
+                let to = to.min(w.len() as u64 * 64);
+                if from >= to {
+                    return;
+                }
+                for wi in (from >> 6)..=((to - 1) >> 6) {
+                    buf[(wi - (base >> 6)) as usize] |= w[wi as usize] & word_mask(wi, from, to);
+                }
+            }
+            Form::Compact(_) => {
+                self.scan(from, to, &mut |k| {
+                    let r = k as u64 - base;
+                    buf[(r >> 6) as usize] |= 1 << (r & 63);
+                    true
+                });
             }
         }
     }
@@ -521,6 +548,28 @@ impl Bitset {
             return (from < to).then_some(from);
         }
         self.segments().iter().find_map(|&(form, a, b)| form.next_clear(a.max(from), b.min(to)))
+    }
+
+    /// Bits de `[base, base + 64·buf.len())` dans `buf` (écrasé), `base` multiple de 64.
+    pub(crate) fn fill_chunk(&self, base: u64, buf: &mut [u64]) {
+        buf.fill(0);
+        let end = (base + 64 * buf.len() as u64).min(END);
+        for (form, a, b) in self.segments() {
+            form.fill(a.max(base), b.min(end), base, buf);
+        }
+    }
+
+    /// Toutes les formes qui font foi sur `[from, to)` sont compactes.
+    pub(crate) fn compact_on(&self, from: u64, to: u64) -> bool {
+        self.segments()
+            .iter()
+            .all(|&(form, a, b)| a.max(from) >= b.min(to) || matches!(form, Form::Compact(_)))
+    }
+
+    /// Longueur en octets, à la Redis (déduite du contenu).
+    #[inline]
+    pub(crate) fn byte_len(&self) -> u64 {
+        self.hi.div_ceil(8)
     }
 
     /// Tous les offsets à 1 dans l'ordre.

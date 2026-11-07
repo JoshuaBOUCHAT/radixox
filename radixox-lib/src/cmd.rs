@@ -348,6 +348,8 @@ pub enum Cmd<'a> {
     GetBit { key: &'a [u8], off: u32 },
     /// BITCOUNT key [start [end [BYTE|BIT]]] (`bits` : unité BIT)
     BitCount { key: &'a [u8], range: Option<(i64, i64, bool)> },
+    /// BITOP AND|OR|XOR|NOT dest key [key ...] (`op` : 0 AND, 1 OR, 2 XOR, 3 NOT)
+    BitOp { op: u8, dest: &'a [u8], keys: SmallVec<4, &'a [u8]> },
     /// BITPOS key bit [start [end [BYTE|BIT]]]
     BitPos { key: &'a [u8], bit: bool, start: Option<i64>, end: Option<i64>, bits: bool },
 
@@ -1113,6 +1115,17 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
             };
             Cmd::BitCount { key: args[0], range }
         }
+        b"bitop" => {
+            at_least!(3);
+            let op = [&b"and"[..], b"or", b"xor", b"not"]
+                .iter()
+                .position(|o| args[0].eq_ignore_ascii_case(o))
+                .ok_or(CmdError::Syntax)? as u8;
+            if op == 3 && n != 3 {
+                return Err(CmdError::Msg("ERR BITOP NOT must be called with a single source key."));
+            }
+            Cmd::BitOp { op, dest: args[1], keys: borrowed!(2) }
+        }
         b"bitpos" => {
             between!(2, 5);
             let bit = match args[1] {
@@ -1678,6 +1691,7 @@ impl<'a> Cmd<'a> {
                 | Cmd::LMove { .. }
                 | Cmd::BLMove { .. }
                 | Cmd::SetBit { on: true, .. }
+                | Cmd::BitOp { .. }
         )
     }
 
@@ -1694,6 +1708,7 @@ impl<'a> Cmd<'a> {
             | Cmd::HIncrBy { .. }
             | Cmd::ZIncrBy { .. }
             | Cmd::SetBit { .. }
+            | Cmd::BitOp { .. }
             | Cmd::FlushDb => 1,
             Cmd::MSet(pairs) => pairs.len(),
             Cmd::Del(keys) => keys.len(),

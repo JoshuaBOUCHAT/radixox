@@ -38,6 +38,15 @@ pub fn cmd_bitcount(art: &mut OxidArt, key: &[u8], range: Option<(i64, i64, bool
     }
 }
 
+pub fn cmd_bitop(art: &mut OxidArt, op: u8, dest: &[u8], keys: &[&[u8]]) -> Frame {
+    use oxidart::bcommand::BitOp;
+    let op = [BitOp::And, BitOp::Or, BitOp::Xor, BitOp::Not][op as usize];
+    match art.cmd_bitop(op, dest, keys) {
+        Ok(n) => Frame::Integer(n as i64),
+        Err(t) => wrongtype(t),
+    }
+}
+
 pub fn cmd_bitpos(art: &mut OxidArt, key: &[u8], bit: bool, start: Option<i64>, end: Option<i64>, bits: bool) -> Frame {
     match art.cmd_bitpos(key, bit, start, end, unit(bits)) {
         Ok(p) => Frame::Integer(p),

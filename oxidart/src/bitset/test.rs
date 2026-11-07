@@ -241,3 +241,117 @@ fn commands_match_redis_model() {
     art.cmd_setbit(b"b", 1, true).unwrap();
     assert_eq!(art.key_type(b"b"), crate::value::RedisType::Bitset);
 }
+
+// ─── BITOP ───────────────────────────────────────────────────────────────────
+
+/// BITOP de Redis sur des ensembles d'offsets : longueur = plus longue source (octets),
+/// NOT sur `[0, 8·longueur)`.
+fn bitop_model(op: BitOp, srcs: &[BTreeSet<u32>]) -> (u64, BTreeSet<u32>) {
+    let len = srcs.iter().filter_map(|s| s.last()).map(|&l| l as u64 / 8 + 1).max().unwrap_or(0);
+    let r = match op {
+        BitOp::Not => (0..len * 8).map(|x| x as u32).filter(|x| !srcs[0].contains(x)).collect(),
+        BitOp::And => srcs[0].iter().copied().filter(|x| srcs[1..].iter().all(|s| s.contains(x))).collect(),
+        BitOp::Or => srcs.iter().flatten().copied().collect(),
+        BitOp::Xor => {
+            let mut r = BTreeSet::new();
+            for s in srcs {
+                for &x in s {
+                    if !r.insert(x) {
+                        r.remove(&x);
+                    }
+                }
+            }
+            r
+        }
+    };
+    (len, r)
+}
+
+use crate::bcommand::BitOp;
+
+#[test]
+fn bitop_matches_model() {
+    let mut rng = Rng(0xB170_9000_0000_0001);
+    let mut art = OxidArt::new();
+    let names = [&b"s0"[..], b"s1", b"s2", b"s3"];
+    for round in 0..120 {
+        let mut model: Vec<BTreeSet<u32>> = Vec::new();
+        for (i, k) in names.iter().enumerate() {
+            art.del(k);
+            let mut s = BTreeSet::new();
+            // formes variées : vide, dense, clairsemée, lointaine, à cheval sur des tranches
+            let (n, span, base) = match (round + i) % 6 {
+                0 => (0, 1, 0),
+                1 => (rng.below(3000), 4000, 0),
+                2 => (rng.below(50), 1 << 32, 0),
+                3 => (rng.below(60_000), 700_000, 0),
+                4 => (rng.below(20_000), 600_000, 200_000),
+                _ => (rng.below(200), 300, rng.below(1 << 20)),
+            };
+            for _ in 0..n {
+                let off = ((base + rng.below(span)) % (1 << 32)) as u32;
+                art.cmd_setbit(k, off, true).unwrap();
+                s.insert(off);
+            }
+            model.push(s);
+        }
+        let op = [BitOp::And, BitOp::Or, BitOp::Xor, BitOp::Not][rng.below(4) as usize];
+        let nsrc = if op == BitOp::Not { 1 } else { 1 + rng.below(4) as usize };
+        let picks: Vec<usize> = (0..nsrc).map(|_| rng.below(4) as usize).collect();
+        // NOT d'une source lointaine : 512 Mio de résultat, on l'évite ici
+        if op == BitOp::Not && model[picks[0]].last().is_some_and(|&l| l > 5_000_000) {
+            continue;
+        }
+        let keys: Vec<&[u8]> = picks.iter().map(|&p| names[p]).collect();
+        let srcs: Vec<BTreeSet<u32>> = picks.iter().map(|&p| model[p].clone()).collect();
+        let (len, want) = bitop_model(op, &srcs);
+        // destination : nouvelle clé, ou une des sources
+        let dest: &[u8] = if rng.below(3) == 0 { names[picks[0]] } else { b"dst" };
+        assert_eq!(art.cmd_bitop(op, dest, &keys).unwrap(), len, "round {round} {op:?}");
+        let got = art.get(dest).map(|v| match v {
+            crate::Value::Bitset(v) => v,
+            _ => panic!("pas un bitset"),
+        });
+        match got {
+            None => assert!(want.is_empty(), "round {round} {op:?} : résultat vide attendu"),
+            Some(v) => assert!(v.iter().eq(want.iter()), "round {round} {op:?} : {} vs {}", v.len(), want.len()),
+        }
+        if !want.is_empty() {
+            let idx = art.get_ref(dest).unwrap().bitset_idx().unwrap();
+            get(idx).check();
+        }
+        art.zset_free_step(4096);
+    }
+}
+
+/// Coût de BITOP (release : `cargo test --release -p oxidart bitop_bench -- --ignored --nocapture`).
+#[test]
+#[ignore = "mesure, en release"]
+fn bitop_bench() {
+    use std::time::Instant;
+    let mut rng = Rng(7);
+    let mut art = OxidArt::new();
+    let mut fill = |art: &mut OxidArt, k: &[u8], n: u64, span: u64| {
+        let mut v: Vec<u32> = (0..n).map(|_| rng.below(span) as u32).collect();
+        v.sort_unstable();
+        v.dedup();
+        art.set(radixox_lib::shared_byte::SharedByte::from_slice(k), crate::Value::Bitset(v));
+    };
+    // dense (classique, 8 Mio chacun) ; clairsemé (compact, 1 M offsets sur 2³²)
+    fill(&mut art, b"d1", 20_000_000, 1 << 26);
+    fill(&mut art, b"d2", 20_000_000, 1 << 26);
+    fill(&mut art, b"s1", 1_000_000, 1 << 32);
+    fill(&mut art, b"s2", 1_000_000, 1 << 32);
+    for (name, op, keys) in [
+        ("OR dense 2×64 Mbits", BitOp::Or, [&b"d1"[..], b"d2"]),
+        ("AND dense", BitOp::And, [&b"d1"[..], b"d2"]),
+        ("OR clairsemé 2×1 M", BitOp::Or, [&b"s1"[..], b"s2"]),
+        ("AND clairsemé", BitOp::And, [&b"s1"[..], b"s2"]),
+        ("AND dense × clairsemé", BitOp::And, [&b"d1"[..], b"s1"]),
+    ] {
+        let t = Instant::now();
+        art.cmd_bitop(op, b"r", &keys).unwrap();
+        let n = art.cmd_bitcount(b"r", None).unwrap();
+        std::println!("{name:28} {:>8.2} ms  ({n} bits)", t.elapsed().as_secs_f64() * 1e3);
+    }
+}

@@ -6,10 +6,11 @@
 #[allow(unused_imports)]
 use crate::prelude::*;
 
+pub use crate::bitset::op::BitOp;
 use crate::{
     OxidArt,
     bitset::{self, Bitset},
-    value::{RedisType, Tag},
+    value::{RawVal, RedisType, Tag, ValUnion},
 };
 
 /// Unité des bornes de BITCOUNT / BITPOS.
@@ -87,6 +88,28 @@ impl OxidArt {
             None => b.count(),
             Some((s, e, unit)) => bit_span(b, s, e, unit).map_or(0, |(a, z)| b.count_in(a, z + 1)),
         })
+    }
+
+    /// BITOP : résultat dans `dest` (écrasée quel que soit son type, sans TTL ; supprimée
+    /// si le résultat est vide). Rend la longueur en octets de la plus longue source.
+    /// Toutes les sources lues avant d'écrire : `dest` peut en être une.
+    pub fn cmd_bitop(&mut self, op: BitOp, dest: &[u8], keys: &[&[u8]]) -> Result<u64, RedisType> {
+        let mut idxs = Vec::with_capacity(keys.len());
+        for k in keys {
+            idxs.push(self.bitset_idx(k)?);
+        }
+        let srcs: Vec<Option<&Bitset>> = idxs.iter().map(|i| i.map(bitset::get)).collect();
+        let len = srcs.iter().flatten().map(|b| b.byte_len()).max().unwrap_or(0);
+        match bitset::op::bitop(op, &srcs, len * 8) {
+            None => {
+                self.del(dest);
+            }
+            Some(b) => {
+                let idx = bitset::alloc(b);
+                self.set_raw(dest, RawVal::new(Tag::Bitset, ValUnion { idx }), None, None);
+            }
+        }
+        Ok(len)
     }
 
     /// BITPOS : premier bit à `bit` dans la plage, -1 sinon. Cas limites de Redis : clé

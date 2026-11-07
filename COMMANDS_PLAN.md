@@ -121,8 +121,8 @@ commande déjà présente ou un oubli ne doit pas surprendre.
 > **Révisé le 2026-11-03 : le bitset devient un type à part, pas une string (compatibilité
 > Redis cassée volontairement). Voir [`BITSET_DESIGN.md`](BITSET_DESIGN.md) ; le tableau
 > ci-dessous reste la référence des cas limites Redis, à adapter.**
-> **2026-11-07 : `SETBIT` `GETBIT` `BITCOUNT` `BITPOS` faits (BITSET_DESIGN §10) ; restent
-> `BITOP` et `BITFIELD` (à repenser sur ce type).**
+> **2026-11-07 : `SETBIT` `GETBIT` `BITCOUNT` `BITPOS` `BITOP` faits (BITSET_DESIGN §10) ;
+> reste `BITFIELD` (à repenser sur ce type).**
 
 (Ancien plan) Des strings, pas un nouveau type (comme Redis) : bits numérotés depuis le bit de poids fort
 du premier octet.

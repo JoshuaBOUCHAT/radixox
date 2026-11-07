@@ -449,6 +449,7 @@ pub fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         Cmd::SetBit { key, off, on } => bitset::cmd_setbit(art, key, off, on),
         Cmd::GetBit { key, off } => bitset::cmd_getbit(art, key, off),
         Cmd::BitCount { key, range } => bitset::cmd_bitcount(art, key, range),
+        Cmd::BitOp { op, dest, keys } => bitset::cmd_bitop(art, op, dest, &keys),
         Cmd::BitPos { key, bit, start, end, bits } => bitset::cmd_bitpos(art, key, bit, start, end, bits),
         Cmd::LLen(key) => list::cmd_llen(art, key),
         Cmd::LRange { key, start, stop } => list::cmd_lrange(art, key, start, stop),

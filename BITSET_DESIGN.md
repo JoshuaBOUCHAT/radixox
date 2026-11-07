@@ -415,13 +415,13 @@ compacte).
 [BYTE|BIT]]]` : mêmes numéros de bits que Redis (le bit `i` de notre bitset est le bit `i`
 de la string Redis), donc mêmes réponses, sauf que **la « longueur » est déduite du
 contenu** (`⌈(dernier bit à 1 + 1) / 8⌉` octets) : un `SETBIT k 100 0` ne l'allonge pas.
-`GET` & co. → `WRONGTYPE`. `BITOP` ensuite (bornée, résultat construit en bloc).
+`GET` & co. → `WRONGTYPE`. `BITOP` : §10.6.
 `BITCOUNT key start` sans `end` accepté (`end` = -1), comme Valkey 8+. Erreurs vérifiées
 contre `valkey-server` 9.1.
 
 ### 10.5 État (2026-11-07)
 
-Fait : §10.1 à §10.4 sauf `BITOP`. Tests : `oxidart/src/bitset/test.rs` (différentiel
+Fait : §10.1 à §10.4 et `BITOP` (§10.6). Tests : `oxidart/src/bitset/test.rs` (différentiel
 contre `BTreeSet` avec bascules dans les deux sens entrelacées, tranches de 24 en test ;
 commandes contre un modèle de Redis), opérations bitset dans `random_op` des tests de save
 (vue T0, condensé, reload sous mutations et bascules), `radixox/tests/bitset.rs`
@@ -435,4 +435,38 @@ Limites connues de la v1 :
 - en-tête de ~100 o par bitset (deux `Form`), à resserrer si les petits bitsets comptent ;
 - agrandir un tableau classique est un `Vec::resize` (copie si la réallocation déplace) :
   borné par la règle de forme, pas par une tranche.
+- `BITOP` est synchrone (§10.6).
+
+### 10.6 BITOP (2026-11-07)
+
+`oxidart/src/bitset/op.rs`. `AND` `OR` `XOR` `NOT` (Valkey 9.1 n'a pas `DIFF` & co. :
+`ERR syntax error`). Réponse : longueur en octets de la plus longue source ; destination
+écrasée quel que soit son type, sans TTL, supprimée si le résultat est vide ; source d'un
+autre type → `WRONGTYPE` ; `NOT` sur `[0, 8·longueur)`. Vérifié contre `valkey-server`.
+
+- Parcours de `[0, L)` par tranches de 4096 mots (256 Ki bits). Les tranches sans bit
+  possible sont sautées par `next_set` des sources (AND : le max, sinon le min).
+- **Sources toutes compactes sur la tranche** : fusion des offsets triés deux à deux, sans
+  mots. **Sinon** : chaque source remplit un tampon de mots (copie masquée en classique,
+  bits posés en compacte, territoires de bascule respectés), combinaison mot à mot.
+- Tranche du résultat gardée en offsets si plus petite qu'en mots ; résultat construit à la
+  fin dans la forme la moins chère (`from_sorted_iter` en bloc, ou tableau).
+- La destination est écrite après la lecture de toutes les sources (elle peut en être une).
+
+Mesures (`bitop_bench`, release, 7600X) :
+
+| Cas | Temps |
+|---|---|
+| OR dense, 2 × 64 Mbits (classiques de 8 Mio) | 4,2 ms |
+| AND dense, idem | 4,7 ms |
+| OR clairsemé, 2 × 1 M offsets sur 2³² | 41 ms (165 avant la fusion d'offsets) |
+| AND clairsemé, idem | 13 ms (98 avant) |
+| AND dense × clairsemé | 1,9 ms |
+
+Soit ~0,07 ns par bit en dense et ~20 ns par offset de résultat en clairsemé (dont ~8 pour
+construire l'arbre). **Synchrone**, comme `ZUNIONSTORE` aujourd'hui : un `BITOP` en
+tranches est une écriture longue, il lui faut un point de linéarisation (sources figées au
+départ, DURABILITY_DESIGN.md) ; à faire avec les autres `…STORE`. Un `NOT` d'une source
+clairsemée lointaine produit un résultat dense (jusqu'à 512 Mio, comme Redis), soumis à
+`maxmemory`.
 

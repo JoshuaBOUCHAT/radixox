@@ -157,3 +157,52 @@ fn form_switches_are_invisible() {
         assert_eq!(q::<i64>(&mut c, &["BITCOUNT", "b:sw", "10000", "4294967295", "BIT"]), mid);
     }
 }
+
+/// BITOP : réponses de valkey-server 9.1 (longueur de la plus longue source, destination
+/// écrasée quel que soit son type et sans TTL, supprimée si le résultat est vide).
+#[test]
+fn bitop_like_redis() {
+    let mut c = server();
+    let _: () = q(&mut c, &["DEL", "bo:a", "bo:b", "bo:d", "bo:l"]);
+    let set = |c: &mut redis::Connection, k: &str, bytes: &[u8]| {
+        for (i, byte) in bytes.iter().enumerate() {
+            for j in 0..8 {
+                if byte & (0x80 >> j) != 0 {
+                    let _: i64 = q(c, &["SETBIT", k, &(i * 8 + j).to_string(), "1"]);
+                }
+            }
+        }
+    };
+    set(&mut c, "bo:a", b"foo");
+    set(&mut c, "bo:b", b"foobar");
+    let _: () = q(&mut c, &["SET", "bo:d", "x", "EX", "100"]);
+    assert_eq!(q::<i64>(&mut c, &["BITOP", "AND", "bo:d", "bo:a", "bo:b"]), 6);
+    assert_eq!(q::<i64>(&mut c, &["TTL", "bo:d"]), -1);
+    assert_eq!(q::<String>(&mut c, &["TYPE", "bo:d"]), "bitset");
+    // "foo" & "foobar" = "foo\0\0\0" : mêmes bits que "foo"
+    assert_eq!(q::<i64>(&mut c, &["BITCOUNT", "bo:d"]), q::<i64>(&mut c, &["BITCOUNT", "bo:a"]));
+    assert_eq!(q::<i64>(&mut c, &["BITOP", "XOR", "bo:d", "bo:a", "bo:b"]), 6);
+    // les 3 premiers octets s'annulent : reste "bar"
+    assert_eq!(q::<i64>(&mut c, &["BITCOUNT", "bo:d"]), q::<i64>(&mut c, &["BITCOUNT", "bo:b", "3", "5"]));
+    assert_eq!(q::<i64>(&mut c, &["BITOP", "OR", "bo:d", "bo:a", "bo:absent"]), 3);
+    assert_eq!(q::<i64>(&mut c, &["BITCOUNT", "bo:d"]), q::<i64>(&mut c, &["BITCOUNT", "bo:a"]));
+    // NOT : complément sur la longueur de la source
+    assert_eq!(q::<i64>(&mut c, &["BITOP", "NOT", "bo:d", "bo:a"]), 3);
+    assert_eq!(q::<i64>(&mut c, &["BITCOUNT", "bo:d"]), 24 - q::<i64>(&mut c, &["BITCOUNT", "bo:a"]));
+    // résultat vide : destination supprimée
+    assert_eq!(q::<i64>(&mut c, &["BITOP", "OR", "bo:d", "bo:absent"]), 0);
+    assert_eq!(q::<i64>(&mut c, &["EXISTS", "bo:d"]), 0);
+    // destination d'un autre type écrasée ; source d'un autre type : WRONGTYPE
+    let _: i64 = q(&mut c, &["LPUSH", "bo:l", "x"]);
+    assert!(err(&mut c, &["BITOP", "OR", "bo:d", "bo:a", "bo:l"]).contains("WRONGTYPE"));
+    assert_eq!(q::<i64>(&mut c, &["BITOP", "OR", "bo:l", "bo:a"]), 3);
+    assert_eq!(q::<String>(&mut c, &["TYPE", "bo:l"]), "bitset");
+    for (args, msg) in [
+        (&["BITOP", "NOT", "bo:d", "bo:a", "bo:b"][..], "BITOP NOT must be called with a single source key."),
+        (&["BITOP", "DIFF", "bo:d", "bo:a"], "syntax error"),
+        (&["BITOP", "AND", "bo:d"], "wrong number of arguments"),
+    ] {
+        let e = err(&mut c, args);
+        assert!(e.contains(msg), "{args:?} : {e}");
+    }
+}
