@@ -167,6 +167,11 @@ fn restart_reloads_the_dump() {
         pipe.cmd("HSET").arg("h").arg("f1").arg("a").arg("f2").arg("b").ignore();
         pipe.cmd("SADD").arg("s").arg("m1").arg("m2").ignore();
         pipe.cmd("SET").arg("t").arg("ttl").arg("EX").arg(1000).ignore();
+        // bitsets : un classique (dense en bas), un compact (offsets lointains)
+        for i in 0..500u32 {
+            pipe.cmd("SETBIT").arg("bits:dense").arg(i * 3).arg(1).ignore();
+            pipe.cmd("SETBIT").arg("bits:sparse").arg(i.wrapping_mul(2_654_435_761)).arg(1).ignore();
+        }
         pipe.query::<()>(&mut c).unwrap();
         let _: String = redis::cmd("BGSAVE").query(&mut c).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -179,7 +184,15 @@ fn restart_reloads_the_dump() {
     let _server = start_on(PORT_RELOAD, &dir);
     let mut c = redis::Client::open(url.as_str()).unwrap().get_connection().unwrap();
     let size: usize = redis::cmd("DBSIZE").query(&mut c).unwrap();
-    assert_eq!(size, N + 4);
+    assert_eq!(size, N + 6);
+    let n: i64 = redis::cmd("BITCOUNT").arg("bits:dense").query(&mut c).unwrap();
+    assert_eq!(n, 500);
+    let n: i64 = redis::cmd("BITCOUNT").arg("bits:sparse").query(&mut c).unwrap();
+    assert_eq!(n, 500);
+    let b: i64 = redis::cmd("GETBIT").arg("bits:sparse").arg(7u32.wrapping_mul(2_654_435_761)).query(&mut c).unwrap();
+    assert_eq!(b, 1);
+    let p: i64 = redis::cmd("BITPOS").arg("bits:dense").arg(0).query(&mut c).unwrap();
+    assert_eq!(p, 1);
     for i in [0, 1, 10, 123, N - 1] {
         let v: String = redis::cmd("GET").arg(format!("user:{i}")).query(&mut c).unwrap();
         assert_eq!(v, format!("valeur-{i}"));

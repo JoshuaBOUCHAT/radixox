@@ -341,6 +341,16 @@ pub enum Cmd<'a> {
     /// SPOP key [count]
     SPop { key: &'a [u8], count: Option<u64> },
 
+    // --- Bitset (type à part, BITSET_DESIGN.md §10.4) -------------------
+    /// SETBIT key offset 0|1
+    SetBit { key: &'a [u8], off: u32, on: bool },
+    /// GETBIT key offset
+    GetBit { key: &'a [u8], off: u32 },
+    /// BITCOUNT key [start [end [BYTE|BIT]]] (`bits` : unité BIT)
+    BitCount { key: &'a [u8], range: Option<(i64, i64, bool)> },
+    /// BITPOS key bit [start [end [BYTE|BIT]]]
+    BitPos { key: &'a [u8], bit: bool, start: Option<i64>, end: Option<i64>, bits: bool },
+
     // --- List --------------------------------------------------------
     /// LPUSH / RPUSH (`right`) / LPUSHX / RPUSHX (`exists`) key element [element ...]
     LPush {
@@ -745,6 +755,24 @@ fn arg_f64(s: &[u8]) -> Option<f64> {
     core::str::from_utf8(s).ok()?.parse().ok().filter(|f: &f64| !f.is_nan())
 }
 
+/// Offset de SETBIT / GETBIT : `0 ..= 2³² − 1`.
+fn bit_offset(s: &[u8]) -> Result<u32, CmdError> {
+    arg_u64(s)
+        .and_then(|o| u32::try_from(o).ok())
+        .ok_or(CmdError::Msg("ERR bit offset is not an integer or out of range"))
+}
+
+/// `BYTE` / `BIT` de BITCOUNT / BITPOS : vrai pour `BIT`.
+fn bit_unit(s: &[u8]) -> Result<bool, CmdError> {
+    if s.eq_ignore_ascii_case(b"bit") {
+        Ok(true)
+    } else if s.eq_ignore_ascii_case(b"byte") {
+        Ok(false)
+    } else {
+        Err(CmdError::Syntax)
+    }
+}
+
 fn int(s: &[u8]) -> Result<i64, CmdError> {
     arg_i64(s).ok_or(CmdError::NotInt)
 }
@@ -1062,6 +1090,40 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
                 members.push((float(pair[0])?, pair[1]));
             }
             Cmd::ZAdd { key: args[0], flags, members }
+        }
+        // ── Bitset ───────────────────────────────────────────────────────
+        b"setbit" => {
+            exact!(3);
+            let on = match args[2] {
+                b"1" => true,
+                b"0" => false,
+                _ => return Err(CmdError::Msg("ERR bit is not an integer or out of range")),
+            };
+            Cmd::SetBit { key: args[0], off: bit_offset(args[1])?, on }
+        }
+        b"getbit" => { exact!(2); Cmd::GetBit { key: args[0], off: bit_offset(args[1])? } }
+        b"bitcount" => {
+            at_least!(1);
+            // `start` seul : `end` = -1 (Valkey 8+)
+            let range = match n {
+                1 => None,
+                2 => Some((int(args[1])?, -1, false)),
+                3 | 4 => Some((int(args[1])?, int(args[2])?, n == 4 && bit_unit(args[3])?)),
+                _ => return Err(CmdError::Syntax),
+            };
+            Cmd::BitCount { key: args[0], range }
+        }
+        b"bitpos" => {
+            between!(2, 5);
+            let bit = match args[1] {
+                b"1" => true,
+                b"0" => false,
+                _ => return Err(CmdError::Msg("ERR The bit argument must be 1 or 0.")),
+            };
+            let start = args.get(2).map(|a| int(a)).transpose()?;
+            let end = args.get(3).map(|a| int(a)).transpose()?;
+            let bits = n == 5 && bit_unit(args[4])?;
+            Cmd::BitPos { key: args[0], bit, start, end, bits }
         }
         // ── List ─────────────────────────────────────────────────────────
         b"lpush" | b"rpush" | b"lpushx" | b"rpushx" => {
@@ -1615,6 +1677,7 @@ impl<'a> Cmd<'a> {
                 | Cmd::LInsert { .. }
                 | Cmd::LMove { .. }
                 | Cmd::BLMove { .. }
+                | Cmd::SetBit { on: true, .. }
         )
     }
 
@@ -1630,6 +1693,7 @@ impl<'a> Cmd<'a> {
             | Cmd::DecrBy { .. }
             | Cmd::HIncrBy { .. }
             | Cmd::ZIncrBy { .. }
+            | Cmd::SetBit { .. }
             | Cmd::FlushDb => 1,
             Cmd::MSet(pairs) => pairs.len(),
             Cmd::Del(keys) => keys.len(),

@@ -118,7 +118,13 @@ commande déjà présente ou un oubli ne doit pas surprendre.
 
 ## 5. Lot 3 — bitmaps (7)
 
-Des strings, pas un nouveau type (comme Redis) : bits numérotés depuis le bit de poids fort
+> **Révisé le 2026-11-03 : le bitset devient un type à part, pas une string (compatibilité
+> Redis cassée volontairement). Voir [`BITSET_DESIGN.md`](BITSET_DESIGN.md) ; le tableau
+> ci-dessous reste la référence des cas limites Redis, à adapter.**
+> **2026-11-07 : `SETBIT` `GETBIT` `BITCOUNT` `BITPOS` faits (BITSET_DESIGN §10) ; restent
+> `BITOP` et `BITFIELD` (à repenser sur ce type).**
+
+(Ancien plan) Des strings, pas un nouveau type (comme Redis) : bits numérotés depuis le bit de poids fort
 du premier octet.
 
 | Commande | Points à respecter |

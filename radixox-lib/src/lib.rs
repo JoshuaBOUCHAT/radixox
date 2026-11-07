@@ -20,6 +20,7 @@ pub(crate) mod prelude {
 
 pub mod array_vec;
 pub mod big_buf;
+pub mod bitset;
 pub mod cmd;
 pub mod gen_arena;
 pub mod handle;
@@ -35,8 +36,8 @@ pub mod rng;
 pub mod save_barrier;
 pub mod shared_byte;
 pub mod shared_frame;
-pub mod sys;
 pub mod small_vec;
+pub mod sys;
 #[cfg(test)]
 mod test;
 pub mod thin_vec;

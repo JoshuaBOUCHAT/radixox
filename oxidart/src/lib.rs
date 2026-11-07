@@ -63,6 +63,8 @@ pub(crate) mod prelude {
 #[allow(unused_imports)]
 use prelude::*;
 
+pub(crate) mod bitset;
+pub mod bcommand;
 pub mod compact;
 pub mod compact_path;
 #[cfg(feature = "zstd")]
@@ -432,6 +434,7 @@ impl OxidArt {
         valart().begin_save();
         zset::save::begin();
         list::save::begin();
+        bitset::save::begin();
     }
 
     /// Termine la save (fin normale ou abandon) : images libérées, liste
@@ -450,6 +453,7 @@ impl OxidArt {
         valart().end_save();
         zset::save::end();
         list::save::end();
+        bitset::save::end();
     }
 
     /// Une tranche de ce que la save laisse à libérer : feuilles des images
@@ -464,7 +468,7 @@ impl OxidArt {
         // Slabs globaux (ZSet, List, valart) : une save active est celle d'un autre arbre du
         // processus (tests à plusieurs nœuds) ; ses images peuvent encore lire ce qui est
         // différé. On attend sa fin.
-        if zset::save::is_saving() || list::save::is_saving() || valart().is_saving() {
+        if zset::save::is_saving() || list::save::is_saving() || bitset::save::is_saving() || valart().is_saving() {
             return false;
         }
         let rest = zset::save::drain_step(rest);
@@ -473,6 +477,10 @@ impl OxidArt {
         }
         let rest = list::save::drain_step(rest);
         if !list::save::deferred_empty() {
+            return false;
+        }
+        let rest = bitset::save::drain_step(rest);
+        if !bitset::save::deferred_empty() {
             return false;
         }
         valart().drain_deferred(rest)
@@ -557,13 +565,14 @@ impl OxidArt {
     /// pendant une save. Vrai s'il en reste.
     pub fn zset_free_step(&mut self, budget: u32) -> bool {
         let z = zset::lazy::step(budget);
-        list::lazy::step(budget / 16) || z
+        let b = bitset::background_step(budget);
+        list::lazy::step(budget / 16) || z || b
     }
 
     /// Des grands ZSet ou de grandes List attendent d'être libérés, et ça peut avancer
     /// maintenant (pas de save en cours).
     pub fn zset_free_pending(&self) -> bool {
-        (zset::lazy::pending() > 0 || list::lazy::pending() > 0) && !self.is_saving()
+        (zset::lazy::pending() > 0 || list::lazy::pending() > 0 || bitset::pending()) && !self.is_saving()
     }
 
     /// Nombre de nœuds qui ont une page de débordement.

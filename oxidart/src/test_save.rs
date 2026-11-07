@@ -60,7 +60,7 @@ thread_local! {
 
 fn random_op(art: &mut OxidArt, rng: &mut Rng) {
     let k = key(rng);
-    match rng.below(20) {
+    match rng.below(23) {
         0..=2 => art.set(sb(&k), Value::String(sb(&val(rng)))),
         3 => art.set_ttl(sb(&k), Duration::from_secs(1 + rng.below(5)), Value::String(sb(&val(rng)))),
         4 => {
@@ -160,6 +160,33 @@ fn random_op(art: &mut OxidArt, rng: &mut Rng) {
         19 if rng.below(8) == 0 => {
             art.del(format!("bigz{}", rng.below(3)).as_bytes());
             art.zset_free_step(64);
+        }
+        // bitsets : rafales denses (→ classique), offsets lointains (→ compacte),
+        // effacements ; les bascules restent en cours d'une opération à l'autre
+        20 | 21 => {
+            let bk = format!("bits{}", rng.below(3));
+            match rng.below(5) {
+                0 | 1 => {
+                    for _ in 0..1 + rng.below(150) {
+                        let _ = art.cmd_setbit(bk.as_bytes(), rng.below(4000) as u32, true);
+                    }
+                }
+                2 => {
+                    let _ = art.cmd_setbit(bk.as_bytes(), rng.next() as u32, true);
+                }
+                3 => {
+                    for _ in 0..1 + rng.below(200) {
+                        let _ = art.cmd_setbit(bk.as_bytes(), rng.below(4000) as u32, false);
+                    }
+                }
+                _ => {
+                    let _ = art.cmd_bitcount(bk.as_bytes(), None);
+                    art.zset_free_step(64);
+                }
+            }
+        }
+        22 if rng.below(6) == 0 => {
+            art.del(format!("bits{}", rng.below(3)).as_bytes());
         }
         _ => {
             let _ = art.get(k.as_bytes());

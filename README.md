@@ -149,6 +149,13 @@ the server, 3 alternated runs, 2026-10-29):
 - **A strict `maxmemory`**: the limit covers the whole process (network buffers, AOF,
   replication backlog, allocator), and an `-OOM` comes before the memory is used, not after.
 - **Binary-safe ordered keys**, compared like `memcmp`.
+- **A real bitset type**: `SETBIT` / `GETBIT` / `BITCOUNT` / `BITPOS` with Redis's bit
+  numbering and answers, but on a type of its own (`TYPE` says `bitset`, `GET` is a
+  `WRONGTYPE`). A sparse bitset is a B+tree of its set offsets, a dense one a plain bit
+  array, and it switches between the two in slices, both forms live meanwhile, so a
+  `SETBIT key 4294967295 1` costs a few bytes instead of 512 MB. Its length is derived
+  from its content (`SETBIT k 100 0` does not grow it, clearing the last bit deletes the
+  key).
 
 ## Benchmarks
 
@@ -337,6 +344,7 @@ default 5 s wait.
 | Set | `SADD` `SREM` `SISMEMBER` `SCARD` `SMEMBERS` `SPOP` |
 | Sorted set | `ZADD` (`NX` `XX` `GT` `LT` `CH` `INCR`) `ZINCRBY` `ZREM` `ZSCORE` `ZMSCORE` `ZCARD` `ZCOUNT` `ZLEXCOUNT` `ZRANGE` (`BYSCORE` `BYLEX` `REV` `LIMIT` `WITHSCORES`) `ZREVRANGE` `ZRANGEBYSCORE` `ZREVRANGEBYSCORE` `ZRANGEBYLEX` `ZREVRANGEBYLEX` `ZRANK` `ZREVRANK` `ZPOPMIN` `ZPOPMAX` `ZREMRANGEBYRANK` `ZREMRANGEBYSCORE` `ZREMRANGEBYLEX` `ZRANDMEMBER` `ZSCAN` `ZUNION` `ZINTER` `ZDIFF` `ZUNIONSTORE` `ZINTERSTORE` `ZDIFFSTORE` `ZINTERCARD` `BZPOPMIN` `BZPOPMAX` |
 | List | `LPUSH` `RPUSH` `LPUSHX` `RPUSHX` `LPOP` `RPOP` `LLEN` `LRANGE` `LINDEX` `LSET` `LINSERT` `LREM` `LTRIM` `LPOS` `LMOVE` `RPOPLPUSH` `BLPOP` `BRPOP` `BLMOVE` `BRPOPLPUSH` |
+| Bitset | `SETBIT` `GETBIT` `BITCOUNT` (`BYTE` `BIT`) `BITPOS` (`BYTE` `BIT`) |
 | Pub/Sub | `SUBSCRIBE` `UNSUBSCRIBE` `PUBLISH` |
 | Persistence | `SAVE` `BGSAVE` (`RESERVE`) `BGREWRITEAOF` `LASTSAVE` |
 | Replication | `REPLICATE` `REPLICAOF NO ONE` `WAIT` `DEBUG DIGEST` |

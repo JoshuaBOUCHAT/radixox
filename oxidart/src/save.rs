@@ -187,6 +187,7 @@ pub(crate) mod reference {
         Set(Vec<Vec<u8>>),
         ZSet(Vec<(u64, Vec<u8>)>),
         List(Vec<Vec<u8>>),
+        Bitset(Vec<u32>),
     }
 
     impl DumpVal {
@@ -211,6 +212,7 @@ pub(crate) mod reference {
                         .collect(),
                 ),
                 Value::List(l) => Self::List(l.iter().map(|i| i.to_vec()).collect()),
+                Value::Bitset(v) => Self::Bitset(v.clone()),
             }
         }
     }
@@ -314,6 +316,8 @@ pub mod format {
     pub const T_SET: u8 = 4;
     pub const T_ZSET: u8 = 5;
     pub const T_LIST: u8 = 6;
+    /// Bitset : nombre de bits à 1, puis les offsets en deltas varint (le premier tel quel).
+    pub const T_BITSET: u8 = 7;
     pub const T_END: u8 = 0x0F;
     pub const TYPE_MASK: u8 = 0x0F;
     pub const TTL_BIT: u8 = 0x80;
@@ -371,6 +375,7 @@ enum Container {
     Set,
     ZSet,
     List,
+    Bitset,
 }
 
 /// Curseur d'une save en cours : un seul DFS, reprenable d'une tranche à
@@ -392,6 +397,8 @@ pub struct SaveCursor {
     zser: Option<ZSer>,
     /// List en cours d'écriture (`Container::List`).
     lser: Option<crate::list::save::LSer>,
+    /// Bitset en cours d'écriture (`Container::Bitset`).
+    bser: Option<crate::bitset::save::BSer>,
     /// Enregistrements visités pas encore écrits (au plus `PIPE_DEPTH + 1`),
     /// dans l'ordre du DFS. Voir `PIPE_DEPTH`.
     pending: VecDeque<Pending>,
@@ -473,6 +480,8 @@ enum PVal {
     Set(u32, u32),
     /// List : idx de son en-tête (vue T0 lue à l'écriture, comme un ZSet).
     List(u32),
+    /// Bitset : idx de son en-tête (vue T0 lue à l'écriture).
+    Bitset(u32),
     /// ZSet : idx de son en-tête (vue T0 lue à l'écriture, comme une racine valart, I6).
     ZSet(u32),
     /// Valeur déjà encodée (petit Hash/Set : sérialisé à la visite, aucun
@@ -578,6 +587,7 @@ impl OxidArt {
             digest: Digest::default(),
             ctr_prefix: None,
             lser: None,
+            bser: None,
         }
     }
 
@@ -597,6 +607,7 @@ impl OxidArt {
                 Container::Set => valart().set_ser_step(&mut cur.ser, out, &mut budget),
                 Container::ZSet => cur.zser.as_mut().expect("ZSet en cours").step(out, &mut budget, &mut cur.digest),
                 Container::List => cur.lser.as_mut().expect("List en cours").step(out, &mut budget, &mut cur.digest),
+                Container::Bitset => cur.bser.as_mut().expect("bitset en cours").step(out, &mut budget, &mut cur.digest),
             };
             if matches!(cur.container, Container::Hash | Container::Set) {
                 cur.digest_entries(&out[mark..], cur.container == Container::Hash);
@@ -608,6 +619,7 @@ impl OxidArt {
             cur.container = Container::None;
             cur.zser = None;
             cur.lser = None;
+            cur.bser = None;
             if budget == 0 {
                 cur.own_pending(); // I5
                 return false;
@@ -727,6 +739,7 @@ impl SaveCursor {
             Tag::Set | Tag::SetSmall => format::T_SET,
             Tag::ZSet => format::T_ZSET,
             Tag::List => format::T_LIST,
+            Tag::Bitset => format::T_BITSET,
             Tag::None => unreachable!(),
         };
         // I1 : lcp calculé à la visite, valide à l'écriture (ordre FIFO).
@@ -779,7 +792,7 @@ impl SaveCursor {
                     self.digest.add(digest::head_term(&self.path, ty, exp, members.len() as u64));
                 }
                 // ZSet, List : terme ajouté par leur sérialiseur, qui lit la vue T0
-                Tag::Hash | Tag::Set | Tag::ZSet | Tag::List => key = Some((p(), self.path.clone(), exp)),
+                Tag::Hash | Tag::Set | Tag::ZSet | Tag::List | Tag::Bitset => key = Some((p(), self.path.clone(), exp)),
                 Tag::None => unreachable!(),
             }
         }
@@ -819,6 +832,7 @@ impl SaveCursor {
                 }
                 Tag::ZSet => PVal::ZSet(val.idx),
                 Tag::List => PVal::List(val.idx),
+                Tag::Bitset => PVal::Bitset(val.idx),
                 Tag::None => unreachable!(),
             }
         };
@@ -855,6 +869,12 @@ fn emit_oldest(cur: &mut SaveCursor, out: &mut Vec<u8>, budget: &mut u32) {
             let (_, key, exp) = p.key.take().expect("clé d'une List");
             cur.lser = Some(crate::list::save::ser_begin(*idx, &key, exp, out));
             cur.container = Container::List;
+            sub(budget, 1);
+        }
+        PVal::Bitset(idx) => {
+            let (_, key, exp) = p.key.take().expect("clé d'un bitset");
+            cur.bser = Some(crate::bitset::save::ser_begin(*idx, &key, exp, out));
+            cur.container = Container::Bitset;
             sub(budget, 1);
         }
         PVal::ZSet(idx) => {

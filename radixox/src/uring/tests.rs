@@ -999,6 +999,7 @@ fn state(art: &mut OxidArt) -> Vec<String> {
                 format!("zset {:?}", r.iter().map(show).collect::<Vec<_>>())
             }
             Value::List(_) => "list".into(),
+            Value::Bitset(v) => format!("bitset {v:?}"),
         };
         out.push(format!("{} {v} {ttl:?}", show(&key)));
     }

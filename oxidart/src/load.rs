@@ -510,6 +510,31 @@ impl<R: Source> DumpReader<R> {
         Ok(self.lists.remove(&idx).ok_or(DumpError("List absente de la section"))?)
     }
 
+    /// Offsets d'un bitset : nombre, puis deltas (le premier tel quel), strictement
+    /// croissants et < 2³².
+    fn bitset(&mut self) -> Result<Vec<u32>, LoadError> {
+        let n = self.varint()?;
+        if n == 0 || n > crate::bitset::END {
+            return Err(DumpError("bitset : nombre de bits invalide").into());
+        }
+        let mut v = Vec::with_capacity(n.min(1 << 20) as usize);
+        let mut prev: Option<u64> = None;
+        for _ in 0..n {
+            let d = self.varint()?;
+            let k = match prev {
+                None => d,
+                Some(_) if d == 0 => return Err(DumpError("bitset hors d'ordre").into()),
+                Some(p) => p.checked_add(d).ok_or(DumpError("bitset : offset invalide"))?,
+            };
+            if k >= crate::bitset::END {
+                return Err(DumpError("bitset : offset invalide").into());
+            }
+            v.push(k as u32);
+            prev = Some(k);
+        }
+        Ok(v)
+    }
+
     /// Valeur de l'enregistrement courant, en `Value` (tests, outils).
     pub(crate) fn value(&mut self, ty: u8) -> Result<Value, LoadError> {
         Ok(match ty {
@@ -528,6 +553,7 @@ impl<R: Source> DumpReader<R> {
             }
             format::T_ZSET => Value::ZSet(self.zset()?),
             format::T_LIST => Value::List(self.list()?),
+            format::T_BITSET => Value::Bitset(self.bitset()?),
             _ => return Err(DumpError("type inconnu").into()),
         })
     }
@@ -586,6 +612,10 @@ impl<R: Source> DumpReader<R> {
             format::T_LIST => {
                 let l = self.list()?;
                 RawVal::new(Tag::List, ValUnion { idx: alloc_list(l) })
+            }
+            format::T_BITSET => {
+                let v = self.bitset()?;
+                RawVal::new(Tag::Bitset, ValUnion { idx: crate::bitset::alloc(crate::bitset::Bitset::from_sorted(&v)) })
             }
             _ => return Err(DumpError("type inconnu").into()),
         })

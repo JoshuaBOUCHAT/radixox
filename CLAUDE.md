@@ -15,7 +15,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > - binaire sans `std` ni libc (`radixox-nostd`, fait le 2026-10-29 ; serveur dans `radixox/src/server.rs`) →
 >   [`NOSTD_PLAN.md`](NOSTD_PLAN.md).
 > - commandes Redis manquantes (lots 1–3, puis MULTI/EXEC et commandes custom en Rust) →
->   [`COMMANDS_PLAN.md`](COMMANDS_PLAN.md).
+>   [`COMMANDS_PLAN.md`](COMMANDS_PLAN.md) ;
+> - bitset natif (B-tree de nœuds de 64 o sur slab global, GC, insertion SIMD) →
+>   [`BITSET_DESIGN.md`](BITSET_DESIGN.md).
 
 ## Projet
 

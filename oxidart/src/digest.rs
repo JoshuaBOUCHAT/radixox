@@ -109,6 +109,16 @@ pub(crate) fn list_item(rank: u64, item: &[u8]) -> u64 {
     h.finalize() as u64
 }
 
+/// Somme des offsets d'un bitset.
+pub(crate) fn bitset_inner(offs: impl Iterator<Item = u32>) -> (u64, u64) {
+    let (mut sum, mut n) = (0u64, 0u64);
+    for k in offs {
+        sum = sum.wrapping_add(crate::bitset::save::digest_item(k));
+        n += 1;
+    }
+    (sum, n)
+}
+
 /// Terme d'un ZSet ou d'une List, à partir de la somme de ses éléments.
 #[inline]
 pub(crate) fn seq_term(key: &[u8], ty: u8, exp: Option<u64>, (sum, card): (u64, u64)) -> Hasher {
@@ -158,6 +168,7 @@ pub(crate) fn value_terms(d: &mut Digest, key: &[u8], exp: Option<u64>, v: &Valu
             let inner = list_inner(l.iter().map(|b| b.as_slice()));
             d.add(seq_term(key, format::T_LIST, exp, inner));
         }
+        Value::Bitset(v) => d.add(seq_term(key, format::T_BITSET, exp, bitset_inner(v.iter().copied()))),
     }
 }
 
@@ -226,6 +237,16 @@ unsafe fn raw_terms(d: &mut Digest, key: &[u8], exp: Option<u64>, tag: Tag, val:
             Tag::List => {
                 let inner = list_inner(crate::value::list_ref(val.idx).iter().map(|b| b.as_slice()));
                 d.add(seq_term(key, format::T_LIST, exp, inner));
+            }
+            Tag::Bitset => {
+                let b = crate::bitset::get(val.idx);
+                let (mut sum, mut n) = (0u64, 0u64);
+                b.scan(0, crate::bitset::END, |k| {
+                    sum = sum.wrapping_add(crate::bitset::save::digest_item(k));
+                    n += 1;
+                    true
+                });
+                d.add(seq_term(key, format::T_BITSET, exp, (sum, n)));
             }
             Tag::None => unreachable!("valeur sans tag"),
         }

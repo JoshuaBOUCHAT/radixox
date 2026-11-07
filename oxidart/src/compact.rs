@@ -97,13 +97,13 @@ impl OxidArt {
     pub fn slab_reusable_bytes(&self) -> u64 {
         let nodes = (self.map.touched_bytes() as u64, self.map.len() as u64 * size_of::<crate::node::Node>() as u64);
         let [zh, lh, va] = crate::value::value_slabs_usage();
-        [nodes, zh, lh, va, crate::zset::btree::slab_usage(), crate::zset::index::slab_usage(), crate::list::slab_usage()]
+        [nodes, zh, lh, va, crate::zset::btree::slab_usage(), crate::zset::index::slab_usage(), crate::list::slab_usage(), crate::bitset::header_usage()]
             .iter()
             .map(|&(t, l)| t.saturating_sub(l))
             .sum()
     }
 
-    pub fn slab_mem(&self) -> [(&'static str, (u64, u64, u64)); 7] {
+    pub fn slab_mem(&self) -> [(&'static str, (u64, u64, u64)); 8] {
         let t = self.map.touched_bytes();
         let nodes = (
             t as u64,
@@ -119,6 +119,7 @@ impl OxidArt {
             ("zset_index", crate::zset::index::slab_mem()),
             ("list_headers", lh),
             ("list_blocks", crate::list::slab_mem()),
+            ("bitset_headers", crate::bitset::header_mem()),
         ]
     }
 
@@ -141,6 +142,7 @@ impl OxidArt {
             + crate::zset::btree::trim_tail()
             + crate::zset::index::trim_tail()
             + crate::list::trim_tail()
+            + crate::bitset::trim_tail()
     }
 
     /// Octets de trous sous le dernier nœud occupé.

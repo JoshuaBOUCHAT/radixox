@@ -29,6 +29,8 @@ pub(crate) enum Tag {
     /// Set d'au plus `SMALL_MAX` membres : `ValUnion::ptr` vers un bloc
     /// `crate::small`.
     SetSmall = 8,
+    /// Bitset (BITSET_DESIGN.md §10) : `ValUnion::idx` = en-tête dans `crate::bitset`.
+    Bitset = 9,
 }
 
 impl Tag {
@@ -40,6 +42,7 @@ impl Tag {
             Tag::List => RedisType::List,
             Tag::Set | Tag::SetSmall => RedisType::Set,
             Tag::ZSet => RedisType::ZSet,
+            Tag::Bitset => RedisType::Bitset,
         }
     }
 }
@@ -359,6 +362,7 @@ pub(crate) fn value_into_raw(val: Value) -> (Tag, ValUnion) {
         Value::Set(s) => set_into_raw(s),
         Value::ZSet(z) => (Tag::ZSet, ValUnion { idx: alloc_zset(z) }),
         Value::List(l) => (Tag::List, ValUnion { idx: alloc_list(l) }),
+        Value::Bitset(v) => (Tag::Bitset, ValUnion { idx: crate::bitset::alloc(crate::bitset::Bitset::from_sorted(&v)) }),
     }
 }
 
@@ -399,6 +403,7 @@ pub(crate) unsafe fn value_from_raw_ref(tag: Tag, val: &ValUnion) -> Value {
             Tag::SetSmall => Value::Set(small::entries::<1>(val.ptr).iter().map(|[m]| m.clone()).collect()),
             Tag::ZSet => Value::ZSet(zset_ref(val.idx).clone()),
             Tag::List => Value::List(list_ref(val.idx).iter().cloned().collect()),
+            Tag::Bitset => Value::Bitset(crate::bitset::get(val.idx).to_vec()),
         }
     }
 }
@@ -441,6 +446,11 @@ pub(crate) unsafe fn value_take_raw(tag: Tag, val: ValUnion) -> Value {
                 }
                 Value::List(out)
             }
+            Tag::Bitset => {
+                let v = crate::bitset::get(val.idx).to_vec();
+                crate::bitset::free(val.idx);
+                Value::Bitset(v)
+            }
         }
     }
 }
@@ -459,6 +469,7 @@ pub(crate) unsafe fn drop_raw(tag: Tag, val: &mut ValUnion) {
             Tag::SetSmall => small::free::<1>(val.ptr),
             Tag::ZSet => free_zset(val.idx),
             Tag::List => free_list(val.idx),
+            Tag::Bitset => crate::bitset::free(val.idx),
             Tag::Int | Tag::None => {}
         }
     }
@@ -584,6 +595,14 @@ impl<'a> NodeValRef<'a> {
         }
     }
 
+    /// Idx de l'en-tête du bitset.
+    pub fn bitset_idx(self) -> Result<u32, RedisType> {
+        match self.tag {
+            Tag::Bitset => Ok(unsafe { self.val.idx }),
+            _ => Err(self.tag.redis_type()),
+        }
+    }
+
     /// Idx du ZSet dans son slab.
     pub fn zset_idx(self) -> Result<u32, RedisType> {
         match self.tag {
@@ -610,6 +629,8 @@ pub enum Value {
     List(VecDeque<SharedByte>),
     Set(Vec<SharedByte>),
     ZSet(ZSet),
+    /// Offsets des bits à 1, strictement croissants.
+    Bitset(Vec<u32>),
 }
 
 impl Value {
@@ -620,6 +641,7 @@ impl Value {
             Value::List(_) => RedisType::List,
             Value::Set(_) => RedisType::Set,
             Value::ZSet(_) => RedisType::ZSet,
+            Value::Bitset(_) => RedisType::Bitset,
         }
     }
 
@@ -700,6 +722,7 @@ pub enum RedisType {
     List,
     Set,
     ZSet,
+    Bitset,
 }
 
 impl RedisType {
@@ -711,6 +734,7 @@ impl RedisType {
             RedisType::List => "list",
             RedisType::Set => "set",
             RedisType::ZSet => "zset",
+            RedisType::Bitset => "bitset",
         }
     }
 }

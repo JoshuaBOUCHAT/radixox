@@ -96,6 +96,7 @@ fn canon_new(v: &Value) -> C {
         }
         Value::ZSet(_) => C::ZSet,
         Value::List(l) => C::List(l.iter().map(|i| i.to_vec()).collect()),
+        Value::Bitset(_) => unreachable!("pas de bitset dans l'oracle"),
     }
 }
 
