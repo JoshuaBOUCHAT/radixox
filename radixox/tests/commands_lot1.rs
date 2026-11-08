@@ -565,3 +565,120 @@ fn aof_replays_lot1_writes() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── SSCAN / HSCAN ────────────────────────────────────────────────────────────
+
+/// Scan complet : (éléments rendus dans l'ordre, nombre d'appels).
+fn scan_all(c: &mut redis::Connection, cmd: &str, key: &str, opts: &[&str]) -> (Vec<String>, usize) {
+    let (mut cursor, mut items, mut calls) = ("0".to_string(), Vec::new(), 0);
+    loop {
+        let mut args = vec![cmd, key, cursor.as_str()];
+        args.extend_from_slice(opts);
+        let reply = q(c, &args).unwrap();
+        calls += 1;
+        let V::Array(parts) = reply else { panic!("{reply:?}") };
+        let next = match &parts[0] {
+            V::BulkString(b) => String::from_utf8(b.clone()).unwrap(),
+            o => panic!("{o:?}"),
+        };
+        let V::Array(page) = &parts[1] else { panic!() };
+        for x in page {
+            let V::BulkString(b) = x else { panic!() };
+            items.push(String::from_utf8(b.clone()).unwrap());
+        }
+        if next == "0" {
+            return (items, calls);
+        }
+        cursor = next;
+    }
+}
+
+#[test]
+fn sscan_hscan() {
+    let mut c = server();
+    del(&mut c, &["l1:ss", "l1:hs", "l1:ssmall", "l1:hsmall", "l1:sstr"]);
+    // absente : [0, []]
+    assert_eq!(scan_all(&mut c, "SSCAN", "l1:ss", &[]), (vec![], 1));
+    // petit Set / Hash : tout d'un coup, quel que soit COUNT (comme Redis)
+    let _ = q(&mut c, &["SADD", "l1:ssmall", "a", "b", "c"]);
+    let (mut v, calls) = scan_all(&mut c, "SSCAN", "l1:ssmall", &["COUNT", "1"]);
+    v.sort();
+    assert_eq!((v, calls), (vec!["a".into(), "b".into(), "c".into()], 1));
+    let _ = q(&mut c, &["HSET", "l1:hsmall", "f1", "v1", "f2", "v2"]);
+    let (mut v, _) = scan_all(&mut c, "HSCAN", "l1:hsmall", &[]);
+    v.sort();
+    assert_eq!(v, ["f1", "f2", "v1", "v2"]);
+    assert_eq!(scan_all(&mut c, "HSCAN", "l1:hsmall", &["NOVALUES", "MATCH", "f1"]).0, ["f1"]);
+
+    // grands : chaque élément une fois, par pages exactes
+    let members: Vec<String> = (0..5000).map(|i| format!("m{i}")).collect();
+    for chunk in members.chunks(1000) {
+        let mut a = vec!["SADD", "l1:ss"];
+        a.extend(chunk.iter().map(String::as_str));
+        let _ = q(&mut c, &a);
+        let mut h = vec!["HSET", "l1:hs"];
+        for m in chunk {
+            h.push(m);
+            h.push(m);
+        }
+        let _ = q(&mut c, &h);
+    }
+    for (opts, calls_max) in [(&[][..], 6), (&["COUNT", "7"][..], 716), (&["COUNT", "100000"][..], 1)] {
+        let (mut got, calls) = scan_all(&mut c, "SSCAN", "l1:ss", opts);
+        assert!(calls <= calls_max, "{opts:?} : {calls} appels");
+        got.sort();
+        let mut want = members.clone();
+        want.sort();
+        assert_eq!(got, want, "{opts:?}");
+    }
+    let (fv, _) = scan_all(&mut c, "HSCAN", "l1:hs", &["COUNT", "50"]);
+    assert_eq!(fv.len(), 10_000);
+    assert!(fv.chunks(2).all(|p| p[0] == p[1]), "paires champ, valeur");
+    let (f, _) = scan_all(&mut c, "HSCAN", "l1:hs", &["NOVALUES"]);
+    assert_eq!(f.len(), 5000);
+    let (mut m7, _) = scan_all(&mut c, "SSCAN", "l1:ss", &["MATCH", "m7*"]);
+    m7.sort();
+    let mut want: Vec<String> = members.iter().filter(|m| m.starts_with("m7")).cloned().collect();
+    want.sort();
+    assert_eq!(m7, want);
+
+    // écritures entre les pages : ni doublon, ni oubli d'un membre stable
+    let (mut cursor, mut seen) = ("0".to_string(), Vec::new());
+    let mut round = 0;
+    loop {
+        let V::Array(parts) = q(&mut c, &["SSCAN", "l1:ss", &cursor, "COUNT", "100"]).unwrap() else { panic!() };
+        let V::BulkString(next) = &parts[0] else { panic!() };
+        let V::Array(page) = &parts[1] else { panic!() };
+        for x in page {
+            let V::BulkString(b) = x else { panic!() };
+            seen.push(String::from_utf8(b.clone()).unwrap());
+        }
+        // instables : m2500.. retirés au fil de l'eau, nouveaux ajoutés
+        for i in 0..20 {
+            let _ = q(&mut c, &["SREM", "l1:ss", &format!("m{}", 2500 + round * 20 + i)]);
+            let _ = q(&mut c, &["SADD", "l1:ss", &format!("new{round}:{i}")]);
+        }
+        round += 1;
+        cursor = String::from_utf8(next.clone()).unwrap();
+        if cursor == "0" {
+            break;
+        }
+    }
+    let mut uniq = seen.clone();
+    uniq.sort();
+    uniq.dedup();
+    assert_eq!(uniq.len(), seen.len(), "aucun doublon");
+    for i in 0..2500 {
+        assert!(seen.contains(&format!("m{i}")), "m{i} stable, oublié");
+    }
+
+    // erreurs
+    let _ = q(&mut c, &["SET", "l1:sstr", "v"]);
+    assert_eq!(err(&mut c, &["SSCAN", "l1:sstr", "0"]), WRONGTYPE);
+    assert_eq!(err(&mut c, &["HSCAN", "l1:sstr", "0"]), WRONGTYPE);
+    assert_eq!(err(&mut c, &["SSCAN", "l1:ss", "x"]), "ERR invalid cursor");
+    assert_eq!(err(&mut c, &["SSCAN", "l1:ss", "0", "COUNT", "0"]), "ERR syntax error");
+    assert_eq!(err(&mut c, &["SSCAN", "l1:ss", "0", "NOVALUES"]), "ERR NOVALUES option can only be used in HSCAN");
+    assert_eq!(err(&mut c, &["HSCAN", "l1:hs", "0", "NOSCORES"]), "ERR NOSCORES option can only be used in ZSCAN");
+    assert_eq!(err(&mut c, &["SSCAN", "l1:ss"]), "ERR wrong number of arguments for 'sscan' command");
+}

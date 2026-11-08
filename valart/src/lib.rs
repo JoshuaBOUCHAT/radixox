@@ -32,6 +32,7 @@ mod common;
 mod compact;
 mod hash;
 mod overflow;
+mod scan;
 mod set;
 
 use common::CollisionBuckets;

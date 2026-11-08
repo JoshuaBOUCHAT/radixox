@@ -423,6 +423,106 @@ pub fn cmd_zscan(
     }
 }
 
+/// Position de reprise de SSCAN / HSCAN : clé d'ordre (8 octets, gros-boutiste) puis membre.
+fn member_pos(from: &[u8]) -> Option<(u64, &[u8])> {
+    (from.len() >= 8).then(|| (u64::from_be_bytes(from[..8].try_into().unwrap()), &from[8..]))
+}
+
+fn encode_member_pos((k, m): (u64, Vec<u8>)) -> Vec<u8> {
+    let mut b = Vec::with_capacity(8 + m.len());
+    b.extend_from_slice(&k.to_be_bytes());
+    b.extend_from_slice(&m);
+    b
+}
+
+/// Réponse `[curseur, [éléments…]]` de SSCAN / HSCAN, ou l'erreur.
+fn encode_member_scan<T>(
+    out: &mut Vec<u8>,
+    r: Result<(u64, Vec<T>), Frame>,
+    wrongtype: bool,
+    per: usize,
+    mut item: impl FnMut(&mut Vec<u8>, T),
+) {
+    use radixox_lib::shared_frame::{encode_array_len, encode_bulk, extend_encode};
+    if wrongtype {
+        extend_encode(out, &Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()));
+        return;
+    }
+    match r {
+        Err(e) => extend_encode(out, &e),
+        Ok((next, items)) => {
+            encode_array_len(out, 2);
+            encode_bulk(out, next.to_string().as_bytes());
+            encode_array_len(out, items.len() * per);
+            for it in items {
+                item(out, it);
+            }
+        }
+    }
+}
+
+/// SSCAN key cursor [MATCH] [COUNT] : ordre de valart (clé d'ordre = hash du membre,
+/// `valart/src/scan.rs`), reprise strictement après la dernière entrée examinée ; pages
+/// comme SCAN (1000 sans COUNT, COUNT exact, budget d'examen). Petit Set : en entier.
+pub fn cmd_sscan(
+    art: &mut OxidArt,
+    client_id: u64,
+    key: &[u8],
+    cursor: &[u8],
+    pattern: Option<&[u8]>,
+    count: Option<usize>,
+    out: &mut Vec<u8>,
+) {
+    let count = count.unwrap_or(DEFAULT_COUNT);
+    let mut wrongtype = false;
+    let now = art.now;
+    let r = with_cursor(client_id, cursor, now, |from| {
+        let keep = |m: &[u8]| pattern.is_none_or(|p| glob_match(p, m));
+        match art.sscan_page(key, member_pos(from), count, budget(count), keep) {
+            Ok((items, next)) => (items, next.map(encode_member_pos)),
+            Err(_) => {
+                wrongtype = true;
+                (Vec::new(), None)
+            }
+        }
+    });
+    encode_member_scan(out, r, wrongtype, 1, |out, m| radixox_lib::shared_frame::encode_bulk(out, &m));
+}
+
+/// HSCAN key cursor [MATCH] [COUNT] [NOVALUES] : comme [`cmd_sscan`], sur les champs.
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_hscan(
+    art: &mut OxidArt,
+    client_id: u64,
+    key: &[u8],
+    cursor: &[u8],
+    pattern: Option<&[u8]>,
+    count: Option<usize>,
+    novalues: bool,
+    out: &mut Vec<u8>,
+) {
+    use radixox_lib::shared_frame::encode_bulk;
+    let count = count.unwrap_or(DEFAULT_COUNT);
+    let mut wrongtype = false;
+    let now = art.now;
+    let r = with_cursor(client_id, cursor, now, |from| {
+        let keep = |f: &[u8]| pattern.is_none_or(|p| glob_match(p, f));
+        match art.hscan_page(key, member_pos(from), count, budget(count), keep) {
+            Ok((items, next)) => (items, next.map(encode_member_pos)),
+            Err(_) => {
+                wrongtype = true;
+                (Vec::new(), None)
+            }
+        }
+    });
+    encode_member_scan(out, r, wrongtype, if novalues { 1 } else { 2 }, |out, (f, v)| {
+        encode_bulk(out, &f);
+        if !novalues {
+            encode_bulk(out, &v);
+        }
+    });
+}
+
 fn scan_page(
     art: &OxidArt,
     from: &[u8],

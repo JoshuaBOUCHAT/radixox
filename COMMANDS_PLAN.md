@@ -50,15 +50,16 @@ commande déjà présente ou un oubli ne doit pas surprendre.
 
 ## 3. Lot 1 — petites commandes sur l'existant (~38)
 
-> **État au 2026-11-08 : 28 commandes du lot faites, 147 commandes Redis en tout**
-> (`COMMAND COUNT` = 154 avec les 7 propres à RadixOx ; table unique `COMMANDS` à côté de
+> **État au 2026-11-08 : 30 commandes du lot faites, 149 commandes Redis en tout**
+> (`COMMAND COUNT` = 156 avec les 7 propres à RadixOx ; table unique `COMMANDS` à côté de
 > `dispatch_inner`, un test relit la source pour qu'elle ne dérive pas). Faites :
 > `APPEND` `STRLEN` `GETRANGE` `SUBSTR` `SETRANGE` `GETSET` `GETDEL` `GETEX`
 > `INCRBYFLOAT` `MSETNX` `PSETEX`, options `NX|XX|GT|LT` d'`EXPIRE` / `PEXPIRE`,
 > `EXPIREAT` `PEXPIREAT` `EXPIRETIME` `PEXPIRETIME` `TOUCH` `RANDOMKEY` `RENAME`
 > `RENAMENX`, `HSETNX` `HSTRLEN` `HINCRBYFLOAT` `HRANDFIELD`, `SMISMEMBER`
-> `SRANDMEMBER` `SMOVE`, `TIME` `FLUSHALL`, `COMMAND COUNT` / `LIST`.
-> **Restent** : `HSCAN` `SSCAN`, `PSUBSCRIBE` `PUNSUBSCRIBE` `PUBSUB`, `ROLE` ; et
+> `SRANDMEMBER` `SMOVE`, `TIME` `FLUSHALL`, `COMMAND COUNT` / `LIST`, `SSCAN` `HSCAN`
+> (ordre par hash du membre, reprise après la dernière entrée : SCAN_DESIGN.md).
+> **Restent** : `PSUBSCRIBE` `PUNSUBSCRIBE` `PUBSUB`, `ROLE` ; et
 > RENAME ne réveille pas encore un client bloqué sur sa destination (`produced_key` de
 > `uring/core.rs` : ajouter `Cmd::Rename { dst, .. }`).
 >

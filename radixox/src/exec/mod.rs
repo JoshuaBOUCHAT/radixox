@@ -209,6 +209,14 @@ pub fn execute_into<'a>(
             scan::cmd_zscan(art, client.id, key, cursor, pattern, count, noscores, out);
             return Executed::Done;
         }
+        Cmd::SScan { key, cursor, pattern, count } => {
+            scan::cmd_sscan(art, client.id, key, cursor, pattern, count, out);
+            return Executed::Done;
+        }
+        Cmd::HScan { key, cursor, pattern, count, novalues } => {
+            scan::cmd_hscan(art, client.id, key, cursor, pattern, count, novalues, out);
+            return Executed::Done;
+        }
         Cmd::Invalid { name, err } => Frame::Error(err.message(name)),
         cmd => execute_sync(cmd, art),
     };
@@ -503,6 +511,8 @@ pub fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         | Cmd::KRange { .. }
         | Cmd::Scan { .. }
         | Cmd::ZScan { .. }
+        | Cmd::SScan { .. }
+        | Cmd::HScan { .. }
         | Cmd::MGet(_)
         | Cmd::Unlink(_)
         | Cmd::BgSave

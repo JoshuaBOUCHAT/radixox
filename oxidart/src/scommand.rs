@@ -347,3 +347,47 @@ impl OxidArt {
         Ok(true)
     }
 }
+
+/// Page de SSCAN / HSCAN : entrées retenues, et position de reprise (clé d'ordre,
+/// membre), `None` à la fin.
+pub type ScanOut<T> = (Vec<T>, Option<(u64, Vec<u8>)>);
+
+impl OxidArt {
+    /// SSCAN : membres après `from` dans l'ordre de valart (`valart::ValTrees::set_scan`),
+    /// au plus `count` retenus par `keep` ou `budget` examinés. Petit Set : en entier.
+    pub fn sscan_page(
+        &mut self,
+        key: &[u8],
+        from: Option<(u64, &[u8])>,
+        count: usize,
+        budget: usize,
+        mut keep: impl FnMut(&[u8]) -> bool,
+    ) -> Result<ScanOut<SharedByte>, RedisType> {
+        let Some(s) = self.set_view(key)? else {
+            return Ok((Vec::new(), None));
+        };
+        let after = |m: &[u8]| from.is_none_or(|(fk, fm)| (valart().scan_order_key(m), m) > (fk, fm));
+        match s {
+            SetView::Small(e) => Ok((
+                e.iter().map(|[m]| m).filter(|m| after(m) && keep(m)).cloned().collect(),
+                None,
+            )),
+            SetView::Tree(root, _) => {
+                let (mut out, mut seen, mut last) = (Vec::new(), 0usize, None);
+                let (count, budget) = (count.max(1), budget.max(1));
+                valart().set_scan(root, from, |k, m| {
+                    seen += 1;
+                    if keep(m) {
+                        out.push(m.clone());
+                    }
+                    let go = out.len() < count && seen < budget;
+                    if !go {
+                        last = Some((k, m.as_slice().to_vec()));
+                    }
+                    go
+                });
+                Ok((out, last))
+            }
+        }
+    }
+}

@@ -101,13 +101,13 @@ impl HashNode {
     }
 
     #[inline]
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.count as usize + self.overflow.as_ref().map_or(0, HashOverflow::len)
     }
 
     /// Valide grâce à l'invariant 4 : inline vide ⇒ overflow vide.
     #[inline]
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.count == 0
     }
 
@@ -133,7 +133,7 @@ impl HashNode {
     }
 
     #[inline]
-    fn slot_at(&self, n: usize) -> Slot {
+    pub(crate) fn slot_at(&self, n: usize) -> Slot {
         let count = self.count as usize;
         if n < count {
             Slot::Inline(n)
@@ -241,7 +241,7 @@ impl HashNode {
     }
 
     #[inline]
-    fn key(&self, slot: Slot) -> &SharedByte {
+    pub(crate) fn key(&self, slot: Slot) -> &SharedByte {
         match slot {
             Slot::Inline(i) => {
                 debug_assert!(i < self.count as usize);
@@ -252,7 +252,7 @@ impl HashNode {
     }
 
     #[inline]
-    fn val(&self, slot: Slot) -> &SharedByte {
+    pub(crate) fn val(&self, slot: Slot) -> &SharedByte {
         match slot {
             Slot::Inline(i) => {
                 debug_assert!(i < self.count as usize);
@@ -273,8 +273,8 @@ impl HashNode {
         }
     }
 
-    #[cfg(test)]
-    fn radix_of(&self, slot: Slot) -> u8 {
+    #[inline]
+    pub(crate) fn radix_of(&self, slot: Slot) -> u8 {
         match slot {
             Slot::Inline(i) => self.prefix[i],
             Slot::Overflow(i) => self.overflow_ref().radix(i),
@@ -290,7 +290,7 @@ impl HashNode {
     }
 
     #[inline]
-    fn child(&self, slot: Slot) -> u32 {
+    pub(crate) fn child(&self, slot: Slot) -> u32 {
         match slot {
             Slot::Inline(i) => {
                 if !self.inline_has_child(i) {
@@ -494,7 +494,7 @@ enum Loc {
 
 impl ValTrees {
     #[inline(always)]
-    fn hash_node(&self, idx: u32) -> &HashNode {
+    pub(crate) fn hash_node(&self, idx: u32) -> &HashNode {
         debug_assert!(self.nodes.is_occupied(idx));
         let node = unsafe { self.nodes.get_unchecked(idx) };
         debug_assert_eq!(node.tag(), NodeType::Hash);

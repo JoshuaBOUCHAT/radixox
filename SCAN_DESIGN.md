@@ -69,6 +69,49 @@ Curseur inconnu, terminé ou repris (génération différente) :
 `ERR invalid or expired cursor`. Seul écart avec Redis, qui accepte tout
 curseur ; repartir de 0 ferait boucler un client lent indéfiniment.
 
+## HSCAN / SSCAN (2026-11-08)
+
+`valart/src/scan.rs` (parcours), `oxidart` `sscan_page` / `hscan_page`,
+`radixox/src/exec/scan.rs` (`cmd_sscan`, `cmd_hscan`). Même table de curseurs, mêmes
+pages que SCAN (1000 sans COUNT, COUNT exact, budget d'examen `max(COUNT, 1000)`, MATCH
+testé sur le membre / champ). Petit Set / Hash (bloc inline) : tout en une page, curseur
+0, comme Redis avec ses listpacks.
+
+Un Set ou un Hash est un trie valart sur le **hash** du membre, pas sur ses octets :
+pas d'ordre lexicographique à suivre. Et une entrée vit au premier slot libre du chemin
+de son hash, donc sa place dépend de l'histoire (une suppression remonte une feuille).
+La position ne peut donc pas être une place dans le trie. Elle est **la dernière entrée
+examinée**, comme pour SCAN, dans un ordre total qui ne dépend que du membre :
+**clé d'ordre** = le hash lu dans l'ordre de la descente (`h0` en poids fort,
+`h.swap_bytes()`), puis les octets du membre. Position envoyée au serveur de curseurs :
+8 octets de clé d'ordre + le membre. Mêmes garanties que SCAN : aucune entrée rendue
+deux fois, toute entrée présente du début à la fin rendue une fois, quelles que soient
+les écritures entre deux pages.
+
+Parcours : dans un nœud, slots pris par radix croissant (≤ 16 : tri sur place ; au-delà,
+table radix → rang, O(256 + n) sans comparaison), en partant du radix de la position ;
+les groupes avant sont sautés sans y descendre. L'entrée d'un slot à enfant partage
+`h0..hd` avec son sous-arbre mais pas la suite : elle **flotte** dans le sous-arbre
+jusqu'à sa place (au plus 7, une par niveau). Le hash de chaque entrée vue est recalculé
+(le nœud n'en garde que le radix et l'octet de contrôle) ; les membres sont donc lus de
+toute façon, et préchargés 8 slots à l'avance ; les nœuds enfants deux slots à l'avance,
+puis leurs premiers membres un slot à l'avance (les deux étages du parcours de SCAN).
+
+Mesure (2026-11-08, Set et Hash de 1M membres, scan complet, CPU serveur relevé dans
+`/proc`, min de 3, contre Valkey 9.1) :
+
+| | RadixOx | Valkey |
+|---|---|---|
+| SSCAN COUNT 1000 | 80 ms | 90 ms |
+| HSCAN COUNT 1000 | 100 ms | 140 ms |
+| SSCAN MATCH `*:7*` COUNT 1000 | 80 ms | 140 ms |
+| SSCAN MATCH `*:7*` COUNT 10 | 170 ms | 610 ms |
+| SSCAN COUNT 10 | 890 ms (100k appels) | 550 ms (72k appels) |
+
+COUNT 10 : ~9 µs par appel contre 7,6 µs ; l'écart total vient surtout du COUNT exact
+(Valkey rend ~14 éléments par appel). Le tri des slots de la racine à chaque page coûtait
+1200 ms ; la table radix → rang l'a ramené à 890.
+
 ## Configuration
 
 | Variable | Défaut | Effet |

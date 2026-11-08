@@ -357,3 +357,45 @@ impl OxidArt {
         Ok(picked.into_iter().map(|(k, v)| (k.clone(), v.clone())).collect())
     }
 }
+
+impl OxidArt {
+    /// HSCAN : comme [`OxidArt::sscan_page`], paires (champ, valeur).
+    pub fn hscan_page(
+        &mut self,
+        key: &[u8],
+        from: Option<(u64, &[u8])>,
+        count: usize,
+        budget: usize,
+        mut keep: impl FnMut(&[u8]) -> bool,
+    ) -> Result<crate::scommand::ScanOut<(SharedByte, SharedByte)>, RedisType> {
+        let Some(h) = self.hash_view(key)? else {
+            return Ok((Vec::new(), None));
+        };
+        let after = |m: &[u8]| from.is_none_or(|(fk, fm)| (valart().scan_order_key(m), m) > (fk, fm));
+        match h {
+            HashView::Small(e) => Ok((
+                e.iter()
+                    .filter(|[f, _]| after(f) && keep(f))
+                    .map(|[f, v]| (f.clone(), v.clone()))
+                    .collect(),
+                None,
+            )),
+            HashView::Tree(root, _) => {
+                let (mut out, mut seen, mut last) = (Vec::new(), 0usize, None);
+                let (count, budget) = (count.max(1), budget.max(1));
+                valart().hash_scan(root, from, |k, f, v| {
+                    seen += 1;
+                    if keep(f) {
+                        out.push((f.clone(), v.clone()));
+                    }
+                    let go = out.len() < count && seen < budget;
+                    if !go {
+                        last = Some((k, f.as_slice().to_vec()));
+                    }
+                    go
+                });
+                Ok((out, last))
+            }
+        }
+    }
+}

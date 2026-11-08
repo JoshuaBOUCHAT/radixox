@@ -555,6 +555,11 @@ pub enum Cmd<'a> {
     /// ZINTERCARD numkeys key [key ...] [LIMIT limit] (0 : sans limite)
     ZInterCard { keys: SmallVec<4, &'a [u8]>, limit: u64 },
 
+    /// SSCAN key cursor [MATCH pattern] [COUNT count]
+    SScan { key: &'a [u8], cursor: &'a [u8], pattern: Option<&'a [u8]>, count: Option<usize> },
+    /// HSCAN key cursor [MATCH pattern] [COUNT count] [NOVALUES]
+    HScan { key: &'a [u8], cursor: &'a [u8], pattern: Option<&'a [u8]>, count: Option<usize>, novalues: bool },
+
     /// ZSCAN key cursor [MATCH pattern] [COUNT count] [NOSCORES]
     ZScan { key: &'a [u8], cursor: &'a [u8], pattern: Option<&'a [u8]>, count: Option<usize>, noscores: bool },
 
@@ -990,6 +995,41 @@ fn parse_set_opts(args: &[&[u8]]) -> Result<SetOpts, CmdError> {
         i += 1;
     }
     Ok(opts)
+}
+
+/// Options de SSCAN / HSCAN / ZSCAN après `key cursor` : MATCH, COUNT (≥ 1), et le
+/// drapeau propre à la commande (`flag` : NOVALUES, NOSCORES), s'il y en a un.
+fn scan_opts<'a>(rest: &[&'a [u8]], flag: Option<&[u8]>) -> Result<(Option<&'a [u8]>, Option<usize>, bool), CmdError> {
+    let (mut pattern, mut count, mut set) = (None, None, false);
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i];
+        if flag.is_some_and(|f| a.eq_ignore_ascii_case(f)) {
+            set = true;
+            i += 1;
+            continue;
+        }
+        // l'option d'une autre commande de la famille : message de Redis
+        if a.eq_ignore_ascii_case(b"novalues") {
+            return Err(CmdError::Msg("ERR NOVALUES option can only be used in HSCAN"));
+        }
+        if a.eq_ignore_ascii_case(b"noscores") {
+            return Err(CmdError::Msg("ERR NOSCORES option can only be used in ZSCAN"));
+        }
+        let v = *rest.get(i + 1).ok_or(CmdError::Syntax)?;
+        if a.eq_ignore_ascii_case(b"match") {
+            pattern = Some(v);
+        } else if a.eq_ignore_ascii_case(b"count") {
+            match int(v)? {
+                c if c < 1 => return Err(CmdError::Syntax),
+                c => count = Some(c as usize),
+            }
+        } else {
+            return Err(CmdError::Syntax);
+        }
+        i += 2;
+    }
+    Ok((pattern, count, set))
 }
 
 /// Options d'EXPIRE & co : NX, XX, GT, LT (combinaisons de Redis 7).
@@ -1697,29 +1737,18 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
         }
         b"zscan" => {
             at_least!(2);
-            let (mut pattern, mut count, mut noscores) = (None, None, false);
-            let mut i = 2;
-            while i < n {
-                let a = args[i];
-                if a.eq_ignore_ascii_case(b"noscores") {
-                    noscores = true;
-                    i += 1;
-                    continue;
-                }
-                let v = *args.get(i + 1).ok_or(CmdError::Syntax)?;
-                if a.eq_ignore_ascii_case(b"match") {
-                    pattern = Some(v);
-                } else if a.eq_ignore_ascii_case(b"count") {
-                    match int(v)? {
-                        c if c < 1 => return Err(CmdError::Syntax),
-                        c => count = Some(c as usize),
-                    }
-                } else {
-                    return Err(CmdError::Syntax);
-                }
-                i += 2;
-            }
+            let (pattern, count, noscores) = scan_opts(&args[2..], Some(b"noscores"))?;
             Cmd::ZScan { key: args[0], cursor: args[1], pattern, count, noscores }
+        }
+        b"sscan" => {
+            at_least!(2);
+            let (pattern, count, _) = scan_opts(&args[2..], None)?;
+            Cmd::SScan { key: args[0], cursor: args[1], pattern, count }
+        }
+        b"hscan" => {
+            at_least!(2);
+            let (pattern, count, novalues) = scan_opts(&args[2..], Some(b"novalues"))?;
+            Cmd::HScan { key: args[0], cursor: args[1], pattern, count, novalues }
         }
 
         // ── Pub/Sub ──────────────────────────────────────────────────────
@@ -1828,24 +1857,25 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
 /// `COMMAND COUNT` / `COMMAND LIST`, et le compte du README. Un test relit
 /// `dispatch_inner` dans la source pour que cette table ne dérive pas.
 pub const COMMANDS: &[&str] = &[
-    "append", "auth", "bgrewriteaof", "bgsave", "bitcount", "bitop", "bitpos", "blmove",
-    "blpop", "brpop", "brpoplpush", "bzpopmax", "bzpopmin", "client", "command", "config",
-    "dbsize", "debug", "decr", "decrby", "del", "echo", "exists", "expire", "expireat",
-    "expiretime", "flushall", "flushdb", "get", "getbit", "getdel", "getex", "getrange",
-    "getset", "hdel", "hello", "hexists", "hget", "hgetall", "hincrby", "hincrbyfloat", "hkeys",
-    "hlen", "hmget", "hmset", "hrandfield", "hset", "hsetnx", "hstrlen", "hvals", "incr",
-    "incrby", "incrbyfloat", "info", "keys", "lastsave", "lindex", "linsert", "llen", "lmove",
-    "lpop", "lpos", "lpush", "lpushx", "lrange", "lrem", "lset", "ltrim", "mget", "mset",
-    "msetnx", "persist", "pexpire", "pexpireat", "pexpiretime", "ping", "psetex", "pttl",
-    "publish", "quit", "randomkey", "rename", "renamenx", "replicaof", "rpop", "rpoplpush",
-    "rpush", "rpushx", "sadd", "save", "scan", "scard", "select", "set", "setbit", "setex",
-    "setnx", "setrange", "shutdown", "sismember", "slaveof", "smembers", "smismember", "smove",
-    "spop", "srandmember", "srem", "strlen", "subscribe", "substr", "time", "touch", "ttl",
-    "type", "unlink", "unsubscribe", "wait", "zadd", "zcard", "zcount", "zdiff", "zdiffstore",
-    "zincrby", "zinter", "zintercard", "zinterstore", "zlexcount", "zmscore", "zpopmax",
-    "zpopmin", "zrandmember", "zrange", "zrangebylex", "zrangebyscore", "zrank", "zrem",
-    "zremrangebylex", "zremrangebyrank", "zremrangebyscore", "zrevrange", "zrevrangebylex",
-    "zrevrangebyscore", "zrevrank", "zscan", "zscore", "zunion", "zunionstore",
+    "append", "auth", "bgrewriteaof", "bgsave", "bitcount", "bitop", "bitpos",
+    "blmove", "blpop", "brpop", "brpoplpush", "bzpopmax", "bzpopmin", "client", "command",
+    "config", "dbsize", "debug", "decr", "decrby", "del", "echo", "exists", "expire",
+    "expireat", "expiretime", "flushall", "flushdb", "get", "getbit", "getdel", "getex",
+    "getrange", "getset", "hdel", "hello", "hexists", "hget", "hgetall", "hincrby",
+    "hincrbyfloat", "hkeys", "hlen", "hmget", "hmset", "hrandfield", "hscan", "hset", "hsetnx",
+    "hstrlen", "hvals", "incr", "incrby", "incrbyfloat", "info", "keys", "lastsave", "lindex",
+    "linsert", "llen", "lmove", "lpop", "lpos", "lpush", "lpushx", "lrange", "lrem", "lset",
+    "ltrim", "mget", "mset", "msetnx", "persist", "pexpire", "pexpireat", "pexpiretime", "ping",
+    "psetex", "pttl", "publish", "quit", "randomkey", "rename", "renamenx", "replicaof", "rpop",
+    "rpoplpush", "rpush", "rpushx", "sadd", "save", "scan", "scard", "select", "set", "setbit",
+    "setex", "setnx", "setrange", "shutdown", "sismember", "slaveof", "smembers", "smismember",
+    "smove", "spop", "srandmember", "srem", "sscan", "strlen", "subscribe", "substr", "time",
+    "touch", "ttl", "type", "unlink", "unsubscribe", "wait", "zadd", "zcard", "zcount", "zdiff",
+    "zdiffstore", "zincrby", "zinter", "zintercard", "zinterstore", "zlexcount", "zmscore",
+    "zpopmax", "zpopmin", "zrandmember", "zrange", "zrangebylex", "zrangebyscore", "zrank",
+    "zrem", "zremrangebylex", "zremrangebyrank", "zremrangebyscore", "zrevrange",
+    "zrevrangebylex", "zrevrangebyscore", "zrevrank", "zscan", "zscore", "zunion",
+    "zunionstore",
 ];
 
 /// Commandes propres à RadixOx (pas dans `COMMANDS`, ni comptées comme commandes Redis).
