@@ -112,6 +112,43 @@ COUNT 10 : ~9 µs par appel contre 7,6 µs ; l'écart total vient surtout du COU
 (Valkey rend ~14 éléments par appel). Le tri des slots de la racine à chaque page coûtait
 1200 ms ; la table radix → rang l'a ramené à 890.
 
+### Performances : chantier ouvert (prochaine session)
+
+Jugement de l'utilisateur (2026-11-08) : **performances discutables**, à reprendre. Rien
+n'a été profilé : les pistes ci-dessous sont des hypothèses, à vérifier par `perf`
+avant de coder (mesurer avant d'affirmer).
+
+Ce que coûte une page aujourd'hui :
+- **redescente depuis la racine à chaque page**, avec construction de la table radix →
+  rang (256 cases + n) à chaque nœud du chemin de la position ;
+- **un hash recalculé (foldhash) pour chaque entrée vue**, alors que la clé d'ordre
+  n'est utile que pour : les entrées flottantes (slot à enfant), le tri d'un groupe de
+  plus d'une entrée, la comparaison à `from` sur le chemin de la position, et la
+  position de la dernière entrée examinée. Ailleurs (groupes d'une seule entrée hors du
+  chemin de `from`), le chemin donne déjà l'ordre : piste la plus prometteuse ;
+- **copie de la page** : `sscan_page` / `hscan_page` clonent chaque membre (et valeur)
+  dans un `Vec<SharedByte>` avant l'encodage ; SCAN encode depuis une `ScanPage` à plat.
+  Encoder directement dans le tampon de sortie pendant le parcours ;
+- MATCH testé après lecture du membre : normal (il faut le lire), mais le clone ne doit
+  avoir lieu que pour les retenus (déjà le cas) ;
+- coût fixe par appel (table de curseurs, encodage, réseau) : le comparer à celui de
+  SCAN sur le même nombre d'appels pour savoir ce qui revient au parcours.
+
+Pistes plus lourdes :
+- **garder le chemin entre deux pages** (pile des nœuds) plutôt que redescendre : interdit
+  par la règle d'or (ARCHITECTURE.md §1.1 : aucun idx de slab ne survit à un tour) sauf à
+  le valider par un compteur de modifications par conteneur (ou global à valart), à
+  ajouter à chaque mutation ; ne vaut que si la redescente pèse vraiment ;
+- éviter le recalcul du hash en le stockant : 8 o par entrée, contraire aux choix mémoire
+  de valart (le nœud ne garde que radix + contrôle) ; probablement non.
+
+Méthode pour la reprise : Set et Hash de 1M membres (`member:{i}`, `field:{i}`), scan
+complet COUNT 10 / 1000 / MATCH `*:7*`, CPU du serveur par `/proc/<pid>/stat` (ticks de
+10 ms : préférer `perf stat -p` pour la précision), min de 3, Valkey 9.1 sur la même
+machine ; puis `perf record` sur RadixOx pour répartir le coût par page (redescente,
+hash, clone, encodage, curseur). Cible : COUNT 10 au moins au coût par appel de Valkey
+(7,6 µs), COUNT 1000 nettement sous Valkey.
+
 ## Configuration
 
 | Variable | Défaut | Effet |

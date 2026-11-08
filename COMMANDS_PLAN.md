@@ -59,6 +59,8 @@ commande déjà présente ou un oubli ne doit pas surprendre.
 > `RENAMENX`, `HSETNX` `HSTRLEN` `HINCRBYFLOAT` `HRANDFIELD`, `SMISMEMBER`
 > `SRANDMEMBER` `SMOVE`, `TIME` `FLUSHALL`, `COMMAND COUNT` / `LIST`, `SSCAN` `HSCAN`
 > (ordre par hash du membre, reprise après la dernière entrée : SCAN_DESIGN.md).
+> **Perf de SSCAN/HSCAN jugée discutable : à reprendre en début de prochaine session,
+> pistes et méthode dans SCAN_DESIGN.md « Performances : chantier ouvert ».**
 > **Restent** : `PSUBSCRIBE` `PUNSUBSCRIBE` `PUBSUB`, `ROLE` ; et
 > RENAME ne réveille pas encore un client bloqué sur sa destination (`produced_key` de
 > `uring/core.rs` : ajouter `Cmd::Rename { dst, .. }`).
