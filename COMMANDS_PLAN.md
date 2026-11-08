@@ -1,7 +1,7 @@
 # Couverture des commandes Redis — plan de travail
 
 Document de passation (2026-10-30) : de quoi implémenter les commandes Redis manquantes
-sans autre contexte. Lire d'abord `CLAUDE.md` et `ARCHITECTURE.md`. Rien n'est commencé.
+sans autre contexte. Lire d'abord `CLAUDE.md` et `ARCHITECTURE.md`. Lot 1 presque fini (§3), lot 3 en partie (§5).
 
 ## 0. Objectif
 
@@ -49,6 +49,42 @@ commande déjà présente ou un oubli ne doit pas surprendre.
   répondre le vrai compte fait partie du lot 1.
 
 ## 3. Lot 1 — petites commandes sur l'existant (~38)
+
+> **État au 2026-11-08 : 28 commandes du lot faites, 147 commandes Redis en tout**
+> (`COMMAND COUNT` = 154 avec les 7 propres à RadixOx ; table unique `COMMANDS` à côté de
+> `dispatch_inner`, un test relit la source pour qu'elle ne dérive pas). Faites :
+> `APPEND` `STRLEN` `GETRANGE` `SUBSTR` `SETRANGE` `GETSET` `GETDEL` `GETEX`
+> `INCRBYFLOAT` `MSETNX` `PSETEX`, options `NX|XX|GT|LT` d'`EXPIRE` / `PEXPIRE`,
+> `EXPIREAT` `PEXPIREAT` `EXPIRETIME` `PEXPIRETIME` `TOUCH` `RANDOMKEY` `RENAME`
+> `RENAMENX`, `HSETNX` `HSTRLEN` `HINCRBYFLOAT` `HRANDFIELD`, `SMISMEMBER`
+> `SRANDMEMBER` `SMOVE`, `TIME` `FLUSHALL`, `COMMAND COUNT` / `LIST`.
+> **Restent** : `HSCAN` `SSCAN`, `PSUBSCRIBE` `PUNSUBSCRIBE` `PUBSUB`, `ROLE` ; et
+> RENAME ne réveille pas encore un client bloqué sur sa destination (`produced_key` de
+> `uring/core.rs` : ajouter `Cmd::Rename { dst, .. }`).
+>
+> Vérification : chaque scénario envoyé à Valkey 9.1 et à RadixOx, réponses brutes
+> comparées (un script hors dépôt), puis `radixox/tests/commands_lot1.rs` (dont le
+> rejeu de l'AOF : même `DEBUG DIGEST` après redémarrage). Primitives d'arbre :
+> `oxidart/src/kcommand.rs` (string + échéance, `expire_at` conditionnel, `rename` qui
+> déplace la valeur sans copie, `random_key`, tirage commun de SRANDMEMBER /
+> HRANDFIELD) ; `valart::set_random`.
+>
+> **Écarts voulus** (README, section *Commands*) :
+> - `INCRBYFLOAT` / `HINCRBYFLOAT` additionnent en **décimal exact** (mantisse `i128`,
+>   ≤ 17 décimales, `exec/float.rs`), en `f64` au-delà. Redis calcule en `long double`
+>   80 bits : `0.1 + 0.2` donne `0.3` des deux côtés, mais `10.6 + -5000` donne
+>   `-4989.4` ici et `-4989.39999999999999991` chez Redis. Reproduire ce bruit
+>   demanderait d'émuler les flottants x87 ; pas fait. Les deux sont **journalisées
+>   telles quelles** (le calcul est déterministe, le même binaire rejoue le même
+>   résultat), pas en `SET … KEEPTTL` comme le prévoyait le tableau ci-dessous.
+> - TTL à la seconde (comme avant) : `TTL` peut différer d'une seconde de Redis ;
+>   `PEXPIREAT` arrondit à la seconde la plus proche (comme `EXPIRETIME` de Redis).
+> - `count` négatif sous −2²⁴ (SRANDMEMBER, HRANDFIELD, et ZRANDMEMBER corrigé au
+>   passage) : `ERR value is out of range` ; Redis construit la réponse, ici
+>   l'allocation ferait abandonner le serveur.
+> - `EXPIRE k 0` ou négatif supprime maintenant la clé, comme Redis (avant : TTL de 0 s,
+>   puis refus des négatifs) ; `SETEX` / `PSETEX` refusent un délai ≤ 0.
+> - Au passage : le parseur d'entiers refusait `-9223372036854775808` (`i64::MIN`).
 
 ### Strings
 | Commande | Points à respecter |

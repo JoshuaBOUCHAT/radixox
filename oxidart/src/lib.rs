@@ -75,6 +75,7 @@ pub mod error;
 pub mod new_node;
 
 pub mod hcommand;
+pub mod kcommand;
 pub mod krange;
 pub mod lcommand;
 pub mod list;

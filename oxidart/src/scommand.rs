@@ -291,3 +291,59 @@ fn parse_u32(data: &[u8]) -> Option<u32> {
     }
     Some(res as u32)
 }
+
+impl OxidArt {
+    /// SMISMEMBER : appartenance de chaque membre.
+    pub fn cmd_smismember(&mut self, key: &[u8], members: &[&[u8]]) -> Result<Vec<bool>, RedisType> {
+        let Some(s) = self.set_view(key)? else {
+            return Ok(vec![false; members.len()]);
+        };
+        Ok(members.iter().map(|m| s.contains(m)).collect())
+    }
+
+    /// SRANDMEMBER : `count` comme Redis (négatif : avec répétitions), `None` : un membre.
+    pub fn cmd_srandmember(&mut self, key: &[u8], count: Option<i64>) -> Result<Vec<SharedByte>, RedisType> {
+        let Some(s) = self.set_view(key)? else {
+            return Ok(Vec::new());
+        };
+        let len = s.len() as usize;
+        if len == 0 || count == Some(0) {
+            return Ok(Vec::new());
+        }
+        let one = |rnd: u64| -> &SharedByte {
+            match s {
+                SetView::Small(e) => &e[(rnd % e.len() as u64) as usize][0],
+                SetView::Tree(root, _) => valart().set_random(root, rnd).expect("Set non vide"),
+            }
+        };
+        let picked = crate::kcommand::sample(
+            len,
+            count.unwrap_or(1),
+            one,
+            // SAFETY: comme `cmd_hrandfield` : les membres vivent autant que la vue.
+            |v| s.for_each(|m| v.push(unsafe { &*(m as *const SharedByte) })),
+            |m| m.as_slice(),
+        );
+        Ok(picked.into_iter().cloned().collect())
+    }
+
+    /// SMOVE : `Err` si `src` ou `dst` tient un autre type ; `Ok(true)` si le membre a
+    /// été déplacé (ou s'il est dans `src` quand `src == dst`).
+    pub fn cmd_smove(&mut self, src: &[u8], dst: &[u8], member: SharedByte) -> Result<bool, RedisType> {
+        let in_src = match self.set_view(src)? {
+            None => return Ok(false),
+            Some(s) => s.contains(&member),
+        };
+        // dst vérifiée même quand le membre manque (comme Redis)
+        self.set_view(dst)?;
+        if !in_src {
+            return Ok(false);
+        }
+        if src == dst {
+            return Ok(true);
+        }
+        self.cmd_srem(src, core::slice::from_ref(&member))?;
+        self.cmd_sadd(dst, &[member], None).map_err(|_| RedisType::None)?;
+        Ok(true)
+    }
+}

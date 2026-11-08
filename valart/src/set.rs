@@ -753,6 +753,28 @@ impl ValTrees {
         Some(key)
     }
 
+    /// SRANDMEMBER : un membre pseudo-aléatoire (mêmes descente et biais que
+    /// [`set_pop`](Self::set_pop)), sans le retirer.
+    pub fn set_random(&self, root: u32, rnd: u64) -> Option<&SharedByte> {
+        if self.set_node(root).is_empty() {
+            return None;
+        }
+        let mut rnd = rnd;
+        let mut idx = root;
+        for _ in 0..DISPATCH_LEVELS {
+            let node = self.set_node(idx);
+            rnd = mix64(rnd);
+            let slot = node.slot_at((rnd % node.len() as u64) as usize);
+            let child = node.child(slot);
+            if child == NO_CHILD {
+                return Some(node.key(slot));
+            }
+            idx = child;
+        }
+        let bucket = self.set_collisions.get(idx);
+        Some(&bucket[(mix64(rnd) % bucket.len() as u64) as usize])
+    }
+
     /// Cardinal de la vue T0 de `set` (O(n), sans consommer les images) : pour un
     /// appelant qui ne tient pas le cardinal T0 lui-même (oracle legacy).
     pub fn set_count_t0(&self, root: u32) -> u32 {

@@ -185,6 +185,9 @@ pub fn cmd_zmscore(art: &mut OxidArt, key: &[u8], members: &[&[u8]]) -> Frame {
 
 /// Sans count : un membre (nul si absent) ; avec : tableau (vide si absent).
 pub fn cmd_zrandmember(art: &mut OxidArt, key: &[u8], count: Option<i64>, with_scores: bool) -> Frame {
+    if count.is_some_and(|c| c < -radixox_lib::cmd::MAX_RAND_REPEAT) && art.type_of(key) == oxidart::value::RedisType::ZSet {
+        return Frame::Error("ERR value is out of range".into());
+    }
     match art.cmd_zrandmember(key, count) {
         Ok(v) if count.is_none() => v.into_iter().next().map_or(Frame::Null, |(m, _)| Frame::BulkString(m)),
         Ok(v) => pairs(v, with_scores),

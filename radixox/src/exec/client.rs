@@ -165,8 +165,18 @@ pub fn cmd_client(args: &[&[u8]], client: &mut Client) -> Frame {
 /// COMMAND [...] : pas de table de commandes publiée. redis-cli demande
 /// `COMMAND DOCS` au démarrage pour ses indications et accepte une liste vide.
 pub fn cmd_command(args: &[&[u8]]) -> Frame {
+    use radixox_lib::cmd::{COMMANDS, INTERNAL_COMMANDS};
+    let all = || COMMANDS.iter().chain(INTERNAL_COMMANDS);
     match args.first() {
-        Some(sub) if sub.eq_ignore_ascii_case(b"count") => Frame::Integer(0),
+        Some(sub) if sub.eq_ignore_ascii_case(b"count") && args.len() > 1 => {
+            Frame::Error("ERR wrong number of arguments for 'command|count' command".into())
+        }
+        Some(sub) if sub.eq_ignore_ascii_case(b"count") => Frame::Integer(all().count() as i64),
+        // FILTERBY pas pris en charge
+        Some(sub) if sub.eq_ignore_ascii_case(b"list") && args.len() > 1 => Frame::Error("ERR syntax error".into()),
+        Some(sub) if sub.eq_ignore_ascii_case(b"list") => {
+            Frame::Array(all().map(|n| Frame::BulkString(SharedByte::from_slice(n.as_bytes()))).collect())
+        }
         _ => Frame::Array(Vec::new()),
     }
 }

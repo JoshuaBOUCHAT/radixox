@@ -335,23 +335,33 @@ default 5 s wait.
 
 ## Commands
 
+147 Redis commands (`COMMAND COUNT` also counts the 7 RadixOx-specific ones: `KRANGE`,
+`KREVRANGE`, `REPLICATE` and the internal `RX*` replication commands).
+
 | Category | Commands |
 |---|---|
-| Strings, counters | `GET` `SET` (`EX` `PX` `NX` `XX`) `SETNX` `SETEX` `MGET` `MSET` `INCR` `DECR` `INCRBY` `DECRBY` |
-| Keys, TTL | `DEL` `UNLINK` (`prefix*`) `EXISTS` `TYPE` `KEYS` `SCAN` (`MATCH` `COUNT` `TYPE`) `EXPIRE` `PEXPIRE` `PERSIST` `TTL` `PTTL` |
+| Strings, counters | `GET` `SET` (`EX` `PX` `NX` `XX`) `SETNX` `SETEX` `PSETEX` `MGET` `MSET` `MSETNX` `GETSET` `GETDEL` `GETEX` `APPEND` `STRLEN` `GETRANGE` `SUBSTR` `SETRANGE` `INCR` `DECR` `INCRBY` `DECRBY` `INCRBYFLOAT` |
+| Keys, TTL | `DEL` `UNLINK` (`prefix*`) `EXISTS` `TYPE` `TOUCH` `RENAME` `RENAMENX` `RANDOMKEY` `KEYS` `SCAN` (`MATCH` `COUNT` `TYPE`) `EXPIRE` `PEXPIRE` `EXPIREAT` `PEXPIREAT` (`NX` `XX` `GT` `LT`) `EXPIRETIME` `PEXPIRETIME` `PERSIST` `TTL` `PTTL` |
 | Ordered keys | `KRANGE` `KREVRANGE` |
-| Hash | `HSET` `HMSET` `HGET` `HMGET` `HGETALL` `HDEL` `HEXISTS` `HLEN` `HKEYS` `HVALS` `HINCRBY` |
-| Set | `SADD` `SREM` `SISMEMBER` `SCARD` `SMEMBERS` `SPOP` |
+| Hash | `HSET` `HMSET` `HGET` `HMGET` `HGETALL` `HDEL` `HEXISTS` `HLEN` `HKEYS` `HVALS` `HINCRBY` `HINCRBYFLOAT` `HSETNX` `HSTRLEN` `HRANDFIELD` |
+| Set | `SADD` `SREM` `SISMEMBER` `SMISMEMBER` `SCARD` `SMEMBERS` `SPOP` `SRANDMEMBER` `SMOVE` |
 | Sorted set | `ZADD` (`NX` `XX` `GT` `LT` `CH` `INCR`) `ZINCRBY` `ZREM` `ZSCORE` `ZMSCORE` `ZCARD` `ZCOUNT` `ZLEXCOUNT` `ZRANGE` (`BYSCORE` `BYLEX` `REV` `LIMIT` `WITHSCORES`) `ZREVRANGE` `ZRANGEBYSCORE` `ZREVRANGEBYSCORE` `ZRANGEBYLEX` `ZREVRANGEBYLEX` `ZRANK` `ZREVRANK` `ZPOPMIN` `ZPOPMAX` `ZREMRANGEBYRANK` `ZREMRANGEBYSCORE` `ZREMRANGEBYLEX` `ZRANDMEMBER` `ZSCAN` `ZUNION` `ZINTER` `ZDIFF` `ZUNIONSTORE` `ZINTERSTORE` `ZDIFFSTORE` `ZINTERCARD` `BZPOPMIN` `BZPOPMAX` |
 | List | `LPUSH` `RPUSH` `LPUSHX` `RPUSHX` `LPOP` `RPOP` `LLEN` `LRANGE` `LINDEX` `LSET` `LINSERT` `LREM` `LTRIM` `LPOS` `LMOVE` `RPOPLPUSH` `BLPOP` `BRPOP` `BLMOVE` `BRPOPLPUSH` |
 | Bitset | `SETBIT` `GETBIT` `BITCOUNT` (`BYTE` `BIT`) `BITPOS` (`BYTE` `BIT`) `BITOP` (`AND` `OR` `XOR` `NOT`) |
 | Pub/Sub | `SUBSCRIBE` `UNSUBSCRIBE` `PUBLISH` |
 | Persistence | `SAVE` `BGSAVE` (`RESERVE`) `BGREWRITEAOF` `LASTSAVE` |
 | Replication | `REPLICATE` `REPLICAOF NO ONE` `WAIT` `DEBUG DIGEST` |
-| Server | `PING` `ECHO` `AUTH` `HELLO` `CLIENT` `COMMAND` `CONFIG` (`maxmemory`, policy, save reserve) `INFO` `DBSIZE` `FLUSHDB` `SELECT 0` `SHUTDOWN` `QUIT` |
+| Server | `PING` `ECHO` `AUTH` `HELLO` `CLIENT` `COMMAND` `CONFIG` (`maxmemory`, policy, save reserve) `INFO` `DBSIZE` `FLUSHDB` `FLUSHALL` `TIME` `SELECT 0` `SHUTDOWN` `QUIT` |
 
 `KEYS`, `UNLINK prefix*`, `FLUSHDB` and large deletions run in slices between other
 commands, so no command blocks the server. Inline commands (telnet, `nc`) work.
+
+Replies match Redis 7 / Valkey, error messages included. Known differences: TTLs have
+a one-second resolution (`PTTL`, `PEXPIRE` are rounded to the second); `INCRBYFLOAT` and
+`HINCRBYFLOAT` add in exact decimal where Redis uses an 80-bit `long double`, so
+`10.6 + -5000` gives `-4989.4` where Redis shows `-4989.39999999999999991`;
+`SRANDMEMBER`, `HRANDFIELD` and `ZRANDMEMBER` refuse a negative count below -2²⁴
+(`ERR value is out of range`) instead of building a reply that large.
 
 ## Persistence
 

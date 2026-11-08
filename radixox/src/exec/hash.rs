@@ -107,3 +107,70 @@ pub fn cmd_hincrby(art: &mut OxidArt, key: &[u8], field: SharedByte, delta: i64)
         Err(TypeError::NotAFloat | TypeError::OutOfMemory) => Frame::Error("ERR internal error".into()),
     }
 }
+
+// ── Lot 1 (COMMANDS_PLAN.md §3) ──────────────────────────────────────────────
+
+fn wrongtype() -> Frame {
+    Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
+}
+
+pub fn cmd_hsetnx(art: &mut OxidArt, key: &[u8], field: SharedByte, val: SharedByte) -> Frame {
+    match art.cmd_hsetnx(key, field, val) {
+        Ok(set) => Frame::Integer(set as i64),
+        Err(_) => wrongtype(),
+    }
+}
+
+pub fn cmd_hstrlen(art: &mut OxidArt, key: &[u8], field: &[u8]) -> Frame {
+    match art.cmd_hstrlen(key, field) {
+        Ok(n) => Frame::Integer(n as i64),
+        Err(_) => wrongtype(),
+    }
+}
+
+pub fn cmd_hincrbyfloat(art: &mut OxidArt, key: &[u8], field: SharedByte, incr: &[u8]) -> Frame {
+    use super::float::{FloatErr, add};
+    // ordre de Redis : l'incrément (valide, fini), puis le type, puis la valeur du champ
+    match add(Some(b"0"), incr) {
+        Err(FloatErr::Incr) => return Frame::Error("ERR value is not a valid float".into()),
+        Err(FloatErr::NanInf) => return Frame::Error("ERR value is NaN or Infinity".into()),
+        _ => {}
+    }
+    let cur = match art.cmd_hget(key, &field) {
+        Err(_) => return wrongtype(),
+        Ok(cur) => cur,
+    };
+    match add(cur.as_deref(), incr) {
+        Ok(r) => {
+            let r = SharedByte::from_slice(r);
+            if art.cmd_hset(key, &[(field, r.clone())], None).is_err() {
+                return wrongtype();
+            }
+            Frame::BulkString(r)
+        }
+        Err(FloatErr::Value) => Frame::Error("ERR hash value is not a float".into()),
+        Err(FloatErr::Incr) => Frame::Error("ERR value is not a valid float".into()),
+        Err(FloatErr::NanInf) => Frame::Error("ERR increment would produce NaN or Infinity".into()),
+    }
+}
+
+pub fn cmd_hrandfield(art: &mut OxidArt, key: &[u8], count: Option<i64>, with_values: bool) -> Frame {
+    if count.is_some_and(|c| c < -radixox_lib::cmd::MAX_RAND_REPEAT) && art.type_of(key) == oxidart::value::RedisType::Hash {
+        return Frame::Error("ERR value is out of range".into());
+    }
+    let picked = match art.cmd_hrandfield(key, count) {
+        Ok(p) => p,
+        Err(_) => return wrongtype(),
+    };
+    if count.is_none() {
+        return picked.into_iter().next().map_or(Frame::Null, |(f, _)| Frame::BulkString(f));
+    }
+    let mut out = Vec::with_capacity(picked.len() * (1 + with_values as usize));
+    for (f, v) in picked {
+        out.push(Frame::BulkString(f));
+        if with_values {
+            out.push(Frame::BulkString(v));
+        }
+    }
+    Frame::Array(out)
+}

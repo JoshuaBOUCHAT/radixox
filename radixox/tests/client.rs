@@ -138,12 +138,15 @@ fn client_misc_subcommands() {
     assert_eq!(c.cmd(&["CLIENT"]), "-ERR wrong number of arguments for 'client' command");
 }
 
+/// DOCS et COMMAND sans argument : vides (redis-cli s'en contente) ; COUNT : le vrai
+/// compte, celui de la table `COMMANDS` (+ les commandes propres à RadixOx).
 #[test]
 fn command_docs_is_empty() {
     let mut c = Raw::new();
     assert_eq!(c.cmd(&["COMMAND", "DOCS"]), "[]");
     assert_eq!(c.cmd(&["COMMAND"]), "[]");
-    assert_eq!(c.cmd(&["COMMAND", "COUNT"]), ":0");
+    let n = radixox_lib::cmd::COMMANDS.len() + radixox_lib::cmd::INTERNAL_COMMANDS.len();
+    assert_eq!(c.cmd(&["COMMAND", "COUNT"]), format!(":{n}"));
 }
 
 /// redis-cli (qui envoie COMMAND DOCS au démarrage) fonctionne.

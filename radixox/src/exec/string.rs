@@ -204,3 +204,226 @@ pub fn cmd_dbsize(art: &mut OxidArt) -> Frame {
     let count = art.len() as i64;
     Frame::Integer(count)
 }
+
+// ── Lot 1 (COMMANDS_PLAN.md §3) : strings ───────────────────────────────────
+
+/// Plus longue string (`proto-max-bulk-len` de Redis).
+const MAX_STR: usize = radixox_lib::cmd::MAX_BULK_LEN;
+
+fn wrongtype() -> Frame {
+    Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
+}
+
+fn too_big() -> Frame {
+    Frame::Error("ERR string exceeds maximum allowed size (proto-max-bulk-len)".into())
+}
+
+fn invalid_expire(name: &str) -> Frame {
+    Frame::Error(format!("ERR invalid expire time in '{name}' command"))
+}
+
+pub fn cmd_append(art: &mut OxidArt, key: &[u8], val: SharedByte) -> Frame {
+    match art.get_str_exp(key) {
+        Err(_) => wrongtype(),
+        Ok(None) => {
+            let n = val.len();
+            art.set_at(key, Value::String(val), None);
+            Frame::Integer(n as i64)
+        }
+        Ok(Some((old, exp))) => {
+            let n = old.len() + val.len();
+            if n > MAX_STR {
+                return too_big();
+            }
+            if val.is_empty() {
+                return Frame::Integer(n as i64);
+            }
+            let mut v = Vec::with_capacity(n);
+            v.extend_from_slice(&old);
+            v.extend_from_slice(&val);
+            art.set_at(key, Value::String(SharedByte::from_slice(v)), exp);
+            Frame::Integer(n as i64)
+        }
+    }
+}
+
+pub fn cmd_strlen(art: &mut OxidArt, key: &[u8]) -> Frame {
+    match art.get_str_exp(key) {
+        Err(_) => wrongtype(),
+        Ok(v) => Frame::Integer(v.map_or(0, |(s, _)| s.len()) as i64),
+    }
+}
+
+pub fn cmd_getrange(art: &mut OxidArt, key: &[u8], start: i64, end: i64) -> Frame {
+    let s = match art.get_str_exp(key) {
+        Err(_) => return wrongtype(),
+        Ok(None) => return Frame::BulkString(SharedByte::from_slice(b"")),
+        Ok(Some((s, _))) => s,
+    };
+    // bornes de Redis (getrangeCommand)
+    let len = s.len() as i64;
+    if (start < 0 && end < 0 && start > end) || len == 0 {
+        return Frame::BulkString(SharedByte::from_slice(b""));
+    }
+    let start = if start < 0 { (len + start).max(0) } else { start };
+    let end = if end < 0 { (len + end).max(0) } else { end.min(len - 1) };
+    if start > end {
+        return Frame::BulkString(SharedByte::from_slice(b""));
+    }
+    Frame::BulkString(SharedByte::from_slice(&s[start as usize..=end as usize]))
+}
+
+pub fn cmd_setrange(art: &mut OxidArt, key: &[u8], off: i64, val: SharedByte) -> Frame {
+    if off < 0 {
+        return Frame::Error("ERR offset is out of range".into());
+    }
+    let (old, exp) = match art.get_str_exp(key) {
+        Err(_) => return wrongtype(),
+        Ok(None) if val.is_empty() => return Frame::Integer(0),
+        Ok(None) => (SharedByte::from_slice(b""), None),
+        Ok(Some((old, exp))) => {
+            if val.is_empty() {
+                return Frame::Integer(old.len() as i64);
+            }
+            (old, exp)
+        }
+    };
+    let off = off as u64;
+    if off + val.len() as u64 > MAX_STR as u64 {
+        return too_big();
+    }
+    let off = off as usize;
+    let n = old.len().max(off + val.len());
+    let mut v = Vec::with_capacity(n);
+    v.extend_from_slice(&old);
+    v.resize(n, 0);
+    v[off..off + val.len()].copy_from_slice(&val);
+    art.set_at(key, Value::String(SharedByte::from_slice(v)), exp);
+    Frame::Integer(n as i64)
+}
+
+pub fn cmd_getset(art: &mut OxidArt, key: &[u8], val: SharedByte) -> Frame {
+    match art.get_str_exp(key) {
+        Err(_) => wrongtype(),
+        Ok(old) => {
+            // GETSET retire le TTL (comme SET)
+            art.set_at(key, Value::String(val), None);
+            old.map_or(Frame::Null, |(s, _)| Frame::BulkString(s))
+        }
+    }
+}
+
+pub fn cmd_getdel(art: &mut OxidArt, key: &[u8]) -> Frame {
+    match art.get_str_exp(key) {
+        Err(_) => wrongtype(),
+        Ok(None) => Frame::Null,
+        Ok(Some((s, _))) => {
+            art.del(key);
+            Frame::BulkString(s)
+        }
+    }
+}
+
+pub fn cmd_getex(art: &mut OxidArt, key: &[u8], op: Option<radixox_lib::cmd::GetExOp>) -> Frame {
+    use radixox_lib::cmd::GetExOp;
+    // échéance vérifiée avant la clé, comme Redis
+    let at = match op {
+        Some(GetExOp::At(a)) => match a.resolve(art.now) {
+            Some(r) => Some(r),
+            None => return invalid_expire("getex"),
+        },
+        _ => None,
+    };
+    let s = match art.get_str_exp(key) {
+        Err(_) => return wrongtype(),
+        Ok(None) => return Frame::Null,
+        Ok(Some((s, _))) => s,
+    };
+    match (op, at) {
+        (Some(GetExOp::Persist), _) => {
+            art.persist(SharedByte::from_slice(key));
+        }
+        (_, Some((at, passed))) => {
+            art.expire_at(key, at, passed, radixox_lib::cmd::ExpireCond::Always);
+        }
+        _ => {}
+    }
+    Frame::BulkString(s)
+}
+
+pub fn cmd_incrbyfloat(art: &mut OxidArt, key: &[u8], incr: &[u8]) -> Frame {
+    use super::float::{FloatErr, add};
+    let (cur, exp) = match art.get_str_exp(key) {
+        Err(_) => return wrongtype(),
+        Ok(None) => (None, None),
+        Ok(Some((s, exp))) => (Some(s), exp),
+    };
+    match add(cur.as_deref(), incr) {
+        Ok(r) => {
+            let r = SharedByte::from_slice(r);
+            // garde le TTL
+            art.set_at(key, Value::String(r.clone()), exp);
+            Frame::BulkString(r)
+        }
+        Err(FloatErr::Value | FloatErr::Incr) => Frame::Error("ERR value is not a valid float".into()),
+        Err(FloatErr::NanInf) => Frame::Error("ERR increment would produce NaN or Infinity".into()),
+    }
+}
+
+pub fn cmd_msetnx(art: &mut OxidArt, pairs: &[(&[u8], SharedByte)]) -> Frame {
+    if pairs.iter().any(|(k, _)| art.type_of(k) != oxidart::value::RedisType::None) {
+        return Frame::Integer(0);
+    }
+    cmd_mset(art, pairs);
+    Frame::Integer(1)
+}
+
+// ── Lot 1 : clés et TTL ──────────────────────────────────────────────────────
+
+pub fn cmd_expire_opt(
+    art: &mut OxidArt,
+    key: &[u8],
+    at: radixox_lib::cmd::ExpireArg,
+    cond: radixox_lib::cmd::ExpireCond,
+    name: &str,
+) -> Frame {
+    match at.resolve(art.now) {
+        None => invalid_expire(name),
+        Some((at, passed)) => Frame::Integer(art.expire_at(key, at, passed, cond) as i64),
+    }
+}
+
+pub fn cmd_expiretime(art: &mut OxidArt, key: &[u8], ms: bool) -> Frame {
+    Frame::Integer(match art.expire_time(key) {
+        Err(()) => -2,
+        Ok(None) => -1,
+        Ok(Some(t)) if ms => t as i64 * 1000,
+        Ok(Some(t)) => t as i64,
+    })
+}
+
+pub fn cmd_touch(art: &mut OxidArt, keys: &[&[u8]]) -> Frame {
+    Frame::Integer(keys.iter().filter(|k| art.touch_key(k)).count() as i64)
+}
+
+pub fn cmd_randomkey(art: &mut OxidArt) -> Frame {
+    match art.random_key() {
+        Some(k) => Frame::BulkString(SharedByte::from_slice(k)),
+        None => Frame::Null,
+    }
+}
+
+pub fn cmd_rename(art: &mut OxidArt, src: &[u8], dst: &[u8], nx: bool) -> Frame {
+    match art.rename(src, dst, nx) {
+        None => Frame::Error("ERR no such key".into()),
+        Some(done) if nx => Frame::Integer(done as i64),
+        Some(_) => Frame::SimpleString("OK"),
+    }
+}
+
+/// TIME : `[secondes, microsecondes]` de l'horloge murale.
+pub fn cmd_time() -> Frame {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::Realtime);
+    let bulk = |n: i64| Frame::BulkString(SharedByte::from_slice(n.to_string().as_bytes()));
+    Frame::Array(vec![bulk(t.tv_sec), bulk(t.tv_nsec / 1000)])
+}

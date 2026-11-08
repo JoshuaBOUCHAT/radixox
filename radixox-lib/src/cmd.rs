@@ -86,6 +86,56 @@ impl Default for SetOpts {
     }
 }
 
+/// Condition d'EXPIRE / PEXPIRE / EXPIREAT / PEXPIREAT (Redis 7) ; une clé sans TTL a
+/// une échéance infinie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExpireCond {
+    #[default]
+    Always,
+    /// NX : seulement sans TTL.
+    Nx,
+    /// XX : seulement avec un TTL.
+    Xx,
+    /// GT : seulement si la nouvelle échéance est plus lointaine.
+    Gt,
+    /// LT : seulement si elle est plus proche.
+    Lt,
+}
+
+/// Échéance donnée à EXPIRE & co, SET EX…, GETEX, telle que reçue : résolue à
+/// l'exécution, contre l'horloge du serveur (`t` en secondes ou en millisecondes,
+/// relative ou absolue).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpireArg {
+    pub t: i64,
+    pub ms: bool,
+    pub abs: bool,
+}
+
+impl ExpireArg {
+    /// Échéance absolue en secondes et « déjà passée », à l'horloge `now` (secondes
+    /// Unix). `None` : débordement (`ERR invalid expire time`). Même résolution que le
+    /// reste des TTL : la seconde (une échéance relative en ms est tronquée).
+    pub fn resolve(self, now: u64) -> Option<(u64, bool)> {
+        let now_ms = (now as i64).checked_mul(1000)?;
+        let t_ms = if self.ms { self.t } else { self.t.checked_mul(1000)? };
+        if self.abs {
+            // échéance absolue : à la seconde la plus proche (EXPIRETIME de Redis arrondit)
+            let t = t_ms.max(0);
+            return Some(((t / 1000 + (t % 1000 >= 500) as i64) as u64, t_ms <= now_ms));
+        }
+        let at_ms = t_ms.checked_add(now_ms)?;
+        Some(((at_ms.max(0) / 1000) as u64, t_ms <= 0))
+    }
+}
+
+/// Option de GETEX.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GetExOp {
+    Persist,
+    At(ExpireArg),
+}
+
 /// `REPLICATE` : ajoute ou retire une cible de réplication.
 #[derive(Debug)]
 pub enum Replicate<'a> {
@@ -171,6 +221,10 @@ pub enum Cmd<'a> {
     /// DEBUG DIGEST [at] : condensé du contenu (clés vivantes à `at`, défaut :
     /// l'horloge du serveur), pour comparer deux serveurs.
     DebugDigest(Option<u64>),
+    /// TIME
+    Time,
+    /// RANDOMKEY
+    RandomKey,
 
     // --- Réplication (DURABILITY_DESIGN.md §10) ----------------------
     /// REPLICATE host port [AUTH pass] | REPLICATE STOP host port
@@ -266,6 +320,37 @@ pub enum Cmd<'a> {
     /// DECRBY key delta
     DecrBy { key: &'a [u8], delta: i64 },
 
+    // --- Strings et clés (lot 1, COMMANDS_PLAN.md §3) -------------------
+    /// APPEND key value
+    Append { key: &'a [u8], val: SharedByte },
+    /// STRLEN key
+    StrLen(&'a [u8]),
+    /// GETRANGE key start end (et SUBSTR)
+    GetRange { key: &'a [u8], start: i64, end: i64 },
+    /// SETRANGE key offset value
+    SetRange { key: &'a [u8], off: i64, val: SharedByte },
+    /// GETSET key value
+    GetSet { key: &'a [u8], val: SharedByte },
+    /// GETDEL key
+    GetDel(&'a [u8]),
+    /// GETEX key [EX s | PX ms | EXAT t | PXAT t | PERSIST]
+    GetEx { key: &'a [u8], op: Option<GetExOp> },
+    /// INCRBYFLOAT key increment (l'incrément brut : validé à l'exécution, après le
+    /// type de la clé, comme Redis)
+    IncrByFloat { key: &'a [u8], incr: &'a [u8] },
+    /// MSETNX key value [key value ...]
+    MSetNx(SmallVec<2, (&'a [u8], SharedByte)>),
+    /// EXPIRE / PEXPIRE avec option, échéance ≤ 0, ou EXPIREAT / PEXPIREAT (`name` :
+    /// la commande, pour `ERR invalid expire time in '<name>' command`). EXPIRE /
+    /// PEXPIRE sans option et > 0 restent `Expire` (chemin AMAC).
+    ExpireOpt { key: &'a [u8], at: ExpireArg, cond: ExpireCond, name: &'static str },
+    /// EXPIRETIME / PEXPIRETIME (`ms`) key
+    ExpireTime { key: &'a [u8], ms: bool },
+    /// TOUCH key [key ...]
+    Touch(SmallVec<4, &'a [u8]>),
+    /// RENAME / RENAMENX (`nx`) src dst
+    Rename { src: &'a [u8], dst: &'a [u8], nx: bool },
+
     // --- Hash --------------------------------------------------------
     /// HSET key field value [field value ...]
     HSet {
@@ -315,6 +400,14 @@ pub enum Cmd<'a> {
         field: SharedByte,
         delta: i64,
     },
+    /// HSETNX key field value
+    HSetNx { key: &'a [u8], field: SharedByte, val: SharedByte },
+    /// HSTRLEN key field
+    HStrLen { key: &'a [u8], field: &'a [u8] },
+    /// HINCRBYFLOAT key field increment (incrément validé à l'exécution)
+    HIncrByFloat { key: &'a [u8], field: SharedByte, incr: &'a [u8] },
+    /// HRANDFIELD key [count [WITHVALUES]]
+    HRandField { key: &'a [u8], count: Option<i64>, with_values: bool },
 
     // --- Set ---------------------------------------------------------
     /// SADD key member [member ...]
@@ -340,6 +433,12 @@ pub enum Cmd<'a> {
 
     /// SPOP key [count]
     SPop { key: &'a [u8], count: Option<u64> },
+    /// SMISMEMBER key member [member ...]
+    SMIsMember { key: &'a [u8], members: SmallVec<4, &'a [u8]> },
+    /// SRANDMEMBER key [count]
+    SRandMember { key: &'a [u8], count: Option<i64> },
+    /// SMOVE source destination member
+    SMove { src: &'a [u8], dst: &'a [u8], member: SharedByte },
 
     // --- Bitset (type à part, BITSET_DESIGN.md §10.4) -------------------
     /// SETBIT key offset 0|1
@@ -741,14 +840,19 @@ fn arg_i64(s: &[u8]) -> Option<i64> {
     if digits.is_empty() {
         return None;
     }
-    let mut n = 0i64;
+    // magnitude en u64 : `-9223372036854775808` (i64::MIN) passe
+    let mut n = 0u64;
     for &b in digits {
         if !b.is_ascii_digit() {
             return None;
         }
-        n = n.checked_mul(10)?.checked_add((b - b'0') as i64)?;
+        n = n.checked_mul(10)?.checked_add((b - b'0') as u64)?;
     }
-    Some(if neg { n.checked_neg()? } else { n })
+    if neg {
+        0i64.checked_sub_unsigned(n)
+    } else {
+        i64::try_from(n).ok()
+    }
 }
 
 /// NaN refusé, comme Redis (`ERR value is not a valid float`) : un score NaN casserait
@@ -888,6 +992,53 @@ fn parse_set_opts(args: &[&[u8]]) -> Result<SetOpts, CmdError> {
     Ok(opts)
 }
 
+/// Options d'EXPIRE & co : NX, XX, GT, LT (combinaisons de Redis 7).
+fn expire_cond(opts: &[&[u8]]) -> Result<ExpireCond, CmdError> {
+    let (mut nx, mut xx, mut gt, mut lt) = (false, false, false, false);
+    for o in opts {
+        match () {
+            _ if o.eq_ignore_ascii_case(b"nx") => nx = true,
+            _ if o.eq_ignore_ascii_case(b"xx") => xx = true,
+            _ if o.eq_ignore_ascii_case(b"gt") => gt = true,
+            _ if o.eq_ignore_ascii_case(b"lt") => lt = true,
+            _ => return Err(CmdError::Unsupported),
+        }
+    }
+    if nx && (xx || gt || lt) {
+        return Err(CmdError::Msg("ERR NX and XX, GT or LT options at the same time are not compatible"));
+    }
+    if gt && lt {
+        return Err(CmdError::Msg("ERR GT and LT options at the same time are not compatible"));
+    }
+    Ok(match (nx, xx, gt, lt) {
+        (true, ..) => ExpireCond::Nx,
+        (_, _, true, _) => ExpireCond::Gt,
+        (_, _, _, true) => ExpireCond::Lt,
+        (_, true, ..) => ExpireCond::Xx,
+        _ => ExpireCond::Always,
+    })
+}
+
+/// `count` de SRANDMEMBER / HRANDFIELD / ZRANDMEMBER (plages de Redis ; `pairs` :
+/// avec WITHVALUES / WITHSCORES, la réponse compte double).
+fn rand_count(s: &[u8], pairs: bool) -> Result<i64, CmdError> {
+    let c = int(s)?;
+    if c == i64::MIN {
+        return Err(CmdError::Msg(
+            "ERR value is out of range, value must between -9223372036854775807 and 9223372036854775807",
+        ));
+    }
+    if pairs && !(-(i64::MAX / 2)..=i64::MAX / 2).contains(&c) {
+        return Err(CmdError::Msg("ERR value is out of range"));
+    }
+    Ok(c)
+}
+
+/// Au-delà de ce nombre de tirages avec répétitions (`count` négatif), SRANDMEMBER &
+/// co répondent `ERR value is out of range` au lieu de construire la réponse : un
+/// `count` de -10¹⁸ ferait allouer sans fin (abandon du serveur). Redis l'accepte.
+pub const MAX_RAND_REPEAT: i64 = 1 << 24;
+
 /// Paires `champ valeur …` (HSET, HMSET).
 fn field_pairs(args: &[&[u8]]) -> SmallVec<2, (SharedByte, SharedByte)> {
     let mut fields = SmallVec::new();
@@ -911,6 +1062,13 @@ fn dispatch<'a>(raw: &[&'a [u8]]) -> Cmd<'a> {
     let name = raw[0];
     match dispatch_inner(name, &raw[1..]) {
         Ok(cmd) => cmd,
+        // `ERR Unsupported option <opt>` : l'option refusée tient lieu de nom
+        Err(CmdError::Unsupported) => {
+            let opt = raw.iter().skip(3).find(|o| {
+                ![&b"nx"[..], b"xx", b"gt", b"lt"].iter().any(|k| o.eq_ignore_ascii_case(k))
+            });
+            Cmd::Invalid { name: opt.copied().unwrap_or(b""), err: CmdError::Unsupported }
+        }
         Err(err) => Cmd::Invalid { name, err },
     }
 }
@@ -982,11 +1140,62 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
             Cmd::Set { key: args[0], val: sb(args[1]), opts }
         }
         b"setnx" => { exact!(2); Cmd::SetNx { key: args[0], val: sb(args[1]) } }
-        b"setex" => {
+        b"setex" | b"psetex" => {
             exact!(3);
-            let ttl = Some(Duration::from_secs(uint(args[1])?));
+            let t = int(args[1])?;
+            if t <= 0 {
+                return Err(CmdError::Msg(if lc[0] == b's' {
+                    "ERR invalid expire time in 'setex' command"
+                } else {
+                    "ERR invalid expire time in 'psetex' command"
+                }));
+            }
+            let ttl = Some(if lc[0] == b's' { Duration::from_secs(t as u64) } else { Duration::from_millis(t as u64) });
             Cmd::Set { key: args[0], val: sb(args[2]), opts: SetOpts { ttl, condition: SetCondition::Always } }
         }
+        b"append" => { exact!(2); Cmd::Append { key: args[0], val: sb(args[1]) } }
+        b"strlen" => { exact!(1); Cmd::StrLen(args[0]) }
+        b"getrange" | b"substr" => { exact!(3); Cmd::GetRange { key: args[0], start: int(args[1])?, end: int(args[2])? } }
+        b"setrange" => { exact!(3); Cmd::SetRange { key: args[0], off: int(args[1])?, val: sb(args[2]) } }
+        b"getset" => { exact!(2); Cmd::GetSet { key: args[0], val: sb(args[1]) } }
+        b"getdel" => { exact!(1); Cmd::GetDel(args[0]) }
+        b"getex" => {
+            at_least!(1);
+            let op = match &args[1..] {
+                [] => None,
+                [p] if p.eq_ignore_ascii_case(b"persist") => Some(GetExOp::Persist),
+                [o, v] => {
+                    let (ms, abs) = match () {
+                        _ if o.eq_ignore_ascii_case(b"ex") => (false, false),
+                        _ if o.eq_ignore_ascii_case(b"px") => (true, false),
+                        _ if o.eq_ignore_ascii_case(b"exat") => (false, true),
+                        _ if o.eq_ignore_ascii_case(b"pxat") => (true, true),
+                        _ => return Err(CmdError::Syntax),
+                    };
+                    let t = int(v)?;
+                    if t <= 0 {
+                        return Err(CmdError::Msg("ERR invalid expire time in 'getex' command"));
+                    }
+                    Some(GetExOp::At(ExpireArg { t, ms, abs }))
+                }
+                _ => return Err(CmdError::Syntax),
+            };
+            Cmd::GetEx { key: args[0], op }
+        }
+        b"incrbyfloat" => { exact!(2); Cmd::IncrByFloat { key: args[0], incr: args[1] } }
+        b"msetnx" => {
+            if n == 0 || n % 2 != 0 {
+                return Err(CmdError::Arity);
+            }
+            let mut pairs = SmallVec::new();
+            for pair in args.chunks_exact(2) {
+                pairs.push((pair[0], sb(pair[1])));
+            }
+            Cmd::MSetNx(pairs)
+        }
+        b"touch" => { at_least!(1); Cmd::Touch(borrowed!(0)) }
+        b"randomkey" => { exact!(0); Cmd::RandomKey }
+        b"rename" | b"renamenx" => { exact!(2); Cmd::Rename { src: args[0], dst: args[1], nx: lc.len() == 8 } }
         b"mget" => { at_least!(1); Cmd::MGet(borrowed!(0)) }
         b"mset" => {
             if n == 0 || n % 2 != 0 {
@@ -1012,8 +1221,28 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
         // ── TTL ──────────────────────────────────────────────────────────
         b"ttl" => { exact!(1); Cmd::Ttl(args[0]) }
         b"pttl" => { exact!(1); Cmd::Pttl(args[0]) }
-        b"expire" => { exact!(2); Cmd::Expire { key: args[0], dur: Duration::from_secs(uint(args[1])?) } }
-        b"pexpire" => { exact!(2); Cmd::Expire { key: args[0], dur: Duration::from_millis(uint(args[1])?) } }
+        b"expire" | b"pexpire" | b"expireat" | b"pexpireat" => {
+            at_least!(2);
+            let ms = lc[0] == b'p';
+            let abs = lc.ends_with(b"at");
+            let t = int(args[1])?;
+            let cond = expire_cond(&args[2..])?;
+            // borne : au-delà, `ExpireOpt` contrôle le débordement (`invalid expire time`)
+            if !abs && cond == ExpireCond::Always && t > 0 && t < if ms { 1 << 50 } else { 1 << 40 } {
+                // chemin courant (AMAC) : relatif, positif, sans option
+                let dur = if ms { Duration::from_millis(t as u64) } else { Duration::from_secs(t as u64) };
+                Cmd::Expire { key: args[0], dur }
+            } else {
+                let name = match (ms, abs) {
+                    (false, false) => "expire",
+                    (true, false) => "pexpire",
+                    (false, true) => "expireat",
+                    (true, true) => "pexpireat",
+                };
+                Cmd::ExpireOpt { key: args[0], at: ExpireArg { t, ms, abs }, cond, name }
+            }
+        }
+        b"expiretime" | b"pexpiretime" => { exact!(1); Cmd::ExpireTime { key: args[0], ms: lc[0] == b'p' } }
         b"persist" => { exact!(1); Cmd::Persist(args[0]) }
 
         // ── Compteurs ────────────────────────────────────────────────────
@@ -1040,6 +1269,19 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
         b"hvals" => { exact!(1); Cmd::HVals(args[0]) }
         b"hmget" => { at_least!(2); Cmd::HMGet { key: args[0], fields: owned!(1) } }
         b"hincrby" => { exact!(3); Cmd::HIncrBy { key: args[0], field: sb(args[1]), delta: int(args[2])? } }
+        b"hsetnx" => { exact!(3); Cmd::HSetNx { key: args[0], field: sb(args[1]), val: sb(args[2]) } }
+        b"hstrlen" => { exact!(2); Cmd::HStrLen { key: args[0], field: args[1] } }
+        b"hincrbyfloat" => { exact!(3); Cmd::HIncrByFloat { key: args[0], field: sb(args[1]), incr: args[2] } }
+        b"hrandfield" => {
+            between!(1, 3);
+            let with_values = match args.get(2) {
+                Some(s) if s.eq_ignore_ascii_case(b"withvalues") => true,
+                Some(_) => return Err(CmdError::Syntax),
+                None => false,
+            };
+            let count = args.get(1).map(|c| rand_count(c, with_values)).transpose()?;
+            Cmd::HRandField { key: args[0], count, with_values }
+        }
 
         // ── Set ──────────────────────────────────────────────────────────
         b"sadd" => { at_least!(2); Cmd::SAdd { key: args[0], members: owned!(1) } }
@@ -1055,6 +1297,15 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
             };
             Cmd::SPop { key: args[0], count }
         }
+        b"smismember" => { at_least!(2); Cmd::SMIsMember { key: args[0], members: borrowed!(1) } }
+        b"srandmember" => {
+            at_least!(1);
+            if n > 2 {
+                return Err(CmdError::Syntax);
+            }
+            Cmd::SRandMember { key: args[0], count: args.get(1).map(|c| rand_count(c, false)).transpose()? }
+        }
+        b"smove" => { exact!(3); Cmd::SMove { src: args[0], dst: args[1], member: sb(args[2]) } }
 
         // ── ZSet ─────────────────────────────────────────────────────────
         b"zadd" => {
@@ -1346,15 +1597,12 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
         b"zmscore" => { at_least!(2); Cmd::ZMScore { key: args[0], members: borrowed!(1) } }
         b"zrandmember" => {
             between!(1, 3);
-            let count = match args.get(1) {
-                Some(c) => Some(int(c)?),
-                None => None,
-            };
             let with_scores = match args.get(2) {
                 Some(s) if s.eq_ignore_ascii_case(b"withscores") => true,
                 Some(_) => return Err(CmdError::Syntax),
                 None => false,
             };
+            let count = args.get(1).map(|c| rand_count(c, with_scores)).transpose()?;
             Cmd::ZRandMember { key: args[0], count, with_scores }
         }
         b"zscore" => { exact!(2); Cmd::ZScore { key: args[0], member: sb(args[1]) } }
@@ -1495,7 +1743,9 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
         b"select" => { exact!(1); Cmd::Select(uint(args[0])?) }
         b"info" => Cmd::Info,
         b"dbsize" => { exact!(0); Cmd::DbSize }
-        b"flushdb" => {
+        b"time" => { exact!(0); Cmd::Time }
+        // une seule base : FLUSHALL = FLUSHDB
+        b"flushdb" | b"flushall" => {
             at_most!(1);
             match args.first() {
                 Some(m) if !m.eq_ignore_ascii_case(b"async") && !m.eq_ignore_ascii_case(b"sync") => {
@@ -1574,6 +1824,34 @@ fn dispatch_inner<'a>(name: &'a [u8], args: &[&'a [u8]]) -> Result<Cmd<'a>, CmdE
     })
 }
 
+/// Commandes de Redis acceptées par `dispatch_inner`, en minuscules et triées :
+/// `COMMAND COUNT` / `COMMAND LIST`, et le compte du README. Un test relit
+/// `dispatch_inner` dans la source pour que cette table ne dérive pas.
+pub const COMMANDS: &[&str] = &[
+    "append", "auth", "bgrewriteaof", "bgsave", "bitcount", "bitop", "bitpos", "blmove",
+    "blpop", "brpop", "brpoplpush", "bzpopmax", "bzpopmin", "client", "command", "config",
+    "dbsize", "debug", "decr", "decrby", "del", "echo", "exists", "expire", "expireat",
+    "expiretime", "flushall", "flushdb", "get", "getbit", "getdel", "getex", "getrange",
+    "getset", "hdel", "hello", "hexists", "hget", "hgetall", "hincrby", "hincrbyfloat", "hkeys",
+    "hlen", "hmget", "hmset", "hrandfield", "hset", "hsetnx", "hstrlen", "hvals", "incr",
+    "incrby", "incrbyfloat", "info", "keys", "lastsave", "lindex", "linsert", "llen", "lmove",
+    "lpop", "lpos", "lpush", "lpushx", "lrange", "lrem", "lset", "ltrim", "mget", "mset",
+    "msetnx", "persist", "pexpire", "pexpireat", "pexpiretime", "ping", "psetex", "pttl",
+    "publish", "quit", "randomkey", "rename", "renamenx", "replicaof", "rpop", "rpoplpush",
+    "rpush", "rpushx", "sadd", "save", "scan", "scard", "select", "set", "setbit", "setex",
+    "setnx", "setrange", "shutdown", "sismember", "slaveof", "smembers", "smismember", "smove",
+    "spop", "srandmember", "srem", "strlen", "subscribe", "substr", "time", "touch", "ttl",
+    "type", "unlink", "unsubscribe", "wait", "zadd", "zcard", "zcount", "zdiff", "zdiffstore",
+    "zincrby", "zinter", "zintercard", "zinterstore", "zlexcount", "zmscore", "zpopmax",
+    "zpopmin", "zrandmember", "zrange", "zrangebylex", "zrangebyscore", "zrank", "zrem",
+    "zremrangebylex", "zremrangebyrank", "zremrangebyscore", "zrevrange", "zrevrangebylex",
+    "zrevrangebyscore", "zrevrank", "zscan", "zscore", "zunion", "zunionstore",
+];
+
+/// Commandes propres à RadixOx (pas dans `COMMANDS`, ni comptées comme commandes Redis).
+pub const INTERNAL_COMMANDS: &[&str] =
+    &["krange", "krevrange", "replicate", "rxblock", "rxhello", "rxload", "rxtick"];
+
 /// Erreur d'une commande reçue en entier mais impossible à exécuter. La
 /// connexion continue : le serveur répond `-ERR …` (`message`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1590,12 +1868,15 @@ pub enum CmdError {
     NotFloat,
     /// Message de Redis tel quel.
     Msg(&'static str),
+    /// Option inconnue d'EXPIRE & co : `ERR Unsupported option <opt>` ; dans
+    /// `Cmd::Invalid`, `name` est alors l'option (casse d'origine).
+    Unsupported,
 }
 
 impl CmdError {
     /// Message d'erreur RESP (sans le `-` initial), comme Redis.
-    pub fn message(self, name: &[u8]) -> String {
-        let name = String::from_utf8_lossy(name).to_ascii_lowercase();
+    pub fn message(self, raw_name: &[u8]) -> String {
+        let name = String::from_utf8_lossy(raw_name).to_ascii_lowercase();
         match self {
             CmdError::Unknown => format!("ERR unknown command '{name}'"),
             CmdError::Arity => format!("ERR wrong number of arguments for '{name}' command"),
@@ -1603,6 +1884,7 @@ impl CmdError {
             CmdError::NotInt => "ERR value is not an integer or out of range".into(),
             CmdError::NotFloat => "ERR value is not a valid float".into(),
             CmdError::Msg(m) => m.into(),
+            CmdError::Unsupported => format!("ERR Unsupported option {}", String::from_utf8_lossy(raw_name)),
         }
     }
 }
@@ -1692,6 +1974,14 @@ impl<'a> Cmd<'a> {
                 | Cmd::BLMove { .. }
                 | Cmd::SetBit { on: true, .. }
                 | Cmd::BitOp { .. }
+                | Cmd::Append { .. }
+                | Cmd::SetRange { .. }
+                | Cmd::GetSet { .. }
+                | Cmd::IncrByFloat { .. }
+                | Cmd::MSetNx(_)
+                | Cmd::HSetNx { .. }
+                | Cmd::HIncrByFloat { .. }
+                | Cmd::SMove { .. }
         )
     }
 
@@ -1709,7 +1999,19 @@ impl<'a> Cmd<'a> {
             | Cmd::ZIncrBy { .. }
             | Cmd::SetBit { .. }
             | Cmd::BitOp { .. }
+            | Cmd::Append { .. }
+            | Cmd::SetRange { .. }
+            | Cmd::GetSet { .. }
+            | Cmd::GetDel(_)
+            | Cmd::GetEx { op: Some(_), .. }
+            | Cmd::IncrByFloat { .. }
+            | Cmd::ExpireOpt { .. }
+            | Cmd::Rename { .. }
+            | Cmd::HSetNx { .. }
+            | Cmd::HIncrByFloat { .. }
+            | Cmd::SMove { .. }
             | Cmd::FlushDb => 1,
+            Cmd::MSetNx(pairs) => pairs.len(),
             Cmd::MSet(pairs) => pairs.len(),
             Cmd::Del(keys) => keys.len(),
             Cmd::Unlink(keys) => keys.len(),
@@ -1871,7 +2173,7 @@ mod tests {
     fn command_names_are_matched_exactly() {
         let unknown = |d: &[u8]| matches!(Cmd::from_slice(d), Some(Cmd::Invalid { err: CmdError::Unknown, .. }));
         assert!(unknown(b"DUMP k\r\n"));
-        assert!(unknown(b"SETRANGE k 0 v\r\n"));
+        assert!(unknown(b"XADD s * f v\r\n"));
         assert!(unknown(b"FOOBARZ\r\n"));
         assert!(unknown(b"QXYZ\r\n"));
         assert!(unknown(b"EVAL x 0\r\n"));
@@ -1955,5 +2257,40 @@ mod tests {
         assert_eq!(frame_need(frame), None);
         assert_eq!(frame_need(b"PING\r\n"), None);
         assert_eq!(frame_need(b"*2\r\n$3\r\nSET\r\n$1048576\r\nxx"), Some(13 + 10 + 1048576 + 2));
+    }
+
+    /// `COMMANDS` + `INTERNAL_COMMANDS` = exactement les noms de `dispatch_inner`.
+    #[test]
+    fn command_table_matches_dispatch() {
+        let src = include_str!("cmd.rs");
+        let body = &src[src.find("fn dispatch_inner").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let mut names: Vec<&str> = Vec::new();
+        for line in body.lines() {
+            let l = line.trim_start();
+            if !l.starts_with("b\"") || !l.contains("=>") {
+                continue;
+            }
+            let pat = &l[..l.find("=>").unwrap()];
+            for alt in pat.split('|') {
+                let a = alt.trim();
+                if let Some(n) = a.strip_prefix("b\"").and_then(|a| a.strip_suffix('"'))
+                    && n.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+                    && !n.is_empty()
+                {
+                    names.push(n);
+                }
+            }
+        }
+        names.sort_unstable();
+        names.dedup();
+        let mut table: Vec<&str> = super::COMMANDS.iter().chain(super::INTERNAL_COMMANDS).copied().collect();
+        table.sort_unstable();
+        assert_eq!(names, table);
+        assert!(super::COMMANDS.windows(2).all(|w| w[0] < w[1]), "COMMANDS triée, sans doublon");
+        for n in super::COMMANDS {
+            let raw = [n.as_bytes()];
+            assert!(!matches!(super::Cmd::from_raw(&raw), Some(super::Cmd::Invalid { err: CmdError::Unknown, .. })), "{n}");
+        }
     }
 }

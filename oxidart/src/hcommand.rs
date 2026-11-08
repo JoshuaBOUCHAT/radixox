@@ -311,3 +311,49 @@ impl OxidArt {
         Ok(new_val)
     }
 }
+
+impl OxidArt {
+    /// HSETNX : pose le champ s'il n'existe pas. `Ok(true)` : posé.
+    pub fn cmd_hsetnx(&mut self, key: &[u8], field: SharedByte, value: SharedByte) -> Result<bool, TypeError> {
+        if self.hash_view(key).map_err(|_| TypeError::ValueNotSet)?.is_some_and(|h| h.get(&field).is_some()) {
+            return Ok(false);
+        }
+        self.cmd_hset(key, &[(field, value)], None).map(|_| true)
+    }
+
+    /// HSTRLEN : longueur de la valeur du champ (0 si absent).
+    pub fn cmd_hstrlen(&mut self, key: &[u8], field: &[u8]) -> Result<usize, RedisType> {
+        Ok(self.hash_view(key)?.and_then(|h| h.get(field).map(|v| v.len())).unwrap_or(0))
+    }
+
+    /// HRANDFIELD : `count` comme Redis (négatif : avec répétitions), `None` : un champ.
+    /// Paires (champ, valeur) ; vide si la clé est absente.
+    pub fn cmd_hrandfield(&mut self, key: &[u8], count: Option<i64>) -> Result<Vec<(SharedByte, SharedByte)>, RedisType> {
+        let Some(h) = self.hash_view(key)? else {
+            return Ok(Vec::new());
+        };
+        let len = h.len() as usize;
+        if len == 0 || count == Some(0) {
+            return Ok(Vec::new());
+        }
+        let one = |rnd: u64| -> (&SharedByte, &SharedByte) {
+            match h {
+                HashView::Small(e) => {
+                    let [k, v] = &e[(rnd % e.len() as u64) as usize];
+                    (k, v)
+                }
+                HashView::Tree(root, _) => valart().hash_random(root, rnd).expect("Hash non vide"),
+            }
+        };
+        let picked = crate::kcommand::sample(
+            len,
+            count.unwrap_or(1),
+            one,
+            // SAFETY: `for_each` prête des entrées du bloc ou de valart, qui vivent autant
+            // que la vue (rien n'est modifié avant le clone de la fin).
+            |v| h.for_each(|k, x| v.push((unsafe { &*(k as *const SharedByte) }, unsafe { &*(x as *const SharedByte) }))),
+            |&(k, _)| k.as_slice(),
+        );
+        Ok(picked.into_iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+    }
+}

@@ -77,3 +77,34 @@ pub fn cmd_spop(art: &mut OxidArt, key: &[u8], count: Option<u64>) -> Frame {
         Err(TypeError::NotAFloat | TypeError::OutOfMemory) => Frame::Error("ERR internal error".into()),
     }
 }
+
+// ── Lot 1 (COMMANDS_PLAN.md §3) ──────────────────────────────────────────────
+
+fn wrongtype() -> Frame {
+    Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into())
+}
+
+pub fn cmd_smismember(art: &mut OxidArt, key: &[u8], members: &[&[u8]]) -> Frame {
+    match art.cmd_smismember(key, members) {
+        Ok(v) => Frame::Array(v.into_iter().map(|b| Frame::Integer(b as i64)).collect()),
+        Err(_) => wrongtype(),
+    }
+}
+
+pub fn cmd_srandmember(art: &mut OxidArt, key: &[u8], count: Option<i64>) -> Frame {
+    if count.is_some_and(|c| c < -radixox_lib::cmd::MAX_RAND_REPEAT) && art.type_of(key) == oxidart::value::RedisType::Set {
+        return Frame::Error("ERR value is out of range".into());
+    }
+    match art.cmd_srandmember(key, count) {
+        Err(_) => wrongtype(),
+        Ok(v) if count.is_none() => v.into_iter().next().map_or(Frame::Null, Frame::BulkString),
+        Ok(v) => Frame::Array(v.into_iter().map(Frame::BulkString).collect()),
+    }
+}
+
+pub fn cmd_smove(art: &mut OxidArt, src: &[u8], dst: &[u8], member: SharedByte) -> Frame {
+    match art.cmd_smove(src, dst, member) {
+        Ok(moved) => Frame::Integer(moved as i64),
+        Err(_) => wrongtype(),
+    }
+}

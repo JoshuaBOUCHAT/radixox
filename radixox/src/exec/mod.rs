@@ -11,6 +11,7 @@ pub mod auth;
 pub mod autosave;
 pub mod bgsave;
 mod bitset;
+mod float;
 pub mod fs_task;
 pub mod client;
 pub mod jobs;
@@ -409,6 +410,22 @@ pub fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         Cmd::DecrBy { key, delta } => cmd_decrby(art, key, delta),
         // ── Server ───────────────────────────────────────────────────────────
         Cmd::DbSize => cmd_dbsize(art),
+        Cmd::Time => string::cmd_time(),
+        Cmd::RandomKey => string::cmd_randomkey(art),
+        // ── Strings et clés, lot 1 ───────────────────────────────────────────
+        Cmd::Append { key, val } => string::cmd_append(art, key, val),
+        Cmd::StrLen(key) => string::cmd_strlen(art, key),
+        Cmd::GetRange { key, start, end } => string::cmd_getrange(art, key, start, end),
+        Cmd::SetRange { key, off, val } => string::cmd_setrange(art, key, off, val),
+        Cmd::GetSet { key, val } => string::cmd_getset(art, key, val),
+        Cmd::GetDel(key) => string::cmd_getdel(art, key),
+        Cmd::GetEx { key, op } => string::cmd_getex(art, key, op),
+        Cmd::IncrByFloat { key, incr } => string::cmd_incrbyfloat(art, key, incr),
+        Cmd::MSetNx(pairs) => string::cmd_msetnx(art, &pairs),
+        Cmd::ExpireOpt { key, at, cond, name } => string::cmd_expire_opt(art, key, at, cond, name),
+        Cmd::ExpireTime { key, ms } => string::cmd_expiretime(art, key, ms),
+        Cmd::Touch(keys) => string::cmd_touch(art, &keys),
+        Cmd::Rename { src, dst, nx } => string::cmd_rename(art, src, dst, nx),
         // ── Hash ─────────────────────────────────────────────────────────────
         Cmd::HSet { key, fields } => cmd_hset(art, key, &fields),
         Cmd::HGet { key, field } => cmd_hget(art, key, field),
@@ -420,6 +437,10 @@ pub fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         Cmd::HVals(key) => cmd_hvals(art, key),
         Cmd::HMGet { key, fields } => cmd_hmget(art, key, &fields),
         Cmd::HIncrBy { key, field, delta } => cmd_hincrby(art, key, field, delta),
+        Cmd::HSetNx { key, field, val } => hash::cmd_hsetnx(art, key, field, val),
+        Cmd::HStrLen { key, field } => hash::cmd_hstrlen(art, key, field),
+        Cmd::HIncrByFloat { key, field, incr } => hash::cmd_hincrbyfloat(art, key, field, incr),
+        Cmd::HRandField { key, count, with_values } => hash::cmd_hrandfield(art, key, count, with_values),
         // ── Set ──────────────────────────────────────────────────────────────
         Cmd::SAdd { key, members } => cmd_sadd(art, key, &members),
         Cmd::SRem { key, members } => cmd_srem(art, key, &members),
@@ -427,6 +448,9 @@ pub fn execute_sync(cmd: Cmd<'_>, art: &mut OxidArt) -> Frame {
         Cmd::SCard(key) => cmd_scard(art, key),
         Cmd::SMembers(key) => cmd_smembers(art, key),
         Cmd::SPop { key, count } => cmd_spop(art, key, count),
+        Cmd::SMIsMember { key, members } => sset::cmd_smismember(art, key, &members),
+        Cmd::SRandMember { key, count } => sset::cmd_srandmember(art, key, count),
+        Cmd::SMove { src, dst, member } => sset::cmd_smove(art, src, dst, member),
         // ── ZSet ─────────────────────────────────────────────────────────────
         Cmd::ZAdd { key, flags, members } => cmd_zadd(art, key, flags, &members),
         Cmd::ZCard(key) => cmd_zcard(art, key),

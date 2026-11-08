@@ -35,7 +35,7 @@ pub enum Journal<'a> {
     Verbatim,
     /// La frame reçue, sauf erreur ou réponse qui dit « rien changé » (`:0`,
     /// nul) : `SETNX`, `SET NX|XX`, `DEL`, `UNLINK`, `EXPIRE`, `PERSIST`,
-    /// `HDEL`, `SADD`, `SREM`, `ZREM`. Décidé commande par commande : un `INCR`
+    /// `HDEL`, `SADD`, `SREM`, `ZREM`, `GETDEL`, `GETEX`, `MSETNX`, `RENAMENX`, `SMOVE`… Décidé commande par commande : un `INCR`
     /// qui répond `:0` a écrit.
     IfChanged,
     /// `SPOP` : `SREM <clé> <membres tirés>`, lus dans la réponse (D4).
@@ -71,7 +71,17 @@ pub fn plan<'a>(cmd: &Cmd<'a>) -> Journal<'a> {
         | Cmd::LPop { .. }
         | Cmd::LRem { .. }
         | Cmd::LInsert { .. }
-        | Cmd::LMove { .. } => Journal::IfChanged,
+        | Cmd::LMove { .. }
+        | Cmd::GetDel(_)
+        | Cmd::GetEx { .. }
+        | Cmd::MSetNx(_)
+        | Cmd::ExpireOpt { .. }
+        | Cmd::Rename { nx: true, .. }
+        | Cmd::HSetNx { .. }
+        | Cmd::SMove { .. } => Journal::IfChanged,
+        // INCRBYFLOAT / HINCRBYFLOAT : telles quelles. Redis les propage en `SET … KEEPTTL`
+        // / `HSET` parce que son `long double` dépend de la plateforme ; ici le calcul
+        // (exec/float.rs) est déterministe, le même binaire rejoue le même résultat.
         // Toutes les écritures (`write_weight` > 0) ; le reste est lu ou
         // propre à la connexion (§3.1).
         c if c.is_write() => Journal::Verbatim,
