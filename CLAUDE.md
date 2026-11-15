@@ -38,7 +38,8 @@ radixox/        lib no_std : `exec` (commandes, encodage, jobs, BGSAVE), `uring`
                 (std, src/bin/uringloop.rs) et `radixox-nostd` (sans libc, src/bin/nostd.rs) ;
                 tests d'intégration
 radixox-mem/    memcpy & co. en Rust pour le binaire sans libc
-scripts/        bench_vs_valkey.sh (référence du README), bench_zipf.sh (accès Zipf, CPU par cœur), stress_save.sh
+scripts/        bench_vs_valkey.sh (référence du README), bench_zipf.sh (accès Zipf, CPU par cœur), stress_save.sh,
+                scan_vs_valkey.py (SSCAN/HSCAN, CPU serveur)
 ```
 
 `HiSlab` (slab mmap + THP) vit dans `radixox-lib/src/hislab/` (ancien crate `hislab`, intégré

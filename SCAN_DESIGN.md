@@ -105,7 +105,7 @@ enfants deux slots à l'avance, puis leurs premiers membres un slot à l'avance 
 ### Performances (2026-11-15)
 
 Set et Hash de 1M membres (`member:{i}`, `field:{i}` → `v{i}`), scan complet, client
-Python non pipeliné, CPU du serveur par `/proc/<pid>/task/*/schedstat` (ns), min de 3,
+Python non pipeliné (`scripts/scan_vs_valkey.py`), CPU du serveur par `/proc/<pid>/task/*/schedstat` (ns), min de 3,
 serveur épinglé sur un cœur, profil `performance`, Valkey 9.1.2 sur la même machine.
 Avant / après : binaires `profiling` de a4de5fb et de ce changement, chargés à neuf,
 passages alternés (ABBA).
