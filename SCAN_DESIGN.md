@@ -88,66 +88,59 @@ examinée**, comme pour SCAN, dans un ordre total qui ne dépend que du membre :
 deux fois, toute entrée présente du début à la fin rendue une fois, quelles que soient
 les écritures entre deux pages.
 
-Parcours : dans un nœud, slots pris par radix croissant (≤ 16 : tri sur place ; au-delà,
-table radix → rang, O(256 + n) sans comparaison), en partant du radix de la position ;
-les groupes avant sont sautés sans y descendre. L'entrée d'un slot à enfant partage
-`h0..hd` avec son sous-arbre mais pas la suite : elle **flotte** dans le sous-arbre
-jusqu'à sa place (au plus 7, une par niveau). Le hash de chaque entrée vue est recalculé
-(le nœud n'en garde que le radix et l'octet de contrôle) ; les membres sont donc lus de
-toute façon, et préchargés 8 slots à l'avance ; les nœuds enfants deux slots à l'avance,
-puis leurs premiers membres un slot à l'avance (les deux étages du parcours de SCAN).
+Parcours : dans un nœud, slots pris par radix croissant, lus à la demande dans un
+bitmap 256 bits des radix présents et une table radix → rang (une passe sur les octets
+de radix, ni tri ni liste), en partant du radix de la position ; les groupes avant sont
+sautés sans y descendre. L'entrée d'un slot à enfant partage `h0..hd` avec son
+sous-arbre mais pas la suite : elle **flotte** dans le sous-arbre jusqu'à sa place (au
+plus 7, une par niveau). La clé d'ordre (foldhash du membre, recalculé : le nœud n'en
+garde que le radix et l'octet de contrôle) n'est calculée que là où le chemin ne suffit
+pas : entrée flottante, groupe de plus d'une entrée, groupe sur le chemin de la
+position ; l'appelant calcule celle de la dernière entrée de la page. Une feuille seule
+à son radix hors du chemin de la position (le cas courant) sort sans hash. Les membres
+sont lus de toute façon (MATCH, réponse) et préchargés 8 slots à l'avance ; les nœuds
+enfants deux slots à l'avance, puis leurs premiers membres un slot à l'avance (les deux
+étages du parcours de SCAN).
 
-Mesure (2026-11-08, Set et Hash de 1M membres, scan complet, CPU serveur relevé dans
-`/proc`, min de 3, contre Valkey 9.1) :
+### Performances (2026-11-15)
 
-| | RadixOx | Valkey |
-|---|---|---|
-| SSCAN COUNT 1000 | 80 ms | 90 ms |
-| HSCAN COUNT 1000 | 100 ms | 140 ms |
-| SSCAN MATCH `*:7*` COUNT 1000 | 80 ms | 140 ms |
-| SSCAN MATCH `*:7*` COUNT 10 | 170 ms | 610 ms |
-| SSCAN COUNT 10 | 890 ms (100k appels) | 550 ms (72k appels) |
+Set et Hash de 1M membres (`member:{i}`, `field:{i}` → `v{i}`), scan complet, client
+Python non pipeliné, CPU du serveur par `/proc/<pid>/task/*/schedstat` (ns), min de 3,
+serveur épinglé sur un cœur, profil `performance`, Valkey 9.1.2 sur la même machine.
+Avant / après : binaires `profiling` de a4de5fb et de ce changement, chargés à neuf,
+passages alternés (ABBA).
 
-COUNT 10 : ~9 µs par appel contre 7,6 µs ; l'écart total vient surtout du COUNT exact
-(Valkey rend ~14 éléments par appel). Le tri des slots de la racine à chaque page coûtait
-1200 ms ; la table radix → rang l'a ramené à 890.
+| | RadixOx avant | RadixOx après | Valkey |
+|---|---|---|---|
+| SSCAN COUNT 1000 | 79 ms | 58–60 ms | 79 ms |
+| HSCAN COUNT 1000 | 96–100 ms | 79–81 ms | 134 ms |
+| SSCAN MATCH `*:7*` COUNT 1000 | 70–72 ms | 54 ms | 86 ms |
+| SSCAN MATCH `*:7*` COUNT 10 | 142–144 ms | 111–113 ms | 505 ms |
+| SSCAN COUNT 10 | 756–760 ms (100k appels) | 600–686 ms | 514 ms (72k appels) |
+| HSCAN COUNT 10 | 818–832 ms (100k appels) | 740–747 ms | 603 ms (72k appels) |
+| SCARD ×100k (aller-retour seul) | 460 ms | 460 ms | 500 ms |
 
-### Performances : chantier ouvert (prochaine session)
+Par appel à COUNT 10 : 6,0–6,9 µs (SSCAN) et 7,4 µs (HSCAN), contre 7,2 et 8,4 µs chez
+Valkey, qui rend ~14 éléments par appel contre 10 (COUNT exact chez nous) : l'écart sur
+le scan complet vient du nombre d'appels.
 
-Jugement de l'utilisateur (2026-11-08) : **performances discutables**, à reprendre. Rien
-n'a été profilé : les pistes ci-dessous sont des hypothèses, à vérifier par `perf`
-avant de coder (mesurer avant d'affirmer).
+Ce que le profil (`perf record`) montrait avant, à COUNT 10 : la moitié du temps
+utilisateur dans le rangement des slots, à chaque page, pour la racine et le niveau 1
+(≈ 256 slots chacun) : table radix → rang, puis copie de tous les slots ≥ position dans
+une `SmallVec` de `(u8, Slot)` de 24 o qui débordait sur le tas (pousser + allouer).
+Une page de 10 n'en consomme que quelques-uns. Le foldhash par entrée pesait surtout à
+COUNT 1000.
 
-Ce que coûte une page aujourd'hui :
-- **redescente depuis la racine à chaque page**, avec construction de la table radix →
-  rang (256 cases + n) à chaque nœud du chemin de la position ;
-- **un hash recalculé (foldhash) pour chaque entrée vue**, alors que la clé d'ordre
-  n'est utile que pour : les entrées flottantes (slot à enfant), le tri d'un groupe de
-  plus d'une entrée, la comparaison à `from` sur le chemin de la position, et la
-  position de la dernière entrée examinée. Ailleurs (groupes d'une seule entrée hors du
-  chemin de `from`), le chemin donne déjà l'ordre : piste la plus prometteuse ;
-- **copie de la page** : `sscan_page` / `hscan_page` clonent chaque membre (et valeur)
-  dans un `Vec<SharedByte>` avant l'encodage ; SCAN encode depuis une `ScanPage` à plat.
-  Encoder directement dans le tampon de sortie pendant le parcours ;
-- MATCH testé après lecture du membre : normal (il faut le lire), mais le clone ne doit
-  avoir lieu que pour les retenus (déjà le cas) ;
-- coût fixe par appel (table de curseurs, encodage, réseau) : le comparer à celui de
-  SCAN sur le même nombre d'appels pour savoir ce qui revient au parcours.
-
-Pistes plus lourdes :
-- **garder le chemin entre deux pages** (pile des nœuds) plutôt que redescendre : interdit
-  par la règle d'or (ARCHITECTURE.md §1.1 : aucun idx de slab ne survit à un tour) sauf à
-  le valider par un compteur de modifications par conteneur (ou global à valart), à
-  ajouter à chaque mutation ; ne vaut que si la redescente pèse vraiment ;
-- éviter le recalcul du hash en le stockant : 8 o par entrée, contraire aux choix mémoire
-  de valart (le nœud ne garde que radix + contrôle) ; probablement non.
-
-Méthode pour la reprise : Set et Hash de 1M membres (`member:{i}`, `field:{i}`), scan
-complet COUNT 10 / 1000 / MATCH `*:7*`, CPU du serveur par `/proc/<pid>/stat` (ticks de
-10 ms : préférer `perf stat -p` pour la précision), min de 3, Valkey 9.1 sur la même
-machine ; puis `perf record` sur RadixOx pour répartir le coût par page (redescente,
-hash, clone, encodage, curseur). Cible : COUNT 10 au moins au coût par appel de Valkey
-(7,6 µs), COUNT 1000 nettement sous Valkey.
+Ce qui reste (profil après) :
+- COUNT 10 : ~1,1 µs utilisateur par appel sur ~6,5 ; `Walk::node` ~0,4 µs, dont ~40 %
+  dans la passe sur les radix (`Order::new`, deux nœuds de 256). Deux boucles à la place
+  du `chain` : rien de mesurable. Le reste est noyau (≈ 68 %, dont ~8 % de nf_tables de
+  firewalld sur loopback, que Valkey paie aussi) ;
+- COUNT 1000 : ~21 µs utilisateur par page sur ~80 (HSCAN) : parcours ~6,6 µs, encodage
+  ~4 µs, clone des membres dans un `Vec` avant l'encodage. Encoder directement pendant
+  le parcours gagnerait 1 à 2 % du total : non fait ;
+- garder le chemin entre deux pages (pile + compteur de modifications) : la redescente
+  ne pèse plus assez pour le justifier.
 
 ## Configuration
 

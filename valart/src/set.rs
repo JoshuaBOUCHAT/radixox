@@ -260,6 +260,12 @@ impl SetNode {
         }
     }
 
+    /// Radix inline puis radix du débordement, dans l'ordre des slots (`slot_at`).
+    #[inline]
+    pub(crate) fn radixes(&self) -> (&[u8], &[u8]) {
+        (&self.prefix[..self.count as usize], self.overflow.as_ref().map_or(&[][..], SetOverflow::radixes))
+    }
+
     #[inline]
     pub(crate) fn radix_of(&self, slot: Slot) -> u8 {
         match slot {

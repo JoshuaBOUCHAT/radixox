@@ -383,14 +383,14 @@ impl OxidArt {
             HashView::Tree(root, _) => {
                 let (mut out, mut seen, mut last) = (Vec::new(), 0usize, None);
                 let (count, budget) = (count.max(1), budget.max(1));
-                valart().hash_scan(root, from, |k, f, v| {
+                valart().hash_scan(root, from, |f, v| {
                     seen += 1;
                     if keep(f) {
                         out.push((f.clone(), v.clone()));
                     }
                     let go = out.len() < count && seen < budget;
                     if !go {
-                        last = Some((k, f.as_slice().to_vec()));
+                        last = Some((valart().scan_order_key(f), f.as_slice().to_vec()));
                     }
                     go
                 });

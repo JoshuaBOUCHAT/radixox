@@ -375,14 +375,14 @@ impl OxidArt {
             SetView::Tree(root, _) => {
                 let (mut out, mut seen, mut last) = (Vec::new(), 0usize, None);
                 let (count, budget) = (count.max(1), budget.max(1));
-                valart().set_scan(root, from, |k, m| {
+                valart().set_scan(root, from, |m| {
                     seen += 1;
                     if keep(m) {
                         out.push(m.clone());
                     }
                     let go = out.len() < count && seen < budget;
                     if !go {
-                        last = Some((k, m.as_slice().to_vec()));
+                        last = Some((valart().scan_order_key(m), m.as_slice().to_vec()));
                     }
                     go
                 });

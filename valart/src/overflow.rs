@@ -173,6 +173,12 @@ impl SetOverflow {
         unsafe { *self.radix_ptr().add(i) }
     }
 
+    /// Radix des entrées, dans l'ordre des slots.
+    #[inline]
+    pub fn radixes(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.radix_ptr(), self.len()) }
+    }
+
     #[inline]
     pub fn ctrl(&self, i: usize) -> u8 {
         debug_assert!(i < self.len());
@@ -658,6 +664,12 @@ impl HashOverflow {
     pub fn radix(&self, i: usize) -> u8 {
         debug_assert!(i < self.len());
         unsafe { *self.radix_ptr().add(i) }
+    }
+
+    /// Radix des entrées, dans l'ordre des slots.
+    #[inline]
+    pub fn radixes(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.radix_ptr(), self.len()) }
     }
 
     #[inline]
